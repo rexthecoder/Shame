@@ -1,5 +1,63 @@
 # Milestone notes
 
+## UI redesign from real Fleet reference screenshots
+
+The user said flatly they didn't like the chrome and to lean heavier
+on Fleet's actual design, not my memory of it. Looked at real material
+this time instead of guessing from recall: JetBrains' own Fleet
+product page, a 2021 hands-on article with an embedded screenshot
+(theregister.com), and — most useful — three real Fleet screenshots
+the user attached directly (official JetBrains press images,
+`intellij`/`community`/`jetsave` projects). That changed the plan
+significantly from the three earlier "UI pass" commits above, which
+were closer to a cleaned-up VS Code than to Fleet.
+
+What the real screenshots actually show, that my memory-based passes
+didn't have:
+- **Tabs live *in* the titlebar**, not in a separate row below it —
+  the whole titlebar is one row: traffic lights, then open-file tabs,
+  then the project name + branch, then action icons, all in one
+  compact strip. Restructured `Render` to match: `render_tabs()` (was
+  `render_tab_bar()`) is now a `flex_1` child of the single merged
+  titlebar row instead of its own bar with its own background.
+- **Nearly flat chrome** — sidebar, titlebar, and status bar all read
+  as the *same* background as the editor, separated only by hairline
+  1px borders, not by distinctly shaded panels. Every chrome surface
+  that used a `sidebar`/`tab_bar`/`status_bar`/`title_bar` theme token
+  for its background now uses plain `background` instead, with
+  `border` instead of the surface-specific border tokens.
+- **Colored file-type tab badges** (a small rounded square — "TS" in
+  blue, "{}" in yellow for JSON, etc.) instead of a generic file icon
+  on each tab — `file_type_badge()`, used only on tabs (the sidebar
+  tree keeps its icon-only treatment; extending badges there too is a
+  reasonable follow-up, not done this round).
+- **A status-bar breadcrumb** (`project / crates / app / src /
+  main.rs`) instead of a raw absolute path —
+  `breadcrumb_path()`, rooted at the open project like Fleet's own.
+- **An active-line accent mark**: a 2px blue bar at the gutter's edge
+  on the cursor's line, alongside the existing full-row tint —
+  `editor-view`'s `render_line` now does both, matching what's visible
+  in the reference screenshots' debugger line.
+
+Kept one deliberately non-Fleet detail per the user's "a little Zed"
+ask: the active tab's 2px blue *top* border accent (Fleet marks its
+active tab with a full blue outline box instead) — the one visual
+signature carried over from the earlier Zed-inspired passes rather
+than copying Fleet exactly everywhere.
+
+**Scoped out of this round**, named rather than silently skipped:
+Fleet's sidebar has its own Files/Search/Git/History mode-switcher
+tabs (a real panel-switching UI, not just a label) and indent guides
+in the editor (vertical lines marking scope depth) — both real,
+visible in the reference screenshots, but both meaningfully more
+engineering than a styling pass: the sidebar tabs would mean wiring
+actual Search/Git panels to UI (the backends exist —
+`core_workspace::search_text`/`current_branch` — but putting a tab
+there that does nothing when clicked would be worse than not having
+it), and indent guides need real per-line indent-depth computation in
+`editor-view`, not a style tweak. Flagged for a follow-up round, not
+attempted blind.
+
 ## Dirty-tree indicator + project-wide text search backend
 
 Two more `core-workspace` pieces, continuing from the git-branch work.

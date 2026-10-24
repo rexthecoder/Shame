@@ -94,6 +94,36 @@ fn language_label(path: &Path) -> String {
     }
 }
 
+/// `project / crates / app / src / main.rs`, not a raw absolute path —
+/// the status-bar breadcrumb Fleet (and most other editors) shows,
+/// rooted at the open project rather than the filesystem root.
+fn breadcrumb_path(root: &Path, path: &Path) -> String {
+    let root_name = root.file_name().and_then(|n| n.to_str()).unwrap_or("/");
+    let relative = path.strip_prefix(root).unwrap_or(path);
+    let mut segments = vec![root_name.to_string()];
+    segments.extend(relative.components().filter_map(|c| c.as_os_str().to_str().map(str::to_string)));
+    segments.join(" / ")
+}
+
+/// A small colored tab badge (label, background color) for a file
+/// name, the way Fleet marks a tab's language at a glance instead of
+/// (or alongside) a generic file icon — `None` for `untitled`/no
+/// extension, same as Fleet shows no badge there either.
+fn file_type_badge(name: &str) -> Option<(&'static str, Rgba)> {
+    let ext = Path::new(name).extension().and_then(|e| e.to_str())?;
+    Some(match ext {
+        "rs" => ("RS", rgb(0xdea584)),
+        "dart" => ("DART", rgb(0x0175c2)),
+        "ts" | "tsx" => ("TS", rgb(0x3178c6)),
+        "js" | "jsx" => ("JS", rgb(0xf0db4f)),
+        "json" => ("{}", rgb(0xcbcb41)),
+        "toml" => ("TOML", rgb(0x9c4221)),
+        "yaml" | "yml" => ("YML", rgb(0xcb171e)),
+        "md" => ("MD", rgb(0x708090)),
+        _ => return None,
+    })
+}
+
 /// Every file under `dir`, for the Quick Open palette.
 fn flatten_files(dir: &Path) -> Vec<PathBuf> {
     let mut files = Vec::new();
@@ -552,6 +582,14 @@ impl Render for DartIde {
                 // `app_owns_titlebar_drag` left at its default `false`,
                 // keeps the window draggable from here without any extra
                 // mouse handling on our side).
+                // Titlebar and tabs share one row, not three stacked bars
+                // (titlebar / tab bar / editor) like the previous pass —
+                // real Fleet puts open-file tabs directly in the titlebar
+                // itself, with the project/branch pill and window actions
+                // off to the right. Still draws over the traffic-light
+                // inset (`pl`) and still gets free native window dragging
+                // from `appears_transparent` the same way the old
+                // titlebar-only row did.
                 h_flex()
                     .w_full()
                     .h(px(38.))
@@ -559,11 +597,19 @@ impl Render for DartIde {
                     .pl(traffic_light_inset)
                     .pr_3()
                     .items_center()
-                    .bg(cx.theme().title_bar)
+                    // Fleet's whole chrome shares one flat background —
+                    // sidebar, tabs, status bar, and the editor itself
+                    // all read as the same surface, separated only by
+                    // hairline borders, not by shaded panels the way
+                    // VS Code/the first pass here did. Matched here and
+                    // at every other chrome surface below.
+                    .bg(cx.theme().background)
                     .border_b_1()
-                    .border_color(cx.theme().title_bar_border)
+                    .border_color(cx.theme().border)
+                    .child(self.render_tabs(&view, cx))
                     .child(
                         h_flex()
+                            .flex_shrink_0()
                             .gap_2()
                             .items_center()
                             .px_2()
@@ -608,9 +654,9 @@ impl Render for DartIde {
                                 .child(
                                     v_flex()
                                         .size_full()
-                                        .bg(cx.theme().sidebar)
+                                        .bg(cx.theme().background)
                                         .border_r_1()
-                                        .border_color(cx.theme().sidebar_border)
+                                        .border_color(cx.theme().border)
                                         .child(
                                             h_flex()
                                                 .items_center()
@@ -619,11 +665,14 @@ impl Render for DartIde {
                                                 .pr_1()
                                                 .py_2()
                                                 .child(
+                                                    // Plain sentence-case, not the bold
+                                                    // uppercase VS Code/Zed convention —
+                                                    // Fleet's own sidebar header (when it
+                                                    // has one at all) is this understated.
                                                     div()
-                                                        .text_xs()
-                                                        .font_bold()
+                                                        .text_sm()
                                                         .text_color(cx.theme().muted_foreground)
-                                                        .child(root_name.to_uppercase()),
+                                                        .child(root_name.clone()),
                                                 )
                                                 .child(
                                                     Button::new("open-folder")
@@ -688,18 +737,12 @@ impl Render for DartIde {
                                 ),
                         )
                         .child(
-                            v_flex()
+                            div()
                                 .flex_1()
                                 .w_full()
                                 .h(relative(1.))
-                                .child(self.render_tab_bar(&view, cx))
-                                .child(
-                                    div()
-                                        .flex_1()
-                                        .w_full()
-                                        .min_h(px(0.))
-                                        .child(self.active_editor().clone()),
-                                )
+                                .min_h(px(0.))
+                                .child(self.active_editor().clone())
                                 .into_any_element(),
                         ),
                 ),
@@ -712,38 +755,59 @@ impl Render for DartIde {
 }
 
 impl DartIde {
-    fn render_tab_bar(&self, view: &Entity<Self>, cx: &mut Context<Self>) -> impl IntoElement {
+    /// Just the tabs, no surrounding bg/border/height of its own — this
+    /// is a `flex_1` child of the merged titlebar row in `Render`, not
+    /// a standalone bar, matching real Fleet (tabs live in the
+    /// titlebar, not a separate row below it).
+    fn render_tabs(&self, view: &Entity<Self>, cx: &mut Context<Self>) -> impl IntoElement {
         let accent = cx.theme().blue;
         let muted = cx.theme().muted_foreground;
         let foreground = cx.theme().foreground;
 
         h_flex()
-            .w_full()
-            .h(px(34.))
-            .flex_shrink_0()
-            .bg(cx.theme().tab_bar)
-            .border_b_1()
-            .border_color(cx.theme().border)
+            .flex_1()
+            .h_full()
+            .items_center()
+            .overflow_hidden()
             .children(self.tabs.iter().enumerate().map(|(ix, tab)| {
                 let is_active = ix == self.active_tab;
                 let is_dirty = tab.editor.read(cx).buffer().is_dirty();
+                let title = tab.title();
 
+                // Flat, text-driven tabs — no boxed/pill background even
+                // for the active one (that's the VS Code/first-pass
+                // look). What marks the active tab is the same here as
+                // every other tab bar in this app: the blue top accent,
+                // plus brighter text — one signature detail carried over
+                // from Zed on an otherwise flat, Fleet-style surface.
                 h_flex()
                     .id(("tab", ix))
                     .h_full()
+                    .flex_shrink_0()
                     .items_center()
                     .gap_2()
                     .px_3()
                     .cursor_pointer()
                     .border_t(px(2.))
                     .border_color(if is_active { accent } else { gpui_kit::transparent_black() })
-                    .bg(if is_active { cx.theme().tab_active } else { cx.theme().tab })
-                    .text_color(if is_active { cx.theme().tab_active_foreground } else { cx.theme().tab_foreground })
+                    .text_color(if is_active { foreground } else { muted })
+                    .when_some(file_type_badge(&title), |el, (label, color)| {
+                        el.child(
+                            div()
+                                .px_1()
+                                .rounded(px(3.))
+                                .bg(color)
+                                .text_size(px(9.))
+                                .font_bold()
+                                .text_color(rgb(0xffffff))
+                                .child(label),
+                        )
+                    })
                     .child(
                         div()
                             .id(("tab-label", ix))
                             .text_sm()
-                            .child(tab.title())
+                            .child(title)
                             .on_click({
                                 let view = view.clone();
                                 move |_event, _window, cx| {
@@ -778,7 +842,7 @@ impl DartIde {
         let editor = self.active_editor().read(cx);
         let buffer = editor.buffer();
         let path = match buffer.path() {
-            Some(path) => path.display().to_string(),
+            Some(path) => breadcrumb_path(&self.root, path),
             None => "untitled".to_string(),
         };
         let is_dirty = buffer.is_dirty();
@@ -793,9 +857,9 @@ impl DartIde {
             .px_3()
             .items_center()
             .justify_between()
-            .bg(cx.theme().status_bar)
+            .bg(cx.theme().background)
             .border_t_1()
-            .border_color(cx.theme().status_bar_border)
+            .border_color(cx.theme().border)
             .text_xs()
             .text_color(cx.theme().muted_foreground)
             .child(

@@ -556,6 +556,10 @@ impl EditorView {
                     .relative()
                     .flex_1()
                     .h_full()
+                    // The thin accent mark real editors put at the gutter's
+                    // edge on the active line — a second, more precise cue
+                    // than the full-row tint above.
+                    .when(is_active_line, |el| el.border_l(px(2.)).border_color(cx.theme().blue))
                     .child(content)
                     .child(click_overlay)
                     .when_some(
