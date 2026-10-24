@@ -193,6 +193,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "core-buffer",
+ "core-lsp",
  "editor-view",
  "gpui-kit",
 ]

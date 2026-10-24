@@ -39,13 +39,15 @@ const LINE_FONT_SIZE: f32 = 14.;
 
 /// Emitted when this editor wants something handled above it that it has
 /// no business doing itself: opening a different file (`editor-view` has
-/// no idea tabs exist) or collecting a new name for a rename (no text
-/// input here — see the crate's module docs on why). `app` subscribes to
-/// both per tab.
+/// no idea tabs exist), collecting a new name for a rename, or showing a
+/// picker for more than one code action (no text input or list widget
+/// here — see the crate's module docs on why). `app` subscribes to all
+/// three per tab.
 #[derive(Debug, Clone)]
 pub enum EditorEvent {
     OpenAt { path: PathBuf, line: u32, column: u32 },
     RequestRename { line: u32, column: u32 },
+    ShowCodeActions { actions: Vec<lsp_types::CodeActionOrCommand> },
 }
 
 /// The exact byte column within `text` closest to `x` pixels from the
@@ -312,6 +314,7 @@ impl EditorView {
                     self.request_format();
                 }
                 "r" => self.start_rename(cx),
+                "." => self.request_code_actions(),
                 "z" => {
                     if keystroke.modifiers.shift {
                         self.buffer.redo();

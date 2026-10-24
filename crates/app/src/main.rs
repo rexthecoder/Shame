@@ -8,6 +8,7 @@
 use std::path::{Path, PathBuf};
 
 use core_buffer::Buffer;
+use core_lsp::lsp_types;
 use editor_view::{EditorEvent, EditorView};
 use gpui_kit::assets::Assets;
 use gpui_kit::component::{
@@ -113,6 +114,7 @@ pub struct DartIde {
     palette_input: Entity<InputState>,
     rename_target: Option<(Entity<EditorView>, u32, u32)>,
     rename_input: Entity<InputState>,
+    code_actions: Option<(Entity<EditorView>, Vec<lsp_types::CodeActionOrCommand>)>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -149,6 +151,7 @@ impl DartIde {
             palette_input,
             rename_target: None,
             rename_input,
+            code_actions: None,
             _subscriptions: Vec::new(),
         };
         this.watch_editor(&editor, window, cx);
@@ -174,6 +177,10 @@ impl DartIde {
                     state.set_value("", window, cx);
                     state.focus(window, cx);
                 });
+                cx.notify();
+            }
+            EditorEvent::ShowCodeActions { actions } => {
+                this.code_actions = Some((editor.clone(), actions.clone()));
                 cx.notify();
             }
         });
@@ -228,6 +235,73 @@ impl DartIde {
                         ),
                 ),
         )
+    }
+
+    /// A small list overlay for picking one of several code actions —
+    /// same `ListItem`-in-an-overlay pattern as the file tree and Quick
+    /// Open, not a new design. Only shown when there's more than one
+    /// action; `editor-view` applies a single action immediately
+    /// without asking.
+    fn render_code_actions(&self, view: &Entity<Self>, cx: &mut Context<Self>) -> Option<Div> {
+        let (_, actions) = self.code_actions.as_ref()?;
+
+        Some(
+            div()
+                .absolute()
+                .inset_0()
+                .flex()
+                .justify_center()
+                .pt(px(96.))
+                .bg(rgba(0x000000aa))
+                .on_key_down({
+                    let view = view.clone();
+                    move |event, _window, cx| {
+                        if event.keystroke.key.as_str() == "escape" {
+                            view.update(cx, |this, cx| {
+                                this.code_actions = None;
+                                cx.notify();
+                            });
+                        }
+                    }
+                })
+                .child(
+                    v_flex()
+                        .w(px(420.))
+                        .bg(cx.theme().background)
+                        .border_1()
+                        .border_color(cx.theme().border)
+                        .rounded(cx.theme().radius)
+                        .children(actions.iter().enumerate().map(|(ix, action)| {
+                            let title = match action {
+                                lsp_types::CodeActionOrCommand::Command(c) => c.title.clone(),
+                                lsp_types::CodeActionOrCommand::CodeAction(a) => a.title.clone(),
+                            };
+                            div()
+                                .id(("code-action", ix))
+                                .px_3()
+                                .py_2()
+                                .text_sm()
+                                .child(title)
+                                .on_click({
+                                    let view = view.clone();
+                                    move |_event, _window, cx| {
+                                        view.update(cx, |this, cx| this.apply_code_action(ix, cx));
+                                    }
+                                })
+                        })),
+                ),
+        )
+    }
+
+    fn apply_code_action(&mut self, index: usize, cx: &mut Context<Self>) {
+        let Some((editor, mut actions)) = self.code_actions.take() else {
+            return;
+        };
+        if index < actions.len() {
+            let action = actions.remove(index);
+            editor.update(cx, |editor, cx| editor.apply_code_action(action, cx));
+        }
+        cx.notify();
     }
 
     fn submit_rename(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
@@ -510,6 +584,7 @@ impl Render for DartIde {
             .child(self.render_status_bar(cx))
             .when_some(self.render_palette(&view, cx), |el, palette| el.child(palette))
             .when_some(self.render_rename_prompt(&view, cx), |el, prompt| el.child(prompt))
+            .when_some(self.render_code_actions(&view, cx), |el, picker| el.child(picker))
     }
 }
 

@@ -1,5 +1,52 @@
 # Milestone notes
 
+## M2: code actions (cmd/ctrl+.) — the last item on the original list
+
+`textDocument/codeAction` turned up something the plan didn't call out
+and that would have been easy to get wrong without checking: **the real
+Dart analysis server never returns a direct edit for a quick-fix.**
+Every single result is `CodeActionOrCommand::Command` — `{"command":
+"dart.edit.codeAction.apply", "arguments": [...], "title": "..."}` — not
+a `CodeAction` with an `edit` field. Applying one means a second round
+trip:
+
+1. `workspace/executeCommand` with that same command + arguments.
+2. The server replies to *that*, but the actual edit shows up
+   separately, as the server making **its own request to us**:
+   `workspace/applyEdit`, carrying the `WorkspaceEdit` and expecting a
+   `{"applied": true}` reply.
+
+Step 2 needed a real extension to `core-lsp`, not just new code in
+`editor-view`: the client only knew how to parse `Response`s (ours,
+matched by id) and `Notification`s (no id). A message with an `id` but
+no `result`/`error` used to be silently dropped — treated as noise
+rather than what it actually is here. Added `ServerMessage::Request`
+for this case, plus `LspClient::respond()` to answer it. The existing
+test for "message with id, no result/error" had its premise checked
+against this change and rewritten as a test for the new variant, rather
+than left asserting the old (now wrong) behavior.
+
+`EditorView::apply_code_action` handles both shapes anyway (direct edit
+or command) so the logic isn't Dart-specific, even though in practice
+every response seen so far from this server is a command. `cmd/ctrl+.`
+sends the request for whatever diagnostics are on the cursor's line; a
+single result applies immediately, more than one emits
+`EditorEvent::ShowCodeActions` for `app` to show a picker — same
+`ListItem`-in-an-overlay pattern as the file tree and Quick Open, not a
+new design.
+
+**Verified against the real server, including the full round trip**: an
+unused `import 'dart:math';` produced 3 commands from
+`textDocument/codeAction`; manually running `workspace/executeCommand`
+for the first one confirmed the server really does send back an
+unsolicited `workspace/applyEdit` *request* (not a response) with the
+edit that removes the import line. Locked in with two permanent tests
+(the command-shaped code action list, and the `applyEdit` request
+params) — 42 tests total now.
+
+This closes every item on the plan's original M2 list except
+completion, which stays deferred to the UI pass.
+
 ## M2: rename (F2 / cmd+ctrl+R)
 
 `textDocument/rename` is wired up, but it's also the first feature that

@@ -16,6 +16,9 @@ pub enum ServerMessage {
     Response { id: i64, result: Result<Value, Value> },
     /// A notification (no reply expected), e.g. `textDocument/publishDiagnostics`.
     Notification { method: String, params: Value },
+    /// A request *from* the server (e.g. `workspace/applyEdit`), which
+    /// expects a reply — call [`LspClient::respond`] with the same `id`.
+    Request { id: i64, method: String, params: Value },
 }
 
 /// A JSON-RPC client for a language server speaking the LSP "Base
@@ -99,6 +102,16 @@ impl LspClient {
         Ok(id)
     }
 
+    /// Reply to a server-to-client [`ServerMessage::Request`] with the
+    /// same `id`.
+    pub fn respond(&self, id: i64, result: Value) -> io::Result<()> {
+        self.send_raw(&serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "result": result,
+        }))
+    }
+
     fn send_raw(&self, value: &Value) -> io::Result<()> {
         let bytes = serde_json::to_vec(value)?;
         let mut stdin = self.stdin.lock().unwrap_or_else(|e| e.into_inner());
@@ -134,7 +147,12 @@ fn parse_server_message(value: Value) -> Option<ServerMessage> {
                 result: Err(error.clone()),
             });
         }
-        return None;
+        // `id` present but no `result`/`error`: this isn't a reply to one
+        // of our requests, it's the server making its own request to us
+        // (e.g. `workspace/applyEdit`) — it still needs `method`.
+        let method = obj.get("method")?.as_str()?.to_string();
+        let params = obj.get("params").cloned().unwrap_or(Value::Null);
+        return Some(ServerMessage::Request { id, method, params });
     }
 
     let method = obj.get("method")?.as_str()?.to_string();
@@ -238,11 +256,24 @@ mod tests {
     }
 
     #[test]
-    fn a_request_from_the_server_with_no_result_or_error_is_ignored() {
-        // Servers can send requests *to* the client too (e.g.
-        // workspace/configuration). We don't support answering those yet,
-        // so parsing one should yield nothing rather than a bogus message.
-        let value = serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "workspace/configuration", "params": {}});
+    fn parses_a_server_to_client_request() {
+        // Servers can send requests *to* the client too, e.g.
+        // workspace/applyEdit — these have an id (expecting a reply, via
+        // respond()) but no result/error, unlike our own responses.
+        let value = serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "workspace/applyEdit", "params": {"edit": {}}});
+        match parse_server_message(value) {
+            Some(ServerMessage::Request { id, method, params }) => {
+                assert_eq!(id, 1);
+                assert_eq!(method, "workspace/applyEdit");
+                assert!(params.get("edit").is_some());
+            }
+            other => panic!("expected a server-to-client request, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_malformed_id_bearing_message_with_no_method_either_is_ignored() {
+        let value = serde_json::json!({"jsonrpc": "2.0", "id": 1});
         assert!(parse_server_message(value).is_none());
     }
 }

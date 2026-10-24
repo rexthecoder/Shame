@@ -13,4 +13,5 @@ path = "src/main.rs"
 gpui-kit.workspace = true
 anyhow.workspace = true
 core-buffer = { path = "../core-buffer" }
+core-lsp = { path = "../core-lsp" }
 editor-view = { path = "../editor-view" }

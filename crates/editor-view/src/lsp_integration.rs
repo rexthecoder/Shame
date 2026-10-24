@@ -1,7 +1,8 @@
 //! Lazily-started `dart language-server` per Dart buffer, wired to
-//! diagnostics, hover, go-to-definition, and formatting (M2 so far — see
-//! the module docs at the top of `lib.rs` for what's deliberately not
-//! here yet: completion, rename, code actions).
+//! diagnostics, hover, go-to-definition, formatting, rename, and code
+//! actions — every M2 item from the project plan except completion,
+//! which stays deferred to the UI pass (see the module docs at the top
+//! of `lib.rs`).
 //!
 //! Scope cuts, to revisit once more of M2 lands:
 //! - One analysis server per *open Dart tab*, not one shared per
@@ -40,13 +41,14 @@ use core_lsp::{LspClient, ServerMessage, lsp_types};
 use gpui_kit::Context;
 use smol::Timer;
 use lsp_types::{
-    ClientCapabilities, Diagnostic, DiagnosticSeverity, DidChangeTextDocumentParams,
-    DidOpenTextDocumentParams, DocumentFormattingParams, FormattingOptions, GotoDefinitionParams,
-    GotoDefinitionResponse, Hover, HoverContents, HoverParams, InitializeParams, LanguageString,
-    Location, MarkedString, Position, PublishDiagnosticsParams, RenameParams,
-    TextDocumentContentChangeEvent, TextDocumentIdentifier, TextDocumentItem,
-    TextDocumentPositionParams, TextEdit, Uri, WorkspaceEdit,
-    VersionedTextDocumentIdentifier,
+    ApplyWorkspaceEditParams, ClientCapabilities, CodeAction, CodeActionContext,
+    CodeActionOrCommand, CodeActionParams, Command, Diagnostic, DiagnosticSeverity,
+    DidChangeTextDocumentParams, DidOpenTextDocumentParams, DocumentFormattingParams,
+    ExecuteCommandParams, FormattingOptions, GotoDefinitionParams, GotoDefinitionResponse, Hover,
+    HoverContents, HoverParams, InitializeParams, LanguageString, Location, MarkedString,
+    Position, PublishDiagnosticsParams, Range, RenameParams, TextDocumentContentChangeEvent,
+    TextDocumentIdentifier, TextDocumentItem, TextDocumentPositionParams, TextEdit, Uri,
+    VersionedTextDocumentIdentifier, WorkspaceEdit,
 };
 
 use crate::{EditorEvent, EditorView};
@@ -62,6 +64,7 @@ pub(crate) struct LspState {
     pending_definition_id: Option<i64>,
     pending_format_id: Option<i64>,
     pending_rename_id: Option<i64>,
+    pending_code_action_id: Option<i64>,
 }
 
 impl EditorView {
@@ -120,6 +123,7 @@ impl EditorView {
             pending_definition_id: None,
             pending_format_id: None,
             pending_rename_id: None,
+            pending_code_action_id: None,
         });
     }
 
@@ -278,6 +282,86 @@ impl EditorView {
         }
     }
 
+    /// Send `textDocument/codeAction` for the cursor's current line,
+    /// including whatever diagnostics on that line the server already
+    /// told us about (so quick-fixes for a visible error/warning show
+    /// up). No-op if there's no ready LSP server for this buffer.
+    pub fn request_code_actions(&mut self) {
+        let Some(lsp) = &mut self.lsp else {
+            return;
+        };
+        if !lsp.ready {
+            return;
+        }
+        let head = self.buffer.selections().primary().head;
+        let line = self.buffer.byte_to_line(head) as u32;
+        let column = (head - self.buffer.line_to_byte(line as usize)) as u32;
+        let position = Position { line, character: column };
+
+        let diagnostics: Vec<Diagnostic> =
+            lsp.diagnostics.iter().filter(|d| d.range.start.line == line).cloned().collect();
+
+        let params = CodeActionParams {
+            text_document: TextDocumentIdentifier { uri: lsp.uri.clone() },
+            range: Range { start: position, end: position },
+            context: CodeActionContext { diagnostics, only: None, trigger_kind: None },
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+        };
+        if let Ok(id) =
+            lsp.client.request("textDocument/codeAction", serde_json::to_value(params).unwrap_or_default())
+        {
+            lsp.pending_code_action_id = Some(id);
+        }
+    }
+
+    /// Apply a chosen code action: a direct edit if it has one, otherwise
+    /// a server command (most Dart quick-fixes are commands — the
+    /// server replies with its own `workspace/applyEdit` *request*,
+    /// handled in `handle_lsp_message`, rather than returning an edit
+    /// directly).
+    pub fn apply_code_action(&mut self, action: CodeActionOrCommand, cx: &mut Context<Self>) {
+        match action {
+            CodeActionOrCommand::CodeAction(CodeAction { edit: Some(edit), .. }) => {
+                self.apply_workspace_edit(edit, cx);
+            }
+            CodeActionOrCommand::CodeAction(CodeAction { command: Some(command), .. }) => {
+                self.execute_command(command);
+            }
+            CodeActionOrCommand::CodeAction(_) => {}
+            CodeActionOrCommand::Command(command) => self.execute_command(command),
+        }
+    }
+
+    fn execute_command(&mut self, command: Command) {
+        let Some(lsp) = &mut self.lsp else {
+            return;
+        };
+        let params = ExecuteCommandParams {
+            command: command.command,
+            arguments: command.arguments.unwrap_or_default(),
+            work_done_progress_params: Default::default(),
+        };
+        let _ =
+            lsp.client.request("workspace/executeCommand", serde_json::to_value(params).unwrap_or_default());
+    }
+
+    /// Apply a `WorkspaceEdit`'s changes to this buffer's own file only.
+    /// An edit touching other files leaves them unchanged — see the
+    /// module docs; the same gap rename already has.
+    fn apply_workspace_edit(&mut self, edit: WorkspaceEdit, cx: &mut Context<Self>) {
+        let Some(own_uri) = self.lsp.as_ref().map(|lsp| lsp.uri.clone()) else {
+            return;
+        };
+        if let Some(changes) = edit.changes {
+            for (uri, edits) in changes {
+                if uri.as_str() == own_uri.as_str() {
+                    self.apply_text_edits(edits, cx);
+                }
+            }
+        }
+    }
+
     /// Apply a server's `TextEdit`s to the buffer. Edits are applied from
     /// the end of the document backwards so that earlier edits' (line,
     /// character) positions stay valid as later ones are applied —
@@ -392,21 +476,37 @@ impl EditorView {
             }
             ServerMessage::Response { id, result } if lsp.pending_rename_id == Some(id) => {
                 lsp.pending_rename_id = None;
-                let own_uri = lsp.uri.clone();
-                let Ok(Some(edit)) = result.map(|v| serde_json::from_value::<Option<WorkspaceEdit>>(v).unwrap_or(None))
+                if let Ok(Some(edit)) =
+                    result.map(|v| serde_json::from_value::<Option<WorkspaceEdit>>(v).unwrap_or(None))
+                {
+                    self.apply_workspace_edit(edit, cx);
+                }
+            }
+            ServerMessage::Response { id, result } if lsp.pending_code_action_id == Some(id) => {
+                lsp.pending_code_action_id = None;
+                let Ok(Some(actions)) = result
+                    .map(|v| serde_json::from_value::<Option<Vec<CodeActionOrCommand>>>(v).unwrap_or(None))
                 else {
                     return;
                 };
-                // Only apply edits to this buffer's own file. A rename
-                // that also touches other files silently leaves those
-                // other files unchanged — a real gap, not an oversight;
-                // see the module docs.
-                if let Some(changes) = edit.changes {
-                    for (uri, edits) in changes {
-                        if uri.as_str() == own_uri.as_str() {
-                            self.apply_text_edits(edits, cx);
-                        }
-                    }
+                let mut actions = actions;
+                match actions.len() {
+                    0 => {}
+                    1 => self.apply_code_action(actions.remove(0), cx),
+                    _ => cx.emit(EditorEvent::ShowCodeActions { actions }),
+                }
+            }
+            // A request *from* the server, not a reply to one of ours.
+            // So far just workspace/applyEdit, sent after we ask it to
+            // run a Dart quick-fix command — apply the edit to our own
+            // file (see apply_workspace_edit's own gap note) and tell
+            // the server we did, which it expects a reply to.
+            ServerMessage::Request { id, method, params } if method == "workspace/applyEdit" => {
+                if let Ok(apply_params) = serde_json::from_value::<ApplyWorkspaceEditParams>(params) {
+                    self.apply_workspace_edit(apply_params.edit, cx);
+                }
+                if let Some(lsp) = &self.lsp {
+                    let _ = lsp.client.respond(id, serde_json::json!({"applied": true}));
                 }
             }
             _ => {}
@@ -542,5 +642,77 @@ mod tests {
         assert_eq!(edits.len(), 2);
         assert_eq!(edits[0].new_text, "sayHello");
         assert_eq!(edits[1].range.start.line, 8);
+    }
+
+    /// Real captured output — `textDocument/codeAction` on an unused
+    /// `import 'dart:math';` line. Confirms the important, easy-to-get-
+    /// wrong fact about this server: every single quick-fix came back
+    /// as a `Command` (`CodeActionOrCommand::Command`), never a
+    /// `CodeAction` with a direct `edit` — so `apply_code_action` has to
+    /// handle the command path to do anything useful for Dart at all.
+    #[test]
+    fn deserializes_a_real_server_code_action_response_as_commands() {
+        let json = serde_json::json!([
+            {
+                "title": "Remove unused import",
+                "command": "dart.edit.codeAction.apply",
+                "arguments": [{"kind": "quickfix.remove.unusedImport"}],
+            },
+            {
+                "title": "Ignore 'unused_import' for this line",
+                "command": "dart.edit.codeAction.apply",
+                "arguments": [{"kind": "quickfix.ignore.line"}],
+            },
+        ]);
+        let actions: Vec<CodeActionOrCommand> = serde_json::from_value(json).expect("should deserialize");
+        assert_eq!(actions.len(), 2);
+        for action in &actions {
+            match action {
+                CodeActionOrCommand::Command(command) => {
+                    assert_eq!(command.command, "dart.edit.codeAction.apply");
+                }
+                CodeActionOrCommand::CodeAction(_) => panic!("expected a Command, not a CodeAction"),
+            }
+        }
+        assert_eq!(
+            match &actions[0] {
+                CodeActionOrCommand::Command(c) => c.title.as_str(),
+                _ => unreachable!(),
+            },
+            "Remove unused import"
+        );
+    }
+
+    /// Real captured output — the `workspace/applyEdit` *request* (not a
+    /// response) the server sends after `workspace/executeCommand` for
+    /// `dart.edit.codeAction.apply`. Confirms `ApplyWorkspaceEditParams`
+    /// deserializes correctly and that this really is a request (has an
+    /// `id`, needs a reply via `LspClient::respond`), which is why
+    /// `core_lsp::ServerMessage` needed its own `Request` variant.
+    #[test]
+    fn deserializes_a_real_server_apply_edit_request() {
+        let message = serde_json::json!({
+            "id": 1,
+            "jsonrpc": "2.0",
+            "method": "workspace/applyEdit",
+            "params": {
+                "edit": {
+                    "changes": {
+                        "file:///a/sample_ca.dart": [
+                            {"newText":"","range":{"end":{"character":0,"line":1},"start":{"character":0,"line":0}}}
+                        ]
+                    }
+                },
+                "label": "Apply Code Action",
+            },
+        });
+        assert_eq!(message["method"], "workspace/applyEdit");
+        assert!(message.get("id").is_some(), "expected this to carry an id, like a request");
+        assert!(message.get("result").is_none() && message.get("error").is_none());
+
+        let params: ApplyWorkspaceEditParams =
+            serde_json::from_value(message["params"].clone()).expect("should deserialize");
+        let changes = params.edit.changes.expect("expected a changes map");
+        assert_eq!(changes.len(), 1);
     }
 }
