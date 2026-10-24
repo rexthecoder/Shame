@@ -1,5 +1,36 @@
 # Milestone notes
 
+## M3: SDK detection
+
+The last item on M3's plan list. `flutter --version --machine` gives a
+single JSON object (not an array, unlike `devices --machine`) with the
+Flutter/Dart SDK versions, channel, and `flutterRoot` — confirmed by
+running it for real on this machine (`fvm`-managed Flutter 3.47.2,
+Dart 3.13.2, under `/Users/bushadigitalltd/fvm/versions/3.47.2`).
+
+The actual point of this isn't just displaying a version somewhere —
+it's `FlutterSdk::dart_sdk_dir()`, which derives
+`<flutterRoot>/bin/cache/dart-sdk`, the real on-disk location of the
+Dart SDK bundled *inside* that specific Flutter SDK. Confirmed that
+directory exists for real on this machine. `core-lsp` currently just
+spawns a bare `dart` and hopes it's on `PATH`; once there's reason to
+touch that code path, this is what should drive which `dart` (and
+which `analysis_server.dart.snapshot`) actually gets launched, instead
+of silently trusting whatever `dart` resolves to — the whole reason
+this crate's doc comment calls `flutter`/`dart` on `PATH` an
+assumption rather than a guarantee.
+
+`detect_sdk()` follows the same one-shot-command shape as
+`list_devices()`: no daemon, no streaming, just run it and parse the
+captured stdout. Real JSON locked into
+`deserializes_real_flutter_version_machine_output`;
+`detects_the_real_sdk_on_this_machine` re-runs the actual CLI on every
+test run (skips gracefully if `flutter` isn't on `PATH`) and asserts
+`flutter_root` is a real directory, not just a string. 49 tests total
+now — this closes out M3's entire backend-only scope; everything left
+in the plan's M3 list (device picker, Run/Stop button, log panel) is
+UI work staying deferred.
+
 ## M3: pubspec.yaml helpers (`pub add` / `pub get`)
 
 Rounded out M3's plan item "pubspec.yaml helpers: add package, pub get"

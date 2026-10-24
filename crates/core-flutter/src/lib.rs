@@ -6,9 +6,9 @@
 //! This is the backend only — a device picker, a Run/Stop button, and a
 //! log panel are all UI work, deliberately not built here yet (see the
 //! project's M3 notes in `NOTES.md` at the repo root for why that's
-//! staying deferred for now). `pubspec::{add_package, pub_get}` round
-//! out the plan's M3 list ("pubspec.yaml helpers: add package, pub
-//! get").
+//! staying deferred for now). `pubspec::{add_package, pub_get}` and
+//! `sdk::detect_sdk` round out the plan's M3 list ("pubspec.yaml
+//! helpers: add package, pub get" and "SDK detection").
 //!
 //! Scope cuts:
 //! - [`FlutterDaemon`] runs one project on one device at a time; nothing
@@ -25,7 +25,9 @@
 mod daemon;
 mod devices;
 mod pubspec;
+mod sdk;
 
 pub use daemon::{DaemonOutput, FlutterDaemon};
 pub use devices::{Device, list_devices};
 pub use pubspec::{PubOutput, add_package, pub_get};
+pub use sdk::{FlutterSdk, detect_sdk};
