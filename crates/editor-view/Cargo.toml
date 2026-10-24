@@ -8,3 +8,4 @@ publish = false
 [dependencies]
 gpui-kit.workspace = true
 core-buffer = { path = "../core-buffer" }
+core-syntax = { path = "../core-syntax" }

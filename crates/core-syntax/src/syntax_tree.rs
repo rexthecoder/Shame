@@ -1,0 +1,265 @@
+use std::ops::Range;
+
+use tree_sitter::{
+    InputEdit, Language, Node, Parser, Point, Query, QueryCursor, StreamingIterator, Tree,
+};
+
+use crate::highlight::{Highlight, HighlightKind};
+
+fn dart_language() -> Language {
+    tree_sitter_dart::LANGUAGE.into()
+}
+
+fn dart_parser() -> Parser {
+    let mut parser = Parser::new();
+    parser
+        .set_language(&dart_language())
+        .expect("tree-sitter-dart ships a grammar compatible with this tree-sitter version");
+    parser
+}
+
+/// A fold candidate: a `{ ... }` block spanning more than one line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FoldRange {
+    pub start_line: usize,
+    pub end_line: usize,
+    pub start_byte: usize,
+    pub end_byte: usize,
+}
+
+/// A parsed Dart syntax tree, re-parsed incrementally as the source edits.
+pub struct SyntaxTree {
+    tree: Tree,
+    query: Query,
+}
+
+impl SyntaxTree {
+    pub fn parse(source: &str) -> Self {
+        let language = dart_language();
+        let tree = dart_parser()
+            .parse(source, None)
+            .expect("tree-sitter only returns None if parsing was cancelled or timed out");
+        let query = Query::new(&language, tree_sitter_dart::HIGHLIGHTS_QUERY)
+            .expect("tree-sitter-dart ships a highlights query valid for its own grammar");
+        Self { tree, query }
+    }
+
+    /// Apply a text edit and re-parse, reusing the previous tree so
+    /// tree-sitter only re-derives the parts of the syntax tree that
+    /// actually changed.
+    pub fn reparse(&mut self, new_source: &str, edit: InputEdit) {
+        self.tree.edit(&edit);
+        if let Some(tree) = dart_parser().parse(new_source, Some(&self.tree)) {
+            self.tree = tree;
+        }
+    }
+
+    pub fn root(&self) -> Node<'_> {
+        self.tree.root_node()
+    }
+
+    /// Run the grammar's highlights query against `source` (which must be
+    /// the same text this tree was parsed/reparsed from).
+    pub fn highlights(&self, source: &str) -> Vec<Highlight> {
+        let capture_names = self.query.capture_names();
+        let mut cursor = QueryCursor::new();
+        let mut matches = cursor.matches(&self.query, self.tree.root_node(), source.as_bytes());
+
+        let mut highlights = Vec::new();
+        while let Some(m) = matches.next() {
+            for capture in m.captures() {
+                let name = capture_names[capture.index as usize];
+                highlights.push(Highlight {
+                    range: capture.node.start_byte()..capture.node.end_byte(),
+                    kind: HighlightKind::from_capture_name(name),
+                });
+            }
+        }
+        highlights.sort_by_key(|h| h.range.start);
+        highlights
+    }
+
+    /// Find the byte offset of the bracket matching the one at `offset`,
+    /// skipping bracket characters that fall inside a comment or string
+    /// (per the highlights query) so e.g. a `)` in a doc comment doesn't
+    /// throw off matching in the real code around it.
+    pub fn matching_bracket(&self, source: &str, offset: usize) -> Option<usize> {
+        const PAIRS: &[(u8, u8)] = &[(b'(', b')'), (b'[', b']'), (b'{', b'}')];
+
+        let bytes = source.as_bytes();
+        let at = *bytes.get(offset)?;
+
+        let skip: Vec<Range<usize>> = self
+            .highlights(source)
+            .into_iter()
+            .filter(|h| matches!(h.kind, HighlightKind::Comment | HighlightKind::String))
+            .map(|h| h.range)
+            .collect();
+        let in_skip = |pos: usize| skip.iter().any(|r| r.contains(&pos));
+
+        if let Some(&(open, close)) = PAIRS.iter().find(|(open, _)| *open == at) {
+            let mut depth = 1usize;
+            for pos in (offset + 1)..bytes.len() {
+                if in_skip(pos) {
+                    continue;
+                }
+                if bytes[pos] == open {
+                    depth += 1;
+                } else if bytes[pos] == close {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Some(pos);
+                    }
+                }
+            }
+            return None;
+        }
+
+        if let Some(&(open, close)) = PAIRS.iter().find(|(_, close)| *close == at) {
+            let mut depth = 1usize;
+            for pos in (0..offset).rev() {
+                if in_skip(pos) {
+                    continue;
+                }
+                if bytes[pos] == close {
+                    depth += 1;
+                } else if bytes[pos] == open {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Some(pos);
+                    }
+                }
+            }
+        }
+
+        None
+    }
+
+    /// Every `{ ... }` block in the tree that spans more than one line,
+    /// found generically (first child is an anonymous `{` token, last is
+    /// an anonymous `}` token) rather than by naming specific Dart node
+    /// kinds, so it keeps working across grammar versions.
+    pub fn fold_ranges(&self) -> Vec<FoldRange> {
+        let mut ranges = Vec::new();
+        collect_fold_ranges(self.tree.root_node(), &mut ranges);
+        ranges.sort_by_key(|r| r.start_byte);
+        ranges
+    }
+}
+
+/// The tree-sitter `Point` (row, column — both 0-indexed, column in bytes)
+/// for a byte offset into `source`. Needed to build an [`InputEdit`] for
+/// [`SyntaxTree::reparse`].
+pub fn point_at(source: &str, byte: usize) -> Point {
+    let byte = byte.min(source.len());
+    let before = &source[..byte];
+    let row = before.matches('\n').count();
+    let column = match before.rfind('\n') {
+        Some(newline) => byte - newline - 1,
+        None => byte,
+    };
+    Point { row, column }
+}
+
+fn collect_fold_ranges(node: Node, out: &mut Vec<FoldRange>) {
+    let mut cursor = node.walk();
+    let children: Vec<Node> = node.children(&mut cursor).collect();
+
+    if let (Some(first), Some(last)) = (children.first(), children.last()) {
+        if first.kind() == "{" && last.kind() == "}" {
+            let start_line = node.start_position().row;
+            let end_line = node.end_position().row;
+            if end_line > start_line {
+                out.push(FoldRange {
+                    start_line,
+                    end_line,
+                    start_byte: node.start_byte(),
+                    end_byte: node.end_byte(),
+                });
+            }
+        }
+    }
+
+    for child in children {
+        collect_fold_ranges(child, out);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const SAMPLE: &str = "// A comment\nclass Foo {\n  int bar() {\n    return 1;\n  }\n}\n";
+
+    #[test]
+    fn parses_without_panicking() {
+        let tree = SyntaxTree::parse(SAMPLE);
+        assert_eq!(tree.root().start_byte(), 0);
+        assert_eq!(tree.root().end_byte(), SAMPLE.len());
+    }
+
+    #[test]
+    fn highlights_find_the_keyword_and_the_comment() {
+        let tree = SyntaxTree::parse(SAMPLE);
+        let highlights = tree.highlights(SAMPLE);
+
+        assert!(
+            highlights
+                .iter()
+                .any(|h| h.kind == HighlightKind::Comment && SAMPLE[h.range.clone()].contains("A comment")),
+            "expected a Comment highlight covering the leading comment"
+        );
+        assert!(
+            highlights.iter().any(|h| h.kind == HighlightKind::Keyword && &SAMPLE[h.range.clone()] == "class"),
+            "expected a Keyword highlight for `class`"
+        );
+    }
+
+    #[test]
+    fn matching_bracket_finds_the_outer_braces() {
+        let tree = SyntaxTree::parse(SAMPLE);
+        let open = SAMPLE.find('{').unwrap();
+        let close = SAMPLE.rfind('}').unwrap();
+
+        assert_eq!(tree.matching_bracket(SAMPLE, open), Some(close));
+        assert_eq!(tree.matching_bracket(SAMPLE, close), Some(open));
+    }
+
+    #[test]
+    fn fold_ranges_cover_multiline_blocks_only() {
+        let tree = SyntaxTree::parse(SAMPLE);
+        let folds = tree.fold_ranges();
+
+        // `class Foo { ... }` and `int bar() { ... }` both span multiple
+        // lines; an empty or single-line `{}` would not appear here.
+        assert_eq!(folds.len(), 2);
+        assert!(folds.iter().all(|f| f.end_line > f.start_line));
+    }
+
+    #[test]
+    fn reparse_reflects_an_inserted_line() {
+        let mut tree = SyntaxTree::parse(SAMPLE);
+        let insert_at = SAMPLE.find("return 1;").unwrap();
+        let inserted = "// inserted\n    ";
+        let new_source = format!("{}{}{}", &SAMPLE[..insert_at], inserted, &SAMPLE[insert_at..]);
+
+        let edit = InputEdit {
+            start_byte: insert_at,
+            old_end_byte: insert_at,
+            new_end_byte: insert_at + inserted.len(),
+            start_position: point_at(SAMPLE, insert_at),
+            old_end_position: point_at(SAMPLE, insert_at),
+            new_end_position: point_at(&new_source, insert_at + inserted.len()),
+        };
+        tree.reparse(&new_source, edit);
+
+        assert_eq!(tree.root().end_byte(), new_source.len());
+        let highlights = tree.highlights(&new_source);
+        assert!(
+            highlights
+                .iter()
+                .any(|h| h.kind == HighlightKind::Comment && new_source[h.range.clone()].contains("inserted")),
+            "expected the newly inserted comment to be highlighted after reparse"
+        );
+    }
+}

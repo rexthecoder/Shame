@@ -1,5 +1,44 @@
 # Milestone notes
 
+## M1/M2: `core-syntax` (Dart highlighting)
+
+`core-syntax` is a real crate now: a thin wrapper around `tree-sitter` +
+`tree-sitter-dart` (0.2.0, published April 2026 — actively maintained,
+~1.3M downloads). `SyntaxTree::parse` parses Dart source and
+`SyntaxTree::highlights` runs the grammar's own `HIGHLIGHTS_QUERY`,
+mapping tree-sitter's fine-grained dotted capture names (`function.method`,
+`variable.builtin`, ...) down to a small `HighlightKind` enum so
+`editor-view` only needs a handful of colors. `SyntaxTree::reparse` takes
+an `InputEdit` and reuses the old tree for incremental re-parsing (API
+exists; see the gap below for why `editor-view` doesn't call it yet).
+
+Two things built on top of the same query, rather than needing separate
+Dart-specific logic:
+- **Bracket matching** (`matching_bracket`): a byte-scan with a depth
+  counter, but skipping any byte inside a highlighted `Comment` or
+  `String` span, so a `)` in a doc comment doesn't throw off matching in
+  the real code around it.
+- **Folding** (`fold_ranges`): walks the tree looking for any node whose
+  first child is a literal `{` token and last child is a literal `}`
+  token and which spans more than one line — a generic heuristic that
+  doesn't need to know Dart's specific node names (`class_body`, `block`,
+  etc.), so it should keep working if the grammar's node kinds change.
+
+7 unit tests cover parsing, highlighting (keyword + comment), bracket
+matching, fold ranges, and one incremental-reparse round trip.
+
+`editor-view` now colors each line using `SyntaxTree::highlights`,
+splitting each line into colored runs and further splitting the run the
+cursor sits in so the cursor marker renders inline with the right color
+on each side.
+
+**Known gap**: `editor-view` calls `SyntaxTree::parse` fresh on every
+render instead of keeping one `SyntaxTree` around and calling `reparse`
+with a real `InputEdit` per keystroke (which the crate's
+`point_at`/`InputEdit` re-export exist for). For M1-sized files this is
+fine; wiring incremental reparse into every `Buffer` edit in
+`editor-view` is follow-up work, not done here.
+
 ## M1: tabs
 
 `DartIde` now holds `Vec<Tab>` (each a path + its own `Entity<EditorView>`)
@@ -57,7 +96,8 @@ end-to-end by eye — that still needs an interactive session or a packaged
 
 Known M1 scope cuts (see also the doc comment at the top of
 `crates/editor-view/src/lib.rs`):
-- No syntax highlighting yet (that's `core-syntax`, not started).
+- Syntax highlighting landed afterwards — see the `core-syntax` section
+  below; this entry is kept only as a record of the original gap.
 - No visual highlight for a non-empty selection range — only the cursor
   is drawn. Multi-character selection (shift+arrows, drag-select) isn't
   wired up at all yet, even though `core-buffer`'s `SelectionSet` already

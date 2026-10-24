@@ -3,20 +3,25 @@
 //! Built only on raw `gpui-kit` primitives (`gpui_kit::*`), never on
 //! `gpui_kit::component`'s pre-built `Editor`/`Textarea` widgets — those
 //! are read as a reference (see `NOTES.md` at the repo root), not a
-//! dependency. `core-buffer` is the only other dependency, kept behind
-//! this crate's own API so the UI layer can change without touching it.
+//! dependency. `core-buffer` and `core-syntax` are the other two
+//! dependencies, kept behind this crate's own API so the UI layer can
+//! change without touching either of them.
 //!
 //! Known M1 scope cuts (not yet implemented, tracked for M2+):
-//! - No syntax highlighting (that's `core-syntax`).
 //! - No visual selection-range highlight; only the cursor is drawn.
 //! - Mouse clicks move the cursor to the start of the clicked line, not the
 //!   clicked column (needs real text measurement).
-//! - Every line is rendered on every frame; no virtualization for huge files.
+//! - Every line is rendered on every frame; no virtualization for huge
+//!   files, and syntax highlighting fully re-parses the buffer on every
+//!   render rather than using `core_syntax::SyntaxTree::reparse`'s
+//!   incremental path.
 
 use std::io;
+use std::ops::Range;
 use std::path::Path;
 
 use core_buffer::{Buffer, Selection};
+use core_syntax::{Highlight, HighlightKind, SyntaxTree};
 use gpui_kit::*;
 
 pub struct EditorView {
@@ -215,11 +220,50 @@ impl EditorView {
         }
     }
 
+    /// Highlight spans intersecting `line_text`'s byte range, run-length
+    /// encoded into `(byte_range_within_line, color)` runs. A `None` color
+    /// run inherits the editor's base text color.
+    fn line_runs(
+        line_start: usize,
+        line_text: &str,
+        highlights: &[Highlight],
+    ) -> Vec<(Range<usize>, Option<HighlightKind>)> {
+        let line_end = line_start + line_text.len();
+        let mut colors: Vec<Option<HighlightKind>> = vec![None; line_text.len()];
+
+        for h in highlights {
+            if h.range.end <= line_start || h.range.start >= line_end {
+                continue;
+            }
+            let start = h.range.start.max(line_start) - line_start;
+            let end = h.range.end.min(line_end) - line_start;
+            for slot in &mut colors[start..end] {
+                *slot = Some(h.kind);
+            }
+        }
+
+        let mut runs = Vec::new();
+        let mut i = 0;
+        while i < colors.len() {
+            let kind = colors[i];
+            let start = i;
+            while i < colors.len() && colors[i] == kind {
+                i += 1;
+            }
+            runs.push((start..i, kind));
+        }
+        if runs.is_empty() {
+            runs.push((0..0, None));
+        }
+        runs
+    }
+
     fn render_line(
         &self,
         index: usize,
         line_text: &str,
         cursor_line: Option<usize>,
+        highlights: &[Highlight],
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let gutter = div()
@@ -230,24 +274,41 @@ impl EditorView {
             .pr_2()
             .child((index + 1).to_string());
 
-        let content = if cursor_line == Some(index) {
+        let line_start = self.buffer.line_to_byte(index);
+        let display_text = line_text.trim_end_matches(['\n', '\r']);
+        let cursor_col = (cursor_line == Some(index)).then(|| {
             let head = self.buffer.selections().primary().head;
-            let line_start = self.buffer.line_to_byte(index);
-            let column = head - line_start;
-            let before = line_text[..column.min(line_text.len())].to_string();
-            let after = line_text[column.min(line_text.len())..].to_string();
+            (head - line_start).min(display_text.len())
+        });
 
-            div()
-                .flex()
-                .items_center()
-                .child(before)
-                .child(div().w(px(2.)).h(px(18.)).bg(rgb(0xffffff)))
-                .child(after)
-        } else {
-            div().child(line_text.trim_end_matches(['\n', '\r']).to_string())
+        let span = |text: &str, kind: Option<HighlightKind>| {
+            let mut el = div();
+            if let Some(kind) = kind {
+                el = el.text_color(highlight_color(kind));
+            }
+            el.child(text.to_string())
         };
 
-        let line_start = self.buffer.line_to_byte(index);
+        let cursor_el = || div().w(px(2.)).h(px(18.)).bg(rgb(0xffffff));
+
+        let mut content = div().flex().items_center();
+        let mut cursor_inserted = false;
+        for (range, kind) in Self::line_runs(line_start, display_text, highlights) {
+            if let Some(col) = cursor_col {
+                if !cursor_inserted && col >= range.start && col < range.end {
+                    content = content
+                        .child(span(&display_text[range.start..col], kind))
+                        .child(cursor_el())
+                        .child(span(&display_text[col..range.end], kind));
+                    cursor_inserted = true;
+                    continue;
+                }
+            }
+            content = content.child(span(&display_text[range], kind));
+        }
+        if cursor_col.is_some() && !cursor_inserted {
+            content = content.child(cursor_el());
+        }
 
         div()
             .id(("editor-line", index))
@@ -262,6 +323,23 @@ impl EditorView {
             )
             .child(gutter)
             .child(content)
+    }
+}
+
+fn highlight_color(kind: HighlightKind) -> Rgba {
+    match kind {
+        HighlightKind::Keyword => rgb(0xc586c0),
+        HighlightKind::String => rgb(0xce9178),
+        HighlightKind::Comment => rgb(0x6a9955),
+        HighlightKind::Number => rgb(0xb5cea8),
+        HighlightKind::Function => rgb(0xdcdcaa),
+        HighlightKind::Type => rgb(0x4ec9b0),
+        HighlightKind::Constant => rgb(0x569cd6),
+        HighlightKind::Property => rgb(0x9cdcfe),
+        HighlightKind::Attribute => rgb(0x4ec9b0),
+        HighlightKind::Variable | HighlightKind::Operator | HighlightKind::Punctuation | HighlightKind::Other => {
+            rgb(0xd4d4d4)
+        }
     }
 }
 
@@ -287,10 +365,18 @@ impl Render for EditorView {
             v
         };
 
+        // Full reparse + highlight query on every render. Fine for the file
+        // sizes M1 targets; see NOTES.md for the incremental-reparse gap.
+        let syntax_tree = SyntaxTree::parse(&text);
+        let highlights = syntax_tree.highlights(&text);
+
         let rendered_lines: Vec<_> = lines
             .iter()
             .enumerate()
-            .map(|(ix, line)| self.render_line(ix, line, cursor_line, cx).into_any_element())
+            .map(|(ix, line)| {
+                self.render_line(ix, line, cursor_line, &highlights, cx)
+                    .into_any_element()
+            })
             .collect();
 
         div()
