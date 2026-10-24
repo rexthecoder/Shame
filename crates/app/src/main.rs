@@ -229,10 +229,15 @@ impl Render for DartIde {
                         )
                         .child(
                             v_flex()
-                                .flex_1()
-                                .h_full()
+                                .h(relative(1.))
                                 .child(self.render_tab_bar(&view, cx))
-                                .child(div().flex_1().w_full().child(self.active_editor().clone()))
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .w_full()
+                                        .min_h(px(0.))
+                                        .child(self.active_editor().clone()),
+                                )
                                 .into_any_element(),
                         ),
                 ),

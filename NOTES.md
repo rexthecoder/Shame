@@ -1,5 +1,34 @@
 # Milestone notes
 
+## M1: fixed real rendering/scrolling bugs
+
+Found by actually using the app, not by inspection: scrolling a long file
+did nothing, and small visual misalignment ("glitches") between the
+gutter and text. Root causes, found by reading `gpui-pre`'s (the actual
+engine behind `gpui-kit`) own source rather than guessing from the docs:
+
+- **`font_family("monospace")` isn't a real font name.** GPUI isn't CSS;
+  it needs an actual installed font (`"Menlo"` on macOS). Every line's
+  row also got a fixed `h(px(20.))` so rows stop having slightly
+  inconsistent heights.
+- **Scrolling needs the flex child to be allowed to shrink.** The editor
+  pane's wrapper had `flex_1()` but no `min_h(px(0.))`. A flex item's
+  default minimum height is "big enough for its content," which silently
+  defeats `overflow_y_scroll()` — the box just keeps growing to fit every
+  line instead of clipping, so there's nothing to scroll *to*.
+- **The growing side of `h_resizable` needs an explicit height.** Per
+  `gpui-component`'s own `examples/editor/src/main.rs`, the non-panel
+  child of `h_resizable` is sized with `.h(relative(1.))`, not
+  `flex_1()`/`h_full()`. Matched that pattern on the column holding the
+  tab bar + editor.
+
+Lesson for later milestones: these were silent failures (no panic, no
+warning, no error — just "doesn't scroll" / "looks slightly off"), and
+docs.rs / partial examples didn't surface them. Reading the actual engine
+source (`~/.cargo/registry/src/.../gpui-pre-*/src/elements/div.rs`) when
+a layout/interaction bug doesn't make sense is worth doing early, not as
+a last resort.
+
 ## M1: selection highlighting and keyboard selection
 
 `editor-view` can now actually create a multi-character selection, not

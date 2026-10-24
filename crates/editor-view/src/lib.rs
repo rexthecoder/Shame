@@ -30,6 +30,7 @@ use gpui_kit::*;
 pub struct EditorView {
     buffer: Buffer,
     focus_handle: FocusHandle,
+    scroll_handle: ScrollHandle,
 }
 
 impl EditorView {
@@ -41,6 +42,7 @@ impl EditorView {
         Self {
             buffer,
             focus_handle: cx.focus_handle(),
+            scroll_handle: ScrollHandle::new(),
         }
     }
 
@@ -347,7 +349,7 @@ impl EditorView {
             el.child(text.to_string())
         };
 
-        let cursor_el = || div().w(px(2.)).h(px(18.)).bg(rgb(0xffffff));
+        let cursor_el = || div().w(px(2.)).h(px(16.)).bg(rgb(0xffffff));
 
         let mut content = div().flex().items_center();
         let mut cursor_inserted = false;
@@ -372,7 +374,10 @@ impl EditorView {
             .id(("editor-line", index))
             .flex()
             .w_full()
-            .font_family("monospace")
+            .h(px(20.))
+            .flex_shrink_0()
+            .font_family("Menlo")
+            .text_size(px(14.))
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(move |this, _event, _window, cx| {
@@ -445,7 +450,8 @@ impl Render for EditorView {
             .track_focus(&self.focus_handle)
             .on_key_down(cx.listener(Self::on_key_down))
             .size_full()
-            .overflow_hidden()
+            .overflow_y_scroll()
+            .track_scroll(&self.scroll_handle)
             .bg(rgb(0x1e1e1e))
             .text_color(rgb(0xd4d4d4))
             .flex()
