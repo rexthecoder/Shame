@@ -1,5 +1,67 @@
 # Milestone notes
 
+## UI pass: Zed/Fleet-inspired chrome (first iteration)
+
+First real pass at the visual design that's been deliberately deferred
+since M0 — "defer UI work" meant *new interactive widgets*, not that the
+shipped chrome had to stay a bare M0 scaffold forever, and the user
+asked directly for this, inspired by Zed and Fleet.
+
+Switched to `gpui-component`'s dark theme by default
+(`Theme::change(ThemeMode::Dark, ...)` in `main()`) rather than hand-
+rolling a palette: its default dark theme already sits close to Zed/
+Fleet's own look (near-black `neutral-950` backgrounds, a blue
+accent/selection), and it comes with a full set of purpose-built
+tokens — `title_bar`/`title_bar_border`, `sidebar`/`sidebar_border`/
+`sidebar_foreground`, `tab_bar`/`tab`/`tab_active`/`tab_foreground`,
+`status_bar`/`status_bar_border`, `selection`, `caret` — that this app
+wasn't using at all before (everything was `cx.theme().background`/
+`border` or flat-out hardcoded hex). Re-themed every chrome surface
+through those tokens instead of improvising new colors, so dark/light
+mode and any future custom theme file actually work app-wide, not just
+on the parts someone remembered to update.
+
+Concretely, in `app`:
+- A slim 40px title bar (was a bulky header with the full folder path
+  crammed into a button label) — app name, a `/ <folder name>` instead
+  of the full path, an icon-only Open Folder button with a tooltip.
+- The file tree now sits in an actual sidebar panel (`sidebar`
+  background + border, distinct from the editor background) with an
+  uppercase folder-name header, VS Code/Zed/Fleet's shared convention.
+- Tabs redesigned Zed-style: the active tab gets a 2px top accent
+  border instead of a flat highlight fill; the unsaved indicator is a
+  small dot (color-coded) that swaps to a close "×" on hover, instead
+  of a permanent "× unsaved" text suffix competing with the title.
+- The status bar is now an actual status bar — `Ln/Col` (new
+  `EditorView::cursor_position()`), colored error/warning counts with
+  icons instead of a plain-text suffix, a `Dart` language tag — laid
+  out left (file + dirty dot) / right (diagnostics, position,
+  language), the same left/right split Zed and Fleet both use.
+- The three floating overlays (Quick Open, rename, code actions) now
+  use the theme's `popover` token and a real drop shadow
+  (`shadow_xl()`) instead of a flat bordered box with no elevation.
+
+In `editor-view`: the editor's own background/foreground, selection
+highlight, and caret now pull from the same theme tokens
+(`background`, `foreground`, `selection`, `caret`) instead of
+hardcoded VS-Code-dark hex, so the editor pane and the chrome around
+it are visually one surface, not two different apps glued together.
+Added a subtle active-line highlight (`theme().muted` at low opacity)
+— present in every mainstream editor and previously missing here
+entirely. Syntax token colors (keyword/string/comment/etc.) are left
+as hardcoded hex for now — that's a separate, genuinely independent
+concern (a syntax theme, not a UI chrome theme) and VS-Code-Dark+-like
+colors read fine against the new near-black background; revisiting
+that is its own task, not bundled into this pass.
+
+**Not independently screenshot-verified this round**: `cargo build`/
+`cargo run -p app` both succeed and the full 61-test suite still
+passes (this was a styling-only change, no logic touched), but the
+running window is a bare `target/debug/dart-ide` binary with no `.app`
+bundle, so the computer-use screenshot tool couldn't be granted access
+to it to confirm the pixels — that needs an actual look from a human,
+or bundling the binary as a proper `.app` first.
+
 ## M4: session convenience methods + a real breakpoint hit
 
 Added typed convenience methods on `DapClient` for the session flow a

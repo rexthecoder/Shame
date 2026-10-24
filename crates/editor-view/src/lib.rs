@@ -30,6 +30,7 @@ use std::path::{Path, PathBuf};
 use core_buffer::{Buffer, Selection};
 use core_lsp::lsp_types;
 use core_syntax::{Highlight, HighlightKind, InputEdit, SyntaxTree, point_at};
+use gpui_kit::component::ActiveTheme as _;
 use gpui_kit::*;
 use gpui_kit::prelude::FluentBuilder as _;
 use lsp_integration::LspState;
@@ -113,6 +114,16 @@ impl EditorView {
 
     pub fn buffer(&self) -> &Buffer {
         &self.buffer
+    }
+
+    /// 1-indexed (line, column) of the primary cursor, for a status bar —
+    /// e.g. "Ln 4, Col 1" the way every other editor shows it, even though
+    /// everywhere else in this crate works in 0-indexed byte offsets.
+    pub fn cursor_position(&self) -> (u32, u32) {
+        let head = self.buffer.selections().primary().head;
+        let line = self.buffer.byte_to_line(head);
+        let column = head - self.buffer.line_to_byte(line);
+        (line as u32 + 1, column as u32 + 1)
     }
 
     /// Replace the buffer with the contents of `path`, discarding undo
@@ -410,10 +421,12 @@ impl EditorView {
         diagnostics_by_line: &std::collections::HashMap<u32, lsp_types::DiagnosticSeverity>,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
+        let is_active_line = cursor_line == Some(index);
         let gutter_color = match diagnostics_by_line.get(&(index as u32)) {
-            Some(&sev) if sev == lsp_types::DiagnosticSeverity::ERROR => rgb(0xf14c4c),
-            Some(&sev) if sev == lsp_types::DiagnosticSeverity::WARNING => rgb(0xcca700),
-            _ => rgb(0x6b7280),
+            Some(&sev) if sev == lsp_types::DiagnosticSeverity::ERROR => cx.theme().danger,
+            Some(&sev) if sev == lsp_types::DiagnosticSeverity::WARNING => cx.theme().warning,
+            _ if is_active_line => cx.theme().foreground,
+            _ => cx.theme().muted_foreground,
         };
         let gutter = div()
             .w(px(GUTTER_WIDTH))
@@ -430,18 +443,20 @@ impl EditorView {
             (head - line_start).min(display_text.len())
         });
 
-        let span = |text: &str, kind: Option<HighlightKind>, selected: bool| {
+        let selection_bg = cx.theme().selection;
+        let span = move |text: &str, kind: Option<HighlightKind>, selected: bool| {
             let mut el = div();
             if let Some(kind) = kind {
                 el = el.text_color(highlight_color(kind));
             }
             if selected {
-                el = el.bg(rgb(0x264f78));
+                el = el.bg(selection_bg);
             }
             el.child(text.to_string())
         };
 
-        let cursor_el = || div().w(px(2.)).h(px(16.)).bg(rgb(0xffffff));
+        let caret_color = cx.theme().caret;
+        let cursor_el = move || div().w(px(2.)).h(px(16.)).bg(caret_color);
 
         let mut content = div().flex().items_center();
         let mut cursor_inserted = false;
@@ -534,6 +549,7 @@ impl EditorView {
             .flex_shrink_0()
             .font_family("Menlo")
             .text_size(px(LINE_FONT_SIZE))
+            .when(is_active_line, |el| el.bg(cx.theme().muted.opacity(0.4)))
             .child(gutter)
             .child(
                 div()
@@ -552,12 +568,13 @@ impl EditorView {
                                     .left_0()
                                     .max_w(px(480.))
                                     .p_2()
-                                    .rounded(px(4.))
-                                    .bg(rgb(0x252526))
+                                    .rounded(cx.theme().radius)
+                                    .shadow_lg()
+                                    .bg(cx.theme().popover)
                                     .border_1()
-                                    .border_color(rgb(0x454545))
+                                    .border_color(cx.theme().border)
                                     .text_size(px(12.))
-                                    .text_color(rgb(0xd4d4d4))
+                                    .text_color(cx.theme().popover_foreground)
                                     .child(text.to_string()),
                             )
                         },
@@ -734,8 +751,8 @@ impl Render for EditorView {
             .size_full()
             .overflow_y_scroll()
             .track_scroll(&self.scroll_handle)
-            .bg(rgb(0x1e1e1e))
-            .text_color(rgb(0xd4d4d4))
+            .bg(cx.theme().background)
+            .text_color(cx.theme().foreground)
             .flex()
             .flex_col()
             .children(rendered_lines)

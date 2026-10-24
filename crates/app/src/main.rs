@@ -201,10 +201,11 @@ impl DartIde {
                 .child(
                     v_flex()
                         .w(px(360.))
-                        .bg(cx.theme().background)
+                        .bg(cx.theme().popover)
                         .border_1()
                         .border_color(cx.theme().border)
                         .rounded(cx.theme().radius)
+                        .shadow_xl()
                         .child(
                             div()
                                 .px_3()
@@ -267,10 +268,11 @@ impl DartIde {
                 .child(
                     v_flex()
                         .w(px(420.))
-                        .bg(cx.theme().background)
+                        .bg(cx.theme().popover)
                         .border_1()
                         .border_color(cx.theme().border)
                         .rounded(cx.theme().radius)
+                        .shadow_xl()
                         .children(actions.iter().enumerate().map(|(ix, action)| {
                             let title = match action {
                                 lsp_types::CodeActionOrCommand::Command(c) => c.title.clone(),
@@ -395,10 +397,11 @@ impl DartIde {
                     v_flex()
                         .w(px(480.))
                         .max_h(px(360.))
-                        .bg(cx.theme().background)
+                        .bg(cx.theme().popover)
                         .border_1()
                         .border_color(cx.theme().border)
                         .rounded(cx.theme().radius)
+                        .shadow_xl()
                         .child(div().p_2().child(Input::new(&self.palette_input)))
                         .child(
                             v_flex().id("palette-list").overflow_y_scroll().children(matches.into_iter().enumerate().map(
@@ -481,44 +484,76 @@ impl Render for DartIde {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let view = cx.entity();
 
+        let root_name = self
+            .root
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("/")
+            .to_string();
+
         v_flex()
             .size_full()
             .relative()
             .key_context("DartIde")
             .on_key_down(cx.listener(Self::on_key_down))
             .bg(cx.theme().background)
+            .text_color(cx.theme().foreground)
             .child(
                 h_flex()
                     .w_full()
-                    .px_4()
-                    .py_2()
+                    .h(px(40.))
+                    .flex_shrink_0()
+                    .px_3()
                     .items_center()
                     .justify_between()
+                    .bg(cx.theme().title_bar)
                     .border_b_1()
-                    .border_color(cx.theme().border)
-                    .child(div().font_bold().child("Dart/Flutter IDE — M1"))
+                    .border_color(cx.theme().title_bar_border)
+                    .child(
+                        h_flex()
+                            .gap_2()
+                            .items_center()
+                            .child(div().text_sm().font_bold().child("Dart/Flutter IDE"))
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child(format!("/ {root_name}")),
+                            ),
+                    )
                     .child(
                         Button::new("open-folder")
                             .ghost()
                             .small()
-                            .label(format!("Open Folder\u{2026} ({})", self.root.display()))
+                            .icon(IconName::FolderOpen)
+                            .tooltip("Open Folder\u{2026} (cmd/ctrl+O)")
                             .on_click(cx.listener(|this, _event, window, cx| {
                                 this.open_folder(window, cx);
                             })),
                     ),
             )
             .child(
-                div().flex_1().w_full().child(
+                div().flex_1().w_full().min_h(px(0.)).child(
                     h_resizable("main-split")
                         .child(
                             resizable_panel()
-                                .size(px(260.))
+                                .size(px(240.))
                                 .size_range(px(180.)..px(480.))
                                 .child(
-                                    div()
+                                    v_flex()
                                         .size_full()
+                                        .bg(cx.theme().sidebar)
                                         .border_r_1()
-                                        .border_color(cx.theme().border)
+                                        .border_color(cx.theme().sidebar_border)
+                                        .child(
+                                            div()
+                                                .px_3()
+                                                .py_2()
+                                                .text_xs()
+                                                .font_bold()
+                                                .text_color(cx.theme().muted_foreground)
+                                                .child(root_name.to_uppercase()),
+                                        )
                                         .child(
                                             tree(&self.tree_state, {
                                                 let view = view.clone();
@@ -535,12 +570,19 @@ impl Render for DartIde {
                                                     ListItem::new(ix)
                                                         .w_full()
                                                         .rounded(cx.theme().radius)
+                                                        .text_color(cx.theme().sidebar_foreground)
                                                         .px_3()
+                                                        .py_0p5()
                                                         .pl(px(16.) * entry.depth() + px(12.))
                                                         .child(
                                                             h_flex()
                                                                 .gap_2()
-                                                                .child(Icon::new(icon))
+                                                                .text_sm()
+                                                                .child(
+                                                                    Icon::new(icon)
+                                                                        .text_color(cx.theme().muted_foreground)
+                                                                        .small(),
+                                                                )
                                                                 .child(item.label.clone()),
                                                         )
                                                         .on_click({
@@ -562,7 +604,8 @@ impl Render for DartIde {
                                                         })
                                                 }
                                             })
-                                            .size_full(),
+                                            .flex_1()
+                                            .w_full(),
                                         ),
                                 ),
                         )
@@ -590,25 +633,36 @@ impl Render for DartIde {
 
 impl DartIde {
     fn render_tab_bar(&self, view: &Entity<Self>, cx: &mut Context<Self>) -> impl IntoElement {
+        let accent = cx.theme().blue;
+        let muted = cx.theme().muted_foreground;
+        let foreground = cx.theme().foreground;
+
         h_flex()
             .w_full()
+            .h(px(34.))
+            .flex_shrink_0()
+            .bg(cx.theme().tab_bar)
             .border_b_1()
             .border_color(cx.theme().border)
             .children(self.tabs.iter().enumerate().map(|(ix, tab)| {
                 let is_active = ix == self.active_tab;
+                let is_dirty = tab.editor.read(cx).buffer().is_dirty();
 
                 h_flex()
                     .id(("tab", ix))
+                    .h_full()
                     .items_center()
                     .gap_2()
                     .px_3()
-                    .py_1()
-                    .border_r_1()
-                    .border_color(cx.theme().border)
-                    .when(is_active, |d| d.bg(cx.theme().accent))
+                    .cursor_pointer()
+                    .border_t(px(2.))
+                    .border_color(if is_active { accent } else { gpui_kit::transparent_black() })
+                    .bg(if is_active { cx.theme().tab_active } else { cx.theme().tab })
+                    .text_color(if is_active { cx.theme().tab_active_foreground } else { cx.theme().tab_foreground })
                     .child(
                         div()
                             .id(("tab-label", ix))
+                            .text_sm()
                             .child(tab.title())
                             .on_click({
                                 let view = view.clone();
@@ -623,8 +677,11 @@ impl DartIde {
                     .child(
                         div()
                             .id(("tab-close", ix))
-                            .text_color(cx.theme().muted_foreground)
-                            .child("×")
+                            .w(px(14.))
+                            .text_center()
+                            .text_color(if is_dirty { accent } else { muted })
+                            .hover(move |s| s.text_color(foreground))
+                            .child(if is_dirty { "\u{25cf}" } else { "\u{00d7}" })
                             .on_click({
                                 let view = view.clone();
                                 move |_event, _window, cx| {
@@ -640,29 +697,63 @@ impl DartIde {
     fn render_status_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let editor = self.active_editor().read(cx);
         let buffer = editor.buffer();
-        let mut status = match buffer.path() {
-            Some(path) => format!(
-                "{}{}",
-                path.display(),
-                if buffer.is_dirty() { " \u{2022} unsaved" } else { "" }
-            ),
+        let path = match buffer.path() {
+            Some(path) => path.display().to_string(),
             None => "untitled".to_string(),
         };
-
+        let is_dirty = buffer.is_dirty();
+        let (line, column) = editor.cursor_position();
         let (errors, warnings) = editor.diagnostic_summary();
-        if errors > 0 || warnings > 0 {
-            status.push_str(&format!("  \u{2022}  {errors} error(s), {warnings} warning(s)"));
-        }
+        let is_dart = buffer.path().is_some_and(|p| p.extension().is_some_and(|e| e == "dart"));
 
         h_flex()
             .w_full()
-            .px_4()
-            .py_1()
+            .h(px(24.))
+            .flex_shrink_0()
+            .px_3()
+            .items_center()
+            .justify_between()
+            .bg(cx.theme().status_bar)
             .border_t_1()
-            .border_color(cx.theme().border)
+            .border_color(cx.theme().status_bar_border)
             .text_xs()
             .text_color(cx.theme().muted_foreground)
-            .child(status)
+            .child(
+                h_flex()
+                    .gap_3()
+                    .items_center()
+                    .when(is_dirty, |el| {
+                        el.child(div().text_color(cx.theme().blue).child("\u{25cf}"))
+                    })
+                    .child(path),
+            )
+            .child(
+                h_flex()
+                    .gap_3()
+                    .items_center()
+                    .when(errors > 0, |el| {
+                        el.child(
+                            h_flex()
+                                .gap_1()
+                                .items_center()
+                                .text_color(cx.theme().danger)
+                                .child(Icon::new(IconName::CircleX).small())
+                                .child(errors.to_string()),
+                        )
+                    })
+                    .when(warnings > 0, |el| {
+                        el.child(
+                            h_flex()
+                                .gap_1()
+                                .items_center()
+                                .text_color(cx.theme().warning)
+                                .child(Icon::new(IconName::TriangleAlert).small())
+                                .child(warnings.to_string()),
+                        )
+                    })
+                    .child(format!("Ln {line}, Col {column}"))
+                    .when(is_dart, |el| el.child("Dart")),
+            )
     }
 }
 
@@ -672,6 +763,11 @@ fn main() {
     app.run(move |cx| {
         // This must be called before using any GPUI Component features.
         gpui_kit::init(cx);
+        // Dark by default — a code editor living in a bright-white chrome
+        // looks like nothing in this space (Zed, Fleet, VS Code all default
+        // dark), and `gpui-component`'s own default dark theme already sits
+        // close to it (near-black backgrounds, a blue selection/accent).
+        gpui_kit::component::Theme::change(gpui_kit::component::ThemeMode::Dark, None, cx);
 
         let window_options = WindowOptions {
             window_bounds: Some(WindowBounds::centered(size(px(1100.), px(720.)), cx)),
