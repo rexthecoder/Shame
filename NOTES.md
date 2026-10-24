@@ -1,5 +1,30 @@
 # Milestone notes
 
+## M4: stepping and expression evaluation
+
+Rounds out `DapClient`'s session methods: `next` (step over), `step_in`,
+`step_out`, and `evaluate` (watch/REPL/hover expressions), alongside
+the `launch`/breakpoints/`continue_thread` set from the previous
+commit.
+
+Verified against the real `dart debug_adapter` the same way as the
+earlier breakpoint test: drove a real paused session, then `next` →
+watched the real `continued` → `stopped (reason: "step")` event pair
+arrive (same shape for `stepIn`/`stepOut`, confirmed too) — locked into
+`deserializes_a_real_step_response_and_event_sequence`. `evaluate`
+turned up a genuine error worth keeping as a real captured shape
+rather than inventing one: sent `evaluate` for `a + b` right after a
+step and got back `success: false`, `"Evaluation is only supported
+when the debugger is paused unless you have a Dart file active in the
+editor"` — same error envelope (`message` + structured `body.error`)
+`core-dap` already handles for any other failed request, now locked
+into `deserializes_a_real_evaluate_error_response`.
+
+64 tests total now. This closes out `core-dap`'s backend session
+surface — breakpoints, run control, stepping, and expression
+evaluation are all there; what's left in M4 (breakpoint gutter,
+variables panel, debug console) is UI work.
+
 ## UI pass: a real custom titlebar, language-aware status bar, code icons
 
 Third round of the chrome work. The previous round reverted to the

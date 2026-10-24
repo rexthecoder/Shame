@@ -145,6 +145,36 @@ impl DapClient {
         self.request("continue", serde_json::json!({"threadId": thread_id}))
     }
 
+    /// Step over the current line.
+    pub fn next(&self, thread_id: i64) -> io::Result<i64> {
+        self.request("next", serde_json::json!({"threadId": thread_id}))
+    }
+
+    /// Step into a function call on the current line.
+    pub fn step_in(&self, thread_id: i64) -> io::Result<i64> {
+        self.request("stepIn", serde_json::json!({"threadId": thread_id}))
+    }
+
+    /// Run until the current function returns.
+    pub fn step_out(&self, thread_id: i64) -> io::Result<i64> {
+        self.request("stepOut", serde_json::json!({"threadId": thread_id}))
+    }
+
+    /// Evaluate an expression in the context of a stack frame (watch
+    /// expressions, a debug console, or a hover value — `context`
+    /// distinguishes which per the DAP spec: `"watch"`, `"repl"`,
+    /// `"hover"`, or `"clipboard"`). Only valid while stopped at that
+    /// frame — real captured error: evaluating while running responds
+    /// `success: false` with `message: "Evaluation is only supported
+    /// when the debugger is paused..."`, same error shape
+    /// [`DapMessage::Response`] already handles for any other command.
+    pub fn evaluate(&self, expression: &str, frame_id: i64, context: &str) -> io::Result<i64> {
+        self.request(
+            "evaluate",
+            serde_json::json!({"expression": expression, "frameId": frame_id, "context": context}),
+        )
+    }
+
     pub fn disconnect(&self, terminate_debuggee: bool) -> io::Result<i64> {
         self.request("disconnect", serde_json::json!({"terminateDebuggee": terminate_debuggee}))
     }
@@ -315,6 +345,60 @@ mod tests {
                 assert_eq!(err["body"]["error"]["variables"]["message"], "Unknown command notARealCommand");
             }
             other => panic!("expected a failed response, got {other:?}"),
+        }
+    }
+
+    /// Captured for real from `next`/`stepIn`/`stepOut` against a real
+    /// paused session: an empty-body success response, then a
+    /// `continued` event, then a `stopped` event with `reason: "step"`
+    /// — the same three-message shape for all three step commands.
+    #[test]
+    fn deserializes_a_real_step_response_and_event_sequence() {
+        match parse_dap_message(serde_json::json!({
+            "seq": 14, "type": "response", "command": "next", "request_seq": 5, "success": true
+        })) {
+            Some(DapMessage::Response { request_seq, command, result: Ok(_) }) => {
+                assert_eq!(request_seq, 5);
+                assert_eq!(command, "next");
+            }
+            other => panic!("expected a successful step response, got {other:?}"),
+        }
+
+        match parse_dap_message(serde_json::json!({
+            "seq": 16, "type": "event", "body": {"allThreadsStopped": false, "reason": "step", "threadId": 1}, "event": "stopped"
+        })) {
+            Some(DapMessage::Event { event, body }) => {
+                assert_eq!(event, "stopped");
+                assert_eq!(body["reason"], "step");
+            }
+            other => panic!("expected a stopped(step) event, got {other:?}"),
+        }
+    }
+
+    /// Captured for real: `evaluate` sent while the program was running
+    /// (not paused at the given frame) — a genuine DAP error response,
+    /// same shape as `deserializes_a_real_error_response` but from a
+    /// real command we actually support, not a made-up one.
+    #[test]
+    fn deserializes_a_real_evaluate_error_response() {
+        let value = serde_json::json!({
+            "seq": 17,
+            "type": "response",
+            "body": {"error": {"format": "{message}", "id": 1, "showUser": false, "variables": {
+                "message": "Evaluation is only supported when the debugger is paused unless you have a Dart file active in the editor"
+            }}},
+            "command": "evaluate",
+            "message": "Evaluation is only supported when the debugger is paused unless you have a Dart file active in the editor",
+            "request_seq": 6,
+            "success": false
+        });
+        match parse_dap_message(value) {
+            Some(DapMessage::Response { request_seq, command, result: Err(err) }) => {
+                assert_eq!(request_seq, 6);
+                assert_eq!(command, "evaluate");
+                assert!(err["message"].as_str().unwrap().contains("only supported when the debugger is paused"));
+            }
+            other => panic!("expected a failed evaluate response, got {other:?}"),
         }
     }
 
