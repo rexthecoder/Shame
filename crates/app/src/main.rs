@@ -521,8 +521,14 @@ impl DartIde {
 }
 
 impl Render for DartIde {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let view = cx.entity();
+
+        // macOS hides the traffic lights once the window is actually in
+        // native fullscreen, so the space this titlebar reserves for them
+        // is wasted there — drop the inset in that state instead of
+        // leaving a permanent gap, the same thing Zed does.
+        let traffic_light_inset = if window.is_fullscreen() { px(12.) } else { px(78.) };
 
         let root_name = self
             .root
@@ -550,7 +556,7 @@ impl Render for DartIde {
                     .w_full()
                     .h(px(38.))
                     .flex_shrink_0()
-                    .pl(px(78.))
+                    .pl(traffic_light_inset)
                     .pr_3()
                     .items_center()
                     .bg(cx.theme().title_bar)

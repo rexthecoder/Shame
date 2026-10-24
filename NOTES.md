@@ -1,5 +1,18 @@
 # Milestone notes
 
+## Drop the traffic-light inset in native fullscreen
+
+Follow-up to the git-branch title bar: the user pointed at Zed
+specifically removing the titlebar's left gap once the window goes
+native fullscreen. macOS hides the traffic lights once a window is
+actually in that state (the real green-button fullscreen, not just a
+large window), so the 78px this titlebar reserves for them is wasted
+space there — `window.is_fullscreen()` now switches that inset down
+to a plain 12px whenever it's true, matching what the space is
+actually needed for in each state. Still reserves the full 78px in
+ordinary windowed mode, where the real traffic lights are still there
+and still need the room.
+
 ## Git branch in the title bar (`core-workspace` starts for real)
 
 User asked for a branch indicator in the title bar like other editors
