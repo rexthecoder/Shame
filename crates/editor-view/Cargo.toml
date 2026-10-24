@@ -11,3 +11,4 @@ core-buffer = { path = "../core-buffer" }
 core-syntax = { path = "../core-syntax" }
 core-lsp = { path = "../core-lsp" }
 serde_json.workspace = true
+smol.workspace = true

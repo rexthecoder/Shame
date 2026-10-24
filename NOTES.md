@@ -1,5 +1,38 @@
 # Milestone notes
 
+## M2: hover
+
+`textDocument/hover` is wired up: hovering over code for ~300ms sends a
+hover request at that line/column; the response renders as a small box
+under the hovered line. Reuses the same per-line `canvas()` overlay
+built for column-accurate clicks — it already turns a pixel position
+into a byte column, so hover just adds a third `MouseMoveEvent` listener
+(no button held) alongside the existing click/drag ones, debounced via
+`smol::Timer::after` + a sequence number (a new hover position bumps the
+sequence; when the timer fires, it only sends the request if the
+sequence hasn't moved on since).
+
+**Verified against the real `dart language-server`, protocol-level**:
+rather than trying to simulate an actual mouse hover in the GUI (not
+practical without display/input access in this environment), drove the
+real server by hand through `initialize` → `initialized` → `didOpen` →
+`textDocument/hover` for a known position (`greet` in a small sample
+file) via the same FIFO-piping approach used earlier for `initialize`.
+The response's `contents` came back as a bare markdown string —
+confirming it deserializes as `HoverContents::Scalar(MarkedString::
+String(..))`, exactly the shape `hover_contents_text` already handles.
+Combined with the already-proven `cx.spawn`/`handle_lsp_message`
+dispatch pattern from diagnostics (same mechanism, different message),
+this gives strong confidence without needing a second full rebuild +
+simulated-interaction cycle.
+
+Known gaps: the popup shows raw markdown (code fences and all), not
+rendered; it's positioned at a fixed spot below the line, not anchored
+to the exact column; and it doesn't clear if the mouse leaves the editor
+entirely without the user typing first (only on keystroke, or moving to
+a new hover position) — see the scope-cut list at the top of
+`lsp_integration.rs`.
+
 ## Open Folder (cmd+O)
 
 Found while trying to let the user test M2's diagnostics: the app always

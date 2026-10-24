@@ -24,6 +24,7 @@ use core_buffer::{Buffer, Selection};
 use core_lsp::lsp_types;
 use core_syntax::{Highlight, HighlightKind, InputEdit, SyntaxTree, point_at};
 use gpui_kit::*;
+use gpui_kit::prelude::FluentBuilder as _;
 use lsp_integration::LspState;
 
 const GUTTER_WIDTH: f32 = 48.;
@@ -60,6 +61,11 @@ pub struct EditorView {
     /// `dart language-server` state for this buffer, if it's a `.dart`
     /// file. See `lsp_integration.rs`.
     lsp: Option<LspState>,
+    /// `(line, column)` the mouse is currently hovering, for debouncing
+    /// `textDocument/hover` requests. See `lsp_integration.rs`.
+    hover_point: Option<(usize, usize)>,
+    hover_sequence: u64,
+    hover_result: Option<(usize, String)>,
 }
 
 impl EditorView {
@@ -77,6 +83,9 @@ impl EditorView {
             syntax_tree,
             synced_text: text,
             lsp: None,
+            hover_point: None,
+            hover_sequence: 0,
+            hover_result: None,
         };
         this.maybe_start_lsp(cx);
         this
@@ -258,6 +267,7 @@ impl EditorView {
     }
 
     fn on_key_down(&mut self, event: &KeyDownEvent, _window: &mut Window, cx: &mut Context<Self>) {
+        self.clear_hover(cx);
         let keystroke = &event.keystroke;
         let primary_mod = keystroke.modifiers.platform || keystroke.modifiers.control;
 
@@ -456,6 +466,21 @@ impl EditorView {
                         this.extend_to(line_start + column, cx);
                     });
                 });
+
+                let text = hit_test_text.clone();
+                let hover_view = view.clone();
+                window.on_mouse_event(move |event: &MouseMoveEvent, phase, window, cx| {
+                    if phase != DispatchPhase::Bubble
+                        || event.pressed_button.is_some()
+                        || !bounds.contains(&event.position)
+                    {
+                        return;
+                    }
+                    let column = column_for_x(window, &text, event.position.x - bounds.origin.x);
+                    hover_view.update(cx, |this, cx| {
+                        this.note_hover_position(index, column, cx);
+                    });
+                });
             },
         )
         .absolute()
@@ -476,7 +501,27 @@ impl EditorView {
                     .flex_1()
                     .h_full()
                     .child(content)
-                    .child(click_overlay),
+                    .child(click_overlay)
+                    .when_some(
+                        self.hover_to_render().filter(|(line, _)| *line == index),
+                        |el, (_, text)| {
+                            el.child(
+                                div()
+                                    .absolute()
+                                    .top(px(20.))
+                                    .left_0()
+                                    .max_w(px(480.))
+                                    .p_2()
+                                    .rounded(px(4.))
+                                    .bg(rgb(0x252526))
+                                    .border_1()
+                                    .border_color(rgb(0x454545))
+                                    .text_size(px(12.))
+                                    .text_color(rgb(0xd4d4d4))
+                                    .child(text.to_string()),
+                            )
+                        },
+                    ),
             )
     }
 }

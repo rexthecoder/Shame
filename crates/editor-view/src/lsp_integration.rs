@@ -1,6 +1,6 @@
 //! Lazily-started `dart language-server` per Dart buffer, wired to
-//! diagnostics only (M2 first slice — see the module docs at the top of
-//! `lib.rs` for what's deliberately not here yet: completion, hover,
+//! diagnostics and hover (M2 so far — see the module docs at the top of
+//! `lib.rs` for what's deliberately not here yet: completion,
 //! go-to-definition, rename, format, code actions).
 //!
 //! Scope cuts, to revisit once more of M2 lands:
@@ -14,16 +14,32 @@
 //!   `range`, i.e. "replace everything"). Always valid LSP regardless of
 //!   what the server negotiated, and far simpler than incremental sync,
 //!   at the cost of re-sending the whole buffer on every keystroke.
+//! - Hover positions (and everything else here) use byte offsets as LSP
+//!   "character" columns, same approximation `editor-view` already makes
+//!   elsewhere — correct for ASCII, wrong for a line with non-ASCII text
+//!   before the hovered column (LSP's default position encoding is
+//!   UTF-16 code units, which this doesn't convert to).
+//! - The hover popup renders at a fixed spot below the hovered line, not
+//!   anchored to the exact hovered column.
+//! - The popup is dismissed on any keystroke, but not when the mouse
+//!   simply leaves the editor without typing — each line's hover
+//!   tracking only fires while the mouse is over *that* line, so moving
+//!   off the text area entirely (onto the gutter, another panel, or out
+//!   of the window) leaves a stale popup until something else changes it.
 
 use std::collections::HashMap;
 use std::str::FromStr;
+use std::time::Duration;
 
 use core_lsp::{LspClient, ServerMessage, lsp_types};
 use gpui_kit::Context;
+use smol::Timer;
 use lsp_types::{
     ClientCapabilities, Diagnostic, DiagnosticSeverity, DidChangeTextDocumentParams,
-    DidOpenTextDocumentParams, InitializeParams, PublishDiagnosticsParams,
-    TextDocumentContentChangeEvent, TextDocumentItem, Uri, VersionedTextDocumentIdentifier,
+    DidOpenTextDocumentParams, Hover, HoverContents, HoverParams, InitializeParams,
+    LanguageString, MarkedString, Position, PublishDiagnosticsParams,
+    TextDocumentContentChangeEvent, TextDocumentIdentifier, TextDocumentItem,
+    TextDocumentPositionParams, Uri, VersionedTextDocumentIdentifier,
 };
 
 use crate::EditorView;
@@ -35,6 +51,7 @@ pub(crate) struct LspState {
     initialize_id: i64,
     ready: bool,
     diagnostics: Vec<Diagnostic>,
+    pending_hover_id: Option<i64>,
 }
 
 impl EditorView {
@@ -89,7 +106,73 @@ impl EditorView {
             initialize_id,
             ready: false,
             diagnostics: Vec::new(),
+            pending_hover_id: None,
         });
+    }
+
+    /// Note that the mouse is hovering over `(line, column)` in the
+    /// text, debouncing a `textDocument/hover` request behind a short
+    /// delay so moving the mouse across a line doesn't fire one request
+    /// per pixel. No-op if there's no ready LSP server for this buffer.
+    pub(crate) fn note_hover_position(&mut self, line: usize, column: usize, cx: &mut Context<Self>) {
+        let is_ready = self.lsp.as_ref().is_some_and(|lsp| lsp.ready);
+        if !is_ready {
+            return;
+        }
+        if self.hover_point == Some((line, column)) {
+            return;
+        }
+        self.hover_point = Some((line, column));
+        let had_result = self.hover_result.take().is_some();
+        self.hover_sequence += 1;
+        let sequence = self.hover_sequence;
+        if had_result {
+            cx.notify();
+        }
+
+        cx.spawn(async move |weak, cx| {
+            Timer::after(Duration::from_millis(300)).await;
+            let _ = weak.update(cx, |this, cx| {
+                if this.hover_sequence == sequence {
+                    this.request_hover(line, column, cx);
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// Clear any pending/shown hover (e.g. the mouse left the text area).
+    pub(crate) fn clear_hover(&mut self, cx: &mut Context<Self>) {
+        self.hover_point = None;
+        self.hover_sequence += 1;
+        if self.hover_result.take().is_some() {
+            cx.notify();
+        }
+    }
+
+    fn request_hover(&mut self, line: usize, column: usize, _cx: &mut Context<Self>) {
+        let Some(lsp) = &mut self.lsp else {
+            return;
+        };
+        let params = HoverParams {
+            text_document_position_params: TextDocumentPositionParams {
+                text_document: TextDocumentIdentifier { uri: lsp.uri.clone() },
+                position: Position {
+                    line: line as u32,
+                    character: column as u32,
+                },
+            },
+            work_done_progress_params: Default::default(),
+        };
+        if let Ok(id) = lsp.client.request("textDocument/hover", serde_json::to_value(params).unwrap_or_default()) {
+            lsp.pending_hover_id = Some(id);
+        }
+    }
+
+    /// The hover text to show (if any) and the 0-indexed line it belongs
+    /// to, for `render` to place it under.
+    pub(crate) fn hover_to_render(&self) -> Option<(usize, &str)> {
+        self.hover_result.as_ref().map(|(line, text)| (*line, text.as_str()))
     }
 
     /// Tell the server about the buffer's current text, if a server is
@@ -150,6 +233,16 @@ impl EditorView {
                     cx.notify();
                 }
             }
+            ServerMessage::Response { id, result } if lsp.pending_hover_id == Some(id) => {
+                lsp.pending_hover_id = None;
+                let Some(line) = self.hover_point.map(|(line, _)| line) else {
+                    return;
+                };
+                if let Ok(Some(hover)) = result.map(|v| serde_json::from_value::<Option<Hover>>(v).unwrap_or(None)) {
+                    self.hover_result = Some((line, hover_contents_text(&hover.contents)));
+                    cx.notify();
+                }
+            }
             _ => {}
         }
     }
@@ -190,5 +283,22 @@ impl EditorView {
                 .or_insert(severity);
         }
         by_line
+    }
+}
+
+fn hover_contents_text(contents: &HoverContents) -> String {
+    match contents {
+        HoverContents::Scalar(marked) => marked_string_text(marked),
+        HoverContents::Array(list) => {
+            list.iter().map(marked_string_text).collect::<Vec<_>>().join("\n\n")
+        }
+        HoverContents::Markup(markup) => markup.value.clone(),
+    }
+}
+
+fn marked_string_text(marked: &MarkedString) -> String {
+    match marked {
+        MarkedString::String(s) => s.clone(),
+        MarkedString::LanguageString(LanguageString { value, .. }) => value.clone(),
     }
 }
