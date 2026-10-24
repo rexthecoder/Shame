@@ -1,5 +1,30 @@
 # Milestone notes
 
+## Git branch in the title bar (`core-workspace` starts for real)
+
+User asked for a branch indicator in the title bar like other editors
+show (referenced another app's title bar as the look to aim for). This
+is `core-workspace`'s first real code — that crate was a stub since M0
+("file tree, file watcher, search, and settings"), and the app's file
+tree/Quick Open list still walk the filesystem directly in `app`
+rather than through it; `current_branch()` is the first piece actually
+built there, not a redesign of the rest.
+
+Same shelling-out pattern `core-flutter` uses for `flutter`/`dart`:
+`git rev-parse --abbrev-ref HEAD` in the project directory. The one
+real wrinkle, confirmed by testing rather than assumed: a **detached**
+HEAD (checked out a commit directly, not a branch) makes that command
+print the literal string `"HEAD"`, not a real branch name — worth
+treating as "no branch to show" rather than literally displaying
+"HEAD" as if it meant something to the user. Verified all three cases
+against the real `git` CLI in temp repos: a fresh commit on its
+default branch, an explicit `checkout -b` onto a named branch, and a
+real detached HEAD (not simulated) — the title bar now shows the
+project name plus a small branch pill next to it when `git_branch` is
+`Some`, and nothing extra when it's `None` (not a repo, or detached).
+
+67 tests total now.
+
 ## M4: stepping and expression evaluation
 
 Rounds out `DapClient`'s session methods: `next` (step over), `step_in`,

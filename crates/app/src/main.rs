@@ -142,6 +142,7 @@ impl Tab {
 
 pub struct DartIde {
     root: PathBuf,
+    git_branch: Option<String>,
     tree_state: Entity<TreeState>,
     tabs: Vec<Tab>,
     active_tab: usize,
@@ -177,8 +178,10 @@ impl DartIde {
         );
         let editor = cx.new(|cx| EditorView::from_buffer(buffer, cx));
 
+        let git_branch = core_workspace::current_branch(&root);
         let mut this = Self {
             root,
+            git_branch,
             tree_state,
             tabs: vec![Tab { path: None, editor: editor.clone() }],
             active_tab: 0,
@@ -381,6 +384,7 @@ impl DartIde {
         self.tree_state.update(cx, |state, cx| {
             state.set_items(items, cx);
         });
+        self.git_branch = core_workspace::current_branch(&root);
         self.root = root;
         cx.notify();
     }
@@ -553,11 +557,35 @@ impl Render for DartIde {
                     .border_b_1()
                     .border_color(cx.theme().title_bar_border)
                     .child(
-                        div()
-                            .text_sm()
-                            .font_bold()
-                            .text_color(cx.theme().muted_foreground)
-                            .child("Dart/Flutter IDE"),
+                        h_flex()
+                            .gap_2()
+                            .items_center()
+                            .px_2()
+                            .py_0p5()
+                            .rounded(cx.theme().radius)
+                            .bg(cx.theme().muted)
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .font_bold()
+                                    .text_color(cx.theme().foreground)
+                                    .child(root_name.clone()),
+                            )
+                            .when_some(self.git_branch.as_ref(), |el, branch| {
+                                el.child(
+                                    h_flex()
+                                        .gap_1()
+                                        .items_center()
+                                        .text_sm()
+                                        .text_color(cx.theme().muted_foreground)
+                                        .child(
+                                            Icon::new(gpui_kit::assets::IconName::GitBranch)
+                                                .text_color(cx.theme().muted_foreground)
+                                                .small(),
+                                        )
+                                        .child(branch.clone()),
+                                )
+                            }),
                     ),
             )
             .child(

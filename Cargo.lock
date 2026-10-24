@@ -194,6 +194,7 @@ dependencies = [
  "anyhow",
  "core-buffer",
  "core-lsp",
+ "core-workspace",
  "editor-view",
  "gpui-kit",
 ]
