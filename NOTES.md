@@ -1,5 +1,45 @@
 # Milestone notes
 
+## Correcting the Fleet read: tabs aren't in the titlebar
+
+The user asked for a closer look at the same reference screenshots —
+right to, since the previous commit's read of them was wrong on the
+structural point that mattered most. A closer look at both images
+shows two separate rows, not one merged row: a titlebar (traffic
+lights, panel-toggle icons, centered project name, action icons on the
+right) and, below it, a *separate* tab row that's scoped to the editor
+column — it doesn't span over the sidebar. The `jetsave` screenshot
+confirms this plainly: the single open tab sits in its own thin strip
+starting exactly where the file tree's right border is, not at the
+window's left edge. Reverted the merge from the previous commit:
+`render_tabs` is a full row again, back above the editor column, not
+embedded in the titlebar.
+
+The active-tab treatment was also wrong: the earlier passes used a top
+accent border (the Zed detail), but the reference screenshots show a
+full rounded border *box* around the whole active tab chip instead —
+changed to match (`border_1` + `rounded`, not `border_t`).
+
+Used the correction to add real functionality rather than just fixing
+the visual, in the same spirit as not faking the sidebar mode tabs
+last round:
+- A sidebar-toggle icon in the titlebar (`PanelLeftClose`/`PanelLeft`,
+  also bound to cmd/ctrl+B) that actually hides/shows the file tree —
+  `sidebar_open` on `DartIde`, and `Render` now builds either the full
+  `h_resizable` split or just the editor column depending on it,
+  rather than a decorative icon that does nothing.
+- A search icon in the titlebar that opens Quick Open — reusing real
+  functionality (the existing cmd/ctrl+P palette) rather than
+  building a new search UI just to give the icon something to do.
+
+Both of those are deliberately *not* 1:1 ports of what the screenshots
+show (Fleet's icons there are Smart Mode/run/notifications/settings,
+none of which this app has a backing concept for yet) — reusing the
+visual motif for something real beats reproducing icons that would
+sit there doing nothing.
+
+71 tests passing (layout-only change, plus the sidebar-toggle state).
+
 ## UI redesign from real Fleet reference screenshots
 
 The user said flatly they didn't like the chrome and to lean heavier

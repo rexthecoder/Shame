@@ -173,6 +173,7 @@ impl Tab {
 pub struct DartIde {
     root: PathBuf,
     git_branch: Option<String>,
+    sidebar_open: bool,
     tree_state: Entity<TreeState>,
     tabs: Vec<Tab>,
     active_tab: usize,
@@ -212,6 +213,7 @@ impl DartIde {
         let mut this = Self {
             root,
             git_branch,
+            sidebar_open: true,
             tree_state,
             tabs: vec![Tab { path: None, editor: editor.clone() }],
             active_tab: 0,
@@ -436,6 +438,12 @@ impl DartIde {
             return;
         }
 
+        if primary_mod && keystroke.key.as_str() == "b" {
+            self.sidebar_open = !self.sidebar_open;
+            cx.notify();
+            return;
+        }
+
         if self.palette_open && keystroke.key.as_str() == "escape" {
             self.palette_open = false;
             cx.notify();
@@ -575,21 +583,19 @@ impl Render for DartIde {
             .bg(cx.theme().background)
             .text_color(cx.theme().foreground)
             .child(
-                // The one titlebar: draws over the traffic-light inset
-                // reserved above (`pl` clears it), and its native AppKit
-                // drag behavior carries over from the system titlebar
-                // strip it replaces (`appears_transparent` alone, with
-                // `app_owns_titlebar_drag` left at its default `false`,
-                // keeps the window draggable from here without any extra
-                // mouse handling on our side).
-                // Titlebar and tabs share one row, not three stacked bars
-                // (titlebar / tab bar / editor) like the previous pass —
-                // real Fleet puts open-file tabs directly in the titlebar
-                // itself, with the project/branch pill and window actions
-                // off to the right. Still draws over the traffic-light
-                // inset (`pl`) and still gets free native window dragging
-                // from `appears_transparent` the same way the old
-                // titlebar-only row did.
+                // The titlebar: icon controls on the left, the
+                // project/branch pill and actions on the right — real
+                // Fleet's own layout (confirmed from the reference
+                // screenshots, not the merged-with-tabs guess the
+                // previous pass made: tabs sit in their own row, scoped
+                // to the editor column, not spanning the sidebar — see
+                // `render_tabs` below). Draws over the traffic-light
+                // inset reserved above (`pl` clears it), and its native
+                // AppKit drag behavior carries over from the system
+                // titlebar strip it replaces (`appears_transparent`
+                // alone, with `app_owns_titlebar_drag` left at its
+                // default `false`, keeps the window draggable from here
+                // without any extra mouse handling on our side).
                 h_flex()
                     .w_full()
                     .h(px(38.))
@@ -597,6 +603,7 @@ impl Render for DartIde {
                     .pl(traffic_light_inset)
                     .pr_3()
                     .items_center()
+                    .gap_2()
                     // Fleet's whole chrome shares one flat background —
                     // sidebar, tabs, status bar, and the editor itself
                     // all read as the same surface, separated only by
@@ -606,7 +613,25 @@ impl Render for DartIde {
                     .bg(cx.theme().background)
                     .border_b_1()
                     .border_color(cx.theme().border)
-                    .child(self.render_tabs(&view, cx))
+                    .child(
+                        div()
+                            .id("toggle-sidebar")
+                            .cursor_pointer()
+                            .child(
+                                Icon::new(if self.sidebar_open {
+                                    IconName::PanelLeftClose
+                                } else {
+                                    IconName::PanelLeft
+                                })
+                                .text_color(cx.theme().muted_foreground)
+                                .small(),
+                            )
+                            .on_click(cx.listener(|this, _event, _window, cx| {
+                                this.sidebar_open = !this.sidebar_open;
+                                cx.notify();
+                            })),
+                    )
+                    .child(div().flex_1())
                     .child(
                         h_flex()
                             .flex_shrink_0()
@@ -642,110 +667,133 @@ impl Render for DartIde {
                                         }),
                                 )
                             }),
+                    )
+                    .child(
+                        div()
+                            .id("quick-open")
+                            .cursor_pointer()
+                            .child(Icon::new(IconName::Search).text_color(cx.theme().muted_foreground).small())
+                            .on_click(cx.listener(|this, _event, window, cx| {
+                                this.palette_open = true;
+                                this.palette_input.update(cx, |state, cx| state.focus(window, cx));
+                                cx.notify();
+                            })),
                     ),
             )
             .child(
-                div().flex_1().w_full().min_h(px(0.)).child(
-                    h_resizable("main-split")
-                        .child(
-                            resizable_panel()
-                                .size(px(240.))
-                                .size_range(px(180.)..px(480.))
-                                .child(
-                                    v_flex()
-                                        .size_full()
-                                        .bg(cx.theme().background)
-                                        .border_r_1()
-                                        .border_color(cx.theme().border)
-                                        .child(
-                                            h_flex()
-                                                .items_center()
-                                                .justify_between()
-                                                .pl_3()
-                                                .pr_1()
-                                                .py_2()
-                                                .child(
-                                                    // Plain sentence-case, not the bold
-                                                    // uppercase VS Code/Zed convention —
-                                                    // Fleet's own sidebar header (when it
-                                                    // has one at all) is this understated.
-                                                    div()
-                                                        .text_sm()
-                                                        .text_color(cx.theme().muted_foreground)
-                                                        .child(root_name.clone()),
-                                                )
-                                                .child(
-                                                    Button::new("open-folder")
-                                                        .ghost()
-                                                        .small()
-                                                        .icon(IconName::FolderOpen)
-                                                        .tooltip("Open Folder\u{2026} (cmd/ctrl+O)")
-                                                        .on_click(cx.listener(|this, _event, window, cx| {
-                                                            this.open_folder(window, cx);
-                                                        })),
-                                                ),
-                                        )
-                                        .child(
-                                            tree(&self.tree_state, {
-                                                let view = view.clone();
-                                                move |ix, entry, _selected, _window, cx| {
-                                                    let item = entry.item();
-                                                    let icon = if !entry.is_folder() {
-                                                        icon_for_file(&item.label)
-                                                    } else if entry.is_expanded() {
-                                                        Icon::new(IconName::FolderOpen)
-                                                    } else {
-                                                        Icon::new(IconName::Folder)
-                                                    };
-
-                                                    ListItem::new(ix)
-                                                        .w_full()
-                                                        .rounded(cx.theme().radius)
-                                                        .text_color(cx.theme().sidebar_foreground)
-                                                        .px_3()
-                                                        .py_0p5()
-                                                        .pl(px(16.) * entry.depth() + px(12.))
-                                                        .child(
-                                                            h_flex()
-                                                                .gap_2()
-                                                                .text_sm()
-                                                                .child(icon.text_color(cx.theme().muted_foreground).small())
-                                                                .child(item.label.clone()),
-                                                        )
-                                                        .on_click({
-                                                            let view = view.clone();
-                                                            let is_folder = item.is_folder();
-                                                            let path = PathBuf::from(item.id.as_str());
-                                                            move |_event, window, cx| {
-                                                                if is_folder {
-                                                                    return;
-                                                                }
-                                                                view.update(cx, |this, cx| {
-                                                                    this.open_path(
-                                                                        path.clone(),
-                                                                        window,
-                                                                        cx,
-                                                                    );
-                                                                });
-                                                            }
-                                                        })
-                                                }
-                                            })
-                                            .flex_1()
-                                            .w_full(),
-                                        ),
-                                ),
-                        )
+                div().flex_1().w_full().min_h(px(0.)).child({
+                    let editor_column = v_flex()
+                        .flex_1()
+                        .w_full()
+                        .h(relative(1.))
+                        .min_h(px(0.))
+                        .child(self.render_tabs(&view, cx))
                         .child(
                             div()
                                 .flex_1()
                                 .w_full()
-                                .h(relative(1.))
                                 .min_h(px(0.))
-                                .child(self.active_editor().clone())
-                                .into_any_element(),
-                        ),
-                ),
+                                .child(self.active_editor().clone()),
+                        )
+                        .into_any_element();
+
+                    if !self.sidebar_open {
+                        editor_column
+                    } else {
+                        h_resizable("main-split")
+                            .child(
+                                resizable_panel()
+                                    .size(px(240.))
+                                    .size_range(px(180.)..px(480.))
+                                    .child(
+                                        v_flex()
+                                            .size_full()
+                                            .bg(cx.theme().background)
+                                            .border_r_1()
+                                            .border_color(cx.theme().border)
+                                            .child(
+                                                h_flex()
+                                                    .items_center()
+                                                    .justify_between()
+                                                    .pl_3()
+                                                    .pr_1()
+                                                    .py_2()
+                                                    .child(
+                                                        // Plain sentence-case, not the bold
+                                                        // uppercase VS Code/Zed convention —
+                                                        // Fleet's own sidebar header (when it
+                                                        // has one at all) is this understated.
+                                                        div()
+                                                            .text_sm()
+                                                            .text_color(cx.theme().muted_foreground)
+                                                            .child(root_name.clone()),
+                                                    )
+                                                    .child(
+                                                        Button::new("open-folder")
+                                                            .ghost()
+                                                            .small()
+                                                            .icon(IconName::FolderOpen)
+                                                            .tooltip("Open Folder\u{2026} (cmd/ctrl+O)")
+                                                            .on_click(cx.listener(|this, _event, window, cx| {
+                                                                this.open_folder(window, cx);
+                                                            })),
+                                                    ),
+                                            )
+                                            .child(
+                                                tree(&self.tree_state, {
+                                                    let view = view.clone();
+                                                    move |ix, entry, _selected, _window, cx| {
+                                                        let item = entry.item();
+                                                        let icon = if !entry.is_folder() {
+                                                            icon_for_file(&item.label)
+                                                        } else if entry.is_expanded() {
+                                                            Icon::new(IconName::FolderOpen)
+                                                        } else {
+                                                            Icon::new(IconName::Folder)
+                                                        };
+
+                                                        ListItem::new(ix)
+                                                            .w_full()
+                                                            .rounded(cx.theme().radius)
+                                                            .text_color(cx.theme().sidebar_foreground)
+                                                            .px_3()
+                                                            .py_0p5()
+                                                            .pl(px(16.) * entry.depth() + px(12.))
+                                                            .child(
+                                                                h_flex()
+                                                                    .gap_2()
+                                                                    .text_sm()
+                                                                    .child(icon.text_color(cx.theme().muted_foreground).small())
+                                                                    .child(item.label.clone()),
+                                                            )
+                                                            .on_click({
+                                                                let view = view.clone();
+                                                                let is_folder = item.is_folder();
+                                                                let path = PathBuf::from(item.id.as_str());
+                                                                move |_event, window, cx| {
+                                                                    if is_folder {
+                                                                        return;
+                                                                    }
+                                                                    view.update(cx, |this, cx| {
+                                                                        this.open_path(
+                                                                            path.clone(),
+                                                                            window,
+                                                                            cx,
+                                                                        );
+                                                                    });
+                                                                }
+                                                            })
+                                                    }
+                                                })
+                                                .flex_1()
+                                                .w_full(),
+                                            ),
+                                    ),
+                            )
+                            .child(editor_column)
+                            .into_any_element()
+                    }
+                }),
             )
             .child(self.render_status_bar(cx))
             .when_some(self.render_palette(&view, cx), |el, palette| el.child(palette))
@@ -755,40 +803,49 @@ impl Render for DartIde {
 }
 
 impl DartIde {
-    /// Just the tabs, no surrounding bg/border/height of its own — this
-    /// is a `flex_1` child of the merged titlebar row in `Render`, not
-    /// a standalone bar, matching real Fleet (tabs live in the
-    /// titlebar, not a separate row below it).
+    /// The open-file tabs, in their own row above the editor — scoped
+    /// to the editor column, not spanning the sidebar, and not merged
+    /// into the titlebar either. Both of those were guesses from a
+    /// too-quick look at the Fleet reference screenshots; a closer
+    /// look showed tabs sitting in a row of their own, directly above
+    /// the editor, with the active tab marked by a full rounded
+    /// border box — not a top accent border.
     fn render_tabs(&self, view: &Entity<Self>, cx: &mut Context<Self>) -> impl IntoElement {
         let accent = cx.theme().blue;
         let muted = cx.theme().muted_foreground;
         let foreground = cx.theme().foreground;
 
         h_flex()
-            .flex_1()
-            .h_full()
+            .w_full()
+            .h(px(36.))
+            .flex_shrink_0()
             .items_center()
+            .gap_1()
+            .px_2()
+            .bg(cx.theme().background)
+            .border_b_1()
+            .border_color(cx.theme().border)
             .overflow_hidden()
             .children(self.tabs.iter().enumerate().map(|(ix, tab)| {
                 let is_active = ix == self.active_tab;
                 let is_dirty = tab.editor.read(cx).buffer().is_dirty();
                 let title = tab.title();
 
-                // Flat, text-driven tabs — no boxed/pill background even
-                // for the active one (that's the VS Code/first-pass
-                // look). What marks the active tab is the same here as
-                // every other tab bar in this app: the blue top accent,
-                // plus brighter text — one signature detail carried over
-                // from Zed on an otherwise flat, Fleet-style surface.
+                // A full rounded border box on the active tab (matching
+                // the reference screenshots exactly), flat/borderless
+                // for every inactive tab — no background fill either
+                // way, keeping this a flat surface like the rest of
+                // the chrome.
                 h_flex()
                     .id(("tab", ix))
-                    .h_full()
                     .flex_shrink_0()
                     .items_center()
                     .gap_2()
-                    .px_3()
+                    .px_2()
+                    .py_1()
                     .cursor_pointer()
-                    .border_t(px(2.))
+                    .rounded(cx.theme().radius)
+                    .border_1()
                     .border_color(if is_active { accent } else { gpui_kit::transparent_black() })
                     .text_color(if is_active { foreground } else { muted })
                     .when_some(file_type_badge(&title), |el, (label, color)| {
