@@ -1,5 +1,33 @@
 # Milestone notes
 
+## M3: pubspec.yaml helpers (`pub add` / `pub get`)
+
+Rounded out M3's plan item "pubspec.yaml helpers: add package, pub get"
+in `core-flutter`. Both are one-shot commands (`flutter pub add
+<package>` / `flutter pub add dev:<package>`, `flutter pub get`), not
+part of the daemon protocol, so this is a plain `Command::output()`
+wrapper, same shape as `list_devices()` — no streaming, no daemon
+state. `PubOutput { success, stdout, stderr }` keeps the raw output
+rather than collapsing to a bool, since a future UI showing *why* a
+`pub get` failed (version conflict, network error) needs the real
+text, not just pass/fail.
+
+**Verified against the real CLI**, not just written against docs: ran
+`flutter pub add path` and `flutter pub add dev:very_good_analysis`
+by hand against a real `flutter create`d scratch project, confirmed
+`pubspec.yaml` actually gained the `path:`/`very_good_analysis:`
+entries each time, then ran `flutter pub get` and watched it succeed.
+That same sequence is captured as an automated test
+(`adds_a_real_package_and_runs_pub_get_against_the_real_cli`), but
+gated behind a `FLUTTER_TEST_PROJECT` env var pointing at a real
+`flutter create`d project rather than running unconditionally — a
+`flutter create` at test time would fetch packages and take too long
+to belong in routine `cargo test`, and a scratch project checked into
+the repo would be the kind of generated, disposable fixture that
+doesn't belong there either. Skips gracefully (prints why, doesn't
+fail) when that env var isn't set or `flutter` isn't on `PATH`. 47
+tests total now.
+
 ## M3 start: `core-flutter` (backend only)
 
 Started M3 the same way M2 started with `core-lsp`: build the
