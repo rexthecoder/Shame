@@ -18,4 +18,4 @@
 mod client;
 mod transport;
 
-pub use client::{DapClient, DapMessage, wait_for_response};
+pub use client::{DapClient, DapMessage, wait_for_event, wait_for_response};

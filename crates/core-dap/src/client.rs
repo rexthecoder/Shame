@@ -101,6 +101,54 @@ impl DapClient {
         Ok(seq)
     }
 
+    /// `launch` request: start the program and begin executing it
+    /// (`noDebug: false` so breakpoints set beforehand actually stop
+    /// it).
+    pub fn launch(&self, program: &str, cwd: &str) -> io::Result<i64> {
+        self.request("launch", serde_json::json!({"program": program, "cwd": cwd, "noDebug": false}))
+    }
+
+    /// Set the full set of line breakpoints for one source file —
+    /// per the DAP spec this *replaces* whatever breakpoints were
+    /// previously set for that file, it isn't additive.
+    pub fn set_breakpoints(&self, path: &str, lines: &[u32]) -> io::Result<i64> {
+        let breakpoints: Vec<_> = lines.iter().map(|line| serde_json::json!({"line": line})).collect();
+        self.request(
+            "setBreakpoints",
+            serde_json::json!({"source": {"path": path}, "breakpoints": breakpoints}),
+        )
+    }
+
+    /// Tell the adapter the client is done setting up (breakpoints,
+    /// exception filters) and it should start running.
+    pub fn configuration_done(&self) -> io::Result<i64> {
+        self.request("configurationDone", serde_json::json!({}))
+    }
+
+    pub fn threads(&self) -> io::Result<i64> {
+        self.request("threads", serde_json::json!({}))
+    }
+
+    pub fn stack_trace(&self, thread_id: i64) -> io::Result<i64> {
+        self.request("stackTrace", serde_json::json!({"threadId": thread_id}))
+    }
+
+    pub fn scopes(&self, frame_id: i64) -> io::Result<i64> {
+        self.request("scopes", serde_json::json!({"frameId": frame_id}))
+    }
+
+    pub fn variables(&self, variables_reference: i64) -> io::Result<i64> {
+        self.request("variables", serde_json::json!({"variablesReference": variables_reference}))
+    }
+
+    pub fn continue_thread(&self, thread_id: i64) -> io::Result<i64> {
+        self.request("continue", serde_json::json!({"threadId": thread_id}))
+    }
+
+    pub fn disconnect(&self, terminate_debuggee: bool) -> io::Result<i64> {
+        self.request("disconnect", serde_json::json!({"terminateDebuggee": terminate_debuggee}))
+    }
+
     /// Reply to an adapter-to-client [`DapMessage::Request`] with a
     /// success response, echoing back its `seq` as `request_seq`.
     pub fn respond(&self, request_seq: i64, command: &str, body: Value) -> io::Result<()> {
@@ -178,6 +226,19 @@ pub fn wait_for_response(events: &Receiver<DapMessage>, request_seq: i64) -> Opt
             Ok(DapMessage::Response { request_seq: got, result, .. }) if got == request_seq => {
                 return Some(result);
             }
+            Ok(_) => continue,
+            Err(_) => return None,
+        }
+    }
+}
+
+/// Block on `events` until an `Event` named `name` arrives, discarding
+/// anything else seen along the way (same caveats as
+/// [`wait_for_response`]).
+pub fn wait_for_event(events: &Receiver<DapMessage>, name: &str) -> Option<Value> {
+    loop {
+        match events.recv_blocking() {
+            Ok(DapMessage::Event { event, body }) if event == name => return Some(body),
             Ok(_) => continue,
             Err(_) => return None,
         }
@@ -315,5 +376,75 @@ mod tests {
             body["supportsConfigurationDoneRequest"].as_bool().unwrap_or(false),
             "expected the real dart debug adapter to advertise supportsConfigurationDoneRequest, got: {body}"
         );
+    }
+
+    /// End-to-end against the real `dart debug_adapter`: launch a
+    /// genuine throwaway Dart script, set a real breakpoint, run until
+    /// it's actually hit, then inspect the real call stack — not just
+    /// a parser test against captured JSON. Skips (rather than fails)
+    /// if `dart` isn't on `PATH`.
+    #[test]
+    fn hits_a_real_breakpoint_in_a_real_dart_script() {
+        if Command::new("dart").arg("--version").output().is_err() {
+            eprintln!("skipping: `dart` not found on PATH");
+            return;
+        }
+
+        let dir = std::env::temp_dir().join(format!("core-dap-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("failed to create scratch dir");
+        let program = dir.join("main.dart");
+        std::fs::write(
+            &program,
+            "int add(int a, int b) {\n  final result = a + b;\n  return result;\n}\n\nvoid main() {\n  final sum = add(1, 2);\n  print('sum=$sum');\n}\n",
+        )
+        .expect("failed to write scratch program");
+
+        let client = DapClient::spawn("dart", &["debug_adapter"]).expect("failed to spawn dart debug_adapter");
+
+        let init_id = client
+            .request(
+                "initialize",
+                serde_json::json!({
+                    "clientID": "core-dap-test",
+                    "adapterID": "dart",
+                    "linesStartAt1": true,
+                    "columnsStartAt1": true,
+                    "pathFormat": "path",
+                }),
+            )
+            .expect("failed to send initialize request");
+        wait_for_response(&client.events, init_id)
+            .expect("adapter closed without responding")
+            .expect("initialize returned an error");
+
+        let program_path = program.to_str().expect("scratch path should be valid utf-8");
+        let dir_path = dir.to_str().expect("scratch dir should be valid utf-8");
+        client.launch(program_path, dir_path).expect("failed to send launch");
+        // Breakpoint on `final result = a + b;`, inside `add`.
+        client.set_breakpoints(program_path, &[2]).expect("failed to send setBreakpoints");
+        client.configuration_done().expect("failed to send configurationDone");
+
+        let stopped = loop {
+            match client.events.recv_blocking() {
+                Ok(DapMessage::Event { event, body }) if event == "stopped" && body["reason"] == "breakpoint" => {
+                    break body;
+                }
+                Ok(_) => continue,
+                Err(_) => panic!("adapter closed before hitting the breakpoint"),
+            }
+        };
+        let thread_id = stopped["threadId"].as_i64().expect("stopped event should carry a threadId");
+
+        let st_id = client.stack_trace(thread_id).expect("failed to send stackTrace");
+        let frames = wait_for_response(&client.events, st_id)
+            .expect("adapter closed without responding")
+            .expect("stackTrace returned an error");
+        assert_eq!(
+            frames["stackFrames"][0]["name"], "add",
+            "expected the top stack frame to be the function we set the breakpoint in, got: {frames}"
+        );
+
+        client.disconnect(true).ok();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

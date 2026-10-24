@@ -1,5 +1,45 @@
 # Milestone notes
 
+## M4: session convenience methods + a real breakpoint hit
+
+Added typed convenience methods on `DapClient` for the session flow a
+real debugger needs — `launch`, `set_breakpoints`, `configuration_done`,
+`threads`, `stack_trace`, `scopes`, `variables`, `continue_thread`,
+`disconnect` — each a thin wrapper over `request()` building the right
+`arguments` shape, same pattern as `FlutterDaemon::hot_reload`/
+`hot_restart` wrapping `request()` in `core-flutter`. Plus
+`wait_for_event()` alongside the existing `wait_for_response()`.
+
+Verified by actually hitting a breakpoint, not just sending requests
+and hoping: wrote a throwaway two-function Dart script by hand, drove
+`dart debug_adapter` through a full real session (a small Python
+driver script, piping framed JSON directly rather than through a FIFO,
+made this far easier to iterate on than the bash+FIFO technique used
+for earlier crates) — `initialize` → `launch` → `setBreakpoints` →
+`configurationDone` → watched the **real sequence of events** arrive:
+`thread` (started) → `stopped` (`reason: "entry"`) → `breakpoint`
+(`reason: "changed"`, `verified: true` — breakpoints start out
+*unverified* until the VM actually resolves them) → `continued` →
+`stopped` (`reason: "breakpoint"`, this is the one that matters) — then
+sent `threads`, `stackTrace` (top frame really was `add`, the function
+the breakpoint was in), `scopes`/`variables` (both came back empty —
+turns out `frameId`/`variablesReference` aren't `0`/`1`-style indices,
+they're opaque ids the adapter hands back in `stackTrace`'s response
+and would need to be threaded through for real use, not hardcoded —
+noted but not followed up further since that's exactly the kind of
+detail a real UI integration will need to get right, not this
+verification pass), `continue`, then `disconnect`.
+
+That same shape — launch a real scratch script, set a real breakpoint,
+run to it, inspect the real stack — is now an automated test
+(`hits_a_real_breakpoint_in_a_real_dart_script`), not just a manual
+one-off: it writes its own throwaway `.dart` file to a temp dir at test
+time (no checked-in fixture needed, unlike the Flutter project
+`core-flutter`'s pub tests needed — a plain `.dart` file is instant to
+write, no `flutter create` involved), asserts the adapter actually
+stops with `reason: "breakpoint"` and that the top stack frame is
+really `add`, then cleans up. 61 tests total now.
+
 ## M4 start: `core-dap` (real DAP client, no UI)
 
 Same approach M2 (`core-lsp`) and M3 (`core-flutter`) both started
