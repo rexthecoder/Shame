@@ -1,5 +1,62 @@
 # Milestone notes
 
+## UI pass: fixing the double titlebar + a real window-creation bug
+
+Follow-up to the first chrome pass, after the user reported the window
+looking small/cramped. Root-caused two separate real bugs, both found
+by actually getting eyes on the running app rather than guessing from
+code:
+
+**Double titlebar.** The first pass added a 40px custom-drawn header
+row (app name, folder breadcrumb, Open Folder button) *below* the
+default system titlebar — meaning the window had two stacked bars,
+the real one (with "dart-ide" as its title, from the binary name) and
+the fake one, which read as broken/cramped rather than "styled."
+Tried the standard fix for this (`titlebar: { appears_transparent:
+true, traffic_light_position: ... }`, the approach Zed itself uses,
+hiding the system bar so the custom one is the only one) — but see
+below, reverted. Landed on the simpler fix instead: dropped the custom
+header row entirely and kept the system titlebar (given a real title
+via `TitlebarOptions { title: Some("Dart/Flutter IDE".into()), ..
+Default::default() }`), moving the folder name + Open Folder button
+into the sidebar's header row instead, where they fit naturally next
+to each other.
+
+**A real window-creation bug, found while chasing the above.** Setting
+`appears_transparent: true` and sizing the window to
+`WindowBounds::Maximized(...)` or to `display.bounds()` directly both
+reliably reproduced the same failure on this machine: the process
+shows as frontmost (confirmed via the menu bar) but no window ever
+becomes visible on screen, while a CPU core pegs at 100% and memory
+climbs without bound — a real resize/relayout feedback loop, not a
+cosmetic issue. Verified this is unrelated to `appears_transparent`
+specifically (reproduced with the plain system titlebar too) and is
+specific to the window's bounds matching the *display's own* bounds —
+a window sized to a large but arbitrary rectangle (1600×1000, centered)
+behaves fine. `gpui-pre`'s own source carries comments about titlebar
+bugs "first observed on macOS 27", this machine's exact Darwin
+version, so this reads as a real platform compatibility gap in this
+GPUI version rather than something to keep chasing a styling fix for.
+Landed on a large fixed-size centered window instead of anything
+display-bounds-derived — still reads as a real, substantial app window,
+without touching the broken code path.
+
+**How this got found**: wrapped the release binary in a minimal,
+throwaway `.app` bundle (`target/DartIDE.app`, registered with
+`lsregister`, never committed) purely so `computer-use`'s screenshot
+tooling could target it by bundle id — a bare `cargo run`/binary isn't
+indexed and can't be granted access. That unblocked actually seeing
+the running window instead of guessing from the user's cropped
+screenshots, which is how both bugs above were actually diagnosed
+rather than guessed at. Also surfaced a separate, *unexplained*
+oddity worth flagging rather than quietly working around: the same
+binary launched via that `.app` bundle (through `open`/LaunchServices)
+never shows a visible window at all regardless of size/titlebar
+settings, while launching the identical binary directly from a shell
+(`./target/release/dart-ide`, how the user actually runs it and how
+`cargo run` works) is completely healthy. Did not chase this further —
+it's a quirk of the throwaway bundle-launch path, not the app itself.
+
 ## UI pass: Zed/Fleet-inspired chrome (first iteration)
 
 First real pass at the visual design that's been deliberately deferred

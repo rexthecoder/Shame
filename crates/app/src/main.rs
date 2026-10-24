@@ -499,40 +499,6 @@ impl Render for DartIde {
             .bg(cx.theme().background)
             .text_color(cx.theme().foreground)
             .child(
-                h_flex()
-                    .w_full()
-                    .h(px(40.))
-                    .flex_shrink_0()
-                    .px_3()
-                    .items_center()
-                    .justify_between()
-                    .bg(cx.theme().title_bar)
-                    .border_b_1()
-                    .border_color(cx.theme().title_bar_border)
-                    .child(
-                        h_flex()
-                            .gap_2()
-                            .items_center()
-                            .child(div().text_sm().font_bold().child("Dart/Flutter IDE"))
-                            .child(
-                                div()
-                                    .text_sm()
-                                    .text_color(cx.theme().muted_foreground)
-                                    .child(format!("/ {root_name}")),
-                            ),
-                    )
-                    .child(
-                        Button::new("open-folder")
-                            .ghost()
-                            .small()
-                            .icon(IconName::FolderOpen)
-                            .tooltip("Open Folder\u{2026} (cmd/ctrl+O)")
-                            .on_click(cx.listener(|this, _event, window, cx| {
-                                this.open_folder(window, cx);
-                            })),
-                    ),
-            )
-            .child(
                 div().flex_1().w_full().min_h(px(0.)).child(
                     h_resizable("main-split")
                         .child(
@@ -546,13 +512,29 @@ impl Render for DartIde {
                                         .border_r_1()
                                         .border_color(cx.theme().sidebar_border)
                                         .child(
-                                            div()
-                                                .px_3()
+                                            h_flex()
+                                                .items_center()
+                                                .justify_between()
+                                                .pl_3()
+                                                .pr_1()
                                                 .py_2()
-                                                .text_xs()
-                                                .font_bold()
-                                                .text_color(cx.theme().muted_foreground)
-                                                .child(root_name.to_uppercase()),
+                                                .child(
+                                                    div()
+                                                        .text_xs()
+                                                        .font_bold()
+                                                        .text_color(cx.theme().muted_foreground)
+                                                        .child(root_name.to_uppercase()),
+                                                )
+                                                .child(
+                                                    Button::new("open-folder")
+                                                        .ghost()
+                                                        .small()
+                                                        .icon(IconName::FolderOpen)
+                                                        .tooltip("Open Folder\u{2026} (cmd/ctrl+O)")
+                                                        .on_click(cx.listener(|this, _event, window, cx| {
+                                                            this.open_folder(window, cx);
+                                                        })),
+                                                ),
                                         )
                                         .child(
                                             tree(&self.tree_state, {
@@ -769,8 +751,23 @@ fn main() {
         // close to it (near-black backgrounds, a blue selection/accent).
         gpui_kit::component::Theme::change(gpui_kit::component::ThemeMode::Dark, None, cx);
 
+        // A large centered window, not a `WindowBounds::Maximized` or a
+        // window sized to `display.bounds()` directly — both of those
+        // reliably reproduced a real bug on this machine: the window never
+        // became visible (frontmost in the menu bar, no content reachable
+        // on screen at all) while a CPU core pegged at 100% and memory grew
+        // without bound, independent of the titlebar settings tested
+        // alongside each. 1600×1000 is still a large, substantial window —
+        // just not exactly the display's own bounds, which is what
+        // triggered the bug.
+        let bounds = Bounds::centered(None, size(px(1600.), px(1000.)), cx);
+
         let window_options = WindowOptions {
-            window_bounds: Some(WindowBounds::centered(size(px(1100.), px(720.)), cx)),
+            window_bounds: Some(WindowBounds::Windowed(bounds)),
+            titlebar: Some(TitlebarOptions {
+                title: Some("Dart/Flutter IDE".into()),
+                ..Default::default()
+            }),
             ..Default::default()
         };
 
