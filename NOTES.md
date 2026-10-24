@@ -1,5 +1,39 @@
 # Milestone notes
 
+## M1 close-out: column-accurate click and drag-select
+
+The last open M1 item: mouse clicks and drag now hit the exact character,
+not just the clicked line. This needed GPUI's real text shaper, not a
+monospace-width guess:
+
+- Each line's text area gets an invisible `canvas()` overlay the same
+  size as the text, used only for hit-testing (nothing from it is ever
+  painted). `canvas()` is GPUI's "low-level paint access without a whole
+  custom `Element`" escape hatch — the right tool here since the simple
+  `.on_mouse_down()` builder API doesn't hand the listener the element's
+  own on-screen bounds, which is what's needed to turn an absolute
+  window-space click position into a position relative to the line.
+- Inside the canvas's `paint` closure (which runs every frame, same as
+  internal scroll handling does), `window.on_mouse_event` registers a
+  `MouseDownEvent` and a `MouseMoveEvent` listener scoped to that line's
+  bounds. On mouse down: shape the line's text with
+  `window.text_system().shape_line(...)`, call `.closest_index_for_x()`
+  to get the exact byte column, and set the cursor there (collapsing any
+  selection — mousedown always starts fresh). On mouse move *while the
+  left button is held*: same column lookup, but call `extend_to`
+  instead, which only moves the selection's head, keeping whatever
+  anchor was set at mouse-down.
+- Drag across multiple lines works without any extra bookkeeping: each
+  line governs its own pixel range independently, and `extend_to` reads
+  the *current* anchor fresh every time it's called, so whichever line's
+  overlay the cursor is currently over just keeps moving the head while
+  the original anchor (set by mousedown) stays put.
+
+This closes every M1 item from the original plan and the "first tasks"
+list. Remaining gaps are now cosmetic/advanced (no double/triple-click
+word or line selection, no multi-cursor visual highlight, no line
+virtualization) rather than missing core interactions.
+
 ## M1 close-out: Quick Open and incremental reparse
 
 Two of the three items left on M1's list after the scroll/visual fixes

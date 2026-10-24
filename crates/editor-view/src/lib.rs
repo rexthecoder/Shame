@@ -8,12 +8,9 @@
 //! change without touching either of them.
 //!
 //! Known M1 scope cuts (not yet implemented, tracked for M2+):
-//! - Only the keyboard (shift+movement, cmd/ctrl+A) can create a
-//!   multi-character selection; there's no mouse drag-select yet.
 //! - Only the primary selection gets a visual highlight; a second
 //!   multi-cursor selection (if one were added) wouldn't show one.
-//! - Mouse clicks move the cursor to the start of the clicked line, not the
-//!   clicked column (needs real text measurement).
+//! - No double/triple-click word/line selection.
 //! - Every line is rendered on every frame; no virtualization for huge
 //!   files.
 
@@ -24,6 +21,28 @@ use std::path::Path;
 use core_buffer::{Buffer, Selection};
 use core_syntax::{Highlight, HighlightKind, InputEdit, SyntaxTree, point_at};
 use gpui_kit::*;
+
+const GUTTER_WIDTH: f32 = 48.;
+const LINE_FONT_SIZE: f32 = 14.;
+
+/// The exact byte column within `text` closest to `x` pixels from the
+/// start of the text area, found with GPUI's own text shaper rather than
+/// approximated — correct for proportional glyph widths too, even though
+/// this editor only uses a monospace font today.
+fn column_for_x(window: &mut Window, text: &SharedString, x: Pixels) -> usize {
+    let run = TextRun {
+        len: text.len(),
+        font: font("Menlo"),
+        color: Hsla::default(),
+        background_color: None,
+        underline: None,
+        strikethrough: None,
+    };
+    let shaped = window
+        .text_system()
+        .shape_line(text.clone(), px(LINE_FONT_SIZE), &[run], None);
+    shaped.closest_index_for_x(x.max(px(0.)))
+}
 
 pub struct EditorView {
     buffer: Buffer,
@@ -334,7 +353,7 @@ impl EditorView {
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let gutter = div()
-            .w(px(48.))
+            .w(px(GUTTER_WIDTH))
             .flex_shrink_0()
             .text_color(rgb(0x6b7280))
             .text_right()
@@ -380,6 +399,50 @@ impl EditorView {
             content = content.child(cursor_el());
         }
 
+        // A transparent overlay the exact size of the text area, used only
+        // to turn a click's pixel x-coordinate into an exact column via
+        // real text shaping (`shape_line`/`closest_index_for_x`) — the
+        // visible text above is still rendered as plain div/span children,
+        // not painted by this canvas.
+        let hit_test_text: SharedString = display_text.to_string().into();
+        let view = cx.entity();
+        let click_overlay = canvas(
+            |_bounds, _window, _cx| (),
+            move |bounds, (), window, _cx| {
+                let text = hit_test_text.clone();
+                let down_view = view.clone();
+                window.on_mouse_event(move |event: &MouseDownEvent, phase, window, cx| {
+                    if phase != DispatchPhase::Bubble
+                        || event.button != MouseButton::Left
+                        || !bounds.contains(&event.position)
+                    {
+                        return;
+                    }
+                    let column = column_for_x(window, &text, event.position.x - bounds.origin.x);
+                    down_view.update(cx, |this, cx| {
+                        this.set_cursor(line_start + column, cx);
+                    });
+                });
+
+                let text = hit_test_text.clone();
+                let move_view = view.clone();
+                window.on_mouse_event(move |event: &MouseMoveEvent, phase, window, cx| {
+                    if phase != DispatchPhase::Bubble
+                        || event.pressed_button != Some(MouseButton::Left)
+                        || !bounds.contains(&event.position)
+                    {
+                        return;
+                    }
+                    let column = column_for_x(window, &text, event.position.x - bounds.origin.x);
+                    move_view.update(cx, |this, cx| {
+                        this.extend_to(line_start + column, cx);
+                    });
+                });
+            },
+        )
+        .absolute()
+        .inset_0();
+
         div()
             .id(("editor-line", index))
             .flex()
@@ -387,15 +450,16 @@ impl EditorView {
             .h(px(20.))
             .flex_shrink_0()
             .font_family("Menlo")
-            .text_size(px(14.))
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(move |this, _event, _window, cx| {
-                    this.set_cursor(line_start, cx);
-                }),
-            )
+            .text_size(px(LINE_FONT_SIZE))
             .child(gutter)
-            .child(content)
+            .child(
+                div()
+                    .relative()
+                    .flex_1()
+                    .h_full()
+                    .child(content)
+                    .child(click_overlay),
+            )
     }
 }
 
