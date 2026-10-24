@@ -15,22 +15,25 @@
 //! - Mouse clicks move the cursor to the start of the clicked line, not the
 //!   clicked column (needs real text measurement).
 //! - Every line is rendered on every frame; no virtualization for huge
-//!   files, and syntax highlighting fully re-parses the buffer on every
-//!   render rather than using `core_syntax::SyntaxTree::reparse`'s
-//!   incremental path.
+//!   files.
 
 use std::io;
 use std::ops::Range;
 use std::path::Path;
 
 use core_buffer::{Buffer, Selection};
-use core_syntax::{Highlight, HighlightKind, SyntaxTree};
+use core_syntax::{Highlight, HighlightKind, InputEdit, SyntaxTree, point_at};
 use gpui_kit::*;
 
 pub struct EditorView {
     buffer: Buffer,
     focus_handle: FocusHandle,
     scroll_handle: ScrollHandle,
+    syntax_tree: SyntaxTree,
+    /// The text `syntax_tree` was last parsed/reparsed from, so `render`
+    /// can diff against the buffer's current text to build a single
+    /// [`InputEdit`] rather than reparsing from scratch every frame.
+    synced_text: String,
 }
 
 impl EditorView {
@@ -39,10 +42,14 @@ impl EditorView {
     }
 
     pub fn from_buffer(buffer: Buffer, cx: &mut Context<Self>) -> Self {
+        let text = buffer.text();
+        let syntax_tree = SyntaxTree::parse(&text);
         Self {
             buffer,
             focus_handle: cx.focus_handle(),
             scroll_handle: ScrollHandle::new(),
+            syntax_tree,
+            synced_text: text,
         }
     }
 
@@ -54,6 +61,9 @@ impl EditorView {
     /// history and resetting the cursor to the start of the file.
     pub fn open_file(&mut self, path: impl AsRef<Path>, cx: &mut Context<Self>) -> io::Result<()> {
         self.buffer = Buffer::open(path)?;
+        let text = self.buffer.text();
+        self.syntax_tree = SyntaxTree::parse(&text);
+        self.synced_text = text;
         cx.notify();
         Ok(())
     }
@@ -389,6 +399,45 @@ impl EditorView {
     }
 }
 
+/// The smallest [`InputEdit`] that turns `old` into `new`, found by
+/// trimming the common prefix and common suffix and treating whatever's
+/// left in the middle as replaced. This doesn't know *which* edit
+/// happened (a keystroke, an undo, a whole-file open) — it only needs the
+/// before/after text, so every caller gets incremental reparsing for
+/// free without threading edit details through every mutation path.
+fn diff_as_edit(old: &str, new: &str) -> Option<InputEdit> {
+    if old == new {
+        return None;
+    }
+
+    let old_bytes = old.as_bytes();
+    let new_bytes = new.as_bytes();
+
+    let common_prefix = old_bytes
+        .iter()
+        .zip(new_bytes.iter())
+        .take_while(|(a, b)| a == b)
+        .count();
+
+    let max_suffix = (old_bytes.len() - common_prefix).min(new_bytes.len() - common_prefix);
+    let common_suffix = (0..max_suffix)
+        .take_while(|&i| old_bytes[old_bytes.len() - 1 - i] == new_bytes[new_bytes.len() - 1 - i])
+        .count();
+
+    let start_byte = common_prefix;
+    let old_end_byte = old_bytes.len() - common_suffix;
+    let new_end_byte = new_bytes.len() - common_suffix;
+
+    Some(InputEdit {
+        start_byte,
+        old_end_byte,
+        new_end_byte,
+        start_position: point_at(old, start_byte),
+        old_end_position: point_at(old, old_end_byte),
+        new_end_position: point_at(new, new_end_byte),
+    })
+}
+
 fn highlight_color(kind: HighlightKind) -> Rgba {
     match kind {
         HighlightKind::Keyword => rgb(0xc586c0),
@@ -403,6 +452,50 @@ fn highlight_color(kind: HighlightKind) -> Rgba {
         HighlightKind::Variable | HighlightKind::Operator | HighlightKind::Punctuation | HighlightKind::Other => {
             rgb(0xd4d4d4)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::diff_as_edit;
+
+    #[test]
+    fn no_change_is_no_edit() {
+        assert!(diff_as_edit("same", "same").is_none());
+    }
+
+    #[test]
+    fn pure_insertion_in_the_middle() {
+        let edit = diff_as_edit("ab", "aXb").unwrap();
+        assert_eq!(edit.start_byte, 1);
+        assert_eq!(edit.old_end_byte, 1);
+        assert_eq!(edit.new_end_byte, 2);
+    }
+
+    #[test]
+    fn pure_deletion_in_the_middle() {
+        let edit = diff_as_edit("aXb", "ab").unwrap();
+        assert_eq!(edit.start_byte, 1);
+        assert_eq!(edit.old_end_byte, 2);
+        assert_eq!(edit.new_end_byte, 1);
+    }
+
+    #[test]
+    fn full_replacement_shares_no_prefix_or_suffix() {
+        let edit = diff_as_edit("hello", "goodbye").unwrap();
+        assert_eq!(edit.start_byte, 0);
+        assert_eq!(edit.old_end_byte, "hello".len());
+        assert_eq!(edit.new_end_byte, "goodbye".len());
+    }
+
+    #[test]
+    fn whole_file_replace_still_produces_one_edit() {
+        let old = "line one\nline two";
+        let new = "totally different file\ncontent here";
+        let edit = diff_as_edit(old, new).unwrap();
+        assert_eq!(edit.start_byte, 0);
+        assert_eq!(edit.old_end_byte, old.len());
+        assert_eq!(edit.new_end_byte, new.len());
     }
 }
 
@@ -430,10 +523,20 @@ impl Render for EditorView {
             v
         };
 
-        // Full reparse + highlight query on every render. Fine for the file
-        // sizes M1 targets; see NOTES.md for the incremental-reparse gap.
-        let syntax_tree = SyntaxTree::parse(&text);
-        let highlights = syntax_tree.highlights(&text);
+        // Incrementally reparse: diff the text we last parsed against the
+        // buffer's current text (common-prefix/common-suffix trim) to get
+        // a single InputEdit, rather than reparsing from scratch every
+        // frame. Whatever changed between renders — one keystroke or a
+        // whole-file open — collapses to one edit either way.
+        if text != self.synced_text {
+            if let Some(edit) = diff_as_edit(&self.synced_text, &text) {
+                self.syntax_tree.reparse(&text, edit);
+            } else {
+                self.syntax_tree = SyntaxTree::parse(&text);
+            }
+            self.synced_text = text.clone();
+        }
+        let highlights = self.syntax_tree.highlights(&text);
 
         let rendered_lines: Vec<_> = lines
             .iter()

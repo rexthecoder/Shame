@@ -13,6 +13,7 @@ use gpui_kit::assets::Assets;
 use gpui_kit::component::{
     ActiveTheme as _, Icon, IconName,
     h_flex,
+    input::{Input, InputState},
     list::ListItem,
     resizable::{h_resizable, resizable_panel},
     tree::{TreeItem, TreeState, tree},
@@ -55,6 +56,32 @@ fn build_tree_items(dir: &Path) -> Vec<TreeItem> {
     items
 }
 
+/// Every file under `dir`, for the Quick Open palette.
+fn flatten_files(dir: &Path) -> Vec<PathBuf> {
+    let mut files = Vec::new();
+
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return files;
+    };
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        if name.starts_with('.') || IGNORED_NAMES.contains(&name) {
+            continue;
+        }
+        if path.is_dir() {
+            files.extend(flatten_files(&path));
+        } else {
+            files.push(path);
+        }
+    }
+
+    files
+}
+
 struct Tab {
     /// `None` for the initial scratch buffer; every file opened from the
     /// tree gets a path, which also doubles as the tab's dedup key.
@@ -79,14 +106,20 @@ pub struct DartIde {
     tree_state: Entity<TreeState>,
     tabs: Vec<Tab>,
     active_tab: usize,
+    all_files: Vec<PathBuf>,
+    palette_open: bool,
+    palette_input: Entity<InputState>,
 }
 
 impl DartIde {
-    fn new(_window: &mut Window, cx: &mut Context<Self>) -> Self {
+    fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         let root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
         let items = build_tree_items(&root);
+        let all_files = flatten_files(&root);
 
         let tree_state = cx.new(|cx| TreeState::new(cx).items(items));
+        let palette_input =
+            cx.new(|cx| InputState::new(window, cx).placeholder("Go to file..."));
 
         let buffer = Buffer::from_str(
             "// Lightweight Dart/Flutter IDE — M1\n\
@@ -94,7 +127,7 @@ impl DartIde {
              // This is our own editor-view (core-buffer + a from-scratch\n\
              // GPUI element), not gpui-component's Textarea. Try typing,\n\
              // arrow keys, backspace/delete, Home/End, and cmd+Z/cmd+Shift+Z.\n\
-             // Click a file in the tree to open it in a new tab.\n",
+             // Click a file in the tree (or cmd+P to go to one) to open it.\n",
         );
         let editor = cx.new(|cx| EditorView::from_buffer(buffer, cx));
 
@@ -102,7 +135,87 @@ impl DartIde {
             tree_state,
             tabs: vec![Tab { path: None, editor }],
             active_tab: 0,
+            all_files,
+            palette_open: false,
+            palette_input,
         }
+    }
+
+    fn on_key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        let keystroke = &event.keystroke;
+        let primary_mod = keystroke.modifiers.platform || keystroke.modifiers.control;
+
+        if primary_mod && keystroke.key.as_str() == "p" {
+            self.palette_open = true;
+            self.palette_input
+                .update(cx, |state, cx| state.focus(window, cx));
+            cx.notify();
+            return;
+        }
+
+        if self.palette_open && keystroke.key.as_str() == "escape" {
+            self.palette_open = false;
+            cx.notify();
+        }
+    }
+
+    fn render_palette(&self, view: &Entity<Self>, cx: &mut Context<Self>) -> Option<Div> {
+        if !self.palette_open {
+            return None;
+        }
+
+        let query = self.palette_input.read(cx).value().to_lowercase();
+        let matches: Vec<&PathBuf> = self
+            .all_files
+            .iter()
+            .filter(|p| query.is_empty() || p.to_string_lossy().to_lowercase().contains(&query))
+            .take(20)
+            .collect();
+
+        Some(
+            div()
+                .absolute()
+                .inset_0()
+                .flex()
+                .justify_center()
+                .pt(px(96.))
+                .bg(rgba(0x000000aa))
+                .child(
+                    v_flex()
+                        .w(px(480.))
+                        .max_h(px(360.))
+                        .bg(cx.theme().background)
+                        .border_1()
+                        .border_color(cx.theme().border)
+                        .rounded(cx.theme().radius)
+                        .child(div().p_2().child(Input::new(&self.palette_input)))
+                        .child(
+                            v_flex().id("palette-list").overflow_y_scroll().children(matches.into_iter().enumerate().map(
+                                |(ix, path)| {
+                                    let label = path.to_string_lossy().to_string();
+                                    let path = path.clone();
+                                    div()
+                                        .id(("palette-item", ix))
+                                        .w_full()
+                                        .px_3()
+                                        .py_1()
+                                        .text_sm()
+                                        .child(label)
+                                        .on_click({
+                                            let view = view.clone();
+                                            move |_event, window, cx| {
+                                                view.update(cx, |this, cx| {
+                                                    this.open_path(path.clone(), window, cx);
+                                                    this.palette_open = false;
+                                                    cx.notify();
+                                                });
+                                            }
+                                        })
+                                },
+                            )),
+                        ),
+                ),
+        )
     }
 
     fn active_editor(&self) -> &Entity<EditorView> {
@@ -158,6 +271,9 @@ impl Render for DartIde {
 
         v_flex()
             .size_full()
+            .relative()
+            .key_context("DartIde")
+            .on_key_down(cx.listener(Self::on_key_down))
             .bg(cx.theme().background)
             .child(
                 h_flex()
@@ -243,6 +359,7 @@ impl Render for DartIde {
                 ),
             )
             .child(self.render_status_bar(cx))
+            .when_some(self.render_palette(&view, cx), |el, palette| el.child(palette))
     }
 }
 

@@ -1,5 +1,38 @@
 # Milestone notes
 
+## M1 close-out: Quick Open and incremental reparse
+
+Two of the three items left on M1's list after the scroll/visual fixes
+(the third, mouse drag-select / column-accurate clicks, is still open —
+see the scope-cut list in `crates/editor-view/src/lib.rs`):
+
+- **Quick Open (cmd/ctrl+P)** stands in for M1's "command palette" item.
+  `DartIde` lists every file under the project root once at startup
+  (`flatten_files`), and cmd+P opens a filter-as-you-type overlay (built
+  from `gpui_kit::component::input::Input` + plain `div`s — no custom
+  modal/palette widget needed) that opens the selected file in a tab,
+  same as clicking it in the tree. Escape closes it. Not a full command
+  palette (no arbitrary commands, just file search) — scoped down
+  deliberately rather than built half-way.
+- **Incremental reparse** is wired up for real now: `EditorView` keeps
+  one persistent `core_syntax::SyntaxTree` plus the text it was last
+  parsed from, and on each render diffs that against the buffer's
+  current text with a common-prefix/common-suffix trim
+  (`diff_as_edit`) to get a single `InputEdit`, then calls
+  `SyntaxTree::reparse` instead of `SyntaxTree::parse`. This doesn't
+  know *which* keystroke happened — it only looks at before/after
+  text — so every edit path (typing, undo, redo, paste) gets incremental
+  reparsing for free without threading edit details through each one.
+  5 unit tests on `diff_as_edit` (insertion, deletion, full replacement,
+  no-op).
+
+One build gotcha worth remembering: a bare `#[test]` inside a module that
+does `use super::*;` in a crate that also does `use gpui_kit::*;` at the
+crate root hit "recursion limit reached while expanding `#[test]`" — some
+re-export in that glob fights with the `#[test]` attribute's own
+resolution. Fix was importing only the specific function under test
+(`use super::diff_as_edit;`) instead of the whole glob.
+
 ## M1: fixed real rendering/scrolling bugs
 
 Found by actually using the app, not by inspection: scrolling a long file
