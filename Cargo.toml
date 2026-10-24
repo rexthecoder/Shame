@@ -1,0 +1,21 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/core-buffer",
+    "crates/core-syntax",
+    "crates/core-lsp",
+    "crates/core-dap",
+    "crates/core-flutter",
+    "crates/core-workspace",
+    "crates/editor-view",
+    "crates/app",
+]
+
+[workspace.package]
+edition = "2024"
+license = "MIT"
+
+[workspace.dependencies]
+gpui-kit = "0.8.0"
+anyhow = "1"
+ropey = "2.0.0-beta.1"
