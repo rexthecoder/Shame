@@ -1,5 +1,21 @@
 //! Own DAP client for `dart debug_adapter` / `flutter debug_adapter` (M4).
 //!
-//! Stub crate: no implementation yet. Has no UI dependency by design, so
-//! the GPUI-based UI layer (`app`, `editor-view`) can be replaced later
-//! without touching this crate.
+//! Has no UI dependency by design, so the GPUI-based UI layer (`app`,
+//! `editor-view`) can be replaced later without touching this crate.
+//! Mirrors `core-lsp`'s shape (spawn a process, send JSON over
+//! `Content-Length`-framed stdio, read messages off a channel) since
+//! DAP's base framing is literally the same protocol LSP uses — but
+//! duplicated rather than shared, and with its own `DapMessage` enum,
+//! since DAP's message shapes (`seq`/`request_seq`/`success`, per-sender
+//! seq numbers) are different enough from LSP's JSON-RPC envelope that
+//! sharing the wrapper types would mean DAP-shaped fields leaking into
+//! a crate meant to stay LSP-generic.
+//!
+//! Breakpoints, stepping, variable inspection, and a debug console are
+//! all UI work and not built here yet — see the project's M3/M4 notes
+//! in `NOTES.md` at the repo root for why UI work stays deferred.
+
+mod client;
+mod transport;
+
+pub use client::{DapClient, DapMessage, wait_for_response};

@@ -980,6 +980,10 @@ dependencies = [
 [[package]]
 name = "core-dap"
 version = "0.1.0"
+dependencies = [
+ "async-channel",
+ "serde_json",
+]
 
 [[package]]
 name = "core-flutter"

@@ -1,5 +1,53 @@
 # Milestone notes
 
+## M4 start: `core-dap` (real DAP client, no UI)
+
+Same approach M2 (`core-lsp`) and M3 (`core-flutter`) both started
+with: build and verify the real protocol client first, zero GPUI
+wiring. Breakpoints, stepping, variable inspection, a debug console —
+all UI work, staying deferred.
+
+The Debug Adapter Protocol's base framing is *literally* LSP's
+`Content-Length` "Base Protocol" (the DAP spec says so directly), so
+`core-dap::transport` is a byte-for-byte duplicate of
+`core-lsp::transport` rather than a shared dependency — keeping this
+crate independent the same way `core-flutter` doesn't depend on
+`core-lsp` either, even though both speak JSON-over-stdio. Where DAP
+actually differs is the message envelope once you're past framing,
+confirmed by hand against the real `dart debug_adapter` (piped
+through a FIFO, same technique as every other protocol crate this
+project has built):
+
+- **Every message carries its own `seq`, assigned by whichever side
+  sent it** — not a single shared id space like LSP's `id`. Requests
+  are matched to replies via `request_seq` on the response, which
+  echoes the request's `seq`.
+- **Responses carry `success: bool` plus `command`**, not an
+  `error`/`result` split: a real captured success looks like
+  `{"seq":1,"type":"response","body":{...},"command":"initialize","request_seq":1,"success":true}`;
+  a real captured failure (sent an unrecognized command on purpose to
+  see the shape) is
+  `{"seq":3,"type":"response","body":{"error":{...}},"command":"notARealCommand","message":"Unknown command notARealCommand","request_seq":2,"success":false}`
+  — note the failure has *both* a top-level `message` string and a
+  structured `body.error`, so `DapMessage::Response`'s `Err` case
+  keeps both rather than picking one.
+- **Events** (`stopped`, `output`, `terminated`, and in this case the
+  handshake's own `initialized`) are `{"seq":N,"type":"event","body":
+  {...},"event":"name"}` — real captured example:
+  `{"seq":2,"type":"event","body":{},"event":"initialized"}`.
+- **The adapter can send its own requests to the client**
+  (`runInTerminal`, `startDebugging`) the same way Dart's analysis
+  server does with `workspace/applyEdit` in M2 — `DapMessage::Request`
+  covers this from the start this time, rather than needing a
+  follow-up fix like `core-lsp` did.
+
+Verified a real `initialize` handshake against `dart debug_adapter`
+end-to-end (not just the parser tests against the captured JSON above):
+spawned it for real, sent `initialize`, got back
+`supportsConfigurationDoneRequest: true` plus the full
+`exceptionBreakpointFilters` list, then watched the `initialized` event
+arrive right after. 60 tests total now.
+
 ## M3: SDK detection
 
 The last item on M3's plan list. `flutter --version --machine` gives a
