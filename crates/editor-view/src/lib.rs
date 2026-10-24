@@ -18,7 +18,7 @@ mod lsp_integration;
 
 use std::io;
 use std::ops::Range;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use core_buffer::{Buffer, Selection};
 use core_lsp::lsp_types;
@@ -29,6 +29,14 @@ use lsp_integration::LspState;
 
 const GUTTER_WIDTH: f32 = 48.;
 const LINE_FONT_SIZE: f32 = 14.;
+
+/// Emitted when this editor wants something handled above it — so far,
+/// just "go to definition landed in a different file." The `app` crate
+/// subscribes to this per tab; `editor-view` has no idea tabs exist.
+#[derive(Debug, Clone)]
+pub enum EditorEvent {
+    OpenAt { path: PathBuf, line: u32, column: u32 },
+}
 
 /// The exact byte column within `text` closest to `x` pixels from the
 /// start of the text area, found with GPUI's own text shaper rather than
@@ -117,6 +125,15 @@ impl EditorView {
             .selections_mut()
             .set_primary(Selection::cursor(offset));
         cx.notify();
+    }
+
+    /// Move the cursor to a 0-indexed (line, column) — e.g. where a
+    /// go-to-definition in a newly-opened file landed. `column` is
+    /// treated as a byte offset within the line, the same approximation
+    /// used everywhere else in this crate.
+    pub fn set_cursor_to_position(&mut self, line: u32, column: u32, cx: &mut Context<Self>) {
+        let offset = self.buffer.line_to_byte(line as usize) + column as usize;
+        self.set_cursor(offset, cx);
     }
 
     /// Move the head to `offset`, keeping the current anchor fixed —
@@ -447,8 +464,13 @@ impl EditorView {
                         return;
                     }
                     let column = column_for_x(window, &text, event.position.x - bounds.origin.x);
+                    let go_to_definition = event.modifiers.platform || event.modifiers.control;
                     down_view.update(cx, |this, cx| {
-                        this.set_cursor(line_start + column, cx);
+                        if go_to_definition {
+                            this.request_definition(index, column);
+                        } else {
+                            this.set_cursor(line_start + column, cx);
+                        }
                     });
                 });
 
@@ -631,6 +653,8 @@ impl Focusable for EditorView {
         self.focus_handle.clone()
     }
 }
+
+impl EventEmitter<EditorEvent> for EditorView {}
 
 impl Render for EditorView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {

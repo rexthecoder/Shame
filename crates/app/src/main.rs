@@ -8,7 +8,7 @@
 use std::path::{Path, PathBuf};
 
 use core_buffer::Buffer;
-use editor_view::EditorView;
+use editor_view::{EditorEvent, EditorView};
 use gpui_kit::assets::Assets;
 use gpui_kit::component::{
     ActiveTheme as _, Icon, IconName, Sizable as _,
@@ -111,6 +111,7 @@ pub struct DartIde {
     all_files: Vec<PathBuf>,
     palette_open: bool,
     palette_input: Entity<InputState>,
+    _subscriptions: Vec<Subscription>,
 }
 
 impl DartIde {
@@ -130,19 +131,38 @@ impl DartIde {
              // GPUI element), not gpui-component's Textarea. Try typing,\n\
              // arrow keys, backspace/delete, Home/End, and cmd+Z/cmd+Shift+Z.\n\
              // Click a file in the tree (or cmd+P to go to one) to open it.\n\
-             // cmd+O to open a different folder.\n",
+             // cmd+O to open a different folder. cmd+click a symbol to go\n\
+             // to its definition.\n",
         );
         let editor = cx.new(|cx| EditorView::from_buffer(buffer, cx));
 
-        Self {
+        let mut this = Self {
             root,
             tree_state,
-            tabs: vec![Tab { path: None, editor }],
+            tabs: vec![Tab { path: None, editor: editor.clone() }],
             active_tab: 0,
             all_files,
             palette_open: false,
             palette_input,
-        }
+            _subscriptions: Vec::new(),
+        };
+        this.watch_editor(&editor, window, cx);
+        this
+    }
+
+    /// Subscribe to an [`EditorEvent`] from one tab's editor — so far,
+    /// just go-to-definition landing in a different file, which needs
+    /// `DartIde` (tabs, the file tree) to actually open it.
+    fn watch_editor(&mut self, editor: &Entity<EditorView>, window: &mut Window, cx: &mut Context<Self>) {
+        let subscription = cx.subscribe_in(editor, window, |this, _editor, event, window, cx| match event {
+            EditorEvent::OpenAt { path, line, column } => {
+                let (line, column) = (*line, *column);
+                this.open_path(path.clone(), window, cx);
+                let target = this.active_editor().clone();
+                target.update(cx, |editor, cx| editor.set_cursor_to_position(line, column, cx));
+            }
+        });
+        self._subscriptions.push(subscription);
     }
 
     /// Show a native folder picker and re-root the file tree and Quick
@@ -276,6 +296,7 @@ impl DartIde {
                 }
             };
             let editor = cx.new(|cx| EditorView::from_buffer(buffer, cx));
+            self.watch_editor(&editor, window, cx);
             self.tabs.push(Tab {
                 path: Some(path),
                 editor,

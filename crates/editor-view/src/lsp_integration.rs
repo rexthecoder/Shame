@@ -1,7 +1,7 @@
 //! Lazily-started `dart language-server` per Dart buffer, wired to
-//! diagnostics and hover (M2 so far — see the module docs at the top of
-//! `lib.rs` for what's deliberately not here yet: completion,
-//! go-to-definition, rename, format, code actions).
+//! diagnostics, hover, and go-to-definition (M2 so far — see the module
+//! docs at the top of `lib.rs` for what's deliberately not here yet:
+//! completion, rename, format, code actions).
 //!
 //! Scope cuts, to revisit once more of M2 lands:
 //! - One analysis server per *open Dart tab*, not one shared per
@@ -28,6 +28,7 @@
 //!   of the window) leaves a stale popup until something else changes it.
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::str::FromStr;
 use std::time::Duration;
 
@@ -36,13 +37,13 @@ use gpui_kit::Context;
 use smol::Timer;
 use lsp_types::{
     ClientCapabilities, Diagnostic, DiagnosticSeverity, DidChangeTextDocumentParams,
-    DidOpenTextDocumentParams, Hover, HoverContents, HoverParams, InitializeParams,
-    LanguageString, MarkedString, Position, PublishDiagnosticsParams,
-    TextDocumentContentChangeEvent, TextDocumentIdentifier, TextDocumentItem,
-    TextDocumentPositionParams, Uri, VersionedTextDocumentIdentifier,
+    DidOpenTextDocumentParams, GotoDefinitionParams, GotoDefinitionResponse, Hover,
+    HoverContents, HoverParams, InitializeParams, LanguageString, Location, MarkedString,
+    Position, PublishDiagnosticsParams, TextDocumentContentChangeEvent, TextDocumentIdentifier,
+    TextDocumentItem, TextDocumentPositionParams, Uri, VersionedTextDocumentIdentifier,
 };
 
-use crate::EditorView;
+use crate::{EditorEvent, EditorView};
 
 pub(crate) struct LspState {
     client: LspClient,
@@ -52,6 +53,7 @@ pub(crate) struct LspState {
     ready: bool,
     diagnostics: Vec<Diagnostic>,
     pending_hover_id: Option<i64>,
+    pending_definition_id: Option<i64>,
 }
 
 impl EditorView {
@@ -107,6 +109,7 @@ impl EditorView {
             ready: false,
             diagnostics: Vec::new(),
             pending_hover_id: None,
+            pending_definition_id: None,
         });
     }
 
@@ -173,6 +176,34 @@ impl EditorView {
     /// to, for `render` to place it under.
     pub(crate) fn hover_to_render(&self) -> Option<(usize, &str)> {
         self.hover_result.as_ref().map(|(line, text)| (*line, text.as_str()))
+    }
+
+    /// Send `textDocument/definition` for `(line, column)`, if a server
+    /// is running and ready. No-op otherwise (e.g. cmd+click on a buffer
+    /// with no LSP, or before `initialize` finished).
+    pub(crate) fn request_definition(&mut self, line: usize, column: usize) {
+        let Some(lsp) = &mut self.lsp else {
+            return;
+        };
+        if !lsp.ready {
+            return;
+        }
+        let params = GotoDefinitionParams {
+            text_document_position_params: TextDocumentPositionParams {
+                text_document: TextDocumentIdentifier { uri: lsp.uri.clone() },
+                position: Position {
+                    line: line as u32,
+                    character: column as u32,
+                },
+            },
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+        };
+        if let Ok(id) =
+            lsp.client.request("textDocument/definition", serde_json::to_value(params).unwrap_or_default())
+        {
+            lsp.pending_definition_id = Some(id);
+        }
     }
 
     /// Tell the server about the buffer's current text, if a server is
@@ -243,6 +274,26 @@ impl EditorView {
                     cx.notify();
                 }
             }
+            ServerMessage::Response { id, result } if lsp.pending_definition_id == Some(id) => {
+                lsp.pending_definition_id = None;
+                let own_uri = lsp.uri.clone();
+                let Ok(value) = result else {
+                    return;
+                };
+                let Ok(Some(response)) = serde_json::from_value::<Option<GotoDefinitionResponse>>(value) else {
+                    return;
+                };
+                let Some((target_uri, line, column)) = first_definition_target(&response) else {
+                    return;
+                };
+
+                if target_uri.as_str() == own_uri.as_str() {
+                    let offset = self.buffer.line_to_byte(line as usize) + column as usize;
+                    self.set_cursor(offset, cx);
+                } else if let Some(path) = uri_to_path(&target_uri) {
+                    cx.emit(EditorEvent::OpenAt { path, line, column });
+                }
+            }
             _ => {}
         }
     }
@@ -301,4 +352,25 @@ fn marked_string_text(marked: &MarkedString) -> String {
         MarkedString::String(s) => s.clone(),
         MarkedString::LanguageString(LanguageString { value, .. }) => value.clone(),
     }
+}
+
+/// The first target `(uri, line, column)` out of a `textDocument/definition`
+/// response, whichever of its three possible shapes the server used.
+fn first_definition_target(response: &GotoDefinitionResponse) -> Option<(Uri, u32, u32)> {
+    let location_target = |location: &Location| {
+        (location.uri.clone(), location.range.start.line, location.range.start.character)
+    };
+    match response {
+        GotoDefinitionResponse::Scalar(location) => Some(location_target(location)),
+        GotoDefinitionResponse::Array(locations) => locations.first().map(location_target),
+        GotoDefinitionResponse::Link(links) => links.first().map(|link| {
+            (link.target_uri.clone(), link.target_selection_range.start.line, link.target_selection_range.start.character)
+        }),
+    }
+}
+
+/// Recover the filesystem path from one of our own `file://` URIs (the
+/// only kind this app ever constructs or expects back from the server).
+fn uri_to_path(uri: &Uri) -> Option<PathBuf> {
+    uri.as_str().strip_prefix("file://").map(PathBuf::from)
 }

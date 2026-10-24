@@ -1,5 +1,51 @@
 # Milestone notes
 
+## M2: go-to-definition (cmd+click)
+
+`textDocument/definition` is wired up: cmd/ctrl+click a symbol sends the
+request at that line/column. The response can come back three different
+shapes (`GotoDefinitionResponse::{Scalar, Array, Link}` — a single
+location, several, or `LocationLink`s with separate target/selection
+ranges); `first_definition_target` picks the first one regardless of
+shape, since this app doesn't yet have UI for "pick one of several"
+(documented as a gap below).
+
+The actually interesting part is what happens next, since Dart lets you
+jump *within* the same file or *into a different one*:
+- **Same file**: just move the cursor — `EditorView` already has
+  everything it needs.
+- **Different file**: `EditorView` has no idea tabs exist (by design —
+  see the crate's module docs), so it `cx.emit`s a new `EditorEvent::
+  OpenAt { path, line, column }`. `app::DartIde` subscribes to this per
+  tab (`cx.subscribe_in`, kept alive in a new `_subscriptions` field) and
+  handles it by calling its own existing `open_path` (same one the file
+  tree and Quick Open already use — opens-or-switches-to a tab) and then
+  calling `EditorView::set_cursor_to_position` on whichever tab ends up
+  active. This is the first thing in the codebase that needed a GPUI
+  event to cross the `editor-view` → `app` boundary, and it's a clean
+  precedent for whatever needs it next (diagnostics click-to-jump,
+  "Peek Definition", etc.).
+
+**Verified against the real server, protocol-level, both directions**:
+built a two-file sample project (`greeter.dart` + `main.dart` importing
+it) and drove the real `dart language-server` by hand through the full
+sequence for a definition request:
+- *Within* `greeter.dart` (method call inside the same file) — resolved
+  correctly to the method's own declaration, same file.
+- *From* `main.dart` to `greeter.dart` (a `Greeter()` constructor call)
+  — resolved correctly across files, confirming
+  `GotoDefinitionResponse::Array` deserializes and the cross-file path
+  works.
+- Re-ran the cross-file case with `rootUri: null` — exactly what this
+  app's own `InitializeParams` actually sends (no project root is set
+  up yet) — and it still resolved correctly, so the real app's
+  simplified initialize call isn't silently breaking this.
+
+Known gaps: no visual indication a symbol is cmd+click-able before you
+click it (no underline-on-hover-with-modifier, which most editors show);
+multiple definition candidates always pick the first one silently
+rather than letting you choose.
+
 ## M2: hover
 
 `textDocument/hover` is wired up: hovering over code for ~300ms sends a
