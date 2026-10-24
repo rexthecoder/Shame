@@ -1,5 +1,54 @@
 # Milestone notes
 
+## M3 start: `core-flutter` (backend only)
+
+Started M3 the same way M2 started with `core-lsp`: build the
+real-verified backend crate first, no GPUI wiring — a device picker,
+Run/Stop button, and log panel are all UI work, staying deferred along
+with everything else UI-shaped. `flutter` (3.47.2, via `fvm`) and a
+real `flutter create --platforms=macos` project were both already on
+this machine.
+
+`flutter run --machine` speaks a genuinely different wire protocol from
+LSP, confirmed by hand before writing any Rust:
+- **Framing is line-delimited, not `Content-Length`-framed.** Each
+  structured message is one line: a JSON *array* holding one object —
+  `[{"event": "...", "params": {...}}]` for events,
+  `[{"id": N, "result": ...}]` for replies to our commands. Other lines
+  (build progress text, the app's own `print()` output, a checkmark
+  line like `✓ Built ...`) are plain text, not JSON at all — kept as
+  `DaemonOutput::Log` rather than discarded, since that's exactly what
+  a future log panel needs, interleaved in the same order they arrived.
+- **`flutter devices --machine` is a *different* one-shot command**,
+  not part of the long-running daemon: it pretty-prints a single
+  multi-line JSON array and exits, so `list_devices()` just waits for
+  the process and parses the whole captured stdout, no line-by-line
+  streaming needed there.
+- **Commands and their id namespace are per-process**, same shape as
+  LSP's request/response correlation but wrapped in that one-element
+  array: `[{"id": 1, "method": "app.restart", "params": {"appId":
+  "...", "fullRestart": false, "pause": false}}]\n` is hot reload
+  (`fullRestart: true` is hot restart); `app.stop` ends the run.
+
+**Verified against the real toolchain, full lifecycle, by hand**: ran
+`flutter devices --machine` for real (it found the iOS Simulator,
+`macos` itself, and Chrome); ran `flutter run --machine -d macos`
+against the scratch project through to `app.started` (~12s, matching
+the real build), sent a real hot reload and watched the
+`app.progress`/`hot.reload` events and the `{"code":0,"message":
+"Reloaded 0 libraries"}` response arrive; then on a second run, sent
+`app.stop` and confirmed both the `app.stop` *event* and the
+`{"result":true}` *response* came back, and that the daemon process
+exited cleanly on its own afterward. None of that full-lifecycle
+sequence is automated (a real `flutter run -d macos` run is 10-15+
+seconds and needs a buildable project — too slow/fragile for routine
+`cargo test`), but the exact lines captured during it are locked into
+`parses_real_captured_daemon_lines`, and `flutter devices --machine`
+itself *is* re-run for real on every test run
+(`lists_real_devices_on_this_machine`), same balance core-lsp struck
+between manual full-protocol verification and automated parser tests.
+46 tests total now.
+
 ## M2: code actions (cmd/ctrl+.) — the last item on the original list
 
 `textDocument/codeAction` turned up something the plan didn't call out
