@@ -1,7 +1,7 @@
 //! Lazily-started `dart language-server` per Dart buffer, wired to
-//! diagnostics, hover, and go-to-definition (M2 so far — see the module
-//! docs at the top of `lib.rs` for what's deliberately not here yet:
-//! completion, rename, format, code actions).
+//! diagnostics, hover, go-to-definition, and formatting (M2 so far — see
+//! the module docs at the top of `lib.rs` for what's deliberately not
+//! here yet: completion, rename, code actions).
 //!
 //! Scope cuts, to revisit once more of M2 lands:
 //! - One analysis server per *open Dart tab*, not one shared per
@@ -26,6 +26,10 @@
 //!   tracking only fires while the mouse is over *that* line, so moving
 //!   off the text area entirely (onto the gutter, another panel, or out
 //!   of the window) leaves a stale popup until something else changes it.
+//! - Formatting (cmd/ctrl+shift+F) is manually triggered only — there's
+//!   no format-on-save. Wiring that up means waiting for the format
+//!   response before the save actually happens, which `save()` doesn't
+//!   do yet (it saves synchronously, immediately).
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -37,10 +41,11 @@ use gpui_kit::Context;
 use smol::Timer;
 use lsp_types::{
     ClientCapabilities, Diagnostic, DiagnosticSeverity, DidChangeTextDocumentParams,
-    DidOpenTextDocumentParams, GotoDefinitionParams, GotoDefinitionResponse, Hover,
-    HoverContents, HoverParams, InitializeParams, LanguageString, Location, MarkedString,
-    Position, PublishDiagnosticsParams, TextDocumentContentChangeEvent, TextDocumentIdentifier,
-    TextDocumentItem, TextDocumentPositionParams, Uri, VersionedTextDocumentIdentifier,
+    DidOpenTextDocumentParams, DocumentFormattingParams, FormattingOptions, GotoDefinitionParams,
+    GotoDefinitionResponse, Hover, HoverContents, HoverParams, InitializeParams, LanguageString,
+    Location, MarkedString, Position, PublishDiagnosticsParams, TextDocumentContentChangeEvent,
+    TextDocumentIdentifier, TextDocumentItem, TextDocumentPositionParams, TextEdit, Uri,
+    VersionedTextDocumentIdentifier,
 };
 
 use crate::{EditorEvent, EditorView};
@@ -54,6 +59,7 @@ pub(crate) struct LspState {
     diagnostics: Vec<Diagnostic>,
     pending_hover_id: Option<i64>,
     pending_definition_id: Option<i64>,
+    pending_format_id: Option<i64>,
 }
 
 impl EditorView {
@@ -110,6 +116,7 @@ impl EditorView {
             diagnostics: Vec::new(),
             pending_hover_id: None,
             pending_definition_id: None,
+            pending_format_id: None,
         });
     }
 
@@ -206,6 +213,53 @@ impl EditorView {
         }
     }
 
+    /// Send `textDocument/formatting` for the whole buffer. No-op if
+    /// there's no ready LSP server for this buffer. Returns whether a
+    /// request was actually sent, so callers (e.g. "format then save")
+    /// know whether to wait for a reply or just proceed.
+    pub fn request_format(&mut self) -> bool {
+        let Some(lsp) = &mut self.lsp else {
+            return false;
+        };
+        if !lsp.ready {
+            return false;
+        }
+        let params = DocumentFormattingParams {
+            text_document: TextDocumentIdentifier { uri: lsp.uri.clone() },
+            options: FormattingOptions {
+                tab_size: 2,
+                insert_spaces: true,
+                ..Default::default()
+            },
+            work_done_progress_params: Default::default(),
+        };
+        match lsp.client.request("textDocument/formatting", serde_json::to_value(params).unwrap_or_default()) {
+            Ok(id) => {
+                lsp.pending_format_id = Some(id);
+                true
+            }
+            Err(_) => false,
+        }
+    }
+
+    /// Apply a server's `TextEdit`s to the buffer. Edits are applied from
+    /// the end of the document backwards so that earlier edits' (line,
+    /// character) positions stay valid as later ones are applied —
+    /// standard multi-edit application, needed because each edit's
+    /// position is defined relative to the *original* document, not to
+    /// the result of previous edits in the same batch.
+    fn apply_text_edits(&mut self, mut edits: Vec<TextEdit>, cx: &mut Context<Self>) {
+        edits.sort_by_key(|edit| (edit.range.start.line, edit.range.start.character));
+        for edit in edits.into_iter().rev() {
+            let start = self.buffer.line_to_byte(edit.range.start.line as usize)
+                + edit.range.start.character as usize;
+            let end = self.buffer.line_to_byte(edit.range.end.line as usize)
+                + edit.range.end.character as usize;
+            self.buffer.edit(start..end, &edit.new_text);
+        }
+        cx.notify();
+    }
+
     /// Tell the server about the buffer's current text, if a server is
     /// running and past its `initialize` handshake. Called whenever the
     /// buffer's text actually changed (same check `render` already does
@@ -294,6 +348,12 @@ impl EditorView {
                     cx.emit(EditorEvent::OpenAt { path, line, column });
                 }
             }
+            ServerMessage::Response { id, result } if lsp.pending_format_id == Some(id) => {
+                lsp.pending_format_id = None;
+                if let Ok(Some(edits)) = result.map(|v| serde_json::from_value::<Option<Vec<TextEdit>>>(v).unwrap_or(None)) {
+                    self.apply_text_edits(edits, cx);
+                }
+            }
             _ => {}
         }
     }
@@ -373,4 +433,33 @@ fn first_definition_target(response: &GotoDefinitionResponse) -> Option<(Uri, u3
 /// only kind this app ever constructs or expects back from the server).
 fn uri_to_path(uri: &Uri) -> Option<PathBuf> {
     uri.as_str().strip_prefix("file://").map(PathBuf::from)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Not synthetic JSON — this is the exact `result` array the real
+    /// `dart language-server` sent back for `textDocument/formatting` on
+    /// a small badly-formatted sample file (captured by hand via a FIFO,
+    /// same technique used elsewhere to verify this crate against the
+    /// real server). Confirms `newText`/`range` camelCase deserializes
+    /// into `TextEdit` the way `apply_text_edits` expects.
+    #[test]
+    fn deserializes_a_real_server_format_response() {
+        let json = serde_json::json!([
+            {"newText":" ","range":{"end":{"character":13,"line":0},"start":{"character":13,"line":0}}},
+            {"newText":" ","range":{"end":{"character":27,"line":1},"start":{"character":27,"line":1}}},
+            {"newText":"","range":{"end":{"character":6,"line":2},"start":{"character":4,"line":2}}}
+        ]);
+        let edits: Vec<TextEdit> = serde_json::from_value(json).expect("should deserialize");
+        assert_eq!(edits.len(), 3);
+        assert_eq!(edits[0].new_text, " ");
+        assert_eq!(edits[0].range.start.character, 13);
+        assert_eq!(edits[2].new_text, "");
+        assert_eq!(edits[2].range, lsp_types::Range {
+            start: Position { line: 2, character: 4 },
+            end: Position { line: 2, character: 6 },
+        });
+    }
 }

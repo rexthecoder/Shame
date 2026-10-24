@@ -298,6 +298,9 @@ impl EditorView {
                     self.save();
                     cx.notify();
                 }
+                "f" if keystroke.modifiers.shift => {
+                    self.request_format();
+                }
                 "z" => {
                     if keystroke.modifiers.shift {
                         self.buffer.redo();

@@ -1,5 +1,35 @@
 # Milestone notes
 
+## M2: formatting (cmd/ctrl+shift+F)
+
+`textDocument/formatting` is wired up: the shortcut sends a format
+request for the whole buffer; the response's `TextEdit`s are applied to
+`core-buffer` via a new `apply_text_edits`, sorted and then applied
+*last edit first* — each edit's (line, character) position is defined
+relative to the original document, not to the result of earlier edits
+in the same batch, so applying from the bottom up is what keeps
+not-yet-applied edits' positions valid (standard technique for
+multi-edit application, not specific to this server).
+
+**Verified against the real server**: a deliberately badly-spaced
+sample (`class Greeter{` with no space, over-indented body) produced
+exactly 3 edits from the real `dart language-server` — two single-space
+insertions and one indent trim. Went a step further than the earlier
+protocol-level checks: added a permanent unit test
+(`deserializes_a_real_server_format_response`) using that *exact*
+captured JSON (not synthetic data) to lock in that `newText`/`range`
+deserializes into `TextEdit` the way `apply_text_edits` expects — this
+one stays in the suite rather than being a one-off check, since format
+responses are exactly the kind of "camelCase JSON edit list" shape that
+silently rotting serde derives would get wrong without anyone noticing
+until a real edit came out garbled.
+
+Known gap: formatting is manual-trigger only (cmd/ctrl+shift+F) — no
+format-on-save. Wiring that up means waiting for the format response
+before `save()` actually runs, and `save()` currently saves
+synchronously/immediately; a real "format then save" needs its own
+small state machine, not attempted here.
+
 ## M2: go-to-definition (cmd+click)
 
 `textDocument/definition` is wired up: cmd/ctrl+click a symbol sends the
