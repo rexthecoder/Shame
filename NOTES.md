@@ -1,5 +1,28 @@
 # Milestone notes
 
+## M1: selection highlighting and keyboard selection
+
+`editor-view` can now actually create a multi-character selection, not
+just move a cursor: shift+Left/Right/Up/Down/Home/End extends the
+selection (anchor stays put, only the head moves), plain Left/Right with
+an existing selection collapses to its start/end first (standard editor
+behavior), and cmd/ctrl+A selects the whole buffer. All of this reuses
+`core-buffer`'s existing `Selection`/`SelectionSet` — no changes needed
+there, since multi-character selections were already modeled, just never
+driven by anything other than a bare cursor.
+
+Rendering: `line_runs` now tracks two independent per-byte dimensions
+(syntax highlight color, and whether a byte is selected) and run-length
+encodes both together, so a selection spanning part of a syntax-colored
+token still shows the right text color *and* the selection background on
+exactly the right sub-range — not an approximation. The run containing the
+cursor is still split further so the caret renders inline with correct
+color/background on both sides.
+
+Known gap: selection is keyboard-only. There's no mouse drag-select, and
+double/triple-click word/line selection isn't implemented either — both
+noted as follow-ups rather than attempted here.
+
 ## M1/M2: `core-syntax` (Dart highlighting)
 
 `core-syntax` is a real crate now: a thin wrapper around `tree-sitter` +
@@ -98,10 +121,8 @@ Known M1 scope cuts (see also the doc comment at the top of
 `crates/editor-view/src/lib.rs`):
 - Syntax highlighting landed afterwards — see the `core-syntax` section
   below; this entry is kept only as a record of the original gap.
-- No visual highlight for a non-empty selection range — only the cursor
-  is drawn. Multi-character selection (shift+arrows, drag-select) isn't
-  wired up at all yet, even though `core-buffer`'s `SelectionSet` already
-  supports it.
+- Selection highlighting landed afterwards too — see the dedicated
+  section below; this entry is also kept only as a record.
 - Mouse clicks snap to the start of the clicked *line*, not the clicked
   *column* — real column hit-testing needs text measurement (`shape_line`)
   that wasn't built yet.
