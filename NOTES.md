@@ -1,5 +1,21 @@
 # Milestone notes
 
+## M1: tabs
+
+`DartIde` now holds `Vec<Tab>` (each a path + its own `Entity<EditorView>`)
+instead of a single editor. Clicking a file in the tree opens it in a new
+tab, or switches to it if it's already open (deduped by path); a tab bar
+above the editor shows each tab's filename with a close (×) button.
+Closing the last tab leaves a fresh blank one rather than an empty window.
+
+Each tab gets its own `EditorView`/`Buffer`, so switching tabs doesn't lose
+undo history, cursor position, or unsaved edits in the other tab — that
+falls out of the design for free rather than needing extra state.
+
+Not done: no "unsaved changes" confirmation when closing a dirty tab, no
+keyboard shortcut to close/cycle tabs (Cmd+W, Cmd+1..9), and no
+persistence of which tabs were open across restarts.
+
 ## M1: file tree wired to the editor
 
 Clicking a file in the left tree now actually opens it in `editor-view`

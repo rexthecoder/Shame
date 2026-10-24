@@ -19,6 +19,7 @@ use gpui_kit::component::{
     v_flex,
 };
 use gpui_kit::base::StyledExt as _;
+use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 /// Directory/file names we never want to show in the M0 file tree.
@@ -54,9 +55,30 @@ fn build_tree_items(dir: &Path) -> Vec<TreeItem> {
     items
 }
 
+struct Tab {
+    /// `None` for the initial scratch buffer; every file opened from the
+    /// tree gets a path, which also doubles as the tab's dedup key.
+    path: Option<PathBuf>,
+    editor: Entity<EditorView>,
+}
+
+impl Tab {
+    fn title(&self) -> String {
+        match &self.path {
+            Some(path) => path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("untitled")
+                .to_string(),
+            None => "untitled".to_string(),
+        }
+    }
+}
+
 pub struct DartIde {
     tree_state: Entity<TreeState>,
-    editor: Entity<EditorView>,
+    tabs: Vec<Tab>,
+    active_tab: usize,
 }
 
 impl DartIde {
@@ -71,16 +93,69 @@ impl DartIde {
              //\n\
              // This is our own editor-view (core-buffer + a from-scratch\n\
              // GPUI element), not gpui-component's Textarea. Try typing,\n\
-             // arrow keys, backspace/delete, Home/End, and cmd+Z/cmd+Shift+Z.\n",
+             // arrow keys, backspace/delete, Home/End, and cmd+Z/cmd+Shift+Z.\n\
+             // Click a file in the tree to open it in a new tab.\n",
         );
         let editor = cx.new(|cx| EditorView::from_buffer(buffer, cx));
 
-        Self { tree_state, editor }
+        Self {
+            tree_state,
+            tabs: vec![Tab { path: None, editor }],
+            active_tab: 0,
+        }
+    }
+
+    fn active_editor(&self) -> &Entity<EditorView> {
+        &self.tabs[self.active_tab].editor
+    }
+
+    /// Open `path` in a new tab, or switch to it if it's already open.
+    fn open_path(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(ix) = self.tabs.iter().position(|t| t.path.as_deref() == Some(path.as_path())) {
+            self.active_tab = ix;
+        } else {
+            let buffer = match Buffer::open(&path) {
+                Ok(buffer) => buffer,
+                Err(err) => {
+                    eprintln!("failed to open {}: {err}", path.display());
+                    return;
+                }
+            };
+            let editor = cx.new(|cx| EditorView::from_buffer(buffer, cx));
+            self.tabs.push(Tab {
+                path: Some(path),
+                editor,
+            });
+            self.active_tab = self.tabs.len() - 1;
+        }
+
+        let focus_handle = self.active_editor().read(cx).focus_handle(cx);
+        window.focus(&focus_handle, cx);
+        cx.notify();
+    }
+
+    fn close_tab(&mut self, ix: usize, cx: &mut Context<Self>) {
+        if ix >= self.tabs.len() {
+            return;
+        }
+        self.tabs.remove(ix);
+        if self.tabs.is_empty() {
+            let editor = cx.new(|cx| EditorView::new(cx));
+            self.tabs.push(Tab { path: None, editor });
+            self.active_tab = 0;
+        } else if self.active_tab > ix {
+            self.active_tab -= 1;
+        } else {
+            self.active_tab = self.active_tab.min(self.tabs.len() - 1);
+        }
+        cx.notify();
     }
 }
 
 impl Render for DartIde {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let view = cx.entity();
+
         v_flex()
             .size_full()
             .bg(cx.theme().background)
@@ -107,7 +182,7 @@ impl Render for DartIde {
                                         .border_color(cx.theme().border)
                                         .child(
                                             tree(&self.tree_state, {
-                                                let editor = self.editor.clone();
+                                                let view = view.clone();
                                                 move |ix, entry, _selected, _window, cx| {
                                                     let item = entry.item();
                                                     let icon = if !entry.is_folder() {
@@ -130,25 +205,20 @@ impl Render for DartIde {
                                                                 .child(item.label.clone()),
                                                         )
                                                         .on_click({
-                                                            let editor = editor.clone();
+                                                            let view = view.clone();
                                                             let is_folder = item.is_folder();
                                                             let path = PathBuf::from(item.id.as_str());
                                                             move |_event, window, cx| {
                                                                 if is_folder {
                                                                     return;
                                                                 }
-                                                                let path = path.clone();
-                                                                editor.update(cx, |editor, cx| {
-                                                                    if let Err(err) =
-                                                                        editor.open_file(&path, cx)
-                                                                    {
-                                                                        eprintln!(
-                                                                            "failed to open {}: {err}",
-                                                                            path.display()
-                                                                        );
-                                                                    }
+                                                                view.update(cx, |this, cx| {
+                                                                    this.open_path(
+                                                                        path.clone(),
+                                                                        window,
+                                                                        cx,
+                                                                    );
                                                                 });
-                                                                window.focus(&editor.read(cx).focus_handle(cx), cx);
                                                             }
                                                         })
                                                 }
@@ -158,10 +228,11 @@ impl Render for DartIde {
                                 ),
                         )
                         .child(
-                            div()
+                            v_flex()
                                 .flex_1()
                                 .h_full()
-                                .child(self.editor.clone())
+                                .child(self.render_tab_bar(&view, cx))
+                                .child(div().flex_1().w_full().child(self.active_editor().clone()))
                                 .into_any_element(),
                         ),
                 ),
@@ -171,8 +242,56 @@ impl Render for DartIde {
 }
 
 impl DartIde {
+    fn render_tab_bar(&self, view: &Entity<Self>, cx: &mut Context<Self>) -> impl IntoElement {
+        h_flex()
+            .w_full()
+            .border_b_1()
+            .border_color(cx.theme().border)
+            .children(self.tabs.iter().enumerate().map(|(ix, tab)| {
+                let is_active = ix == self.active_tab;
+
+                h_flex()
+                    .id(("tab", ix))
+                    .items_center()
+                    .gap_2()
+                    .px_3()
+                    .py_1()
+                    .border_r_1()
+                    .border_color(cx.theme().border)
+                    .when(is_active, |d| d.bg(cx.theme().accent))
+                    .child(
+                        div()
+                            .id(("tab-label", ix))
+                            .child(tab.title())
+                            .on_click({
+                                let view = view.clone();
+                                move |_event, _window, cx| {
+                                    view.update(cx, |this, cx| {
+                                        this.active_tab = ix;
+                                        cx.notify();
+                                    });
+                                }
+                            }),
+                    )
+                    .child(
+                        div()
+                            .id(("tab-close", ix))
+                            .text_color(cx.theme().muted_foreground)
+                            .child("×")
+                            .on_click({
+                                let view = view.clone();
+                                move |_event, _window, cx| {
+                                    view.update(cx, |this, cx| {
+                                        this.close_tab(ix, cx);
+                                    });
+                                }
+                            }),
+                    )
+            }))
+    }
+
     fn render_status_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let editor = self.editor.read(cx);
+        let editor = self.active_editor().read(cx);
         let buffer = editor.buffer();
         let status = match buffer.path() {
             Some(path) => format!(
