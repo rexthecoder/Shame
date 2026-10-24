@@ -1,5 +1,20 @@
 # Milestone notes
 
+## Open Folder (cmd+O)
+
+Found while trying to let the user test M2's diagnostics: the app always
+rooted the file tree and Quick Open at `std::env::current_dir()` with no
+way to point it anywhere else — a real gap, not a corner case, since
+most people won't launch this from a terminal already sitting in the
+Dart/Flutter project they want to edit.
+
+Added a native folder picker (`cx.prompt_for_paths` with
+`directories: true, files: false`) behind cmd/ctrl+O and an "Open
+Folder…" button in the header (showing the current root). Picking a
+folder rebuilds the file tree (`TreeState::set_items`) and the Quick
+Open file list for the new root; open tabs are left alone rather than
+closed out from under the user.
+
 ## M2 first slice: live diagnostics from the real `dart language-server`
 
 Wired `core-lsp` into `editor-view` (new `lsp_integration.rs` module) and

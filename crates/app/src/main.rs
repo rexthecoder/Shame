@@ -11,7 +11,8 @@ use core_buffer::Buffer;
 use editor_view::EditorView;
 use gpui_kit::assets::Assets;
 use gpui_kit::component::{
-    ActiveTheme as _, Icon, IconName,
+    ActiveTheme as _, Icon, IconName, Sizable as _,
+    button::{Button, ButtonVariants as _},
     h_flex,
     input::{Input, InputState},
     list::ListItem,
@@ -103,6 +104,7 @@ impl Tab {
 }
 
 pub struct DartIde {
+    root: PathBuf,
     tree_state: Entity<TreeState>,
     tabs: Vec<Tab>,
     active_tab: usize,
@@ -127,11 +129,13 @@ impl DartIde {
              // This is our own editor-view (core-buffer + a from-scratch\n\
              // GPUI element), not gpui-component's Textarea. Try typing,\n\
              // arrow keys, backspace/delete, Home/End, and cmd+Z/cmd+Shift+Z.\n\
-             // Click a file in the tree (or cmd+P to go to one) to open it.\n",
+             // Click a file in the tree (or cmd+P to go to one) to open it.\n\
+             // cmd+O to open a different folder.\n",
         );
         let editor = cx.new(|cx| EditorView::from_buffer(buffer, cx));
 
         Self {
+            root,
             tree_state,
             tabs: vec![Tab { path: None, editor }],
             active_tab: 0,
@@ -141,9 +145,46 @@ impl DartIde {
         }
     }
 
+    /// Show a native folder picker and re-root the file tree and Quick
+    /// Open file list to whatever the user picks. Leaves open tabs alone.
+    fn open_folder(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let paths = cx.prompt_for_paths(PathPromptOptions {
+            files: false,
+            directories: true,
+            multiple: false,
+            prompt: Some("Open Folder".into()),
+        });
+
+        let view = cx.entity();
+        cx.spawn_in(window, async move |_, window| {
+            let root = paths.await.ok()?.ok()??.into_iter().next()?;
+            window
+                .update(|_window, cx| {
+                    view.update(cx, |this, cx| this.set_root(root, cx));
+                })
+                .ok()
+        })
+        .detach();
+    }
+
+    fn set_root(&mut self, root: PathBuf, cx: &mut Context<Self>) {
+        let items = build_tree_items(&root);
+        self.all_files = flatten_files(&root);
+        self.tree_state.update(cx, |state, cx| {
+            state.set_items(items, cx);
+        });
+        self.root = root;
+        cx.notify();
+    }
+
     fn on_key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         let keystroke = &event.keystroke;
         let primary_mod = keystroke.modifiers.platform || keystroke.modifiers.control;
+
+        if primary_mod && keystroke.key.as_str() == "o" {
+            self.open_folder(window, cx);
+            return;
+        }
 
         if primary_mod && keystroke.key.as_str() == "p" {
             self.palette_open = true;
@@ -280,9 +321,20 @@ impl Render for DartIde {
                     .w_full()
                     .px_4()
                     .py_2()
+                    .items_center()
+                    .justify_between()
                     .border_b_1()
                     .border_color(cx.theme().border)
-                    .child(div().font_bold().child("Dart/Flutter IDE — M1")),
+                    .child(div().font_bold().child("Dart/Flutter IDE — M1"))
+                    .child(
+                        Button::new("open-folder")
+                            .ghost()
+                            .small()
+                            .label(format!("Open Folder\u{2026} ({})", self.root.display()))
+                            .on_click(cx.listener(|this, _event, window, cx| {
+                                this.open_folder(window, cx);
+                            })),
+                    ),
             )
             .child(
                 div().flex_1().w_full().child(
