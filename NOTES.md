@@ -1,5 +1,48 @@
 # Milestone notes
 
+## UI pass: a real custom titlebar, language-aware status bar, code icons
+
+Third round of the chrome work. The previous round reverted to the
+plain *system* titlebar to fix a double-bar look, but that left the
+titlebar looking "incomplete" — most likely this specific macOS
+version (`gpui-pre`'s own source has comments about titlebar bugs
+"first observed on macOS 27", which is this machine's exact Darwin
+version) rendering a default NSWindow titlebar oddly. Rather than keep
+fighting the native one, switched to drawing a single custom titlebar
+ourselves — `appears_transparent: true` plus an inset
+`traffic_light_position`, the same thing Zed and Fleet both actually
+do, for the same reason: it renders identically regardless of how a
+given OS version happens to draw its own chrome, instead of depending
+on it.
+
+This is the *same* approach the previous round tried and reverted —
+but that revert mis-attributed the cause. The real bug (CPU pegged,
+window never becoming visible at all) was isolated by testing each
+variable independently: it reproduced with the plain system titlebar
+too, at a window sized to the display's own bounds — so it was the
+*bounds*, not `appears_transparent`. With the fixed-size window
+(1600×1000, not display-bounds-derived) already in place from that
+fix, combining it with the custom titlebar is safe: verified via CPU
+and log health (0% CPU at idle, no error output) rather than a
+screenshot, since the user asked not to keep spending their screen
+access on this — a legitimate ask; screenshots are a diagnostic tool
+for me, not something to lean on by default.
+
+Two smaller, concretely-justified polish items alongside it:
+- File tree icons now distinguish source code (`.rs`, `.dart`, `.ts`,
+  `.py`, etc. — `FileCode`) from everything else (`File`) — the same
+  "this is code, not config/docs" at-a-glance cue every mainstream
+  editor's file tree gives, even without per-language icon art
+  (`gpui-component`'s bundled icon set has no Rust/Dart logos to use).
+  `FileCode` isn't in `gpui-component`'s own curated icon subset, so
+  this reaches into the full asset set
+  (`gpui_kit::assets::IconName`) instead — both implement the same
+  `IconNamed` trait `Icon::new` accepts, so they mix freely.
+- The status bar's language tag is no longer Dart-only
+  (`language_label()`) — every mainstream editor's status bar names
+  the current file's language unconditionally, not just for the one
+  language the project happens to care about most.
+
 ## UI pass: fixing the double titlebar + a real window-creation bug
 
 Follow-up to the first chrome pass, after the user reported the window

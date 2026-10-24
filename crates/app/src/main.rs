@@ -58,6 +58,42 @@ fn build_tree_items(dir: &Path) -> Vec<TreeItem> {
     items
 }
 
+/// Source-code extensions get `FileCode` instead of the generic `File`
+/// icon — the same at-a-glance "this is code, not config/docs" cue Zed
+/// and Fleet both give their file trees, even without per-language icon
+/// art (`gpui-component`'s bundled icon set has no Rust/Dart logos).
+/// `FileCode` isn't in `gpui_component::IconName`'s curated subset, so
+/// this reaches into the full asset set (`gpui_kit::assets::IconName`)
+/// instead — both implement the same `IconNamed` trait `Icon::new`
+/// accepts, so they mix freely.
+fn icon_for_file(name: &str) -> Icon {
+    let is_code = Path::new(name)
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|ext| matches!(ext, "rs" | "dart" | "ts" | "tsx" | "js" | "jsx" | "py" | "go" | "c" | "cpp" | "h"));
+    if is_code {
+        Icon::new(gpui_kit::assets::IconName::FileCode)
+    } else {
+        Icon::new(IconName::File)
+    }
+}
+
+/// A friendly language name for the status bar — every editor shows one
+/// for the current file, not just when it happens to be the one
+/// language the project cares about most.
+fn language_label(path: &Path) -> String {
+    match path.extension().and_then(|e| e.to_str()) {
+        Some("dart") => "Dart".to_string(),
+        Some("rs") => "Rust".to_string(),
+        Some("toml") => "TOML".to_string(),
+        Some("yaml") | Some("yml") => "YAML".to_string(),
+        Some("json") => "JSON".to_string(),
+        Some("md") => "Markdown".to_string(),
+        Some(ext) => ext.to_uppercase(),
+        None => "Plain Text".to_string(),
+    }
+}
+
 /// Every file under `dir`, for the Quick Open palette.
 fn flatten_files(dir: &Path) -> Vec<PathBuf> {
     let mut files = Vec::new();
@@ -499,6 +535,32 @@ impl Render for DartIde {
             .bg(cx.theme().background)
             .text_color(cx.theme().foreground)
             .child(
+                // The one titlebar: draws over the traffic-light inset
+                // reserved above (`pl` clears it), and its native AppKit
+                // drag behavior carries over from the system titlebar
+                // strip it replaces (`appears_transparent` alone, with
+                // `app_owns_titlebar_drag` left at its default `false`,
+                // keeps the window draggable from here without any extra
+                // mouse handling on our side).
+                h_flex()
+                    .w_full()
+                    .h(px(38.))
+                    .flex_shrink_0()
+                    .pl(px(78.))
+                    .pr_3()
+                    .items_center()
+                    .bg(cx.theme().title_bar)
+                    .border_b_1()
+                    .border_color(cx.theme().title_bar_border)
+                    .child(
+                        div()
+                            .text_sm()
+                            .font_bold()
+                            .text_color(cx.theme().muted_foreground)
+                            .child("Dart/Flutter IDE"),
+                    ),
+            )
+            .child(
                 div().flex_1().w_full().min_h(px(0.)).child(
                     h_resizable("main-split")
                         .child(
@@ -542,11 +604,11 @@ impl Render for DartIde {
                                                 move |ix, entry, _selected, _window, cx| {
                                                     let item = entry.item();
                                                     let icon = if !entry.is_folder() {
-                                                        IconName::File
+                                                        icon_for_file(&item.label)
                                                     } else if entry.is_expanded() {
-                                                        IconName::FolderOpen
+                                                        Icon::new(IconName::FolderOpen)
                                                     } else {
-                                                        IconName::Folder
+                                                        Icon::new(IconName::Folder)
                                                     };
 
                                                     ListItem::new(ix)
@@ -560,11 +622,7 @@ impl Render for DartIde {
                                                             h_flex()
                                                                 .gap_2()
                                                                 .text_sm()
-                                                                .child(
-                                                                    Icon::new(icon)
-                                                                        .text_color(cx.theme().muted_foreground)
-                                                                        .small(),
-                                                                )
+                                                                .child(icon.text_color(cx.theme().muted_foreground).small())
                                                                 .child(item.label.clone()),
                                                         )
                                                         .on_click({
@@ -686,7 +744,7 @@ impl DartIde {
         let is_dirty = buffer.is_dirty();
         let (line, column) = editor.cursor_position();
         let (errors, warnings) = editor.diagnostic_summary();
-        let is_dart = buffer.path().is_some_and(|p| p.extension().is_some_and(|e| e == "dart"));
+        let language = buffer.path().map(|p| language_label(&p));
 
         h_flex()
             .w_full()
@@ -734,7 +792,7 @@ impl DartIde {
                         )
                     })
                     .child(format!("Ln {line}, Col {column}"))
-                    .when(is_dart, |el| el.child("Dart")),
+                    .when_some(language, |el, language| el.child(language)),
             )
     }
 }
@@ -765,8 +823,19 @@ fn main() {
         let window_options = WindowOptions {
             window_bounds: Some(WindowBounds::Windowed(bounds)),
             titlebar: Some(TitlebarOptions {
-                title: Some("Dart/Flutter IDE".into()),
-                ..Default::default()
+                title: None,
+                // Draw our own titlebar instead of leaning on the native
+                // one (the thing the earlier "incomplete titlebar" look
+                // came from) — this is the actual Zed/Fleet approach, not
+                // a styling preference: it renders identically everywhere
+                // instead of depending on how this specific macOS version
+                // happens to draw a default NSWindow titlebar. Safe to
+                // combine with the fixed-size window above — the earlier
+                // freeze was caused by the window's *bounds* matching the
+                // display exactly, confirmed independent of this setting
+                // (it also froze with the plain system titlebar).
+                appears_transparent: true,
+                traffic_light_position: Some(point(px(12.), px(12.))),
             }),
             ..Default::default()
         };
