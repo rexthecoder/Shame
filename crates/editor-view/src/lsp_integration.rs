@@ -43,8 +43,9 @@ use lsp_types::{
     ClientCapabilities, Diagnostic, DiagnosticSeverity, DidChangeTextDocumentParams,
     DidOpenTextDocumentParams, DocumentFormattingParams, FormattingOptions, GotoDefinitionParams,
     GotoDefinitionResponse, Hover, HoverContents, HoverParams, InitializeParams, LanguageString,
-    Location, MarkedString, Position, PublishDiagnosticsParams, TextDocumentContentChangeEvent,
-    TextDocumentIdentifier, TextDocumentItem, TextDocumentPositionParams, TextEdit, Uri,
+    Location, MarkedString, Position, PublishDiagnosticsParams, RenameParams,
+    TextDocumentContentChangeEvent, TextDocumentIdentifier, TextDocumentItem,
+    TextDocumentPositionParams, TextEdit, Uri, WorkspaceEdit,
     VersionedTextDocumentIdentifier,
 };
 
@@ -60,6 +61,7 @@ pub(crate) struct LspState {
     pending_hover_id: Option<i64>,
     pending_definition_id: Option<i64>,
     pending_format_id: Option<i64>,
+    pending_rename_id: Option<i64>,
 }
 
 impl EditorView {
@@ -117,6 +119,7 @@ impl EditorView {
             pending_hover_id: None,
             pending_definition_id: None,
             pending_format_id: None,
+            pending_rename_id: None,
         });
     }
 
@@ -183,6 +186,39 @@ impl EditorView {
     /// to, for `render` to place it under.
     pub(crate) fn hover_to_render(&self) -> Option<(usize, &str)> {
         self.hover_result.as_ref().map(|(line, text)| (*line, text.as_str()))
+    }
+
+    /// Ask `app` to collect a new name for the symbol at the cursor (see
+    /// the module docs at the top of `lib.rs` for why the prompt itself
+    /// isn't here). No-op if there's no ready LSP server for this buffer.
+    pub(crate) fn start_rename(&mut self, cx: &mut Context<Self>) {
+        let is_ready = self.lsp.as_ref().is_some_and(|lsp| lsp.ready);
+        if !is_ready {
+            return;
+        }
+        let head = self.buffer.selections().primary().head;
+        let line = self.buffer.byte_to_line(head) as u32;
+        let column = (head - self.buffer.line_to_byte(line as usize)) as u32;
+        cx.emit(EditorEvent::RequestRename { line, column });
+    }
+
+    /// Send `textDocument/rename` for `(line, column)` with `new_name`.
+    /// Called by `app` once it's collected the new name from the user.
+    pub fn send_rename(&mut self, line: u32, column: u32, new_name: String) {
+        let Some(lsp) = &mut self.lsp else {
+            return;
+        };
+        let params = RenameParams {
+            text_document_position: TextDocumentPositionParams {
+                text_document: TextDocumentIdentifier { uri: lsp.uri.clone() },
+                position: Position { line, character: column },
+            },
+            new_name,
+            work_done_progress_params: Default::default(),
+        };
+        if let Ok(id) = lsp.client.request("textDocument/rename", serde_json::to_value(params).unwrap_or_default()) {
+            lsp.pending_rename_id = Some(id);
+        }
     }
 
     /// Send `textDocument/definition` for `(line, column)`, if a server
@@ -354,6 +390,25 @@ impl EditorView {
                     self.apply_text_edits(edits, cx);
                 }
             }
+            ServerMessage::Response { id, result } if lsp.pending_rename_id == Some(id) => {
+                lsp.pending_rename_id = None;
+                let own_uri = lsp.uri.clone();
+                let Ok(Some(edit)) = result.map(|v| serde_json::from_value::<Option<WorkspaceEdit>>(v).unwrap_or(None))
+                else {
+                    return;
+                };
+                // Only apply edits to this buffer's own file. A rename
+                // that also touches other files silently leaves those
+                // other files unchanged — a real gap, not an oversight;
+                // see the module docs.
+                if let Some(changes) = edit.changes {
+                    for (uri, edits) in changes {
+                        if uri.as_str() == own_uri.as_str() {
+                            self.apply_text_edits(edits, cx);
+                        }
+                    }
+                }
+            }
             _ => {}
         }
     }
@@ -461,5 +516,31 @@ mod tests {
             start: Position { line: 2, character: 4 },
             end: Position { line: 2, character: 6 },
         });
+    }
+
+    /// Also real captured output — `textDocument/rename` on `greet` in a
+    /// small sample file, renaming it to `sayHello`. Confirms
+    /// `WorkspaceEdit.changes` (a map of URI string -> `TextEdit[]`, the
+    /// shape this server actually uses, not `documentChanges`)
+    /// deserializes the way the rename response handler expects, and
+    /// that both occurrences (the declaration and the one call site)
+    /// came back in the single same-file entry.
+    #[test]
+    fn deserializes_a_real_server_rename_response() {
+        let json = serde_json::json!({
+            "changes": {
+                "file:///a/sample_rename.dart": [
+                    {"newText":"sayHello","range":{"end":{"character":14,"line":1},"start":{"character":9,"line":1}}},
+                    {"newText":"sayHello","range":{"end":{"character":15,"line":8},"start":{"character":10,"line":8}}}
+                ]
+            }
+        });
+        let edit: WorkspaceEdit = serde_json::from_value(json).expect("should deserialize");
+        let changes = edit.changes.expect("expected a changes map");
+        assert_eq!(changes.len(), 1);
+        let (_uri, edits) = changes.into_iter().next().unwrap();
+        assert_eq!(edits.len(), 2);
+        assert_eq!(edits[0].new_text, "sayHello");
+        assert_eq!(edits[1].range.start.line, 8);
     }
 }

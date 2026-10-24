@@ -111,6 +111,8 @@ pub struct DartIde {
     all_files: Vec<PathBuf>,
     palette_open: bool,
     palette_input: Entity<InputState>,
+    rename_target: Option<(Entity<EditorView>, u32, u32)>,
+    rename_input: Entity<InputState>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -123,6 +125,7 @@ impl DartIde {
         let tree_state = cx.new(|cx| TreeState::new(cx).items(items));
         let palette_input =
             cx.new(|cx| InputState::new(window, cx).placeholder("Go to file..."));
+        let rename_input = cx.new(|cx| InputState::new(window, cx).placeholder("New name..."));
 
         let buffer = Buffer::from_str(
             "// Lightweight Dart/Flutter IDE — M1\n\
@@ -144,25 +147,98 @@ impl DartIde {
             all_files,
             palette_open: false,
             palette_input,
+            rename_target: None,
+            rename_input,
             _subscriptions: Vec::new(),
         };
         this.watch_editor(&editor, window, cx);
         this
     }
 
-    /// Subscribe to an [`EditorEvent`] from one tab's editor — so far,
-    /// just go-to-definition landing in a different file, which needs
-    /// `DartIde` (tabs, the file tree) to actually open it.
+    /// Subscribe to an [`EditorEvent`] from one tab's editor: so far,
+    /// go-to-definition landing in a different file (needs `DartIde`'s
+    /// tabs to actually open it) and rename asking for a new name (needs
+    /// `DartIde`'s input prompt — `editor-view` won't build its own, see
+    /// its module docs).
     fn watch_editor(&mut self, editor: &Entity<EditorView>, window: &mut Window, cx: &mut Context<Self>) {
-        let subscription = cx.subscribe_in(editor, window, |this, _editor, event, window, cx| match event {
+        let subscription = cx.subscribe_in(editor, window, |this, editor, event, window, cx| match event {
             EditorEvent::OpenAt { path, line, column } => {
                 let (line, column) = (*line, *column);
                 this.open_path(path.clone(), window, cx);
                 let target = this.active_editor().clone();
                 target.update(cx, |editor, cx| editor.set_cursor_to_position(line, column, cx));
             }
+            EditorEvent::RequestRename { line, column } => {
+                this.rename_target = Some((editor.clone(), *line, *column));
+                this.rename_input.update(cx, |state, cx| {
+                    state.set_value("", window, cx);
+                    state.focus(window, cx);
+                });
+                cx.notify();
+            }
         });
         self._subscriptions.push(subscription);
+    }
+
+    fn render_rename_prompt(&self, view: &Entity<Self>, cx: &mut Context<Self>) -> Option<Div> {
+        self.rename_target.as_ref()?;
+
+        Some(
+            div()
+                .absolute()
+                .inset_0()
+                .flex()
+                .justify_center()
+                .pt(px(96.))
+                .bg(rgba(0x000000aa))
+                .child(
+                    v_flex()
+                        .w(px(360.))
+                        .bg(cx.theme().background)
+                        .border_1()
+                        .border_color(cx.theme().border)
+                        .rounded(cx.theme().radius)
+                        .child(
+                            div()
+                                .px_3()
+                                .py_2()
+                                .text_sm()
+                                .text_color(cx.theme().muted_foreground)
+                                .child("Rename symbol"),
+                        )
+                        .child(
+                            div()
+                                .px_3()
+                                .pb_3()
+                                .on_key_down({
+                                    let view = view.clone();
+                                    move |event, window, cx| {
+                                        let key = event.keystroke.key.as_str();
+                                        if key == "escape" {
+                                            view.update(cx, |this, cx| {
+                                                this.rename_target = None;
+                                                cx.notify();
+                                            });
+                                        } else if key == "enter" {
+                                            view.update(cx, |this, cx| this.submit_rename(window, cx));
+                                        }
+                                    }
+                                })
+                                .child(Input::new(&self.rename_input)),
+                        ),
+                ),
+        )
+    }
+
+    fn submit_rename(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        let Some((editor, line, column)) = self.rename_target.take() else {
+            return;
+        };
+        let new_name = self.rename_input.read(cx).value().to_string();
+        if !new_name.is_empty() {
+            editor.update(cx, |editor, _cx| editor.send_rename(line, column, new_name));
+        }
+        cx.notify();
     }
 
     /// Show a native folder picker and re-root the file tree and Quick
@@ -433,6 +509,7 @@ impl Render for DartIde {
             )
             .child(self.render_status_bar(cx))
             .when_some(self.render_palette(&view, cx), |el, palette| el.child(palette))
+            .when_some(self.render_rename_prompt(&view, cx), |el, prompt| el.child(prompt))
     }
 }
 

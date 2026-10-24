@@ -1,5 +1,39 @@
 # Milestone notes
 
+## M2: rename (F2 / cmd+ctrl+R)
+
+`textDocument/rename` is wired up, but it's also the first feature that
+genuinely needed user text input (a new name) — which `editor-view`
+deliberately won't build itself (a text field is exactly the kind of
+pre-built widget that crate avoids; see its module docs). So the flow
+splits across the boundary that `EditorEvent` already established for
+go-to-definition:
+
+- `EditorView::start_rename` (F2, or cmd/ctrl+R as a hedge in case this
+  GPUI version doesn't name the F2 key `"f2"` — both are wired) computes
+  the cursor's line/column and emits `EditorEvent::RequestRename`.
+- `app::DartIde` catches it and opens a small prompt — same `Input` +
+  overlay pattern as the Quick Open palette, not a new design, since the
+  user explicitly OK'd reusing established patterns rather than building
+  new UI for this.
+- Enter calls a new public `EditorView::send_rename(line, column,
+  new_name)`; Escape just clears the prompt.
+- The response (`WorkspaceEdit`) only has `changes`, not
+  `documentChanges`, for the Dart server — `apply_text_edits` (already
+  built for formatting) handles each file's edit list, but **only the
+  edits for this buffer's own URI are applied**. A rename that also
+  touches other files (very possible — rename a method and every call
+  site across the project comes back) silently leaves those other files
+  unchanged. This is a real, user-visible limitation, not a nitpick:
+  worth fixing before relying on this for anything but a local rename.
+
+**Verified against the real server**: renamed `greet` to `sayHello` in a
+sample file with both a declaration and a call site; the response
+correctly contained both edits in one same-file entry. Added a
+permanent test (same approach as formatting's) using that exact
+captured JSON to lock in that `WorkspaceEdit.changes` deserializes
+correctly — 39 tests total now.
+
 ## M2: formatting (cmd/ctrl+shift+F)
 
 `textDocument/formatting` is wired up: the shortcut sends a format

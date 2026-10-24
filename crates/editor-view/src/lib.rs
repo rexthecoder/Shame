@@ -7,6 +7,13 @@
 //! dependencies, kept behind this crate's own API so the UI layer can
 //! change without touching either of them.
 //!
+//! That boundary is also why rename has no input box *here*: a text
+//! field is exactly the kind of pre-built widget this crate avoids, and
+//! writing our own from scratch isn't worth it for one feature. Rename
+//! starts in `EditorView` (F2/cmd+ctrl+R, computing the cursor position)
+//! but the actual "type a new name" prompt is `app`'s job — see
+//! `EditorEvent::RequestRename`.
+//!
 //! Known M1 scope cuts (not yet implemented, tracked for M2+):
 //! - Only the primary selection gets a visual highlight; a second
 //!   multi-cursor selection (if one were added) wouldn't show one.
@@ -30,12 +37,15 @@ use lsp_integration::LspState;
 const GUTTER_WIDTH: f32 = 48.;
 const LINE_FONT_SIZE: f32 = 14.;
 
-/// Emitted when this editor wants something handled above it — so far,
-/// just "go to definition landed in a different file." The `app` crate
-/// subscribes to this per tab; `editor-view` has no idea tabs exist.
+/// Emitted when this editor wants something handled above it that it has
+/// no business doing itself: opening a different file (`editor-view` has
+/// no idea tabs exist) or collecting a new name for a rename (no text
+/// input here — see the crate's module docs on why). `app` subscribes to
+/// both per tab.
 #[derive(Debug, Clone)]
 pub enum EditorEvent {
     OpenAt { path: PathBuf, line: u32, column: u32 },
+    RequestRename { line: u32, column: u32 },
 }
 
 /// The exact byte column within `text` closest to `x` pixels from the
@@ -301,6 +311,7 @@ impl EditorView {
                 "f" if keystroke.modifiers.shift => {
                     self.request_format();
                 }
+                "r" => self.start_rename(cx),
                 "z" => {
                     if keystroke.modifiers.shift {
                         self.buffer.redo();
@@ -316,6 +327,7 @@ impl EditorView {
 
         let extend = keystroke.modifiers.shift;
         match keystroke.key.as_str() {
+            "f2" => self.start_rename(cx),
             "backspace" => self.backspace(cx),
             "delete" => self.delete_forward(cx),
             "enter" => self.insert_at_cursor("\n", cx),
