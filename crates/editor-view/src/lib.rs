@@ -14,13 +14,17 @@
 //! - Every line is rendered on every frame; no virtualization for huge
 //!   files.
 
+mod lsp_integration;
+
 use std::io;
 use std::ops::Range;
 use std::path::Path;
 
 use core_buffer::{Buffer, Selection};
+use core_lsp::lsp_types;
 use core_syntax::{Highlight, HighlightKind, InputEdit, SyntaxTree, point_at};
 use gpui_kit::*;
+use lsp_integration::LspState;
 
 const GUTTER_WIDTH: f32 = 48.;
 const LINE_FONT_SIZE: f32 = 14.;
@@ -53,6 +57,9 @@ pub struct EditorView {
     /// can diff against the buffer's current text to build a single
     /// [`InputEdit`] rather than reparsing from scratch every frame.
     synced_text: String,
+    /// `dart language-server` state for this buffer, if it's a `.dart`
+    /// file. See `lsp_integration.rs`.
+    lsp: Option<LspState>,
 }
 
 impl EditorView {
@@ -63,13 +70,16 @@ impl EditorView {
     pub fn from_buffer(buffer: Buffer, cx: &mut Context<Self>) -> Self {
         let text = buffer.text();
         let syntax_tree = SyntaxTree::parse(&text);
-        Self {
+        let mut this = Self {
             buffer,
             focus_handle: cx.focus_handle(),
             scroll_handle: ScrollHandle::new(),
             syntax_tree,
             synced_text: text,
-        }
+            lsp: None,
+        };
+        this.maybe_start_lsp(cx);
+        this
     }
 
     pub fn buffer(&self) -> &Buffer {
@@ -83,6 +93,8 @@ impl EditorView {
         let text = self.buffer.text();
         self.syntax_tree = SyntaxTree::parse(&text);
         self.synced_text = text;
+        self.lsp = None;
+        self.maybe_start_lsp(cx);
         cx.notify();
         Ok(())
     }
@@ -350,12 +362,18 @@ impl EditorView {
         cursor_line: Option<usize>,
         highlights: &[Highlight],
         selection: Option<Range<usize>>,
+        diagnostics_by_line: &std::collections::HashMap<u32, lsp_types::DiagnosticSeverity>,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
+        let gutter_color = match diagnostics_by_line.get(&(index as u32)) {
+            Some(&sev) if sev == lsp_types::DiagnosticSeverity::ERROR => rgb(0xf14c4c),
+            Some(&sev) if sev == lsp_types::DiagnosticSeverity::WARNING => rgb(0xcca700),
+            _ => rgb(0x6b7280),
+        };
         let gutter = div()
             .w(px(GUTTER_WIDTH))
             .flex_shrink_0()
-            .text_color(rgb(0x6b7280))
+            .text_color(gutter_color)
             .text_right()
             .pr_2()
             .child((index + 1).to_string());
@@ -598,15 +616,25 @@ impl Render for EditorView {
             } else {
                 self.syntax_tree = SyntaxTree::parse(&text);
             }
+            self.sync_lsp_text(&text);
             self.synced_text = text.clone();
         }
         let highlights = self.syntax_tree.highlights(&text);
+        let diagnostics_by_line = self.diagnostics_by_line();
 
         let rendered_lines: Vec<_> = lines
             .iter()
             .enumerate()
             .map(|(ix, line)| {
-                self.render_line(ix, line, cursor_line, &highlights, selection_range.clone(), cx)
+                self.render_line(
+                    ix,
+                    line,
+                    cursor_line,
+                    &highlights,
+                    selection_range.clone(),
+                    &diagnostics_by_line,
+                    cx,
+                )
                     .into_any_element()
             })
             .collect();

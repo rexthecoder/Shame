@@ -415,7 +415,7 @@ impl DartIde {
     fn render_status_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let editor = self.active_editor().read(cx);
         let buffer = editor.buffer();
-        let status = match buffer.path() {
+        let mut status = match buffer.path() {
             Some(path) => format!(
                 "{}{}",
                 path.display(),
@@ -423,6 +423,11 @@ impl DartIde {
             ),
             None => "untitled".to_string(),
         };
+
+        let (errors, warnings) = editor.diagnostic_summary();
+        if errors > 0 || warnings > 0 {
+            status.push_str(&format!("  \u{2022}  {errors} error(s), {warnings} warning(s)"));
+        }
 
         h_flex()
             .w_full()

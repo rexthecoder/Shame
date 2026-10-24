@@ -1410,8 +1410,10 @@ name = "editor-view"
 version = "0.1.0"
 dependencies = [
  "core-buffer",
+ "core-lsp",
  "core-syntax",
  "gpui-kit",
+ "serde_json",
 ]
 
 [[package]]

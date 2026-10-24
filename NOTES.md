@@ -1,5 +1,47 @@
 # Milestone notes
 
+## M2 first slice: live diagnostics from the real `dart language-server`
+
+Wired `core-lsp` into `editor-view` (new `lsp_integration.rs` module) and
+verified it against the real analysis server, not just by reading the
+code:
+
+- A `.dart` buffer lazily spawns `dart language-server`, does the
+  `initialize` → `initialized` → `textDocument/didOpen` handshake, then
+  sends `textDocument/didChange` (full-document sync, no incremental
+  diffing — always valid LSP, much simpler) whenever the buffer's text
+  actually changes, reusing the same "did the text change since last
+  render" check already there for syntax reparsing.
+- `textDocument/publishDiagnostics` notifications are parsed into
+  `lsp_types::Diagnostic` and used two ways: `EditorView::
+  diagnostic_summary()` (error/warning counts, shown in `app`'s status
+  bar) and a per-line "worst severity" map that colors each line's
+  gutter number red (error) or yellow (warning) — column-level
+  underlines are a later increment, not this one.
+
+**Verified for real**, not assumed: wrote `sample_error.dart` (a class
+with a missing semicolon) in the scratchpad, temporarily pointed the
+app's startup buffer at it, rebuilt, and ran it for real. Confirmed two
+things from the outside, without touching the UI:
+1. `ps` showed a real `dart language-server` process as a **child** of
+   the running `dart-ide` process — proving `maybe_start_lsp` actually
+   fires, not just compiles.
+2. A temporary `eprintln!` in the diagnostics handler, with stderr
+   captured to a log file, showed the exact diagnostics the real
+   analysis server sent back: two "Expected to find ';'." errors and one
+   "Dead code" warning — exactly what that file should produce. Removed
+   the logging and the temporary startup change afterward; this was a
+   one-off verification, not a permanent behavior change.
+
+Known gaps for the rest of M2: no completion, hover, go-to-definition,
+rename, formatting, or code actions yet — diagnostics only. One
+analysis server per open Dart *tab*, not one shared per project (simple,
+but wasteful with several Dart files open at once). No automated test
+exercises this path end-to-end inside the test suite (it needs
+`gpui-kit`'s `test-support` + a real subprocess, which is a bigger lift
+than the manual verification above) — `editor-view` still has zero
+automated tests of its own, same gap noted after M1's scroll fixes.
+
 ## M2 start: `core-lsp`
 
 `core-lsp` is a real crate now: our own JSON-RPC client for the LSP "Base
