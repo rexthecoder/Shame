@@ -651,6 +651,8 @@ impl Render for DartIde {
                         )
                         .child(
                             v_flex()
+                                .flex_1()
+                                .w_full()
                                 .h(relative(1.))
                                 .child(self.render_tab_bar(&view, cx))
                                 .child(
