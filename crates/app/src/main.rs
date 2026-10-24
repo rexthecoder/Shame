@@ -578,6 +578,7 @@ impl Render for DartIde {
                                     .child(root_name.clone()),
                             )
                             .when_some(self.git_branch.as_ref(), |el, branch| {
+                                let is_dirty = core_workspace::has_uncommitted_changes(&self.root);
                                 el.child(
                                     h_flex()
                                         .gap_1()
@@ -589,7 +590,10 @@ impl Render for DartIde {
                                                 .text_color(cx.theme().muted_foreground)
                                                 .small(),
                                         )
-                                        .child(branch.clone()),
+                                        .child(branch.clone())
+                                        .when(is_dirty, |el| {
+                                            el.child(div().text_color(cx.theme().blue).child("\u{25cf}"))
+                                        }),
                                 )
                             }),
                     ),

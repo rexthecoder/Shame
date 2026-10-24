@@ -1,5 +1,41 @@
 # Milestone notes
 
+## Dirty-tree indicator + project-wide text search backend
+
+Two more `core-workspace` pieces, continuing from the git-branch work.
+
+**`has_uncommitted_changes`**: shells out to `git status --porcelain`
+— empty output means clean, non-empty means dirty (staged, unstaged,
+*or* untracked files all show up there, confirmed by testing all
+three against the real CLI rather than assuming). Wired into the
+title bar's branch pill as the same blue dot the tab bar already uses
+for an unsaved buffer, so the two "something here needs your
+attention" indicators look like the same concept, not two unrelated
+ad-hoc dots. Computed fresh on each `DartIde` render rather than
+cached in state — cheap, and `DartIde` only re-renders on its own
+state changes (tab switches, folder open, rename), not on every
+editor keystroke (`EditorView` is a separate `Entity` with its own
+render cycle), so there's no need for a dedicated refresh/invalidation
+path here.
+
+**`search_text`**: a plain case-insensitive substring search across
+every text file under a root directory, walking the filesystem the
+same way the file tree's own `build_tree_items` does (same ignored-
+directory list, `.git`/`target`/`node_modules`, plus dotfiles) rather
+than sharing code with it — `core-workspace` has no dependency on
+`app`, by design, so duplicating a four-name ignore list is the right
+tradeoff over introducing one. A file that isn't valid UTF-8 (almost
+certainly binary) is skipped rather than failing the whole search,
+same as the tree already silently skips directories it can't read.
+Verified against real files on disk: matches inside `target`/`.git`
+are confirmed absent, not just untested; case-insensitivity and an
+empty query both checked for real too. Nothing calls this yet — a
+results panel is UI work, staying deferred — but the engine itself is
+exactly the kind of backend-only piece this project keeps building
+ahead of the UI that will eventually sit on top of it.
+
+71 tests total now.
+
 ## Drop the traffic-light inset in native fullscreen
 
 Follow-up to the git-branch title bar: the user pointed at Zed

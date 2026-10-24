@@ -16,6 +16,17 @@ pub fn current_branch(dir: &Path) -> Option<String> {
     if branch.is_empty() || branch == "HEAD" { None } else { Some(branch) }
 }
 
+/// Whether the git repo at (or containing) `dir` has any uncommitted
+/// changes — staged, unstaged, or untracked. `false` for a directory
+/// that isn't a git repo at all, same as a clean one; callers that
+/// care about the difference should check [`current_branch`] first.
+pub fn has_uncommitted_changes(dir: &Path) -> bool {
+    let Ok(output) = Command::new("git").args(["status", "--porcelain"]).current_dir(dir).output() else {
+        return false;
+    };
+    output.status.success() && !output.stdout.is_empty()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -74,6 +85,26 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
 
         assert_eq!(current_branch(&dir), None);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn detects_real_uncommitted_changes() {
+        let dir = std::env::temp_dir().join(format!("core-workspace-dirty-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        init_repo(&dir);
+
+        assert!(!has_uncommitted_changes(&dir), "a fresh commit should be clean");
+
+        std::fs::write(dir.join("a.txt"), "changed").unwrap();
+        assert!(has_uncommitted_changes(&dir), "an edited tracked file should be dirty");
+
+        git(&dir, &["checkout", "--quiet", "--", "a.txt"]);
+        assert!(!has_uncommitted_changes(&dir), "reverting the edit should be clean again");
+
+        std::fs::write(dir.join("untracked.txt"), "new").unwrap();
+        assert!(has_uncommitted_changes(&dir), "an untracked file should count as dirty too");
 
         let _ = std::fs::remove_dir_all(&dir);
     }
