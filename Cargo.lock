@@ -1074,6 +1074,12 @@ dependencies = [
 [[package]]
 name = "core-lsp"
 version = "0.1.0"
+dependencies = [
+ "async-channel",
+ "lsp-types",
+ "serde",
+ "serde_json",
+]
 
 [[package]]
 name = "core-syntax"

@@ -1,5 +1,31 @@
 # Milestone notes
 
+## M2 start: `core-lsp`
+
+`core-lsp` is a real crate now: our own JSON-RPC client for the LSP "Base
+Protocol" (per the plan — write the client ourselves, use `lsp_types` for
+the protocol's own types rather than hand-rolling those too). It's a
+plain transport + request/notification/event client, with zero Dart- or
+LSP-method-specific logic and zero UI dependency:
+
+- `transport::{read_message, write_message}` — `Content-Length`-framed
+  JSON over any `Read`/`Write`, tested against in-memory byte streams
+  (no process needed).
+- `client::LspClient` — spawns a server process, owns its stdin, and
+  runs a background thread that frames/parses stdout into
+  `ServerMessage::{Response, Notification}`, delivered over an
+  `async_channel` (not `std::sync::mpsc`) so a GPUI entity can `.recv()`
+  them with real `.await` later instead of blocking an executor thread.
+
+**Verified against the real `dart language-server`, not just mocks**:
+`dart language-server` (bundled with the Dart SDK already on this
+machine, via `fvm`) defaults to speaking LSP already — no extra flags
+needed. Confirmed by hand first (a raw `printf`-framed `initialize`
+request piped through a FIFO) before writing any Rust, then again as an
+actual `#[test]` that spawns the real process, sends `initialize`, and
+asserts the real capabilities come back — skipped, not failed, on a
+machine without `dart` on `PATH`. 10 tests total, including that one.
+
 ## M1 close-out: column-accurate click and drag-select
 
 The last open M1 item: mouse clicks and drag now hit the exact character,
