@@ -17,5 +17,7 @@
 mod git;
 mod search;
 
-pub use git::{current_branch, has_uncommitted_changes};
+pub use git::{
+    LineChange, ahead_behind, current_branch, has_uncommitted_changes, line_changes, status_map,
+};
 pub use search::{SearchMatch, search_text};

@@ -10,5 +10,6 @@ gpui-kit.workspace = true
 core-buffer = { path = "../core-buffer" }
 core-syntax = { path = "../core-syntax" }
 core-lsp = { path = "../core-lsp" }
+core-workspace = { path = "../core-workspace" }
 serde_json.workspace = true
 smol.workspace = true

@@ -1423,6 +1423,7 @@ dependencies = [
  "core-buffer",
  "core-lsp",
  "core-syntax",
+ "core-workspace",
  "gpui-kit",
  "serde_json",
  "smol",

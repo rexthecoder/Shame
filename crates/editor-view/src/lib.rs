@@ -30,13 +30,35 @@ use std::path::{Path, PathBuf};
 use core_buffer::{Buffer, Selection};
 use core_lsp::lsp_types;
 use core_syntax::{Highlight, HighlightKind, InputEdit, SyntaxTree, point_at};
+use core_workspace::LineChange;
 use gpui_kit::component::ActiveTheme as _;
 use gpui_kit::*;
 use gpui_kit::prelude::FluentBuilder as _;
 use lsp_integration::LspState;
 
+/// Second pass on this editor's look. The first pass piled on chrome —
+/// a bordered gutter column with its own background tint, a left-edge
+/// accent bar on the active line, an underline under diagnostic text —
+/// and the result fought itself instead of reading as one surface. This
+/// pass goes the other way: fewer elements, each one doing one clear job,
+/// which is the actual throughline in the `cutoff-studio` reference this
+/// crate is meant to be learning from ("a flat, quiet ... layout") rather
+/// than any specific color or border it draws.
 const GUTTER_WIDTH: f32 = 48.;
-const LINE_FONT_SIZE: f32 = 14.;
+const LINE_FONT_SIZE: f32 = 12.5;
+/// Numbers run one step smaller than the code they label, the way every
+/// reference editor's gutter does.
+const GUTTER_FONT_SIZE: f32 = 11.5;
+/// Enough breathing room to read as an editor without the file feeling
+/// sparse (the first pass tried 26px, which did).
+const LINE_HEIGHT: f32 = 22.;
+/// `tokens::LINE_ACTIVE` in the app crate — duplicated here because this
+/// crate deliberately has no dependency on `app`.
+const ACTIVE_LINE_BG: u32 = 0x15161a;
+/// SF Mono over Menlo: still the system monospace macOS ships, but with
+/// tighter, more even letterforms — the difference a long file's worth
+/// of code actually shows, where a typeface pass alone wouldn't.
+const FONT_FAMILY: &str = "SF Mono";
 
 /// Emitted when this editor wants something handled above it that it has
 /// no business doing itself: opening a different file (`editor-view` has
@@ -58,7 +80,7 @@ pub enum EditorEvent {
 fn column_for_x(window: &mut Window, text: &SharedString, x: Pixels) -> usize {
     let run = TextRun {
         len: text.len(),
-        font: font("Menlo"),
+        font: font(FONT_FAMILY),
         color: Hsla::default(),
         background_color: None,
         underline: None,
@@ -360,16 +382,17 @@ impl EditorView {
         }
     }
 
-    /// Highlight spans and the selection intersecting `line_text`'s byte
-    /// range, run-length encoded into `(byte_range_within_line, color,
-    /// is_selected)` runs. A `None` color run inherits the editor's base
-    /// text color.
+    /// Highlight spans, the selection, and any word-occurrence matches
+    /// intersecting `line_text`'s byte range, run-length encoded into
+    /// `(byte_range_within_line, color, is_selected, is_word_match)`
+    /// runs. A `None` color run inherits the editor's base text color.
     fn line_runs(
         line_start: usize,
         line_text: &str,
         highlights: &[Highlight],
         selection: Option<Range<usize>>,
-    ) -> Vec<(Range<usize>, Option<HighlightKind>, bool)> {
+        word_matches: &[Range<usize>],
+    ) -> Vec<(Range<usize>, Option<HighlightKind>, bool, bool)> {
         let line_end = line_start + line_text.len();
         let mut colors: Vec<Option<HighlightKind>> = vec![None; line_text.len()];
 
@@ -395,20 +418,89 @@ impl EditorView {
             }
         }
 
+        let mut word_hit = vec![false; line_text.len()];
+        for m in word_matches {
+            if m.end <= line_start || m.start >= line_end {
+                continue;
+            }
+            let start = m.start.max(line_start) - line_start;
+            let end = m.end.min(line_end) - line_start;
+            for slot in &mut word_hit[start..end] {
+                *slot = true;
+            }
+        }
+
         let mut runs = Vec::new();
         let mut i = 0;
         while i < colors.len() {
-            let key = (colors[i], selected[i]);
+            let key = (colors[i], selected[i], word_hit[i]);
             let start = i;
-            while i < colors.len() && (colors[i], selected[i]) == key {
+            while i < colors.len() && (colors[i], selected[i], word_hit[i]) == key {
                 i += 1;
             }
-            runs.push((start..i, key.0, key.1));
+            runs.push((start..i, key.0, key.1, key.2));
         }
         if runs.is_empty() {
-            runs.push((0..0, None, false));
+            runs.push((0..0, None, false, false));
         }
         runs
+    }
+
+    /// The word (identifier-ish run of alphanumerics/underscores)
+    /// touching byte column `col` in `text`, preferring the word to the
+    /// right of the cursor but falling back to the one just behind it —
+    /// the same convention every editor uses for "what am I pointing at"
+    /// when the cursor sits exactly between two characters.
+    fn word_at(text: &str, col: usize) -> Option<&str> {
+        let bytes = text.as_bytes();
+        if col > bytes.len() {
+            return None;
+        }
+        let is_word = |i: usize| i < bytes.len() && is_word_byte(bytes[i]);
+        let mut idx = col;
+        if !is_word(idx) {
+            if idx > 0 && is_word(idx - 1) {
+                idx -= 1;
+            } else {
+                return None;
+            }
+        }
+        let mut start = idx;
+        while start > 0 && is_word(start - 1) {
+            start -= 1;
+        }
+        let mut end = idx;
+        while is_word(end) {
+            end += 1;
+        }
+        Some(&text[start..end])
+    }
+
+    /// Every whole-word occurrence of `word` in `text`, as local byte
+    /// ranges — "whole-word" meaning neither neighbor is itself a word
+    /// character, so searching for `name` doesn't also light up the
+    /// middle of `rename` or `name2`.
+    fn word_occurrences(text: &str, word: &str) -> Vec<Range<usize>> {
+        if word.is_empty() {
+            return Vec::new();
+        }
+        let bytes = text.as_bytes();
+        let mut ranges = Vec::new();
+        let mut from = 0;
+        while let Some(pos) = text[from..].find(word) {
+            let start = from + pos;
+            let end = start + word.len();
+            let left_ok = start == 0 || !is_word_byte(bytes[start - 1]);
+            let right_ok = end == bytes.len() || !is_word_byte(bytes[end]);
+            if left_ok && right_ok {
+                ranges.push(start..end);
+            }
+            from = start + 1;
+            if from >= bytes.len() {
+                break;
+            }
+        }
+        ranges
     }
 
     fn render_line(
@@ -419,22 +511,52 @@ impl EditorView {
         highlights: &[Highlight],
         selection: Option<Range<usize>>,
         diagnostics_by_line: &std::collections::HashMap<u32, lsp_types::DiagnosticSeverity>,
+        line_changes: &std::collections::HashMap<u32, LineChange>,
+        indent_width: usize,
+        current_word: Option<&str>,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let is_active_line = cursor_line == Some(index);
-        let gutter_color = match diagnostics_by_line.get(&(index as u32)) {
-            Some(&sev) if sev == lsp_types::DiagnosticSeverity::ERROR => cx.theme().danger,
-            Some(&sev) if sev == lsp_types::DiagnosticSeverity::WARNING => cx.theme().warning,
-            _ if is_active_line => cx.theme().foreground,
-            _ => cx.theme().muted_foreground,
+        let diagnostic_severity = diagnostics_by_line.get(&(index as u32)).copied();
+        // A warm amber rather than a plain gray — line numbers get their
+        // own identity instead of borrowing the theme's generic muted
+        // color, the same way the `cutoff-studio`/reference editors both
+        // give the gutter a distinct hue instead of flattening it into
+        // "just dim text".
+        let gutter_color: Hsla = match diagnostic_severity {
+            Some(sev) if sev == lsp_types::DiagnosticSeverity::ERROR => cx.theme().danger,
+            Some(sev) if sev == lsp_types::DiagnosticSeverity::WARNING => cx.theme().warning,
+            _ if is_active_line => cx.theme().foreground.opacity(0.8),
+            _ => cx.theme().muted_foreground.opacity(0.55),
         };
+        // Numbers only — color is what marks the current line and any
+        // diagnostics, not an extra border or panel fill competing for
+        // attention next to it.
         let gutter = div()
             .w(px(GUTTER_WIDTH))
             .flex_shrink_0()
+            .text_size(px(GUTTER_FONT_SIZE))
             .text_color(gutter_color)
             .text_right()
-            .pr_2()
+            .pr_3()
             .child((index + 1).to_string());
+
+        // A thin bar flush against the window's left edge for a line
+        // that differs from `HEAD` — green for a new line, blue for an
+        // edited one, and a short amber notch at the top of the line
+        // that now sits where something was deleted. The same cue every
+        // editor with git integration gives, and the one thing in the
+        // gutter that isn't about navigation at all.
+        let change_marker = line_changes.get(&(index as u32)).map(|change| {
+            let (color, full_height) = match change {
+                LineChange::Added => (cx.theme().success, true),
+                LineChange::Modified => (cx.theme().info, true),
+                LineChange::Removed => (cx.theme().warning, false),
+            };
+            let mut marker = div().absolute().left_0().top_0().w(px(2.)).bg(color);
+            marker = if full_height { marker.bottom_0() } else { marker.h(px(5.)) };
+            marker
+        });
 
         let line_start = self.buffer.line_to_byte(index);
         let display_text = line_text.trim_end_matches(['\n', '\r']);
@@ -443,39 +565,90 @@ impl EditorView {
             (head - line_start).min(display_text.len())
         });
 
-        let selection_bg = cx.theme().selection;
-        let span = move |text: &str, kind: Option<HighlightKind>, selected: bool| {
+        // A translucent selection wash, not the theme's fully opaque
+        // selection colour — the code underneath stays readable while the
+        // selection is still unmistakable.
+        let selection_bg = cx.theme().selection.opacity(0.35);
+        // Every other occurrence of the word the cursor is sitting in,
+        // picked out with a flat tint — the "where else does this name
+        // show up" cue every mature editor gives for free, and one of
+        // the first things a code editor gets asked why it's missing.
+        let word_match_bg = cx.theme().blue.opacity(0.14);
+        let span = move |text: &str, kind: Option<HighlightKind>, selected: bool, word_match: bool| {
             let mut el = div();
             if let Some(kind) = kind {
                 el = el.text_color(highlight_color(kind));
             }
             if selected {
                 el = el.bg(selection_bg);
+            } else if word_match {
+                el = el.bg(word_match_bg);
             }
             el.child(text.to_string())
         };
 
         let caret_color = cx.theme().caret;
-        let cursor_el = move || div().w(px(2.)).h(px(16.)).bg(caret_color);
+        let cursor_el = move || {
+            div()
+                .w(px(1.5))
+                .h(px(LINE_FONT_SIZE + 2.))
+                .bg(caret_color)
+                .rounded(px(0.75))
+        };
+
+        let word_matches: Vec<Range<usize>> = current_word
+            .map(|word| {
+                Self::word_occurrences(display_text, word)
+                    .into_iter()
+                    .map(|r| (r.start + line_start)..(r.end + line_start))
+                    .collect()
+            })
+            .unwrap_or_default();
 
         let mut content = div().flex().items_center();
         let mut cursor_inserted = false;
-        for (range, kind, selected) in Self::line_runs(line_start, display_text, highlights, selection.clone()) {
+        for (range, kind, selected, word_match) in
+            Self::line_runs(line_start, display_text, highlights, selection.clone(), &word_matches)
+        {
             if let Some(col) = cursor_col {
                 if !cursor_inserted && col >= range.start && col < range.end {
                     content = content
-                        .child(span(&display_text[range.start..col], kind, selected))
+                        .child(span(&display_text[range.start..col], kind, selected, word_match))
                         .child(cursor_el())
-                        .child(span(&display_text[col..range.end], kind, selected));
+                        .child(span(&display_text[col..range.end], kind, selected, word_match));
                     cursor_inserted = true;
                     continue;
                 }
             }
-            content = content.child(span(&display_text[range], kind, selected));
+            content = content.child(span(&display_text[range], kind, selected, word_match));
         }
         if cursor_col.is_some() && !cursor_inserted {
             content = content.child(cursor_el());
         }
+
+        // Faint vertical indent guides, drawn at multiples of the file's
+        // own indent width up to this line's leading spaces — the standard
+        // editor treatment, and correct for both 2-space Dart and 4-space
+        // Rust files.
+        let leading_spaces = display_text.as_bytes().iter().take_while(|&&b| b == b' ').count();
+        let guides: Vec<_> = (indent_width..leading_spaces)
+            .step_by(indent_width)
+            .take(16)
+            .map(|column| {
+                // This font's advance width is 0.6 em, so one space column
+                // sits `0.6 * font_size` from the text area's left edge.
+                // Dimmed to a third of the border color — a guide you
+                // only notice when you look for it, not a grid line.
+                div()
+                    .absolute()
+                    .top(px(3.))
+                    .bottom(px(3.))
+                    .left(px(LINE_FONT_SIZE * 0.6 * column as f32))
+                    .w(px(1.))
+                    .bg(cx.theme().border.opacity(0.35))
+                    .into_any_element()
+            })
+            .collect();
 
         // A transparent overlay the exact size of the text area, used only
         // to turn a click's pixel x-coordinate into an exact column via
@@ -543,23 +716,27 @@ impl EditorView {
 
         div()
             .id(("editor-line", index))
+            .relative()
             .flex()
             .w_full()
-            .h(px(20.))
+            .h(px(LINE_HEIGHT))
             .flex_shrink_0()
-            .font_family("Menlo")
+            .font_family(FONT_FAMILY)
             .text_size(px(LINE_FONT_SIZE))
-            .when(is_active_line, |el| el.bg(cx.theme().muted.opacity(0.4)))
+            // The active line gets a full-width, flat wash of colour —
+            // subtle enough to read as a highlight, not a second panel.
+            // That's the whole cue; the gutter number brightening to match
+            // is enough to say "and here's where", without a second marker
+            // competing for the same job.
+            .when(is_active_line, |el| el.bg(rgb(ACTIVE_LINE_BG)))
+            .when_some(change_marker, |el, marker| el.child(marker))
             .child(gutter)
             .child(
                 div()
                     .relative()
                     .flex_1()
                     .h_full()
-                    // The thin accent mark real editors put at the gutter's
-                    // edge on the active line — a second, more precise cue
-                    // than the full-row tint above.
-                    .when(is_active_line, |el| el.border_l(px(2.)).border_color(cx.theme().blue))
+                    .children(guides)
                     .child(content)
                     .child(click_overlay)
                     .when_some(
@@ -568,7 +745,7 @@ impl EditorView {
                             el.child(
                                 div()
                                     .absolute()
-                                    .top(px(20.))
+                                    .top(px(LINE_HEIGHT))
                                     .left_0()
                                     .max_w(px(480.))
                                     .p_2()
@@ -626,20 +803,56 @@ fn diff_as_edit(old: &str, new: &str) -> Option<InputEdit> {
     })
 }
 
+/// Whether `b` can be part of an identifier — ASCII alphanumerics and
+/// underscore, plus (conservatively) every non-ASCII byte, so a run never
+/// gets split in the middle of a multi-byte UTF-8 character.
+fn is_word_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_' || b >= 0x80
+}
+
+/// The file's own indentation width — the smallest positive leading-space
+/// count, clamped to a sane range. Guides are drawn at multiples of it,
+/// which keeps a 2-space Dart file and a 4-space Rust file correct without
+/// letting an oddly aligned continuation line invent a new guide column.
+fn indent_width(lines: &[String]) -> usize {
+    lines
+        .iter()
+        .filter_map(|line| {
+            let trimmed = line.trim_start_matches(' ');
+            if trimmed.is_empty() {
+                return None;
+            }
+            let indent = line.len() - trimmed.len();
+            (indent > 0).then_some(indent)
+        })
+        .min()
+        .unwrap_or(4)
+        .clamp(2, 8)
+}
+
+/// A quiet, One Dark-derived palette: each kind gets its own hue family
+/// (purple/gold/blue/cyan/red/green/orange) so two unrelated kinds never
+/// compete for the same colour the way the previous pass's keyword and
+/// constant (both orange) or property and variable (both blue) did. This
+/// is the same family the `cutoff-studio` reference leans on for its own
+/// `--syn-*` tokens — not copied line for line, since that's CSS for a
+/// web layout and this is GPUI, but the same idea: keywords read as
+/// purple, types/classes as gold, calls as blue, namespaces/attributes
+/// as cyan, member access as a warm red, literals as green/orange, and
+/// everything structural (operators, punctuation) recedes to a dim
+/// blue-gray instead of competing with any of it.
 fn highlight_color(kind: HighlightKind) -> Rgba {
     match kind {
-        HighlightKind::Keyword => rgb(0xc586c0),
-        HighlightKind::String => rgb(0xce9178),
-        HighlightKind::Comment => rgb(0x6a9955),
-        HighlightKind::Number => rgb(0xb5cea8),
-        HighlightKind::Function => rgb(0xdcdcaa),
-        HighlightKind::Type => rgb(0x4ec9b0),
-        HighlightKind::Constant => rgb(0x569cd6),
-        HighlightKind::Property => rgb(0x9cdcfe),
-        HighlightKind::Attribute => rgb(0x4ec9b0),
-        HighlightKind::Variable | HighlightKind::Operator | HighlightKind::Punctuation | HighlightKind::Other => {
-            rgb(0xd4d4d4)
-        }
+        HighlightKind::Keyword => rgb(0xd19a66),
+        HighlightKind::Type => rgb(0xe5c07b),
+        HighlightKind::Function => rgb(0x61afef),
+        HighlightKind::Attribute => rgb(0x56b6c2),
+        HighlightKind::Property => rgb(0xe5c07b),
+        HighlightKind::String => rgb(0x98c379),
+        HighlightKind::Number | HighlightKind::Constant => rgb(0xd19a66),
+        HighlightKind::Comment => rgb(0x5c6670),
+        HighlightKind::Variable => rgb(0xc8ccd4),
+        HighlightKind::Operator | HighlightKind::Punctuation | HighlightKind::Other => rgb(0x9aa3b2),
     }
 }
 
@@ -703,6 +916,22 @@ impl Render for EditorView {
         let cursor_line = Some(self.buffer.byte_to_line(head));
         let selection_range = (!primary.is_empty()).then(|| primary.range());
 
+        // The word under a bare caret (no active selection) gets every
+        // other occurrence of itself picked out across the whole file —
+        // computed once here, up front, so every line below just asks
+        // "does this range fall inside a match" instead of each
+        // reaching back into the buffer separately.
+        let current_word = if selection_range.is_none() {
+            let line_idx = self.buffer.byte_to_line(head);
+            let line_start = self.buffer.line_to_byte(line_idx);
+            let line_text = self.buffer.line(line_idx);
+            let display = line_text.trim_end_matches(['\n', '\r']);
+            let col = (head - line_start).min(display.len());
+            Self::word_at(display, col).map(str::to_string)
+        } else {
+            None
+        };
+
         let lines: Vec<String> = if text.is_empty() {
             vec![String::new()]
         } else {
@@ -729,6 +958,8 @@ impl Render for EditorView {
         }
         let highlights = self.syntax_tree.highlights(&text);
         let diagnostics_by_line = self.diagnostics_by_line();
+        let line_changes = self.buffer.path().map(core_workspace::line_changes).unwrap_or_default();
+        let indent_width = indent_width(&lines);
 
         let rendered_lines: Vec<_> = lines
             .iter()
@@ -741,11 +972,20 @@ impl Render for EditorView {
                     &highlights,
                     selection_range.clone(),
                     &diagnostics_by_line,
+                    &line_changes,
+                    indent_width,
+                    current_word.as_deref(),
                     cx,
                 )
                     .into_any_element()
             })
             .collect();
+
+        let rows = div()
+            .relative()
+            .flex()
+            .flex_col()
+            .children(rendered_lines);
 
         div()
             .id("editor-view")
@@ -757,8 +997,11 @@ impl Render for EditorView {
             .track_scroll(&self.scroll_handle)
             .bg(cx.theme().background)
             .text_color(cx.theme().foreground)
-            .flex()
-            .flex_col()
-            .children(rendered_lines)
+            // A little breathing room above the first line and below the
+            // last, so code never sits flush against the tab bar or the
+            // status bar.
+            .pt_3()
+            .pb_8()
+            .child(rows)
     }
 }

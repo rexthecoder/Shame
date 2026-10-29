@@ -5,12 +5,22 @@
 //! See `NOTES.md` at the repo root for the measured startup time, idle RAM,
 //! and binary size from the M0 spike.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+
+mod theme;
+// Roll-out in progress (docs/design-plan.md): new components consume these
+// as they land, so some tokens are unused until their phase completes.
+#[allow(dead_code)]
+mod tokens;
 
 use core_buffer::Buffer;
 use core_lsp::lsp_types;
 use editor_view::{EditorEvent, EditorView};
-use gpui_kit::assets::Assets;
+// The full icon catalog, not the default component subset: the chrome uses
+// icons (Columns2, Bug, Wand, Zap, UserPlus, PenTool...) that only exist in
+// `AllAssets`, and the default `Assets` renders those paths blank.
+use gpui_kit::assets::AllAssets;
 use gpui_kit::component::{
     ActiveTheme as _, Icon, IconName, Sizable as _,
     button::{Button, ButtonVariants as _},
@@ -26,7 +36,7 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 /// Directory/file names we never want to show in the M0 file tree.
-const IGNORED_NAMES: &[&str] = &["target", "node_modules"];
+const IGNORED_NAMES: &[&str] = &["target", "node_modules", ".DS_Store"];
 
 fn build_tree_items(dir: &Path) -> Vec<TreeItem> {
     let mut items = Vec::new();
@@ -41,7 +51,9 @@ fn build_tree_items(dir: &Path) -> Vec<TreeItem> {
             continue;
         };
 
-        if name.starts_with('.') || IGNORED_NAMES.contains(&name) {
+        // Dotfiles are shown (the reference tree lists `.dart_tool`,
+        // `.gitignore`, `.metadata`); only `.git` itself stays hidden.
+        if name == ".git" || IGNORED_NAMES.contains(&name) {
             continue;
         }
 
@@ -78,6 +90,37 @@ fn icon_for_file(name: &str) -> Icon {
     }
 }
 
+/// Chrome icon button used by the titlebar. Several are placeholders for
+/// phases that have not landed yet; the reference bar is dense on purpose.
+fn icon_button(id: &'static str, icon: gpui_kit::assets::IconName) -> Button {
+    Button::new(id).ghost().small().icon(Icon::new(icon))
+}
+
+/// The small git-status chip on a file-tree row: a single letter on a
+/// tinted square, the same idiom the reference tree uses.
+fn status_badge(letter: char, cx: &App) -> Div {
+    let color = match letter {
+        'M' => cx.theme().warning,
+        'A' => cx.theme().success,
+        'D' => cx.theme().danger,
+        'R' => cx.theme().info,
+        'U' => cx.theme().info,
+        _ => cx.theme().muted_foreground,
+    };
+    div()
+        .flex_shrink_0()
+        .size(px(16.))
+        .flex()
+        .items_center()
+        .justify_center()
+        .rounded(px(4.))
+        .bg(color.opacity(0.16))
+        .text_size(px(9.5))
+        .font_medium()
+        .text_color(color)
+        .child(letter.to_string())
+}
+
 /// A friendly language name for the status bar — every editor shows one
 /// for the current file, not just when it happens to be the one
 /// language the project cares about most.
@@ -102,26 +145,24 @@ fn breadcrumb_path(root: &Path, path: &Path) -> String {
     let relative = path.strip_prefix(root).unwrap_or(path);
     let mut segments = vec![root_name.to_string()];
     segments.extend(relative.components().filter_map(|c| c.as_os_str().to_str().map(str::to_string)));
-    segments.join(" / ")
+    segments.join(" \u{203A} ")
 }
 
-/// A small colored tab badge (label, background color) for a file
-/// name, the way Fleet marks a tab's language at a glance instead of
-/// (or alongside) a generic file icon — `None` for `untitled`/no
-/// extension, same as Fleet shows no badge there either.
-fn file_type_badge(name: &str) -> Option<(&'static str, Rgba)> {
-    let ext = Path::new(name).extension().and_then(|e| e.to_str())?;
-    Some(match ext {
-        "rs" => ("RS", rgb(0xdea584)),
-        "dart" => ("DART", rgb(0x0175c2)),
-        "ts" | "tsx" => ("TS", rgb(0x3178c6)),
-        "js" | "jsx" => ("JS", rgb(0xf0db4f)),
-        "json" => ("{}", rgb(0xcbcb41)),
-        "toml" => ("TOML", rgb(0x9c4221)),
-        "yaml" | "yml" => ("YML", rgb(0xcb171e)),
-        "md" => ("MD", rgb(0x708090)),
-        _ => return None,
-    })
+/// A subtle per-language tint for a file's icon — the way Zed and Fleet
+/// let you recognise a file's type at a glance without a loud text badge.
+/// `untitled`/extension-less files fall back to a neutral gray.
+fn file_icon_color(name: &str) -> Rgba {
+    match Path::new(name).extension().and_then(|e| e.to_str()) {
+        Some("rs") => rgb(0xdea584),
+        Some("dart") => rgb(0x40c4ff),
+        Some("ts") | Some("tsx") => rgb(0x4f9cf9),
+        Some("js") | Some("jsx") => rgb(0xf0db4f),
+        Some("json") => rgb(0xcbcb41),
+        Some("toml") => rgb(0xe07b53),
+        Some("yaml") | Some("yml") => rgb(0xe05252),
+        Some("md") => rgb(0x8fa3b8),
+        _ => rgb(0x9aa0a6),
+    }
 }
 
 /// Every file under `dir`, for the Quick Open palette.
@@ -137,7 +178,7 @@ fn flatten_files(dir: &Path) -> Vec<PathBuf> {
         let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
             continue;
         };
-        if name.starts_with('.') || IGNORED_NAMES.contains(&name) {
+        if name == ".git" || IGNORED_NAMES.contains(&name) {
             continue;
         }
         if path.is_dir() {
@@ -173,6 +214,10 @@ impl Tab {
 pub struct DartIde {
     root: PathBuf,
     git_branch: Option<String>,
+    /// Cached `git status` for the tree's row badges. Recomputed on
+    /// refresh and folder change, never on every render — otherwise
+    /// typing in Quick Open would shell out to git on each keystroke.
+    git_status: HashMap<PathBuf, char>,
     sidebar_open: bool,
     tree_state: Entity<TreeState>,
     tabs: Vec<Tab>,
@@ -180,6 +225,7 @@ pub struct DartIde {
     all_files: Vec<PathBuf>,
     palette_open: bool,
     palette_input: Entity<InputState>,
+    palette_selected: usize,
     rename_target: Option<(Entity<EditorView>, u32, u32)>,
     rename_input: Entity<InputState>,
     code_actions: Option<(Entity<EditorView>, Vec<lsp_types::CodeActionOrCommand>)>,
@@ -210,9 +256,11 @@ impl DartIde {
         let editor = cx.new(|cx| EditorView::from_buffer(buffer, cx));
 
         let git_branch = core_workspace::current_branch(&root);
+        let git_status = core_workspace::status_map(&root);
         let mut this = Self {
             root,
             git_branch,
+            git_status,
             sidebar_open: true,
             tree_state,
             tabs: vec![Tab { path: None, editor: editor.clone() }],
@@ -220,13 +268,48 @@ impl DartIde {
             all_files,
             palette_open: false,
             palette_input,
+            palette_selected: 0,
             rename_target: None,
             rename_input,
             code_actions: None,
             _subscriptions: Vec::new(),
         };
         this.watch_editor(&editor, window, cx);
+
+        // The palette list is drawn by `DartIde` but the query lives in a
+        // child `InputState`, so `DartIde` has to be told when the text
+        // changes — otherwise results (and the highlighted row) would stay
+        // frozen at whatever was on screen when the palette opened.
+        let palette_changes = cx.subscribe(&this.palette_input, |this, _, event: &gpui_kit::component::input::InputEvent, cx| {
+            if matches!(event, gpui_kit::component::input::InputEvent::Change) {
+                this.palette_selected = 0;
+                cx.notify();
+            }
+        });
+        this._subscriptions.push(palette_changes);
         this
+    }
+
+    /// Files matching the Quick Open query, in the order they're shown.
+    fn palette_matches(&self, cx: &Context<Self>) -> Vec<PathBuf> {
+        let query = self.palette_input.read(cx).value().to_lowercase();
+        self.all_files
+            .iter()
+            .filter(|path| query.is_empty() || path.to_string_lossy().to_lowercase().contains(&query))
+            .take(20)
+            .cloned()
+            .collect()
+    }
+
+    /// Open whichever Quick Open row is currently highlighted.
+    fn open_palette_selection(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let matches = self.palette_matches(cx);
+        let Some(path) = matches.get(self.palette_selected).cloned() else {
+            return;
+        };
+        self.open_path(path, window, cx);
+        self.palette_open = false;
+        cx.notify();
     }
 
     /// Subscribe to an [`EditorEvent`] from one tab's editor: so far,
@@ -267,15 +350,15 @@ impl DartIde {
                 .inset_0()
                 .flex()
                 .justify_center()
-                .pt(px(96.))
-                .bg(rgba(0x000000aa))
+                .pt(px(84.))
+                .bg(rgba(0x00000066))
                 .child(
                     v_flex()
                         .w(px(360.))
                         .bg(cx.theme().popover)
                         .border_1()
                         .border_color(cx.theme().border)
-                        .rounded(cx.theme().radius)
+                        .rounded(px(10.))
                         .shadow_xl()
                         .child(
                             div()
@@ -323,8 +406,8 @@ impl DartIde {
                 .inset_0()
                 .flex()
                 .justify_center()
-                .pt(px(96.))
-                .bg(rgba(0x000000aa))
+                .pt(px(84.))
+                .bg(rgba(0x00000066))
                 .on_key_down({
                     let view = view.clone();
                     move |event, _window, cx| {
@@ -342,7 +425,7 @@ impl DartIde {
                         .bg(cx.theme().popover)
                         .border_1()
                         .border_color(cx.theme().border)
-                        .rounded(cx.theme().radius)
+                        .rounded(px(10.))
                         .shadow_xl()
                         .children(actions.iter().enumerate().map(|(ix, action)| {
                             let title = match action {
@@ -354,6 +437,8 @@ impl DartIde {
                                 .px_3()
                                 .py_2()
                                 .text_sm()
+                                .cursor_pointer()
+                                .hover(|s| s.bg(cx.theme().list_hover))
                                 .child(title)
                                 .on_click({
                                     let view = view.clone();
@@ -417,6 +502,7 @@ impl DartIde {
             state.set_items(items, cx);
         });
         self.git_branch = core_workspace::current_branch(&root);
+        self.git_status = core_workspace::status_map(&root);
         self.root = root;
         cx.notify();
     }
@@ -432,6 +518,7 @@ impl DartIde {
 
         if primary_mod && keystroke.key.as_str() == "p" {
             self.palette_open = true;
+            self.palette_selected = 0;
             self.palette_input
                 .update(cx, |state, cx| state.focus(window, cx));
             cx.notify();
@@ -444,9 +531,24 @@ impl DartIde {
             return;
         }
 
-        if self.palette_open && keystroke.key.as_str() == "escape" {
-            self.palette_open = false;
-            cx.notify();
+        if self.palette_open {
+            match keystroke.key.as_str() {
+                "escape" => {
+                    self.palette_open = false;
+                    cx.notify();
+                }
+                "up" => {
+                    self.palette_selected = self.palette_selected.saturating_sub(1);
+                    cx.notify();
+                }
+                "down" => {
+                    let last = self.palette_matches(cx).len().saturating_sub(1);
+                    self.palette_selected = (self.palette_selected + 1).min(last);
+                    cx.notify();
+                }
+                "enter" => self.open_palette_selection(window, cx),
+                _ => {}
+            }
         }
     }
 
@@ -455,13 +557,8 @@ impl DartIde {
             return None;
         }
 
-        let query = self.palette_input.read(cx).value().to_lowercase();
-        let matches: Vec<&PathBuf> = self
-            .all_files
-            .iter()
-            .filter(|p| query.is_empty() || p.to_string_lossy().to_lowercase().contains(&query))
-            .take(20)
-            .collect();
+        let matches = self.palette_matches(cx);
+        let selected = self.palette_selected.min(matches.len().saturating_sub(1));
 
         Some(
             div()
@@ -469,42 +566,102 @@ impl DartIde {
                 .inset_0()
                 .flex()
                 .justify_center()
-                .pt(px(96.))
-                .bg(rgba(0x000000aa))
+                .pt(px(84.))
+                .bg(rgba(0x00000066))
                 .child(
                     v_flex()
-                        .w(px(480.))
-                        .max_h(px(360.))
+                        .w(px(560.))
+                        .max_h(px(420.))
                         .bg(cx.theme().popover)
                         .border_1()
                         .border_color(cx.theme().border)
-                        .rounded(cx.theme().radius)
+                        .rounded(px(10.))
                         .shadow_xl()
-                        .child(div().p_2().child(Input::new(&self.palette_input)))
+                        .overflow_hidden()
                         .child(
-                            v_flex().id("palette-list").overflow_y_scroll().children(matches.into_iter().enumerate().map(
-                                |(ix, path)| {
-                                    let label = path.to_string_lossy().to_string();
-                                    let path = path.clone();
-                                    div()
+                            div()
+                                .p_2()
+                                .border_b_1()
+                                .border_color(cx.theme().border)
+                                .child(Input::new(&self.palette_input)),
+                        )
+                        .child(
+                            v_flex()
+                                .id("palette-list")
+                                .py_1()
+                                .overflow_y_scroll()
+                                .children(matches.into_iter().enumerate().map(|(ix, path)| {
+                                    let name = path
+                                        .file_name()
+                                        .and_then(|n| n.to_str())
+                                        .unwrap_or_default()
+                                        .to_string();
+                                    let directory = path
+                                        .parent()
+                                        .and_then(|p| p.strip_prefix(&self.root).ok())
+                                        .map(|p| p.to_string_lossy().to_string())
+                                        .filter(|p| !p.is_empty())
+                                        .unwrap_or_else(|| ".".to_string());
+                                    let row_path = path.clone();
+                                    let is_selected = ix == selected;
+
+                                    h_flex()
                                         .id(("palette-item", ix))
                                         .w_full()
+                                        .items_center()
+                                        .gap_2()
                                         .px_3()
-                                        .py_1()
-                                        .text_sm()
-                                        .child(label)
+                                        .py_2()
+                                        .cursor_pointer()
+                                        .when(is_selected, |el| el.bg(cx.theme().list_active))
+                                        .when(!is_selected, |el| {
+                                            el.hover(|s| s.bg(cx.theme().list_hover))
+                                        })
+                                        .child(
+                                            icon_for_file(&name)
+                                                .text_color(file_icon_color(&name))
+                                                .small(),
+                                        )
+                                        .child(
+                                            v_flex()
+                                                .gap_0p5()
+                                                .child(
+                                                    div()
+                                                        .text_sm()
+                                                        .text_color(cx.theme().foreground)
+                                                        .child(name),
+                                                )
+                                                .child(
+                                                    div()
+                                                        .text_xs()
+                                                        .text_color(cx.theme().muted_foreground)
+                                                        .child(directory),
+                                                ),
+                                        )
                                         .on_click({
                                             let view = view.clone();
                                             move |_event, window, cx| {
                                                 view.update(cx, |this, cx| {
-                                                    this.open_path(path.clone(), window, cx);
+                                                    this.open_path(row_path.clone(), window, cx);
                                                     this.palette_open = false;
                                                     cx.notify();
                                                 });
                                             }
                                         })
-                                },
-                            )),
+                                })),
+                        )
+                        .child(
+                            h_flex()
+                                .px_3()
+                                .py_1()
+                                .gap_3()
+                                .border_t_1()
+                                .border_color(cx.theme().border)
+                                .text_xs()
+                                .text_color(cx.theme().muted_foreground)
+                                .child("↑↓ Navigate")
+                                .child("↵ Open")
+                                .child("Esc Close"),
                         ),
                 ),
         )
@@ -534,6 +691,22 @@ impl DartIde {
             });
             self.active_tab = self.tabs.len() - 1;
         }
+
+        let focus_handle = self.active_editor().read(cx).focus_handle(cx);
+        window.focus(&focus_handle, cx);
+        cx.notify();
+    }
+
+    /// A fresh, empty "untitled" tab — the `+` next to the open tabs,
+    /// same as every other editor's new-scratch-buffer affordance.
+    /// Always adds a new one rather than reusing an existing blank tab,
+    /// matching how `close_tab` already treats "no tabs left" (it, too,
+    /// creates a fresh blank tab rather than special-casing zero).
+    fn new_scratch_tab(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let editor = cx.new(|cx| EditorView::new(cx));
+        self.watch_editor(&editor, window, cx);
+        self.tabs.push(Tab { path: None, editor });
+        self.active_tab = self.tabs.len() - 1;
 
         let focus_handle = self.active_editor().read(cx).focus_handle(cx);
         window.focus(&focus_handle, cx);
@@ -575,6 +748,15 @@ impl Render for DartIde {
             .unwrap_or("/")
             .to_string();
 
+        let active_file_name = self
+            .active_editor()
+            .read(cx)
+            .buffer()
+            .path()
+            .and_then(|path| path.file_name())
+            .and_then(|name| name.to_str())
+            .map(str::to_string);
+
         v_flex()
             .size_full()
             .relative()
@@ -583,167 +765,352 @@ impl Render for DartIde {
             .bg(cx.theme().background)
             .text_color(cx.theme().foreground)
             .child(
-                // The titlebar: icon controls on the left, the
-                // project/branch pill and actions on the right — real
-                // Fleet's own layout (confirmed from the reference
-                // screenshots, not the merged-with-tabs guess the
-                // previous pass made: tabs sit in their own row, scoped
-                // to the editor column, not spanning the sidebar — see
-                // `render_tabs` below). Draws over the traffic-light
-                // inset reserved above (`pl` clears it), and its native
-                // AppKit drag behavior carries over from the system
-                // titlebar strip it replaces (`appears_transparent`
-                // alone, with `app_owns_titlebar_drag` left at its
-                // default `false`, keeps the window draggable from here
-                // without any extra mouse handling on our side).
                 h_flex()
                     .w_full()
-                    .h(px(38.))
+                    .h(px(tokens::TITLEBAR_H))
                     .flex_shrink_0()
                     .pl(traffic_light_inset)
-                    .pr_3()
+                    .pr_2()
                     .items_center()
-                    .gap_2()
-                    // Fleet's whole chrome shares one flat background —
-                    // sidebar, tabs, status bar, and the editor itself
-                    // all read as the same surface, separated only by
-                    // hairline borders, not by shaded panels the way
-                    // VS Code/the first pass here did. Matched here and
-                    // at every other chrome surface below.
-                    .bg(cx.theme().background)
+                    .bg(cx.theme().title_bar)
                     .border_b_1()
-                    .border_color(cx.theme().border)
+                    .border_color(cx.theme().title_bar_border)
                     .child(
-                        div()
-                            .id("toggle-sidebar")
-                            .cursor_pointer()
+                        h_flex()
+                            .flex_1()
+                            .items_center()
+                            .gap_1()
+                            .child(icon_button("menu", gpui_kit::assets::IconName::Menu))
                             .child(
-                                Icon::new(if self.sidebar_open {
-                                    IconName::PanelLeftClose
-                                } else {
-                                    IconName::PanelLeft
-                                })
-                                .text_color(cx.theme().muted_foreground)
-                                .small(),
+                                Button::new("layout-sidebar")
+                                    .ghost()
+                                    .small()
+                                    .icon(Icon::new(if self.sidebar_open {
+                                        gpui_kit::assets::IconName::PanelLeftClose
+                                    } else {
+                                        gpui_kit::assets::IconName::PanelLeftOpen
+                                    }))
+                                    .tooltip("Toggle sidebar (cmd/ctrl+B)")
+                                    .on_click(cx.listener(|this, _event, _window, cx| {
+                                        this.sidebar_open = !this.sidebar_open;
+                                        cx.notify();
+                                    })),
                             )
-                            .on_click(cx.listener(|this, _event, _window, cx| {
-                                this.sidebar_open = !this.sidebar_open;
-                                cx.notify();
-                            })),
+                            .child(icon_button("layout-panel", gpui_kit::assets::IconName::PanelTop))
+                            .child(icon_button("layout-columns", gpui_kit::assets::IconName::Columns2))
+                            .child(icon_button("add-person", gpui_kit::assets::IconName::UserPlus)),
                     )
-                    .child(div().flex_1())
                     .child(
                         h_flex()
                             .flex_shrink_0()
-                            .gap_2()
                             .items_center()
-                            .px_2()
-                            .py_0p5()
-                            .rounded(cx.theme().radius)
-                            .bg(cx.theme().muted)
+                            .gap_2()
                             .child(
                                 div()
-                                    .text_sm()
-                                    .font_bold()
+                                    .text_size(px(tokens::UI))
+                                    .font_medium()
                                     .text_color(cx.theme().foreground)
                                     .child(root_name.clone()),
                             )
-                            .when_some(self.git_branch.as_ref(), |el, branch| {
-                                let is_dirty = core_workspace::has_uncommitted_changes(&self.root);
+                            .when_some(self.git_branch.clone(), |el, branch| {
+                                let ahead = core_workspace::ahead_behind(&self.root)
+                                    .map(|(ahead, _)| ahead)
+                                    .unwrap_or(0);
                                 el.child(
                                     h_flex()
-                                        .gap_1()
                                         .items_center()
-                                        .text_sm()
-                                        .text_color(cx.theme().muted_foreground)
-                                        .child(
-                                            Icon::new(gpui_kit::assets::IconName::GitBranch)
-                                                .text_color(cx.theme().muted_foreground)
-                                                .small(),
-                                        )
-                                        .child(branch.clone())
-                                        .when(is_dirty, |el| {
-                                            el.child(div().text_color(cx.theme().blue).child("\u{25cf}"))
+                                        .gap_1()
+                                        .text_size(px(tokens::UI_SM))
+                                        .text_color(cx.theme().green)
+                                        .child(Icon::new(gpui_kit::assets::IconName::GitBranch).small())
+                                        .child(branch)
+                                        .when(ahead > 0, |el| {
+                                            el.child(format!("\u{2191}{ahead}"))
                                         }),
                                 )
                             }),
                     )
                     .child(
-                        div()
-                            .id("quick-open")
-                            .cursor_pointer()
-                            .child(Icon::new(IconName::Search).text_color(cx.theme().muted_foreground).small())
-                            .on_click(cx.listener(|this, _event, window, cx| {
-                                this.palette_open = true;
-                                this.palette_input.update(cx, |state, cx| state.focus(window, cx));
-                                cx.notify();
-                            })),
+                        h_flex()
+                            .flex_1()
+                            .justify_end()
+                            .items_center()
+                            .gap_1()
+                            .child(
+                                h_flex()
+                                    .items_center()
+                                    .gap(px(tokens::SPACE_1))
+                                    .text_size(px(tokens::UI_SM))
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child(Icon::new(gpui_kit::assets::IconName::Monitor).small())
+                                    .child("macOS"),
+                            )
+                            .when_some(active_file_name, |el, file| {
+                                el.child(
+                                    div()
+                                        .h(px(22.))
+                                        .px(px(tokens::SPACE_3))
+                                        .flex()
+                                        .items_center()
+                                        .gap(px(tokens::SPACE_1))
+                                        .rounded(px(tokens::RADIUS_PILL))
+                                        .bg(cx.theme().secondary)
+                                        .text_size(px(tokens::UI_SM))
+                                        .text_color(cx.theme().foreground)
+                                        .child(
+                                            Icon::new(gpui_kit::assets::IconName::PenTool)
+                                                .small()
+                                                .text_color(cx.theme().info),
+                                        )
+                                        .child(file),
+                                )
+                            })
+                            .child(icon_button("run", gpui_kit::assets::IconName::Play))
+                            .child(icon_button("debug", gpui_kit::assets::IconName::Bug))
+                            .child(icon_button("agent-wand", gpui_kit::assets::IconName::Wand))
+                            .child(
+                                Button::new("quick-open")
+                                    .ghost()
+                                    .small()
+                                    .icon(Icon::new(gpui_kit::assets::IconName::Search))
+                                    .tooltip("Go to file (cmd/ctrl+P)")
+                                    .on_click(cx.listener(|this, _event, window, cx| {
+                                        this.palette_open = true;
+                                        this.palette_selected = 0;
+                                        this.palette_input
+                                            .update(cx, |state, cx| state.focus(window, cx));
+                                        cx.notify();
+                                    })),
+                            )
+                            .child(icon_button("fast", gpui_kit::assets::IconName::Zap))
+                            .child(icon_button("settings", gpui_kit::assets::IconName::Settings))
+                            // Menu / layout / run / debug / wand / bolt /
+                            // settings are layout placeholders until the
+                            // phase that gives each one a handler; only the
+                            // sidebar toggle and search are wired today.
                     ),
             )
             .child(
-                div().flex_1().w_full().min_h(px(0.)).child({
+                div()
+                    .flex_1()
+                    .w_full()
+                    .min_h(px(0.))
+                    .p(px(tokens::GUTTER))
+                    .child({
+                    let editor_card = v_flex()
+                                .flex_1()
+                                .h_full()
+                                .min_h(px(0.))
+                                .bg(cx.theme().background)
+                                .border_1()
+                                .border_color(cx.theme().border)
+                                .rounded(px(tokens::RADIUS_CARD))
+                                .overflow_hidden()
+                                .child(self.render_tabs(&view, cx))
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .w_full()
+                                        .min_h(px(0.))
+                                        .child(self.active_editor().clone()),
+                                )
+                        .into_any_element();
+
                     let editor_column = v_flex()
                         .flex_1()
                         .w_full()
                         .h(relative(1.))
                         .min_h(px(0.))
-                        .child(self.render_tabs(&view, cx))
-                        .child(
-                            div()
-                                .flex_1()
-                                .w_full()
-                                .min_h(px(0.))
-                                .child(self.active_editor().clone()),
-                        )
+                        .px(px(tokens::GUTTER / 2.))
+                        .gap(px(tokens::GUTTER))
+                        .child(editor_card)
+                        .child(self.render_terminal(cx))
                         .into_any_element();
 
                     if !self.sidebar_open {
-                        editor_column
+                        h_flex()
+                            .h_full()
+                            .w_full()
+                            .min_h(px(0.))
+                            .child(editor_column)
+                            .child(
+                                div()
+                                    .h_full()
+                                    .w(px(tokens::RAIL_RIGHT))
+                                    .pl(px(tokens::GUTTER / 2.))
+                                    .child(self.render_agent_rail(cx)),
+                            )
+                            .into_any_element()
                     } else {
-                        h_resizable("main-split")
+                        let right_rail = resizable_panel()
+                            .size(px(tokens::RAIL_RIGHT))
+                            .size_range(px(tokens::RAIL_RIGHT_MIN)..px(tokens::RAIL_RIGHT_MAX))
+                            .pl(px(tokens::GUTTER / 2.))
+                            .child(self.render_agent_rail(cx));
+
+                        h_resizable("shell-split")
                             .child(
                                 resizable_panel()
-                                    .size(px(240.))
-                                    .size_range(px(180.)..px(480.))
+                                    .size(px(tokens::RAIL_LEFT))
+                                    .size_range(
+                                        px(tokens::RAIL_LEFT_MIN)..px(tokens::RAIL_LEFT_MAX),
+                                    )
+                                    .pr(px(tokens::GUTTER / 2.))
                                     .child(
                                         v_flex()
                                             .size_full()
-                                            .bg(cx.theme().background)
-                                            .border_r_1()
+                                            .bg(cx.theme().sidebar)
+                                            .border_1()
                                             .border_color(cx.theme().border)
+                                            .rounded(px(tokens::RADIUS_CARD))
+                                            .overflow_hidden()
                                             .child(
                                                 h_flex()
+                                                    .w_full()
+                                                    .h(px(34.))
+                                                    .flex_shrink_0()
                                                     .items_center()
                                                     .justify_between()
-                                                    .pl_3()
-                                                    .pr_1()
-                                                    .py_2()
+                                                    .px(px(tokens::SPACE_4))
                                                     .child(
-                                                        // Plain sentence-case, not the bold
-                                                        // uppercase VS Code/Zed convention —
-                                                        // Fleet's own sidebar header (when it
-                                                        // has one at all) is this understated.
-                                                        div()
-                                                            .text_sm()
-                                                            .text_color(cx.theme().muted_foreground)
-                                                            .child(root_name.clone()),
+                                                        h_flex()
+                                                            .items_center()
+                                                            .gap(px(tokens::SPACE_2))
+                                                            .h(px(26.))
+                                                            .px(px(tokens::SPACE_3))
+                                                            .rounded(px(tokens::RADIUS_PANEL))
+                                                            .bg(cx.theme().secondary)
+                                                            .border_1()
+                                                            .border_color(tokens::accent_dim())
+                                                            .child(
+                                                                Icon::new(IconName::Folder)
+                                                                    .small()
+                                                                    .text_color(cx.theme().primary),
+                                                            )
+                                                            .child(
+                                                                div()
+                                                                    .text_size(px(tokens::UI))
+                                                                    .text_color(cx.theme().foreground)
+                                                                    .child("Files"),
+                                                            )
+                                                            .child(
+                                                                Button::new("close-rail")
+                                                                    .ghost()
+                                                                    .small()
+                                                                    .icon(Icon::new(gpui_kit::assets::IconName::X))
+                                                                    .tooltip("Hide the file tree")
+                                                                    .on_click(cx.listener(
+                                                                        |this, _event, _window, cx| {
+                                                                            this.sidebar_open = false;
+                                                                            cx.notify();
+                                                                        },
+                                                                    )),
+                                                            ),
                                                     )
                                                     .child(
-                                                        Button::new("open-folder")
+                                                        Button::new("rail-new")
                                                             .ghost()
                                                             .small()
-                                                            .icon(IconName::FolderOpen)
-                                                            .tooltip("Open Folder\u{2026} (cmd/ctrl+O)")
-                                                            .on_click(cx.listener(|this, _event, window, cx| {
-                                                                this.open_folder(window, cx);
-                                                            })),
+                                                            .icon(Icon::new(IconName::Plus))
+                                                            .tooltip("New scratch tab")
+                                                            .on_click(cx.listener(
+                                                                |this, _event, window, cx| {
+                                                                    this.new_scratch_tab(window, cx);
+                                                                },
+                                                            )),
+                                                    ),
+                                            )
+                                            .child(
+                                                h_flex()
+                                                    .w_full()
+                                                    .h(px(28.))
+                                                    .flex_shrink_0()
+                                                    .items_center()
+                                                    .justify_between()
+                                                    .px(px(tokens::SPACE_4))
+                                                    .child(
+                                                        h_flex()
+                                                            .items_center()
+                                                            .gap(px(tokens::SPACE_2))
+                                                            .child(
+                                                                div()
+                                                                    .text_size(px(tokens::UI_SM))
+                                                                    .text_color(cx.theme().muted_foreground)
+                                                                    .child(root_name.clone()),
+                                                            )
+                                                            .child(
+                                                                Button::new("rail-filter")
+                                                                    .ghost()
+                                                                    .small()
+                                                                    .icon(Icon::new(gpui_kit::assets::IconName::Search))
+                                                                    .tooltip("Go to file (cmd/ctrl+P)")
+                                                                    .on_click(cx.listener(
+                                                                        |this, _event, window, cx| {
+                                                                            this.palette_open = true;
+                                                                            this.palette_selected = 0;
+                                                                            this.palette_input.update(cx, |state, cx| {
+                                                                                state.focus(window, cx);
+                                                                            });
+                                                                            cx.notify();
+                                                                        },
+                                                                    )),
+                                                            ),
+                                                    )
+                                                    .child(
+                                                        h_flex()
+                                                            .items_center()
+                                                            .gap(px(tokens::SPACE_1))
+                                                            .child(
+                                                                Button::new("open-folder")
+                                                                    .ghost()
+                                                                    .small()
+                                                                    .icon(Icon::new(IconName::FolderOpen))
+                                                                    .tooltip("Open Folder\u{2026} (cmd/ctrl+O)")
+                                                                    .on_click(cx.listener(
+                                                                        |this, _event, window, cx| {
+                                                                            this.open_folder(window, cx);
+                                                                        },
+                                                                    )),
+                                                            )
+                                                            .child(
+                                                                Button::new("rail-refresh")
+                                                                    .ghost()
+                                                                    .small()
+                                                                    .icon(Icon::new(gpui_kit::assets::IconName::RefreshCw))
+                                                                    .tooltip("Refresh file tree")
+                                                                    .on_click(cx.listener(
+                                                                        |this, _event, _window, cx| {
+                                                                            let items = build_tree_items(&this.root);
+                                                                            this.git_status = core_workspace::status_map(&this.root);
+                                                                            this.tree_state.update(cx, |state, cx| {
+                                                                                state.set_items(items, cx);
+                                                                            });
+                                                                            cx.notify();
+                                                                        },
+                                                                    )),
+                                                            ),
                                                     ),
                                             )
                                             .child(
                                                 tree(&self.tree_state, {
                                                     let view = view.clone();
+                                                    // The file open in the
+                                                    // editor is marked in the
+                                                    // tree, so the sidebar and
+                                                    // the editor always agree
+                                                    // about where you are.
+                                                    let active_path = self
+                                                        .active_editor()
+                                                        .read(cx)
+                                                        .buffer()
+                                                        .path()
+                                                        .map(|path| {
+                                                            path.to_string_lossy().to_string()
+                                                        });
+                                                    let git_status = self.git_status.clone();
                                                     move |ix, entry, _selected, _window, cx| {
                                                         let item = entry.item();
+                                                        let item_path = PathBuf::from(item.id.as_str());
                                                         let icon = if !entry.is_folder() {
                                                             icon_for_file(&item.label)
                                                         } else if entry.is_expanded() {
@@ -751,20 +1118,64 @@ impl Render for DartIde {
                                                         } else {
                                                             Icon::new(IconName::Folder)
                                                         };
+                                                        let icon_color = if entry.is_folder() {
+                                                            cx.theme().muted_foreground
+                                                        } else {
+                                                            file_icon_color(&item.label).into()
+                                                        };
+                                                        let is_active_file =
+                                                            active_path.as_deref()
+                                                                == Some(item.id.as_str());
+
+                                                        // A file shows its own
+                                                        // git letter; a folder
+                                                        // reads as modified
+                                                        // when anything under
+                                                        // it changed.
+                                                        let badge = if entry.is_folder() {
+                                                            git_status
+                                                                .keys()
+                                                                .any(|changed| {
+                                                                    changed.starts_with(&item_path)
+                                                                })
+                                                                .then_some('M')
+                                                        } else {
+                                                            git_status.get(&item_path).copied()
+                                                        };
 
                                                         ListItem::new(ix)
                                                             .w_full()
-                                                            .rounded(cx.theme().radius)
+                                                            .h(px(tokens::TREE_ROW_H))
+                                                            .rounded(px(tokens::RADIUS_SM))
                                                             .text_color(cx.theme().sidebar_foreground)
-                                                            .px_3()
-                                                            .py_0p5()
-                                                            .pl(px(16.) * entry.depth() + px(12.))
+                                                            .px(px(tokens::SPACE_2))
+                                                            .py_0()
+                                                            .pl(px(16.) * entry.depth()
+                                                                + px(tokens::SPACE_4))
+                                                            .selected(is_active_file)
+                                                            .when(is_active_file, |el| {
+                                                                el.font_medium()
+                                                                    .bg(tokens::accent_dim())
+                                                            })
                                                             .child(
                                                                 h_flex()
-                                                                    .gap_2()
-                                                                    .text_sm()
-                                                                    .child(icon.text_color(cx.theme().muted_foreground).small())
-                                                                    .child(item.label.clone()),
+                                                                    .w_full()
+                                                                    .items_center()
+                                                                    .gap(px(tokens::SPACE_2))
+                                                                    .child(
+                                                                        icon.text_color(icon_color).small(),
+                                                                    )
+                                                                    .child(
+                                                                        div()
+                                                                            .flex_1()
+                                                                            .min_w(px(0.))
+                                                                            .truncate()
+                                                                            .text_size(px(tokens::UI))
+                                                                            .child(item.label.clone()),
+                                                                    )
+                                                                    .when_some(badge, |el, letter| {
+                                                                        el.child(status_badge(letter, &*cx))
+                                                                    }),
                                                             )
                                                             .on_click({
                                                                 let view = view.clone();
@@ -791,6 +1202,7 @@ impl Render for DartIde {
                                     ),
                             )
                             .child(editor_column)
+                            .child(right_rail)
                             .into_any_element()
                     }
                 }),
@@ -805,24 +1217,23 @@ impl Render for DartIde {
 impl DartIde {
     /// The open-file tabs, in their own row above the editor — scoped
     /// to the editor column, not spanning the sidebar, and not merged
-    /// into the titlebar either. Both of those were guesses from a
-    /// too-quick look at the Fleet reference screenshots; a closer
-    /// look showed tabs sitting in a row of their own, directly above
-    /// the editor, with the active tab marked by a full rounded
-    /// border box — not a top accent border.
+    /// into the titlebar either. The active tab is a filled chip on the
+    /// tab-bar surface (the standard Zed/Fleet treatment), not a bright
+    /// outline; inactive tabs stay transparent until hovered.
     fn render_tabs(&self, view: &Entity<Self>, cx: &mut Context<Self>) -> impl IntoElement {
-        let accent = cx.theme().blue;
+        let accent = cx.theme().primary;
         let muted = cx.theme().muted_foreground;
-        let foreground = cx.theme().foreground;
+        let active_fg = cx.theme().tab_active_foreground;
+        let inactive_fg = cx.theme().tab_foreground;
 
         h_flex()
             .w_full()
-            .h(px(36.))
+            .h(px(tokens::TABSTRIP_H))
             .flex_shrink_0()
             .items_center()
-            .gap_1()
-            .px_2()
-            .bg(cx.theme().background)
+            .gap(px(tokens::SPACE_2))
+            .px(px(tokens::SPACE_4))
+            .bg(cx.theme().tab_bar)
             .border_b_1()
             .border_color(cx.theme().border)
             .overflow_hidden()
@@ -831,39 +1242,33 @@ impl DartIde {
                 let is_dirty = tab.editor.read(cx).buffer().is_dirty();
                 let title = tab.title();
 
-                // A full rounded border box on the active tab (matching
-                // the reference screenshots exactly), flat/borderless
-                // for every inactive tab — no background fill either
-                // way, keeping this a flat surface like the rest of
-                // the chrome.
                 h_flex()
                     .id(("tab", ix))
+                    .h(px(30.))
                     .flex_shrink_0()
                     .items_center()
-                    .gap_2()
-                    .px_2()
-                    .py_1()
+                    .gap(px(tokens::SPACE_2))
+                    .px(px(tokens::SPACE_4))
                     .cursor_pointer()
-                    .rounded(cx.theme().radius)
-                    .border_1()
-                    .border_color(if is_active { accent } else { gpui_kit::transparent_black() })
-                    .text_color(if is_active { foreground } else { muted })
-                    .when_some(file_type_badge(&title), |el, (label, color)| {
-                        el.child(
-                            div()
-                                .px_1()
-                                .rounded(px(3.))
-                                .bg(color)
-                                .text_size(px(9.))
-                                .font_bold()
-                                .text_color(rgb(0xffffff))
-                                .child(label),
-                        )
+                    .rounded(px(tokens::RADIUS_PANEL))
+                    .when(is_active, |el| {
+                        el.bg(cx.theme().tab_active)
+                            .border_1()
+                            .border_color(cx.theme().border)
                     })
+                    .when(!is_active, |el| {
+                        el.hover(|s| s.bg(cx.theme().list_hover))
+                    })
+                    .text_color(if is_active { active_fg } else { inactive_fg })
+                    .child(
+                        icon_for_file(&title)
+                            .text_color(file_icon_color(&title))
+                            .small(),
+                    )
                     .child(
                         div()
                             .id(("tab-label", ix))
-                            .text_sm()
+                            .text_size(px(tokens::UI))
                             .child(title)
                             .on_click({
                                 let view = view.clone();
@@ -875,24 +1280,149 @@ impl DartIde {
                                 }
                             }),
                     )
-                    .child(
-                        div()
-                            .id(("tab-close", ix))
-                            .w(px(14.))
-                            .text_center()
-                            .text_color(if is_dirty { accent } else { muted })
-                            .hover(move |s| s.text_color(foreground))
-                            .child(if is_dirty { "\u{25cf}" } else { "\u{00d7}" })
-                            .on_click({
-                                let view = view.clone();
-                                move |_event, _window, cx| {
-                                    view.update(cx, |this, cx| {
-                                        this.close_tab(ix, cx);
-                                    });
-                                }
-                            }),
-                    )
+                    // Only the tab you can actually act on shows its
+                    // affordance: a dirty tab keeps its dot, the active
+                    // tab gets the close cross, and every other tab is
+                    // left clean until you reach for it.
+                    .when(is_dirty || is_active, |el| {
+                        el.child(
+                            div()
+                                .id(("tab-close", ix))
+                                .w(px(14.))
+                                .text_center()
+                                .text_color(if is_dirty { accent } else { muted })
+                                .hover(move |s| s.text_color(active_fg))
+                                .child(if is_dirty { "\u{25cf}" } else { "\u{00d7}" })
+                                .on_click({
+                                    let view = view.clone();
+                                    move |_event, _window, cx| {
+                                        view.update(cx, |this, cx| {
+                                            this.close_tab(ix, cx);
+                                        });
+                                    }
+                                }),
+                        )
+                    })
             }))
+            .child(
+                div()
+                    .id("new-tab")
+                    .flex_shrink_0()
+                    .cursor_pointer()
+                    .p_1()
+                    .rounded(px(tokens::RADIUS_SM))
+                    .hover(|s| s.bg(cx.theme().list_hover))
+                    .child(
+                        Icon::new(gpui_kit::assets::IconName::Plus)
+                            .text_color(cx.theme().muted_foreground)
+                            .small(),
+                    )
+                    .on_click(cx.listener(|this, _event, window, cx| {
+                        this.new_scratch_tab(window, cx);
+                    })),
+            )
+    }
+
+    /// Bottom dock of the center column. Phase 1 draws the card and its
+    /// header only; the shell (Phase 5) supplies real scrollback.
+    fn render_terminal(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        v_flex()
+            .w_full()
+            .h(px(tokens::TERMINAL_H))
+            .flex_shrink_0()
+            .bg(cx.theme().secondary)
+            .border_1()
+            .border_color(cx.theme().border)
+            .rounded(px(tokens::RADIUS_CARD))
+            .overflow_hidden()
+            .child(
+                h_flex()
+                    .w_full()
+                    .h(px(32.))
+                    .flex_shrink_0()
+                    .items_center()
+                    .justify_between()
+                    .px_2()
+                    .border_b_1()
+                    .border_color(cx.theme().border)
+                    .child(
+                        h_flex()
+                            .items_center()
+                            .gap_1()
+                            .px_2()
+                            .h(px(22.))
+                            .rounded(px(tokens::RADIUS_SM))
+                            .bg(cx.theme().background)
+                            .text_size(px(tokens::UI_SM))
+                            .text_color(cx.theme().foreground)
+                            .child(div().text_color(cx.theme().primary).child(">_"))
+                            .child("panes \u{2014} bash"),
+                    ),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .w_full()
+                    .min_h(px(0.))
+                    .p(px(tokens::SPACE_5))
+                    .text_size(px(tokens::MONO))
+                    .text_color(cx.theme().muted_foreground)
+                    .child("Terminal dock \u{2014} Phase 5"),
+            )
+    }
+
+    /// Right rail. Phase 1 draws the card and its tab header only; the agent
+    /// conversation (Phase 6) fills the body.
+    fn render_agent_rail(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        v_flex()
+            .size_full()
+            .bg(cx.theme().sidebar)
+            .border_1()
+            .border_color(cx.theme().border)
+            .rounded(px(tokens::RADIUS_CARD))
+            .overflow_hidden()
+            .child(
+                h_flex()
+                    .w_full()
+                    .h(px(tokens::TABSTRIP_H))
+                    .flex_shrink_0()
+                    .items_center()
+                    .justify_between()
+                    .px_2()
+                    .border_b_1()
+                    .border_color(cx.theme().border)
+                    .child(
+                        h_flex()
+                            .items_center()
+                            .gap_1()
+                            .h(px(30.))
+                            .px(px(tokens::SPACE_4))
+                            .rounded(px(tokens::RADIUS_PANEL))
+                            .bg(cx.theme().tab_active)
+                            .border_1()
+                            .border_color(tokens::accent_dim())
+                            .text_size(px(tokens::UI))
+                            .text_color(cx.theme().foreground)
+                            .child(
+                                Icon::new(gpui_kit::assets::IconName::Bot)
+                                    .small()
+                                    .text_color(cx.theme().primary),
+                            )
+                            .child("Demo Agent"),
+                    ),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .w_full()
+                    .min_h(px(0.))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .text_size(px(tokens::UI_SM))
+                    .text_color(cx.theme().muted_foreground)
+                    .child("Agent panel \u{2014} Phase 6"),
+            )
     }
 
     fn render_status_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -909,22 +1439,46 @@ impl DartIde {
 
         h_flex()
             .w_full()
-            .h(px(24.))
+            .h(px(26.))
             .flex_shrink_0()
             .px_3()
             .items_center()
             .justify_between()
-            .bg(cx.theme().background)
+            .bg(cx.theme().status_bar)
             .border_t_1()
-            .border_color(cx.theme().border)
-            .text_xs()
+            .border_color(cx.theme().status_bar_border)
+            .text_size(px(tokens::UI_SM))
             .text_color(cx.theme().muted_foreground)
             .child(
                 h_flex()
-                    .gap_3()
+                    .gap_2()
                     .items_center()
+                    .when_some(self.git_branch.as_ref(), |el, branch| {
+                        let repo_dirty = core_workspace::has_uncommitted_changes(&self.root);
+                        let ahead_behind = core_workspace::ahead_behind(&self.root);
+                        el.child(
+                            h_flex()
+                                .gap_1()
+                                .items_center()
+                                .text_color(cx.theme().green)
+                                .child(Icon::new(gpui_kit::assets::IconName::GitBranch).small())
+                                .child(branch.clone())
+                                .when(repo_dirty, |el| {
+                                    el.child(div().text_color(cx.theme().primary).child("\u{25cf}"))
+                                })
+                                .when_some(ahead_behind, |el, (ahead, behind)| {
+                                    el.when(ahead > 0, |el| {
+                                        el.child(format!("\u{2191}{ahead}"))
+                                    })
+                                    .when(behind > 0, |el| {
+                                        el.child(format!("\u{2193}{behind}"))
+                                    })
+                                }),
+                        )
+                        .child(div().w(px(1.)).h(px(11.)).bg(cx.theme().border))
+                    })
                     .when(is_dirty, |el| {
-                        el.child(div().text_color(cx.theme().blue).child("\u{25cf}"))
+                        el.child(div().text_color(cx.theme().primary).child("\u{25cf}"))
                     })
                     .child(path),
             )
@@ -952,14 +1506,19 @@ impl DartIde {
                                 .child(warnings.to_string()),
                         )
                     })
-                    .child(format!("Ln {line}, Col {column}"))
-                    .when_some(language, |el, language| el.child(language)),
+                    .child(format!("{line}:{column}"))
+                    .child("LF")
+                    .when_some(language, |el, language| {
+                        el.child(div().w(px(1.)).h(px(11.)).bg(cx.theme().border))
+                            .child(language)
+                    })
+                    .child("UTF-8"),
             )
     }
 }
 
 fn main() {
-    let app = gpui_kit::application().with_assets(Assets);
+    let app = gpui_kit::application().with_assets(AllAssets);
 
     app.run(move |cx| {
         // This must be called before using any GPUI Component features.
@@ -969,6 +1528,7 @@ fn main() {
         // dark), and `gpui-component`'s own default dark theme already sits
         // close to it (near-black backgrounds, a blue selection/accent).
         gpui_kit::component::Theme::change(gpui_kit::component::ThemeMode::Dark, None, cx);
+        theme::apply(cx);
 
         // A large centered window, not a `WindowBounds::Maximized` or a
         // window sized to `display.bounds()` directly — both of those
