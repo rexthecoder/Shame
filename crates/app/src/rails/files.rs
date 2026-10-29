@@ -375,7 +375,6 @@ impl DartIde {
                                     };
 
                                     div()
-                                        .id(("tree-row", ix))
                                         .w_full()
                                         .h(px(tokens::TREE_ROW_H))
                                         .px(px(tokens::SPACE_3))
@@ -383,6 +382,7 @@ impl DartIde {
                                         .items_center()
                                         .child(
                                             h_flex()
+                                                .id(("tree-row", ix))
                                                 .relative()
                                                 .w_full()
                                                 .h(px(26.))
@@ -412,7 +412,7 @@ impl DartIde {
                                                 })
                                                 .when(!is_active_file, |el| {
                                                     el.hover(move |s| {
-                                                        s.bg(rgba(0xffffff08)).text_color(fg)
+                                                        s.bg(rgba(0xffffff0c)).text_color(fg)
                                                     })
                                                 })
                                                 .child(
@@ -445,20 +445,23 @@ impl DartIde {
                                                 )
                                                 .when_some(badge, |el, letter| {
                                                     el.child(status_badge(letter, cx))
+                                                })
+                                                .when(!is_folder, |el| {
+                                                    let view = view.clone();
+                                                    let path = PathBuf::from(item.id.as_str());
+                                                    el.on_click(move |event, window, cx| {
+                                                        let as_preview = event.click_count() < 2;
+                                                        view.update(cx, |this, cx| {
+                                                            this.open_path_with_mode(
+                                                                path.clone(),
+                                                                as_preview,
+                                                                window,
+                                                                cx,
+                                                            );
+                                                        });
+                                                    })
                                                 }),
                                         )
-                                        .on_click({
-                                            let view = view.clone();
-                                            let path = PathBuf::from(item.id.as_str());
-                                            move |_event, window, cx| {
-                                                if is_folder {
-                                                    return;
-                                                }
-                                                view.update(cx, |this, cx| {
-                                                    this.open_path(path.clone(), window, cx);
-                                                });
-                                            }
-                                        })
                                         .into_any_element()
                                 }
                             })

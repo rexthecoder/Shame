@@ -75,6 +75,12 @@ pub(crate) struct Tab {
     pub(crate) path: Option<PathBuf>,
     pub(crate) editor: Entity<EditorView>,
     pub(crate) md_mode: MarkdownMode,
+    /// Zed/VS Code-style preview tab (`true` when opened via single-click in
+    /// the file tree, promoted to `false` on double-click or buffer edit).
+    pub(crate) is_preview: bool,
+    /// Baseline buffer revision when opened, used to auto-pin a preview tab as
+    /// soon as the user types or modifies the buffer.
+    pub(crate) opened_revision: u64,
 }
 
 impl Tab {
@@ -87,6 +93,19 @@ impl Tab {
                 .to_string(),
             None => "untitled".to_string(),
         }
+    }
+
+    pub(crate) fn parent_label(&self) -> Option<String> {
+        self.path
+            .as_ref()?
+            .parent()?
+            .file_name()?
+            .to_str()
+            .map(str::to_string)
+    }
+
+    pub(crate) fn is_pinned(&self, cx: &App) -> bool {
+        !self.is_preview || self.editor.read(cx).buffer().revision() != self.opened_revision
     }
 
     pub(crate) fn is_markdown(&self) -> bool {
@@ -110,6 +129,8 @@ pub struct DartIde {
     pub(crate) tree_state: Entity<TreeState>,
     pub(crate) tabs: Vec<Tab>,
     pub(crate) active_tab: usize,
+    pub(crate) tab_scroll: ScrollHandle,
+    pub(crate) tab_overflow_open: bool,
     pub(crate) all_files: Vec<PathBuf>,
     pub(crate) palette_open: bool,
     pub(crate) palette_input: Entity<InputState>,
@@ -145,6 +166,8 @@ impl DartIde {
             tree_state,
             tabs: Vec::new(),
             active_tab: 0,
+            tab_scroll: ScrollHandle::new(),
+            tab_overflow_open: false,
             all_files,
             palette_open: false,
             palette_input,
@@ -616,29 +639,75 @@ impl DartIde {
     }
 
     pub(crate) fn open_path(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(ix) = self
-            .tabs
-            .iter()
-            .position(|t| t.path.as_deref() == Some(path.as_path()))
-        {
+        self.open_path_with_mode(path, false, window, cx);
+    }
+
+    pub(crate) fn open_path_with_mode(
+        &mut self,
+        path: PathBuf,
+        as_preview: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let canonical = std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
+
+        //Promote any existing tab that has been edited so `is_preview` stays accurate.
+        for tab in &mut self.tabs {
+            if tab.editor.read(cx).buffer().revision() != tab.opened_revision {
+                tab.is_preview = false;
+            }
+        }
+
+        if let Some(ix) = self.tabs.iter().position(|t| {
+            t.path.as_ref().is_some_and(|existing| {
+                existing == &canonical
+                    || std::fs::canonicalize(existing)
+                        .map(|c| c == canonical)
+                        .unwrap_or(false)
+            })
+        }) {
+            if !as_preview {
+                self.tabs[ix].is_preview = false;
+            }
             self.active_tab = ix;
         } else {
-            let buffer = match Buffer::open(&path) {
+            let buffer = match Buffer::open(&canonical) {
                 Ok(buffer) => buffer,
                 Err(err) => {
-                    eprintln!("failed to open {}: {err}", path.display());
+                    eprintln!("failed to open {}: {err}", canonical.display());
                     return;
                 }
             };
+            let opened_revision = buffer.revision();
             let editor = cx.new(|cx| EditorView::from_buffer(buffer, cx));
             self.watch_editor(&editor, window, cx);
-            self.tabs.push(Tab {
-                path: Some(path),
+            let new_tab = Tab {
+                path: Some(canonical),
                 editor,
                 md_mode: MarkdownMode::Code,
-            });
-            self.active_tab = self.tabs.len() - 1;
+                is_preview: as_preview,
+                opened_revision,
+            };
+
+            // Zed-style preview slot: if opening in preview mode and an
+            // unmodified preview tab already exists, replace it in-place so
+            // browsing the file tree doesn't spawn dozens of transient tabs.
+            if as_preview {
+                if let Some(preview_ix) = self.tabs.iter().position(|t| t.is_preview) {
+                    self.tabs[preview_ix] = new_tab;
+                    self.active_tab = preview_ix;
+                } else {
+                    self.tabs.push(new_tab);
+                    self.active_tab = self.tabs.len() - 1;
+                }
+            } else {
+                self.tabs.push(new_tab);
+                self.active_tab = self.tabs.len() - 1;
+            }
         }
+
+        self.tab_overflow_open = false;
+        self.tab_scroll.scroll_to_item(self.active_tab);
 
         if let Some(editor) = self.active_editor() {
             let focus_handle = editor.read(cx).focus_handle(cx);
@@ -649,18 +718,57 @@ impl DartIde {
 
     pub(crate) fn new_scratch_tab(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let editor = cx.new(|cx| EditorView::new(cx));
+        let opened_revision = editor.read(cx).buffer().revision();
         self.watch_editor(&editor, window, cx);
         self.tabs.push(Tab {
             path: None,
             editor,
             md_mode: MarkdownMode::Code,
+            is_preview: false,
+            opened_revision,
         });
         self.active_tab = self.tabs.len() - 1;
+        self.tab_overflow_open = false;
+        self.tab_scroll.scroll_to_item(self.active_tab);
 
         if let Some(editor) = self.active_editor() {
             let focus_handle = editor.read(cx).focus_handle(cx);
             window.focus(&focus_handle, cx);
         }
+        cx.notify();
+    }
+
+    pub(crate) fn close_other_tabs(&mut self, keep_ix: usize, cx: &mut Context<Self>) {
+        if let Some(keep) = self.tabs.get(keep_ix) {
+            let keep_tab = Tab {
+                path: keep.path.clone(),
+                editor: keep.editor.clone(),
+                md_mode: keep.md_mode,
+                is_preview: false,
+                opened_revision: keep.opened_revision,
+            };
+            self.tabs = vec![keep_tab];
+            self.active_tab = 0;
+            self.tab_overflow_open = false;
+            cx.notify();
+        }
+    }
+
+    pub(crate) fn close_clean_tabs(&mut self, cx: &mut Context<Self>) {
+        let active_path = self.tabs.get(self.active_tab).and_then(|t| t.path.clone());
+        self.tabs.retain(|t| t.editor.read(cx).buffer().is_dirty());
+        if self.tabs.is_empty() {
+            self.active_tab = 0;
+        } else if let Some(path) = active_path {
+            self.active_tab = self
+                .tabs
+                .iter()
+                .position(|t| t.path.as_ref() == Some(&path))
+                .unwrap_or(0);
+        } else {
+            self.active_tab = 0;
+        }
+        self.tab_overflow_open = false;
         cx.notify();
     }
 

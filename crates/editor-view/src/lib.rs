@@ -222,9 +222,14 @@ impl EditorView {
         self.buffer
             .selections_mut()
             .set_primary(Selection::cursor(offset));
-        let line = self.buffer.byte_to_line(offset);
-        self.scroll_handle.scroll_to_item(line, ScrollStrategy::Top);
         cx.notify();
+    }
+
+    fn ensure_cursor_visible(&mut self) {
+        let head = self.buffer.selections().primary().head;
+        let line = self.buffer.byte_to_line(head);
+        self.scroll_handle
+            .scroll_to_item(line, ScrollStrategy::Nearest);
     }
 
     /// Move the cursor to a 0-indexed (line, column) — e.g. where a
@@ -234,6 +239,8 @@ impl EditorView {
     pub fn set_cursor_to_position(&mut self, line: u32, column: u32, cx: &mut Context<Self>) {
         let offset = self.buffer.line_to_byte(line as usize) + column as usize;
         self.set_cursor(offset, cx);
+        self.scroll_handle
+            .scroll_to_item(line as usize, ScrollStrategy::Center);
     }
 
     /// Move the head to `offset`, keeping the current anchor fixed —
@@ -243,8 +250,6 @@ impl EditorView {
         self.buffer
             .selections_mut()
             .set_primary(Selection::new(anchor, offset));
-        let line = self.buffer.byte_to_line(offset);
-        self.scroll_handle.scroll_to_item(line, ScrollStrategy::Top);
         cx.notify();
     }
 
@@ -254,6 +259,7 @@ impl EditorView {
         } else {
             self.set_cursor(offset, cx);
         }
+        self.ensure_cursor_visible();
     }
 
     fn insert_at_cursor(&mut self, text: &str, cx: &mut Context<Self>) {
@@ -262,6 +268,7 @@ impl EditorView {
         let insert_at = range.start;
         self.buffer.edit(range, text);
         self.set_cursor(insert_at + text.len(), cx);
+        self.ensure_cursor_visible();
     }
 
     fn backspace(&mut self, cx: &mut Context<Self>) {
@@ -439,17 +446,21 @@ impl EditorView {
         }
     }
 
-    /// Highlight spans, the selection, and any word-occurrence matches
-    /// intersecting `line_text`'s byte range, run-length encoded into
-    /// `(byte_range_within_line, color, is_selected, is_word_match)`
-    /// runs. A `None` color run inherits the editor's base text color.
+    /// Highlight spans intersecting `line_text`'s byte range, run-length
+    /// encoded into `(byte_range_within_line, color)` runs.
+    ///
+    /// Note: selection and word-occurrence highlights are intentionally NOT
+    /// split into separate `div()` spans here — splitting a single `TextSystem`
+    /// shaped line into extra `div()` boxes causes subpixel kerning/advance
+    /// rounding differences in GPUI's flex layout, shifting the text when a
+    /// word or selection is highlighted. Instead, selection and word-match
+    /// backgrounds are painted directly on the line canvas using exact glyph
+    /// `x_for_index` coordinates.
     fn line_runs(
         line_start: usize,
         line_text: &str,
         highlights: &[Highlight],
-        selection: Option<Range<usize>>,
-        word_matches: &[Range<usize>],
-    ) -> Vec<(Range<usize>, Option<HighlightKind>, bool, bool)> {
+    ) -> Vec<(Range<usize>, Option<HighlightKind>)> {
         let line_end = line_start + line_text.len();
         let mut colors: Vec<Option<HighlightKind>> = vec![None; line_text.len()];
 
@@ -464,41 +475,18 @@ impl EditorView {
             }
         }
 
-        let mut selected = vec![false; line_text.len()];
-        if let Some(sel) = selection {
-            if sel.end > line_start && sel.start < line_end {
-                let start = sel.start.max(line_start) - line_start;
-                let end = sel.end.min(line_end) - line_start;
-                for slot in &mut selected[start..end] {
-                    *slot = true;
-                }
-            }
-        }
-
-        let mut word_hit = vec![false; line_text.len()];
-        for m in word_matches {
-            if m.end <= line_start || m.start >= line_end {
-                continue;
-            }
-            let start = m.start.max(line_start) - line_start;
-            let end = m.end.min(line_end) - line_start;
-            for slot in &mut word_hit[start..end] {
-                *slot = true;
-            }
-        }
-
         let mut runs = Vec::new();
         let mut i = 0;
         while i < colors.len() {
-            let key = (colors[i], selected[i], word_hit[i]);
+            let kind = colors[i];
             let start = i;
-            while i < colors.len() && (colors[i], selected[i], word_hit[i]) == key {
+            while i < colors.len() && colors[i] == kind {
                 i += 1;
             }
-            runs.push((start..i, key.0, key.1, key.2));
+            runs.push((start..i, kind));
         }
         if runs.is_empty() {
-            runs.push((0..0, None, false, false));
+            runs.push((0..0, None));
         }
         runs
     }
@@ -670,17 +658,10 @@ impl EditorView {
             (head - line_start).min(display_text.len())
         });
 
-        // A translucent selection wash, not the theme's fully opaque
-        // selection colour — the code underneath stays readable while the
-        // selection is still unmistakable.
         let selection_bg = cx.theme().selection.opacity(0.35);
-        // Every other occurrence of the word the cursor is sitting in,
-        // picked out with a flat tint — the "where else does this name
-        // show up" cue every mature editor gives for free, and one of
-        // the first things a code editor gets asked why it's missing.
-        let word_match_bg = cx.theme().blue.opacity(0.14);
+        let word_match_bg = cx.theme().blue.opacity(0.16);
         let is_doc_line = display_text.trim_start().starts_with("///");
-        let span = move |text: &str, kind: Option<HighlightKind>, selected: bool, word_match: bool| {
+        let span = move |text: &str, kind: Option<HighlightKind>| {
             let mut el = div();
             if let Some(kind) = kind {
                 el = el.text_color(highlight_color(kind));
@@ -688,59 +669,37 @@ impl EditorView {
                     el = el.italic();
                 }
             }
-            if selected {
-                el = el.bg(selection_bg);
-            } else if word_match {
-                el = el.bg(word_match_bg);
-            }
             el.child(text.to_string())
         };
 
         let caret_color = cx.theme().caret;
-        let cursor_el = move || {
-            div()
-                .w(px(1.5))
-                .h(px(LINE_FONT_SIZE + 2.))
-                .bg(caret_color)
-                .rounded(px(0.75))
-        };
 
-        let mut word_matches: Vec<Range<usize>> = current_word
-            .map(|word| {
-                Self::word_occurrences(display_text, word)
-                    .into_iter()
-                    .map(|r| (r.start + line_start)..(r.end + line_start))
-                    .collect()
-            })
+        // Local byte ranges within `display_text` for word-occurrences and matching brackets.
+        let mut local_word_matches: Vec<Range<usize>> = current_word
+            .map(|word| Self::word_occurrences(display_text, word))
             .unwrap_or_default();
         if let Some((b1, b2)) = bracket_pair {
             let line_end = line_start + display_text.len();
             for b in [b1, b2] {
                 if b >= line_start && b < line_end {
-                    word_matches.push(b..(b + 1));
+                    let col = b - line_start;
+                    local_word_matches.push(col..(col + 1));
                 }
             }
         }
 
-        let mut content = div().flex().items_center();
-        let mut cursor_inserted = false;
-        for (range, kind, selected, word_match) in
-            Self::line_runs(line_start, display_text, highlights, selection.clone(), &word_matches)
-        {
-            if let Some(col) = cursor_col {
-                if !cursor_inserted && col >= range.start && col < range.end {
-                    content = content
-                        .child(span(&display_text[range.start..col], kind, selected, word_match))
-                        .child(cursor_el())
-                        .child(span(&display_text[col..range.end], kind, selected, word_match));
-                    cursor_inserted = true;
-                    continue;
-                }
-            }
-            content = content.child(span(&display_text[range], kind, selected, word_match));
-        }
-        if cursor_col.is_some() && !cursor_inserted {
-            content = content.child(cursor_el());
+        let local_selection: Option<Range<usize>> = selection.and_then(|sel| {
+            let line_end = line_start + display_text.len();
+            (sel.end > line_start && sel.start < line_end).then(|| {
+                let start = sel.start.max(line_start) - line_start;
+                let end = sel.end.min(line_end) - line_start;
+                start..end
+            })
+        });
+
+        let mut content = div().relative().flex().items_center().h_full();
+        for (range, kind) in Self::line_runs(line_start, display_text, highlights) {
+            content = content.child(span(&display_text[range], kind));
         }
         if let Some((sev, msg)) = diagnostic_msg {
             let diag_color = match *sev {
@@ -790,11 +749,87 @@ impl EditorView {
             })
             .collect();
 
-        // A transparent overlay the exact size of the text area, used only
-        // to turn a click's pixel x-coordinate into an exact column via
-        // real text shaping (`shape_line`/`closest_index_for_x`) — the
-        // visible text above is still rendered as plain div/span children,
-        // not painted by this canvas.
+        // A background highlight layer painted BEFORE the text so word
+        // occurrences and selections never split `div()` text runs (which would
+        // cause subpixel glyph-advance shifts when clicking a word).
+        let bg_text: SharedString = display_text.to_string().into();
+        let highlight_underlay = canvas(
+            move |bounds, window, _cx| {
+                let mut rects: Vec<(Bounds<Pixels>, Hsla, Pixels)> = Vec::new();
+                if local_word_matches.is_empty() && local_selection.is_none() && cursor_col.is_none()
+                {
+                    return (rects, None);
+                }
+
+                let run = TextRun {
+                    len: bg_text.len(),
+                    font: font(FONT_FAMILY),
+                    color: Hsla::default(),
+                    background_color: None,
+                    underline: None,
+                    strikethrough: None,
+                };
+                let shaped = window.text_system().shape_line(
+                    bg_text.clone(),
+                    px(LINE_FONT_SIZE),
+                    &[run],
+                    None,
+                );
+
+                let box_h = px(LINE_FONT_SIZE + 4.);
+                let box_y = bounds.origin.y + (bounds.size.height - box_h) * 0.5;
+
+                for range in &local_word_matches {
+                    let x1 = shaped.x_for_index(range.start.min(bg_text.len()));
+                    let x2 = shaped.x_for_index(range.end.min(bg_text.len()));
+                    if x2 > x1 {
+                        rects.push((
+                            Bounds::new(point(bounds.origin.x + x1, box_y), size(x2 - x1, box_h)),
+                            word_match_bg,
+                            px(3.),
+                        ));
+                    }
+                }
+
+                if let Some(sel) = &local_selection {
+                    let x1 = shaped.x_for_index(sel.start.min(bg_text.len()));
+                    let x2 = shaped.x_for_index(sel.end.min(bg_text.len()));
+                    if x2 > x1 {
+                        rects.push((
+                            Bounds::new(
+                                point(bounds.origin.x + x1, bounds.origin.y + px(1.)),
+                                size(x2 - x1, bounds.size.height - px(2.)),
+                            ),
+                            selection_bg,
+                            px(2.),
+                        ));
+                    }
+                }
+
+                let caret_bounds = cursor_col.map(|col| {
+                    let x = shaped.x_for_index(col.min(bg_text.len()));
+                    let caret_h = px(LINE_FONT_SIZE + 3.);
+                    let y = bounds.origin.y + (bounds.size.height - caret_h) * 0.5;
+                    Bounds::new(point(bounds.origin.x + x, y), size(px(1.5), caret_h))
+                });
+
+                (rects, caret_bounds)
+            },
+            move |_bounds, (rects, caret_bounds), window, _cx| {
+                for (rect, color, radius) in rects {
+                    window.paint_quad(fill(rect, color).corner_radii(radius));
+                }
+                if let Some(caret_rect) = caret_bounds {
+                    window.paint_quad(fill(caret_rect, caret_color).corner_radii(px(0.75)));
+                }
+            },
+        )
+        .absolute()
+        .inset_0();
+
+        // A transparent overlay the exact size of the text area, used to turn a
+        // click's pixel x-coordinate into an exact column via real text shaping
+        // (`shape_line`/`closest_index_for_x`).
         let hit_test_text: SharedString = display_text.to_string().into();
         let view = cx.entity();
         let click_overlay = canvas(
@@ -878,6 +913,7 @@ impl EditorView {
                     .flex_1()
                     .h_full()
                     .children(guides)
+                    .child(highlight_underlay)
                     .child(content)
                     .child(click_overlay)
                     .when_some(

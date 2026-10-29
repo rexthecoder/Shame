@@ -279,6 +279,7 @@ impl DartIde {
         };
 
         let editor_card = v_flex()
+            .relative()
             .flex_1()
             .h_full()
             .min_h(px(0.))
@@ -289,6 +290,9 @@ impl DartIde {
             .overflow_hidden()
             .when(has_tabs, |el| el.child(self.render_tabs(view, cx)))
             .child(div().flex_1().w_full().min_h(px(0.)).child(editor_body))
+            .when_some(self.render_tab_overflow_popover(view, cx), |el, pop| {
+                el.child(pop)
+            })
             .into_any_element();
 
         let editor_column = v_flex()
