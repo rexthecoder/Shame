@@ -74,25 +74,6 @@ pub enum EditorEvent {
     ShowCodeActions { actions: Vec<lsp_types::CodeActionOrCommand> },
 }
 
-/// The exact byte column within `text` closest to `x` pixels from the
-/// start of the text area, found with GPUI's own text shaper rather than
-/// approximated — correct for proportional glyph widths too, even though
-/// this editor only uses a monospace font today.
-fn column_for_x(window: &mut Window, text: &SharedString, x: Pixels) -> usize {
-    let run = TextRun {
-        len: text.len(),
-        font: font(FONT_FAMILY),
-        color: Hsla::default(),
-        background_color: None,
-        underline: None,
-        strikethrough: None,
-    };
-    let shaped = window
-        .text_system()
-        .shape_line(text.clone(), px(LINE_FONT_SIZE), &[run], None);
-    shaped.closest_index_for_x(x.max(px(0.)))
-}
-
 /// Maximum file size (256 KiB) for tree-sitter parsing and syntax queries.
 /// Files above this threshold or non-code lockfiles open in fast plain-text mode.
 const MAX_SYNTAX_BYTES: usize = 256 * 1024;
@@ -660,19 +641,36 @@ impl EditorView {
 
         let selection_bg = cx.theme().selection.opacity(0.35);
         let word_match_bg = cx.theme().blue.opacity(0.16);
+        let default_fg: Hsla = cx.theme().foreground;
         let is_doc_line = display_text.trim_start().starts_with("///");
-        let span = move |text: &str, kind: Option<HighlightKind>| {
-            let mut el = div();
-            if let Some(kind) = kind {
-                el = el.text_color(highlight_color(kind));
-                if kind == HighlightKind::Comment || (is_doc_line && kind == HighlightKind::Attribute) {
-                    el = el.italic();
-                }
-            }
-            el.child(text.to_string())
-        };
-
         let caret_color = cx.theme().caret;
+
+        // Build `TextRun`s for the single `shape_line` call that both paints
+        // the text and computes exact `x_for_index` positions for the cursor,
+        // selection, and word-match highlights — guaranteeing 0.0px drift
+        // between characters and the caret!
+        let text_runs: Vec<TextRun> = Self::line_runs(line_start, display_text, highlights)
+            .into_iter()
+            .filter(|(range, _)| !range.is_empty())
+            .map(|(range, kind)| {
+                let mut run_font = font(FONT_FAMILY);
+                if let Some(k) = kind {
+                    if k == HighlightKind::Comment
+                        || (is_doc_line && k == HighlightKind::Attribute)
+                    {
+                        run_font.style = FontStyle::Italic;
+                    }
+                }
+                TextRun {
+                    len: range.len(),
+                    font: run_font,
+                    color: kind.map(|k| highlight_color(k).into()).unwrap_or(default_fg),
+                    background_color: None,
+                    underline: None,
+                    strikethrough: None,
+                }
+            })
+            .collect();
 
         // Local byte ranges within `display_text` for word-occurrences and matching brackets.
         let mut local_word_matches: Vec<Range<usize>> = current_word
@@ -697,154 +695,123 @@ impl EditorView {
             })
         });
 
-        let mut content = div().relative().flex().items_center().h_full();
-        for (range, kind) in Self::line_runs(line_start, display_text, highlights) {
-            content = content.child(span(&display_text[range], kind));
-        }
-        if let Some((sev, msg)) = diagnostic_msg {
+        let diag_pill = diagnostic_msg.map(|(sev, msg)| {
             let diag_color = match *sev {
                 s if s == lsp_types::DiagnosticSeverity::ERROR => cx.theme().danger,
                 s if s == lsp_types::DiagnosticSeverity::WARNING => cx.theme().warning,
                 _ => cx.theme().info,
             };
-            content = content.child(
-                h_flex()
-                    .ml_4()
-                    .px_2()
-                    .h(px(17.))
-                    .items_center()
-                    .gap_1()
-                    .rounded(px(4.))
-                    .bg(diag_color.opacity(0.12))
-                    .border_1()
-                    .border_color(diag_color.opacity(0.28))
-                    .text_size(px(11.))
-                    .text_color(diag_color)
-                    .child("\u{25cf}")
-                    .child(msg.clone()),
-            );
-        }
+            h_flex()
+                .ml_4()
+                .px_2()
+                .h(px(17.))
+                .items_center()
+                .gap_1()
+                .rounded(px(4.))
+                .bg(diag_color.opacity(0.12))
+                .border_1()
+                .border_color(diag_color.opacity(0.28))
+                .text_size(px(11.))
+                .text_color(diag_color)
+                .child("\u{25cf}")
+                .child(msg.clone())
+        });
 
-        // Faint vertical indent guides, drawn at multiples of the file's
-        // own indent width up to this line's leading spaces — the standard
-        // editor treatment, and correct for both 2-space Dart and 4-space
-        // Rust files.
+        // Single unified line canvas: shapes `display_text` ONCE with `text_runs`
+        // and uses that exact `ShapedLine` for:
+        // 1. Indent guides (using actual shaped space width)
+        // 2. Word-occurrence & matching-bracket background pills
+        // 3. Selection highlight
+        // 4. Painting the syntax-highlighted line (`shaped.paint(...)`)
+        // 5. Painting the vertical caret at `shaped.x_for_index(cursor_col)`
+        // 6. Mouse click/drag/hover column hit-testing (`shaped.closest_index_for_x`)
+        let line_shared: SharedString = display_text.to_string().into();
+        let line_len = line_shared.len();
         let leading_spaces = display_text.as_bytes().iter().take_while(|&&b| b == b' ').count();
-        let guides: Vec<_> = (indent_width..leading_spaces)
-            .step_by(indent_width)
-            .take(16)
-            .map(|column| {
-                // This font's advance width is 0.6 em, so one space column
-                // sits `0.6 * font_size` from the text area's left edge.
-                // Dimmed to a third of the border color — a guide you
-                // only notice when you look for it, not a grid line.
-                div()
-                    .absolute()
-                    .top(px(3.))
-                    .bottom(px(3.))
-                    .left(px(LINE_FONT_SIZE * 0.6 * column as f32))
-                    .w(px(1.))
-                    .bg(cx.theme().border.opacity(0.35))
-                    .into_any_element()
-            })
-            .collect();
-
-        // A background highlight layer painted BEFORE the text so word
-        // occurrences and selections never split `div()` text runs (which would
-        // cause subpixel glyph-advance shifts when clicking a word).
-        let bg_text: SharedString = display_text.to_string().into();
-        let highlight_underlay = canvas(
+        let view = cx.entity();
+        let line_canvas = canvas(
             move |bounds, window, _cx| {
-                let mut rects: Vec<(Bounds<Pixels>, Hsla, Pixels)> = Vec::new();
-                if local_word_matches.is_empty() && local_selection.is_none() && cursor_col.is_none()
-                {
-                    return (rects, None);
-                }
-
-                let run = TextRun {
-                    len: bg_text.len(),
-                    font: font(FONT_FAMILY),
-                    color: Hsla::default(),
-                    background_color: None,
-                    underline: None,
-                    strikethrough: None,
-                };
                 let shaped = window.text_system().shape_line(
-                    bg_text.clone(),
+                    line_shared.clone(),
                     px(LINE_FONT_SIZE),
-                    &[run],
+                    &text_runs,
                     None,
                 );
+                let text_end_x = shaped.width;
+                (bounds, shaped, text_end_x)
+            },
+            move |bounds, (_, shaped, _text_end_x), window, cx| {
+                // 1. Faint vertical indent guides at exact shaped column offsets
+                for column in (indent_width..leading_spaces).step_by(indent_width).take(16) {
+                    let x = shaped.x_for_index(column.min(line_len));
+                    let guide_rect = Bounds::new(
+                        point(bounds.origin.x + x, bounds.origin.y + px(3.)),
+                        size(px(1.), bounds.size.height - px(6.)),
+                    );
+                    window.paint_quad(fill(guide_rect, cx.theme().border.opacity(0.35)));
+                }
 
+                // 2. Word-occurrence & bracket highlight pills
                 let box_h = px(LINE_FONT_SIZE + 4.);
                 let box_y = bounds.origin.y + (bounds.size.height - box_h) * 0.5;
-
                 for range in &local_word_matches {
-                    let x1 = shaped.x_for_index(range.start.min(bg_text.len()));
-                    let x2 = shaped.x_for_index(range.end.min(bg_text.len()));
+                    let x1 = shaped.x_for_index(range.start.min(line_len));
+                    let x2 = shaped.x_for_index(range.end.min(line_len));
                     if x2 > x1 {
-                        rects.push((
-                            Bounds::new(point(bounds.origin.x + x1, box_y), size(x2 - x1, box_h)),
-                            word_match_bg,
-                            px(3.),
-                        ));
+                        let rect = Bounds::new(
+                            point(bounds.origin.x + x1, box_y),
+                            size(x2 - x1, box_h),
+                        );
+                        window.paint_quad(fill(rect, word_match_bg).corner_radii(px(3.)));
                     }
                 }
 
+                // 3. Selection highlight
                 if let Some(sel) = &local_selection {
-                    let x1 = shaped.x_for_index(sel.start.min(bg_text.len()));
-                    let x2 = shaped.x_for_index(sel.end.min(bg_text.len()));
+                    let x1 = shaped.x_for_index(sel.start.min(line_len));
+                    let x2 = shaped.x_for_index(sel.end.min(line_len));
                     if x2 > x1 {
-                        rects.push((
-                            Bounds::new(
-                                point(bounds.origin.x + x1, bounds.origin.y + px(1.)),
-                                size(x2 - x1, bounds.size.height - px(2.)),
-                            ),
-                            selection_bg,
-                            px(2.),
-                        ));
+                        let rect = Bounds::new(
+                            point(bounds.origin.x + x1, bounds.origin.y + px(1.)),
+                            size(x2 - x1, bounds.size.height - px(2.)),
+                        );
+                        window.paint_quad(fill(rect, selection_bg).corner_radii(px(2.)));
                     }
                 }
 
-                let caret_bounds = cursor_col.map(|col| {
-                    let x = shaped.x_for_index(col.min(bg_text.len()));
+                // 4. Paint syntax-highlighted text
+                let text_y = bounds.origin.y + (bounds.size.height - px(LINE_HEIGHT)) * 0.5;
+                let _ = shaped.paint(
+                    point(bounds.origin.x, text_y),
+                    px(LINE_HEIGHT),
+                    TextAlign::Left,
+                    None,
+                    window,
+                    cx,
+                );
+
+                // 5. Paint caret on top of text at the exact shaped glyph boundary
+                if let Some(col) = cursor_col {
+                    let x = shaped.x_for_index(col.min(line_len));
                     let caret_h = px(LINE_FONT_SIZE + 3.);
                     let y = bounds.origin.y + (bounds.size.height - caret_h) * 0.5;
-                    Bounds::new(point(bounds.origin.x + x, y), size(px(1.5), caret_h))
-                });
-
-                (rects, caret_bounds)
-            },
-            move |_bounds, (rects, caret_bounds), window, _cx| {
-                for (rect, color, radius) in rects {
-                    window.paint_quad(fill(rect, color).corner_radii(radius));
-                }
-                if let Some(caret_rect) = caret_bounds {
+                    let caret_rect =
+                        Bounds::new(point(bounds.origin.x + x, y), size(px(1.5), caret_h));
                     window.paint_quad(fill(caret_rect, caret_color).corner_radii(px(0.75)));
                 }
-            },
-        )
-        .absolute()
-        .inset_0();
 
-        // A transparent overlay the exact size of the text area, used to turn a
-        // click's pixel x-coordinate into an exact column via real text shaping
-        // (`shape_line`/`closest_index_for_x`).
-        let hit_test_text: SharedString = display_text.to_string().into();
-        let view = cx.entity();
-        let click_overlay = canvas(
-            |_bounds, _window, _cx| (),
-            move |bounds, (), window, _cx| {
-                let text = hit_test_text.clone();
+                // 6. Mouse interactions using the exact same `shaped` line
+                let down_shaped = shaped.clone();
                 let down_view = view.clone();
-                window.on_mouse_event(move |event: &MouseDownEvent, phase, window, cx| {
+                window.on_mouse_event(move |event: &MouseDownEvent, phase, _window, cx| {
                     if phase != DispatchPhase::Bubble
                         || event.button != MouseButton::Left
                         || !bounds.contains(&event.position)
                     {
                         return;
                     }
-                    let column = column_for_x(window, &text, event.position.x - bounds.origin.x);
+                    let rel_x = (event.position.x - bounds.origin.x).max(px(0.));
+                    let column = down_shaped.closest_index_for_x(rel_x);
                     let go_to_definition = event.modifiers.platform || event.modifiers.control;
                     down_view.update(cx, |this, cx| {
                         if go_to_definition {
@@ -855,39 +822,40 @@ impl EditorView {
                     });
                 });
 
-                let text = hit_test_text.clone();
+                let move_shaped = shaped.clone();
                 let move_view = view.clone();
-                window.on_mouse_event(move |event: &MouseMoveEvent, phase, window, cx| {
+                window.on_mouse_event(move |event: &MouseMoveEvent, phase, _window, cx| {
                     if phase != DispatchPhase::Bubble
                         || event.pressed_button != Some(MouseButton::Left)
                         || !bounds.contains(&event.position)
                     {
                         return;
                     }
-                    let column = column_for_x(window, &text, event.position.x - bounds.origin.x);
+                    let rel_x = (event.position.x - bounds.origin.x).max(px(0.));
+                    let column = move_shaped.closest_index_for_x(rel_x);
                     move_view.update(cx, |this, cx| {
                         this.extend_to(line_start + column, cx);
                     });
                 });
 
-                let text = hit_test_text.clone();
-                let hover_view = view.clone();
-                window.on_mouse_event(move |event: &MouseMoveEvent, phase, window, cx| {
+                let hover_shaped = shaped.clone();
+                let hover_view = view;
+                window.on_mouse_event(move |event: &MouseMoveEvent, phase, _window, cx| {
                     if phase != DispatchPhase::Bubble
                         || event.pressed_button.is_some()
                         || !bounds.contains(&event.position)
                     {
                         return;
                     }
-                    let column = column_for_x(window, &text, event.position.x - bounds.origin.x);
+                    let rel_x = (event.position.x - bounds.origin.x).max(px(0.));
+                    let column = hover_shaped.closest_index_for_x(rel_x);
                     hover_view.update(cx, |this, cx| {
                         this.note_hover_position(index, column, cx);
                     });
                 });
             },
         )
-        .absolute()
-        .inset_0();
+        .size_full();
 
         div()
             .id(("editor-line", index))
@@ -912,10 +880,19 @@ impl EditorView {
                     .relative()
                     .flex_1()
                     .h_full()
-                    .children(guides)
-                    .child(highlight_underlay)
-                    .child(content)
-                    .child(click_overlay)
+                    .child(line_canvas)
+                    .when_some(diag_pill, |el, pill| {
+                        el.child(
+                            div()
+                                .absolute()
+                                .right_4()
+                                .top_0()
+                                .bottom_0()
+                                .flex()
+                                .items_center()
+                                .child(pill),
+                        )
+                    })
                     .when_some(
                         self.hover_to_render().filter(|(line, _)| *line == index),
                         |el, (_, text)| {

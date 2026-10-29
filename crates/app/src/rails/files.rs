@@ -391,13 +391,13 @@ impl DartIde {
                                                 .items_center()
                                                 .gap(px(tokens::SPACE_2))
                                                 .rounded(px(tokens::RADIUS_SM))
+                                                .border_1()
+                                                .border_color(gpui_kit::transparent_black())
                                                 .cursor_pointer()
                                                 .text_color(row_fg)
                                                 .children(guides)
                                                 .when(is_active_file, |el| {
-                                                    el.font_medium()
-                                                        .bg(rgba(0xea7a3c16))
-                                                        .border_1()
+                                                    el.bg(rgba(0xea7a3c16))
                                                         .border_color(rgba(0xea7a3c36))
                                                         .child(
                                                             div()

@@ -548,10 +548,11 @@ impl DartIde {
                                         .justify_between()
                                         .px_3()
                                         .rounded(px(tokens::RADIUS_SM))
+                                        .border_1()
+                                        .border_color(gpui_kit::transparent_black())
                                         .cursor_pointer()
                                         .when(is_selected, |el| {
                                             el.bg(rgba(0xea7a3c16))
-                                                .border_1()
                                                 .border_color(rgba(0xea7a3c36))
                                                 .child(
                                                     div()
@@ -580,7 +581,6 @@ impl DartIde {
                                                 .child(
                                                     div()
                                                         .text_size(px(tokens::UI))
-                                                        .when(is_selected, |s| s.font_medium())
                                                         .text_color(cx.theme().foreground)
                                                         .child(name),
                                                 ),

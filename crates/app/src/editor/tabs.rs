@@ -75,9 +75,10 @@ impl DartIde {
                                     .px(px(tokens::SPACE_3))
                                     .cursor_pointer()
                                     .rounded(px(tokens::RADIUS_PANEL))
+                                    .border_1()
+                                    .border_color(gpui_kit::transparent_black())
                                     .when(is_active, |el| {
                                         el.bg(cx.theme().tab_active)
-                                            .border_1()
                                             .border_color(tokens::accent_dim())
                                     })
                                     .when(!is_active, |el| {
@@ -255,10 +256,11 @@ impl DartIde {
                                 .gap(px(tokens::SPACE_1))
                                 .items_center()
                                 .rounded(px(tokens::RADIUS_SM))
+                                .border_1()
+                                .border_color(gpui_kit::transparent_black())
                                 .cursor_pointer()
                                 .when(is_current, |s| {
                                     s.bg(rgba(0xea7a3c22))
-                                        .border_1()
                                         .border_color(rgba(0xea7a3c55))
                                         .text_color(active_fg)
                                 })
@@ -409,10 +411,11 @@ impl DartIde {
                                 .items_center()
                                 .justify_between()
                                 .rounded(px(tokens::RADIUS_SM))
+                                .border_1()
+                                .border_color(gpui_kit::transparent_black())
                                 .cursor_pointer()
                                 .when(is_active, |el| {
                                     el.bg(rgba(0xea7a3c18))
-                                        .border_1()
                                         .border_color(rgba(0xea7a3c38))
                                 })
                                 .when(!is_active, |el| el.hover(move |s| s.bg(list_hover)))
