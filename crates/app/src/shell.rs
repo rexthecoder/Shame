@@ -1,6 +1,7 @@
 use gpui_kit::component::{
     ActiveTheme as _, Icon, Sizable as _,
     h_flex,
+    input::Input,
     resizable::{h_resizable, resizable_panel},
     text::markdown,
     v_flex,
@@ -26,6 +27,179 @@ fn keycap(label: &'static str, cx: &App) -> Div {
 }
 
 impl DartIde {
+    fn render_find_bar(
+        &self,
+        view: &Entity<Self>,
+        cx: &mut Context<Self>,
+    ) -> Option<Div> {
+        if !self.find_open {
+            return None;
+        }
+        let editor = self.active_editor()?.clone();
+        let (current_match, total_matches) = editor.read(cx).search_status();
+        let query_empty = self.find_input.read(cx).value().is_empty();
+        let muted = cx.theme().muted_foreground;
+        let fg = cx.theme().foreground;
+        let badge_label = if query_empty {
+            "Type to search".to_string()
+        } else if total_matches == 0 {
+            "0 results".to_string()
+        } else {
+            format!("{current_match} / {total_matches}")
+        };
+
+        Some(
+            h_flex()
+                .w_full()
+                .h(px(32.))
+                .px(px(tokens::SPACE_4))
+                .gap(px(tokens::SPACE_3))
+                .items_center()
+                .justify_between()
+                .bg(cx.theme().tab_bar)
+                .border_b_1()
+                .border_color(cx.theme().border)
+                .on_key_down({
+                    let view = view.clone();
+                    let editor = editor.clone();
+                    move |event, window, cx| {
+                        let key = event.keystroke.key.as_str();
+                        if key == "escape" {
+                            view.update(cx, |this, cx| this.close_find(window, cx));
+                        } else if key == "enter" {
+                            let shift = event.keystroke.modifiers.shift;
+                            editor.update(cx, |ed, cx| {
+                                if shift {
+                                    ed.find_prev(cx);
+                                } else {
+                                    ed.find_next(cx);
+                                }
+                            });
+                        }
+                    }
+                })
+                .child(
+                    h_flex()
+                        .flex_1()
+                        .max_w(px(320.))
+                        .h(px(22.))
+                        .px(px(tokens::SPACE_3))
+                        .gap(px(tokens::SPACE_2))
+                        .items_center()
+                        .rounded(px(tokens::RADIUS_SM))
+                        .bg(cx.theme().background)
+                        .border_1()
+                        .border_color(cx.theme().border)
+                        .child(
+                            Icon::new(gpui_kit::assets::IconName::Search)
+                                .with_size(px(12.))
+                                .text_color(muted),
+                        )
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w(px(0.))
+                                .child(
+                                    Input::new(&self.find_input)
+                                        .appearance(false)
+                                        .xsmall(),
+                                ),
+                        ),
+                )
+                .child(
+                    h_flex()
+                        .items_center()
+                        .gap(px(tokens::SPACE_2))
+                        .child(
+                            div()
+                                .px(px(tokens::SPACE_2))
+                                .py(px(1.))
+                                .rounded(px(tokens::RADIUS_SM))
+                                .font_family("SF Mono")
+                                .text_size(px(tokens::UI_XS))
+                                .text_color(if !query_empty && total_matches == 0 {
+                                    cx.theme().danger
+                                } else {
+                                    muted
+                                })
+                                .child(badge_label),
+                        )
+                        .child(
+                            div()
+                                .w(px(1.))
+                                .h(px(14.))
+                                .bg(cx.theme().border),
+                        )
+                        .child(
+                            h_flex()
+                                .id("find-prev")
+                                .w(px(22.))
+                                .h(px(22.))
+                                .items_center()
+                                .justify_center()
+                                .rounded(px(tokens::RADIUS_SM))
+                                .cursor_pointer()
+                                .hover(move |s| s.bg(rgba(0xffffff0c)).text_color(fg))
+                                .child(
+                                    Icon::new(gpui_kit::assets::IconName::ChevronUp)
+                                        .with_size(px(12.))
+                                        .text_color(muted),
+                                )
+                                .on_click({
+                                    let editor = editor.clone();
+                                    move |_event, _window, cx| {
+                                        editor.update(cx, |ed, cx| ed.find_prev(cx));
+                                    }
+                                }),
+                        )
+                        .child(
+                            h_flex()
+                                .id("find-next")
+                                .w(px(22.))
+                                .h(px(22.))
+                                .items_center()
+                                .justify_center()
+                                .rounded(px(tokens::RADIUS_SM))
+                                .cursor_pointer()
+                                .hover(move |s| s.bg(rgba(0xffffff0c)).text_color(fg))
+                                .child(
+                                    Icon::new(gpui_kit::assets::IconName::ChevronDown)
+                                        .with_size(px(12.))
+                                        .text_color(muted),
+                                )
+                                .on_click({
+                                    let editor = editor.clone();
+                                    move |_event, _window, cx| {
+                                        editor.update(cx, |ed, cx| ed.find_next(cx));
+                                    }
+                                }),
+                        )
+                        .child(
+                            h_flex()
+                                .id("find-close")
+                                .w(px(22.))
+                                .h(px(22.))
+                                .items_center()
+                                .justify_center()
+                                .rounded(px(tokens::RADIUS_SM))
+                                .cursor_pointer()
+                                .hover(move |s| s.bg(rgba(0xffffff0c)).text_color(fg))
+                                .child(
+                                    Icon::new(gpui_kit::assets::IconName::X)
+                                        .with_size(px(12.))
+                                        .text_color(muted),
+                                )
+                                .on_click({
+                                    let view = view.clone();
+                                    move |_event, window, cx| {
+                                        view.update(cx, |this, cx| this.close_find(window, cx));
+                                    }
+                                }),
+                        ),
+                ),
+        )
+    }
+
     fn render_empty_editor(
         &self,
         view: &Entity<Self>,
@@ -289,6 +463,7 @@ impl DartIde {
             .rounded(px(tokens::RADIUS_CARD))
             .overflow_hidden()
             .when(has_tabs, |el| el.child(self.render_tabs(view, cx)))
+            .when_some(self.render_find_bar(view, cx), |el, bar| el.child(bar))
             .child(div().flex_1().w_full().min_h(px(0.)).child(editor_body))
             .when_some(self.render_tab_overflow_popover(view, cx), |el, pop| {
                 el.child(pop)

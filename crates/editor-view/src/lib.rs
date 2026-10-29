@@ -111,6 +111,11 @@ pub struct EditorView {
     hover_point: Option<(usize, usize)>,
     hover_sequence: u64,
     hover_result: Option<(usize, String)>,
+    /// Active in-file search query (`⌘F`) and all case-insensitive byte ranges
+    /// matching it across the buffer.
+    search_query: String,
+    search_matches: Vec<Range<usize>>,
+    active_search_match: usize,
 }
 
 impl EditorView {
@@ -145,6 +150,9 @@ impl EditorView {
             hover_point: None,
             hover_sequence: 0,
             hover_result: None,
+            search_query: String::new(),
+            search_matches: Vec::new(),
+            active_search_match: 0,
         };
         this.maybe_start_lsp(cx);
         this
@@ -224,6 +232,148 @@ impl EditorView {
             .scroll_to_item(line as usize, ScrollStrategy::Center);
     }
 
+    /// Update the active in-file search query (`⌘F`), recomputing all
+    /// case-insensitive matches and jumping to the nearest match at or after
+    /// the current cursor.
+    pub fn set_search_query(&mut self, query: &str, cx: &mut Context<Self>) {
+        if self.search_query == query {
+            return;
+        }
+        self.search_query = query.to_string();
+        self.recompute_search_matches();
+        if !self.search_matches.is_empty() {
+            let head = self.buffer.selections().primary().start();
+            self.active_search_match = self
+                .search_matches
+                .iter()
+                .position(|r| r.start >= head)
+                .unwrap_or(0);
+            let target = self.search_matches[self.active_search_match].clone();
+            self.buffer
+                .selections_mut()
+                .set_primary(Selection::cursor(target.start));
+            let line = self.buffer.byte_to_line(target.start);
+            self.scroll_handle
+                .scroll_to_item(line, ScrollStrategy::Center);
+        }
+        cx.notify();
+    }
+
+    pub fn clear_search(&mut self, cx: &mut Context<Self>) {
+        if !self.search_query.is_empty() || !self.search_matches.is_empty() {
+            self.search_query.clear();
+            self.search_matches.clear();
+            self.active_search_match = 0;
+            cx.notify();
+        }
+    }
+
+    /// `(current_1_indexed_match, total_matches)` for the find bar badge.
+    pub fn search_status(&self) -> (usize, usize) {
+        if self.search_matches.is_empty() {
+            (0, 0)
+        } else {
+            (
+                (self.active_search_match + 1).min(self.search_matches.len()),
+                self.search_matches.len(),
+            )
+        }
+    }
+
+    pub fn find_next(&mut self, cx: &mut Context<Self>) {
+        if self.search_matches.is_empty() {
+            return;
+        }
+        self.active_search_match = (self.active_search_match + 1) % self.search_matches.len();
+        let target = self.search_matches[self.active_search_match].clone();
+        self.buffer
+            .selections_mut()
+            .set_primary(Selection::cursor(target.start));
+        let line = self.buffer.byte_to_line(target.start);
+        self.scroll_handle
+            .scroll_to_item(line, ScrollStrategy::Center);
+        cx.notify();
+    }
+
+    pub fn find_prev(&mut self, cx: &mut Context<Self>) {
+        if self.search_matches.is_empty() {
+            return;
+        }
+        self.active_search_match = if self.active_search_match == 0 {
+            self.search_matches.len() - 1
+        } else {
+            self.active_search_match - 1
+        };
+        let target = self.search_matches[self.active_search_match].clone();
+        self.buffer
+            .selections_mut()
+            .set_primary(Selection::cursor(target.start));
+        let line = self.buffer.byte_to_line(target.start);
+        self.scroll_handle
+            .scroll_to_item(line, ScrollStrategy::Center);
+        cx.notify();
+    }
+
+    fn recompute_search_matches(&mut self) {
+        self.search_matches.clear();
+        if self.search_query.is_empty() {
+            self.active_search_match = 0;
+            return;
+        }
+        let text = self.buffer.text();
+        let needle = self.search_query.to_lowercase();
+        let needle_len = needle.len();
+        if needle_len == 0 {
+            return;
+        }
+        let hay = text.to_lowercase();
+        let mut from = 0;
+        while let Some(pos) = hay[from..].find(&needle) {
+            let start = from + pos;
+            let end = start + needle_len;
+            if text.is_char_boundary(start) && text.is_char_boundary(end) {
+                self.search_matches.push(start..end);
+            }
+            from = start + needle_len.max(1);
+            if from >= hay.len() {
+                break;
+            }
+        }
+        if self.active_search_match >= self.search_matches.len() {
+            self.active_search_match = 0;
+        }
+    }
+
+    /// Select the word at `column` on `line_idx` (double-click behavior).
+    fn select_word_on_line(&mut self, line_idx: usize, column: usize, cx: &mut Context<Self>) {
+        let line_start = self.buffer.line_to_byte(line_idx);
+        let line_text = self.buffer.line(line_idx);
+        let display = line_text.trim_end_matches(['\n', '\r']);
+        if let Some(range) = Self::word_range_at(display, column.min(display.len())) {
+            self.buffer.selections_mut().set_primary(Selection::new(
+                line_start + range.start,
+                line_start + range.end,
+            ));
+            cx.notify();
+        } else {
+            self.set_cursor(line_start + column.min(display.len()), cx);
+        }
+    }
+
+    /// Select the entire `line_idx` including its newline (triple-click behavior).
+    fn select_line(&mut self, line_idx: usize, cx: &mut Context<Self>) {
+        let start = self.buffer.line_to_byte(line_idx);
+        let end = if line_idx + 1 < self.buffer.line_count() {
+            self.buffer.line_to_byte(line_idx + 1)
+        } else {
+            self.buffer.len_bytes()
+        };
+        self.buffer
+            .selections_mut()
+            .set_primary(Selection::new(start, end));
+        cx.notify();
+    }
+
     /// Move the head to `offset`, keeping the current anchor fixed —
     /// i.e. extend (or shrink) the selection rather than collapsing it.
     fn extend_to(&mut self, offset: usize, cx: &mut Context<Self>) {
@@ -260,12 +410,174 @@ impl EditorView {
             self.set_cursor(start, cx);
             return;
         }
-        let start = self.buffer.prev_char_boundary(primary.head);
-        if start == primary.head {
+        let head = primary.head;
+        let start = self.buffer.prev_char_boundary(head);
+        if start == head {
             return;
         }
-        self.buffer.remove(start..primary.head);
+        // Smart pair deletion: if the cursor sits right between an empty
+        // pair `()`, `{}`, `[]`, `""`, or `''`, delete both characters at once.
+        let end = self.buffer.next_char_boundary(head);
+        if end > head {
+            let pair = self.buffer.slice(start..end);
+            if matches!(pair.as_str(), "()" | "{}" | "[]" | "\"\"" | "''" | "``") {
+                self.buffer.remove(start..end);
+                self.set_cursor(start, cx);
+                return;
+            }
+        }
+        self.buffer.remove(start..head);
         self.set_cursor(start, cx);
+    }
+
+    /// Smart newline on `Enter`: preserves the current line's leading
+    /// indentation, adds one indent level after `{` / `(` / `[`, and splits an
+    /// empty `{|}` block into three properly indented lines.
+    fn insert_newline(&mut self, cx: &mut Context<Self>) {
+        let primary = self.buffer.selections().primary();
+        let range = primary.range();
+        let line_idx = self.buffer.byte_to_line(range.start);
+        let line_start = self.buffer.line_to_byte(line_idx);
+        let line_text = self.buffer.line(line_idx);
+        let indent_len = line_text
+            .as_bytes()
+            .iter()
+            .take_while(|&&b| b == b' ')
+            .count();
+        let base_indent = " ".repeat(indent_len);
+        let step_indent = " ".repeat(self.indent_width);
+
+        let before_cursor = self.buffer.slice(line_start..range.start);
+        let trimmed_before = before_cursor.trim_end();
+        let opens_block = trimmed_before.ends_with('{')
+            || trimmed_before.ends_with('(')
+            || trimmed_before.ends_with('[');
+
+        let next_end = self.buffer.next_char_boundary(range.end);
+        let next_char = (next_end > range.end)
+            .then(|| self.buffer.slice(range.end..next_end))
+            .unwrap_or_default();
+        let closes_block = matches!(next_char.as_str(), "}" | ")" | "]");
+
+        if opens_block && closes_block {
+            let inserted = format!("\n{base_indent}{step_indent}\n{base_indent}");
+            let cursor_target = range.start + 1 + base_indent.len() + step_indent.len();
+            self.buffer.edit(range, &inserted);
+            self.set_cursor(cursor_target, cx);
+            self.ensure_cursor_visible();
+        } else if opens_block {
+            let inserted = format!("\n{base_indent}{step_indent}");
+            self.insert_at_cursor(&inserted, cx);
+        } else {
+            let inserted = format!("\n{base_indent}");
+            self.insert_at_cursor(&inserted, cx);
+        }
+    }
+
+    /// Smart character input: handles auto-closing brackets/quotes, wrapping
+    /// an active selection in brackets/quotes, and skipping over an existing
+    /// closing bracket/quote.
+    fn handle_char_input(&mut self, text: &str, cx: &mut Context<Self>) {
+        let primary = self.buffer.selections().primary();
+        let close_for = match text {
+            "(" => Some(")"),
+            "{" => Some("}"),
+            "[" => Some("]"),
+            "\"" => Some("\""),
+            "'" => Some("'"),
+            "`" => Some("`"),
+            _ => None,
+        };
+
+        // 1. Wrap a non-empty selection in the pair
+        if !primary.is_empty() {
+            if let Some(close) = close_for {
+                let range = primary.range();
+                let selected = self.buffer.slice(range.clone());
+                let wrapped = format!("{text}{selected}{close}");
+                self.buffer.edit(range.clone(), &wrapped);
+                self.buffer.selections_mut().set_primary(Selection::new(
+                    range.start + text.len(),
+                    range.start + text.len() + selected.len(),
+                ));
+                cx.notify();
+                return;
+            }
+        }
+
+        // 2. Skip over an existing closing delimiter when typing `)`, `}`, `]`, `"`, `'`
+        if primary.is_empty() && matches!(text, ")" | "}" | "]" | "\"" | "'" | "`") {
+            let head = primary.head;
+            let next_end = self.buffer.next_char_boundary(head);
+            if next_end > head && self.buffer.slice(head..next_end) == text {
+                self.set_cursor(next_end, cx);
+                return;
+            }
+        }
+
+        // 3. Auto-close opening delimiter if the character after the cursor is
+        //    whitespace, a closing delimiter, or end-of-line.
+        if primary.is_empty() {
+            if let Some(close) = close_for {
+                let head = primary.head;
+                let next_end = self.buffer.next_char_boundary(head);
+                let next_ch = (next_end > head)
+                    .then(|| self.buffer.slice(head..next_end))
+                    .unwrap_or_default();
+                let should_autoclose = next_ch.is_empty()
+                    || next_ch.starts_with([' ', '\t', '\n', '\r', ')', '}', ']', ',', ';']);
+                if should_autoclose {
+                    let pair = format!("{text}{close}");
+                    self.buffer.edit(head..head, &pair);
+                    self.set_cursor(head + text.len(), cx);
+                    self.ensure_cursor_visible();
+                    return;
+                }
+            }
+        }
+
+        self.insert_at_cursor(text, cx);
+    }
+
+    /// Toggle `// ` line comments across the current line or selected lines (`⌘/`).
+    pub fn toggle_line_comment(&mut self, cx: &mut Context<Self>) {
+        let primary = self.buffer.selections().primary();
+        let range = primary.range();
+        let start_line = self.buffer.byte_to_line(range.start);
+        let end_line = if range.end > range.start {
+            let l = self.buffer.byte_to_line(range.end);
+            if self.buffer.line_to_byte(l) == range.end && l > start_line {
+                l - 1
+            } else {
+                l
+            }
+        } else {
+            start_line
+        };
+
+        let all_commented = (start_line..=end_line).all(|line_idx| {
+            let line = self.buffer.line(line_idx);
+            let trimmed = line.trim_start_matches(' ').trim_end_matches(['\n', '\r']);
+            !trimmed.is_empty() && trimmed.starts_with("//")
+        });
+
+        for line_idx in (start_line..=end_line).rev() {
+            let line_start = self.buffer.line_to_byte(line_idx);
+            let line = self.buffer.line(line_idx);
+            let leading = line.as_bytes().iter().take_while(|&&b| b == b' ').count();
+            let trimmed = line[leading..].trim_end_matches(['\n', '\r']);
+            if trimmed.is_empty() {
+                continue;
+            }
+            let comment_at = line_start + leading;
+            if all_commented {
+                let remove_len = if trimmed.starts_with("// ") { 3 } else { 2 };
+                self.buffer.remove(comment_at..(comment_at + remove_len));
+            } else {
+                self.buffer.insert(comment_at, "// ");
+            }
+        }
+        cx.notify();
     }
 
     fn delete_forward(&mut self, cx: &mut Context<Self>) {
@@ -393,6 +705,7 @@ impl EditorView {
                 }
                 "r" => self.start_rename(cx),
                 "." => self.request_code_actions(),
+                "/" => self.toggle_line_comment(cx),
                 "z" => {
                     if keystroke.modifiers.shift {
                         self.buffer.redo();
@@ -401,7 +714,11 @@ impl EditorView {
                     }
                     cx.notify();
                 }
-                _ => {}
+                _ => {
+                    // Let app-level shortcuts (`⌘F`, `⌘P`, `⌘L`, `⌘G`, `⌘B`, `⌘J`, `⌘W`, `⌘N`, `⌘O`)
+                    // bubble up to `DartIde::on_key_down`.
+                    return;
+                }
             }
             return;
         }
@@ -411,8 +728,11 @@ impl EditorView {
             "f2" => self.start_rename(cx),
             "backspace" => self.backspace(cx),
             "delete" => self.delete_forward(cx),
-            "enter" => self.insert_at_cursor("\n", cx),
-            "tab" => self.insert_at_cursor("    ", cx),
+            "enter" => self.insert_newline(cx),
+            "tab" => {
+                let spaces = " ".repeat(self.indent_width);
+                self.insert_at_cursor(&spaces, cx);
+            }
             "left" => self.move_left(extend, cx),
             "right" => self.move_right(extend, cx),
             "up" => self.move_vertical(-1, extend, cx),
@@ -421,7 +741,7 @@ impl EditorView {
             "end" => self.move_end(extend, cx),
             _ => {
                 if let Some(text) = &keystroke.key_char {
-                    self.insert_at_cursor(text, cx);
+                    self.handle_char_input(text, cx);
                 }
             }
         }
@@ -472,12 +792,7 @@ impl EditorView {
         runs
     }
 
-    /// The word (identifier-ish run of alphanumerics/underscores)
-    /// touching byte column `col` in `text`, preferring the word to the
-    /// right of the cursor but falling back to the one just behind it —
-    /// the same convention every editor uses for "what am I pointing at"
-    /// when the cursor sits exactly between two characters.
-    fn word_at(text: &str, col: usize) -> Option<&str> {
+    fn word_range_at(text: &str, col: usize) -> Option<Range<usize>> {
         let bytes = text.as_bytes();
         if col > bytes.len() {
             return None;
@@ -499,7 +814,17 @@ impl EditorView {
         while is_word(end) {
             end += 1;
         }
-        Some(&text[start..end])
+        Some(start..end)
+    }
+
+    /// The word (identifier-ish run of alphanumerics/underscores)
+    /// touching byte column `col` in `text`, preferring the word to the
+    /// right of the cursor but falling back to the one just behind it —
+    /// the same convention every editor uses for "what am I pointing at"
+    /// when the cursor sits exactly between two characters.
+    fn word_at(text: &str, col: usize) -> Option<&str> {
+        let range = Self::word_range_at(text, col)?;
+        Some(&text[range])
     }
 
     /// Every whole-word occurrence of `word` in `text`, as local byte
@@ -641,6 +966,9 @@ impl EditorView {
 
         let selection_bg = cx.theme().selection.opacity(0.35);
         let word_match_bg = cx.theme().blue.opacity(0.16);
+        let search_match_bg = cx.theme().warning.opacity(0.22);
+        let active_search_bg = cx.theme().primary.opacity(0.38);
+        let active_search_border = cx.theme().primary.opacity(0.85);
         let default_fg: Hsla = cx.theme().foreground;
         let is_doc_line = display_text.trim_start().starts_with("///");
         let caret_color = cx.theme().caret;
@@ -694,6 +1022,20 @@ impl EditorView {
                 start..end
             })
         });
+
+        let line_end = line_start + display_text.len();
+        let active_search_range = self.search_matches.get(self.active_search_match).cloned();
+        let local_search_matches: Vec<(Range<usize>, bool)> = self
+            .search_matches
+            .iter()
+            .filter(|m| m.end > line_start && m.start < line_end)
+            .map(|m| {
+                let is_active_match = active_search_range.as_ref() == Some(m);
+                let start = m.start.max(line_start) - line_start;
+                let end = m.end.min(line_end) - line_start;
+                (start..end, is_active_match)
+            })
+            .collect();
 
         let diag_pill = diagnostic_msg.map(|(sev, msg)| {
             let diag_color = match *sev {
@@ -751,7 +1093,7 @@ impl EditorView {
                     window.paint_quad(fill(guide_rect, cx.theme().border.opacity(0.35)));
                 }
 
-                // 2. Word-occurrence & bracket highlight pills
+                // 2. Word-occurrence, bracket, & search-match highlight pills
                 let box_h = px(LINE_FONT_SIZE + 4.);
                 let box_y = bounds.origin.y + (bounds.size.height - box_h) * 0.5;
                 for range in &local_word_matches {
@@ -763,6 +1105,28 @@ impl EditorView {
                             size(x2 - x1, box_h),
                         );
                         window.paint_quad(fill(rect, word_match_bg).corner_radii(px(3.)));
+                    }
+                }
+                for (range, is_active_match) in &local_search_matches {
+                    let x1 = shaped.x_for_index(range.start.min(line_len));
+                    let x2 = shaped.x_for_index(range.end.min(line_len));
+                    if x2 > x1 {
+                        let rect = Bounds::new(
+                            point(bounds.origin.x + x1, box_y),
+                            size(x2 - x1, box_h),
+                        );
+                        if *is_active_match {
+                            window.paint_quad(gpui_kit::quad(
+                                rect,
+                                px(3.),
+                                active_search_bg,
+                                Edges::all(px(1.)),
+                                active_search_border,
+                                BorderStyle::Solid,
+                            ));
+                        } else {
+                            window.paint_quad(fill(rect, search_match_bg).corner_radii(px(3.)));
+                        }
                     }
                 }
 
@@ -813,9 +1177,16 @@ impl EditorView {
                     let rel_x = (event.position.x - bounds.origin.x).max(px(0.));
                     let column = down_shaped.closest_index_for_x(rel_x);
                     let go_to_definition = event.modifiers.platform || event.modifiers.control;
+                    let click_count = event.click_count;
                     down_view.update(cx, |this, cx| {
                         if go_to_definition {
                             this.request_definition(index, column);
+                        } else if click_count >= 3 {
+                            this.select_line(index, cx);
+                        } else if click_count == 2 {
+                            this.select_word_on_line(index, column, cx);
+                        } else if event.modifiers.shift {
+                            this.extend_to(line_start + column, cx);
                         } else {
                             this.set_cursor(line_start + column, cx);
                         }
@@ -1050,6 +1421,9 @@ impl Render for EditorView {
         if self.buffer.revision() != self.synced_revision {
             self.synced_revision = self.buffer.revision();
             self.indent_width = self.buffer.detect_indent_width();
+            if !self.search_query.is_empty() {
+                self.recompute_search_matches();
+            }
 
             if should_parse_syntax(&self.buffer) {
                 let text = self.buffer.text();
@@ -1073,7 +1447,7 @@ impl Render for EditorView {
         let cursor_line = Some(self.buffer.byte_to_line(head));
         let selection_range = (!primary.is_empty()).then(|| primary.range());
 
-        let current_word = if selection_range.is_none() {
+        let current_word = if selection_range.is_none() && self.search_query.is_empty() {
             let line_idx = self.buffer.byte_to_line(head);
             let line_start = self.buffer.line_to_byte(line_idx);
             let line_text = self.buffer.line(line_idx);

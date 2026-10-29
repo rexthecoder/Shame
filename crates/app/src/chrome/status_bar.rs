@@ -30,6 +30,8 @@ impl DartIde {
             .unwrap_or((0, 0));
         let total_issues = errors + warnings;
         let muted = cx.theme().muted_foreground;
+        let fg = cx.theme().foreground;
+        let view = cx.entity();
 
         let mut breadcrumb = h_flex().items_center().gap(px(tokens::SPACE_2));
         for (ix, seg) in segments.iter().enumerate() {
@@ -126,9 +128,23 @@ impl DartIde {
                             .text_color(muted),
                     )
                     .when_some(cursor_pos, |el, (line, column)| {
-                        el.child(format!("{line}:{column}"))
-                            .child("LF")
-                            .child("UTF-8")
+                        el.child(
+                            div()
+                                .id("status-goto-line")
+                                .px_1p5()
+                                .py_0p5()
+                                .rounded(px(tokens::RADIUS_SM))
+                                .cursor_pointer()
+                                .hover(move |s| s.bg(rgba(0xffffff10)).text_color(fg))
+                                .child(format!("{line}:{column}"))
+                                .on_click(move |_event, window, cx| {
+                                    view.update(cx, |this, cx| {
+                                        this.open_go_to_line(window, cx);
+                                    });
+                                }),
+                        )
+                        .child("LF")
+                        .child("UTF-8")
                     }),
             )
     }

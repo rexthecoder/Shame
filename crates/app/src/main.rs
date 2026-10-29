@@ -135,6 +135,10 @@ pub struct DartIde {
     pub(crate) palette_open: bool,
     pub(crate) palette_input: Entity<InputState>,
     pub(crate) palette_selected: usize,
+    pub(crate) find_open: bool,
+    pub(crate) find_input: Entity<InputState>,
+    pub(crate) go_to_line_open: bool,
+    pub(crate) go_to_line_input: Entity<InputState>,
     pub(crate) rename_target: Option<(Entity<EditorView>, u32, u32)>,
     pub(crate) rename_input: Entity<InputState>,
     pub(crate) code_actions: Option<(Entity<EditorView>, Vec<lsp_types::CodeActionOrCommand>)>,
@@ -151,6 +155,11 @@ impl DartIde {
         let tree_state = cx.new(|cx| TreeState::new(cx).items(items));
         let palette_input =
             cx.new(|cx| InputState::new(window, cx).placeholder("Go to file..."));
+        let find_input =
+            cx.new(|cx| InputState::new(window, cx).placeholder("Find in file..."));
+        let go_to_line_input = cx.new(|cx| {
+            InputState::new(window, cx).placeholder("Line[:Column] (e.g. 42 or 42:8)...")
+        });
         let rename_input = cx.new(|cx| InputState::new(window, cx).placeholder("New name..."));
 
         let git_branch = core_workspace::current_branch(&root);
@@ -172,6 +181,10 @@ impl DartIde {
             palette_open: false,
             palette_input,
             palette_selected: 0,
+            find_open: false,
+            find_input,
+            go_to_line_open: false,
+            go_to_line_input,
             rename_target: None,
             rename_input,
             code_actions: None,
@@ -187,7 +200,20 @@ impl DartIde {
                 }
             },
         );
+        let find_changes = cx.subscribe(
+            &this.find_input,
+            |this, state, event: &gpui_kit::component::input::InputEvent, cx| {
+                if matches!(event, gpui_kit::component::input::InputEvent::Change) {
+                    let query = state.read(cx).value().to_string();
+                    if let Some(editor) = this.active_editor().cloned() {
+                        editor.update(cx, |ed, cx| ed.set_search_query(&query, cx));
+                    }
+                    cx.notify();
+                }
+            },
+        );
         this._subscriptions.push(palette_changes);
+        this._subscriptions.push(find_changes);
         this
     }
 
@@ -293,7 +319,21 @@ impl DartIde {
                                         }
                                     }
                                 })
-                                .child(Input::new(&self.rename_input)),
+                                .child(
+                                    h_flex()
+                                        .h(px(28.))
+                                        .px_2p5()
+                                        .items_center()
+                                        .rounded(px(tokens::RADIUS_SM))
+                                        .bg(cx.theme().background)
+                                        .border_1()
+                                        .border_color(cx.theme().border)
+                                        .child(
+                                            Input::new(&self.rename_input)
+                                                .appearance(false)
+                                                .small(),
+                                        ),
+                                ),
                         ),
                 ),
         )
@@ -437,6 +477,29 @@ impl DartIde {
             return;
         }
 
+        if primary_mod && !keystroke.modifiers.shift && keystroke.key.as_str() == "f" {
+            if self.active_editor().is_some() {
+                self.find_open = true;
+                let query = self.find_input.read(cx).value().to_string();
+                if let Some(editor) = self.active_editor().cloned() {
+                    if !query.is_empty() {
+                        editor.update(cx, |ed, cx| ed.set_search_query(&query, cx));
+                    }
+                }
+                self.find_input
+                    .update(cx, |state, cx| state.focus(window, cx));
+                cx.notify();
+            }
+            return;
+        }
+
+        if primary_mod && matches!(keystroke.key.as_str(), "l" | "g") {
+            if self.active_editor().is_some() {
+                self.open_go_to_line(window, cx);
+            }
+            return;
+        }
+
         if primary_mod && keystroke.key.as_str() == "b" {
             self.sidebar_open = !self.sidebar_open;
             cx.notify();
@@ -511,11 +574,30 @@ impl DartIde {
                         .shadow_xl()
                         .overflow_hidden()
                         .child(
-                            div()
-                                .p_2()
+                            h_flex()
+                                .h(px(38.))
+                                .px_3()
+                                .gap_2()
+                                .items_center()
                                 .border_b_1()
                                 .border_color(cx.theme().border)
-                                .child(Input::new(&self.palette_input)),
+                                .child(
+                                    gpui_kit::component::Icon::new(
+                                        gpui_kit::assets::IconName::Search,
+                                    )
+                                    .with_size(px(13.))
+                                    .text_color(cx.theme().muted_foreground),
+                                )
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .min_w(px(0.))
+                                        .child(
+                                            Input::new(&self.palette_input)
+                                                .appearance(false)
+                                                .small(),
+                                        ),
+                                ),
                         )
                         .child(
                             v_flex()
@@ -629,6 +711,132 @@ impl DartIde {
                                 .child("\u{2191}\u{2193} Navigate")
                                 .child("\u{21b5} Open")
                                 .child("Esc Dismiss"),
+                        ),
+                ),
+        )
+    }
+
+    pub(crate) fn open_go_to_line(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.active_editor().is_none() {
+            return;
+        }
+        self.go_to_line_open = true;
+        self.go_to_line_input.update(cx, |state, cx| {
+            state.set_value("", window, cx);
+            state.focus(window, cx);
+        });
+        cx.notify();
+    }
+
+    pub(crate) fn close_find(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.find_open = false;
+        if let Some(editor) = self.active_editor().cloned() {
+            editor.update(cx, |ed, cx| ed.clear_search(cx));
+            let fh = editor.read(cx).focus_handle(cx);
+            window.focus(&fh, cx);
+        }
+        cx.notify();
+    }
+
+    fn submit_go_to_line(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let raw = self.go_to_line_input.read(cx).value().trim().to_string();
+        self.go_to_line_open = false;
+        if let Some(editor) = self.active_editor().cloned() {
+            let mut parts = raw.split(':');
+            if let Some(line_1) = parts.next().and_then(|s| s.trim().parse::<u32>().ok()) {
+                let col_1 = parts
+                    .next()
+                    .and_then(|s| s.trim().parse::<u32>().ok())
+                    .unwrap_or(1);
+                editor.update(cx, |ed, cx| {
+                    let max_line = ed.buffer().line_count().saturating_sub(1) as u32;
+                    let line_0 = line_1.saturating_sub(1).min(max_line);
+                    let col_0 = col_1.saturating_sub(1);
+                    ed.set_cursor_to_position(line_0, col_0, cx);
+                });
+            }
+            let fh = editor.read(cx).focus_handle(cx);
+            window.focus(&fh, cx);
+        }
+        cx.notify();
+    }
+
+    fn render_go_to_line_prompt(&self, view: &Entity<Self>, cx: &mut Context<Self>) -> Option<Div> {
+        if !self.go_to_line_open {
+            return None;
+        }
+        let line_count = self
+            .active_editor()
+            .map(|ed| ed.read(cx).buffer().line_count())
+            .unwrap_or(1);
+
+        Some(
+            div()
+                .absolute()
+                .inset_0()
+                .flex()
+                .justify_center()
+                .pt(px(84.))
+                .bg(rgba(0x00000066))
+                .child(
+                    v_flex()
+                        .w(px(360.))
+                        .bg(cx.theme().popover)
+                        .border_1()
+                        .border_color(cx.theme().border)
+                        .rounded(px(tokens::RADIUS_CARD))
+                        .shadow_xl()
+                        .child(
+                            h_flex()
+                                .px_3()
+                                .py_2()
+                                .items_center()
+                                .justify_between()
+                                .text_size(px(tokens::UI_SM))
+                                .text_color(cx.theme().muted_foreground)
+                                .child("Go to Line")
+                                .child(
+                                    div()
+                                        .font_family("SF Mono")
+                                        .text_size(px(tokens::UI_XS))
+                                        .child(format!("1..{line_count}")),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .px_3()
+                                .pb_3()
+                                .on_key_down({
+                                    let view = view.clone();
+                                    move |event, window, cx| {
+                                        let key = event.keystroke.key.as_str();
+                                        if key == "escape" {
+                                            view.update(cx, |this, cx| {
+                                                this.go_to_line_open = false;
+                                                cx.notify();
+                                            });
+                                        } else if key == "enter" {
+                                            view.update(cx, |this, cx| {
+                                                this.submit_go_to_line(window, cx)
+                                            });
+                                        }
+                                    }
+                                })
+                                .child(
+                                    h_flex()
+                                        .h(px(28.))
+                                        .px_2p5()
+                                        .items_center()
+                                        .rounded(px(tokens::RADIUS_SM))
+                                        .bg(cx.theme().background)
+                                        .border_1()
+                                        .border_color(cx.theme().border)
+                                        .child(
+                                            Input::new(&self.go_to_line_input)
+                                                .appearance(false)
+                                                .small(),
+                                        ),
+                                ),
                         ),
                 ),
         )
@@ -803,6 +1011,9 @@ impl Render for DartIde {
             .child(self.render_shell(&view, cx))
             .child(self.render_status_bar(cx))
             .when_some(self.render_palette(&view, cx), |el, palette| el.child(palette))
+            .when_some(self.render_go_to_line_prompt(&view, cx), |el, prompt| {
+                el.child(prompt)
+            })
             .when_some(self.render_rename_prompt(&view, cx), |el, prompt| {
                 el.child(prompt)
             })
