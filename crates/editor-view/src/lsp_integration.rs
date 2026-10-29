@@ -550,6 +550,36 @@ impl EditorView {
         }
         by_line
     }
+
+    /// The primary diagnostic message (from the most severe diagnostic) on each
+    /// 0-indexed line, used for inline Error-Lens style annotations.
+    pub(crate) fn diagnostic_messages_by_line(&self) -> HashMap<u32, (DiagnosticSeverity, String)> {
+        let mut by_line: HashMap<u32, (DiagnosticSeverity, String)> = HashMap::new();
+        let Some(lsp) = &self.lsp else {
+            return by_line;
+        };
+        for diagnostic in &lsp.diagnostics {
+            let severity = diagnostic.severity.unwrap_or(DiagnosticSeverity::INFORMATION);
+            let line = diagnostic.range.start.line;
+            let first_line = diagnostic
+                .message
+                .lines()
+                .next()
+                .unwrap_or(&diagnostic.message)
+                .trim()
+                .to_string();
+            if first_line.is_empty() {
+                continue;
+            }
+            match by_line.get(&line) {
+                Some((existing_sev, _)) if *existing_sev <= severity => {}
+                _ => {
+                    by_line.insert(line, (severity, first_line));
+                }
+            }
+        }
+        by_line
+    }
 }
 
 fn hover_contents_text(contents: &HoverContents) -> String {

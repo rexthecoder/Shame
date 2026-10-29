@@ -20,6 +20,7 @@ use core_buffer::Buffer;
 use core_lsp::lsp_types;
 use editor_view::{EditorEvent, EditorView};
 use gpui_kit::assets::AllAssets;
+use gpui_kit::base::StyledExt as _;
 use gpui_kit::component::{
     ActiveTheme as _, Sizable as _,
     h_flex,
@@ -466,7 +467,8 @@ impl DartIde {
                         .child(
                             v_flex()
                                 .id("palette-list")
-                                .py_1()
+                                .p_1p5()
+                                .gap(px(tokens::SPACE_1))
                                 .overflow_y_scroll()
                                 .children(matches.into_iter().enumerate().map(|(ix, path)| {
                                     let name = path
@@ -480,41 +482,75 @@ impl DartIde {
                                         .map(|p| p.to_string_lossy().to_string())
                                         .filter(|p| !p.is_empty())
                                         .unwrap_or_else(|| ".".to_string());
+                                    let badge = self.git_status.get(&path).copied();
                                     let row_path = path.clone();
                                     let is_selected = ix == selected;
 
                                     h_flex()
                                         .id(("palette-item", ix))
+                                        .relative()
                                         .w_full()
+                                        .h(px(30.))
                                         .items_center()
-                                        .gap_2()
+                                        .justify_between()
                                         .px_3()
-                                        .py_2()
+                                        .rounded(px(tokens::RADIUS_SM))
                                         .cursor_pointer()
-                                        .when(is_selected, |el| el.bg(cx.theme().list_active))
-                                        .when(!is_selected, |el| {
-                                            el.hover(|s| s.bg(cx.theme().list_hover))
-                                        })
-                                        .child(
-                                            icon_for_file(&name)
-                                                .text_color(file_icon_color(&name))
-                                                .small(),
-                                        )
-                                        .child(
-                                            v_flex()
-                                                .gap_0p5()
+                                        .when(is_selected, |el| {
+                                            el.bg(rgba(0xea7a3c16))
+                                                .border_1()
+                                                .border_color(rgba(0xea7a3c36))
                                                 .child(
                                                     div()
-                                                        .text_sm()
-                                                        .text_color(cx.theme().foreground)
-                                                        .child(name),
+                                                        .absolute()
+                                                        .left(px(2.))
+                                                        .top(px(6.))
+                                                        .bottom(px(6.))
+                                                        .w(px(2.5))
+                                                        .rounded(px(2.))
+                                                        .bg(cx.theme().primary),
+                                                )
+                                        })
+                                        .when(!is_selected, |el| {
+                                            el.hover(|s| s.bg(rgba(0xffffff08)))
+                                        })
+                                        .child(
+                                            h_flex()
+                                                .items_center()
+                                                .gap_2()
+                                                .min_w(px(0.))
+                                                .child(
+                                                    icon_for_file(&name)
+                                                        .text_color(file_icon_color(&name))
+                                                        .small(),
                                                 )
                                                 .child(
                                                     div()
-                                                        .text_xs()
+                                                        .text_size(px(tokens::UI))
+                                                        .when(is_selected, |s| s.font_medium())
+                                                        .text_color(cx.theme().foreground)
+                                                        .child(name),
+                                                ),
+                                        )
+                                        .child(
+                                            h_flex()
+                                                .items_center()
+                                                .gap_2()
+                                                .child(
+                                                    div()
+                                                        .text_size(px(tokens::UI_SM))
                                                         .text_color(cx.theme().muted_foreground)
                                                         .child(directory),
-                                                ),
+                                                )
+                                                .when_some(badge, |el, letter| {
+                                                    el.child(
+                                                        div()
+                                                            .text_size(px(10.))
+                                                            .font_medium()
+                                                            .text_color(cx.theme().warning)
+                                                            .child(letter.to_string()),
+                                                    )
+                                                }),
                                         )
                                         .on_click({
                                             let view = view.clone();
@@ -531,15 +567,15 @@ impl DartIde {
                         .child(
                             h_flex()
                                 .px_3()
-                                .py_1()
+                                .py_1p5()
                                 .gap_3()
                                 .border_t_1()
                                 .border_color(cx.theme().border)
-                                .text_xs()
+                                .text_size(px(tokens::UI_XS))
                                 .text_color(cx.theme().muted_foreground)
-                                .child("↑↓ Navigate")
-                                .child("↵ Open")
-                                .child("Esc Close"),
+                                .child("\u{2191}\u{2193} Navigate")
+                                .child("\u{21b5} Open")
+                                .child("Esc Dismiss"),
                         ),
                 ),
         )

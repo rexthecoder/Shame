@@ -31,6 +31,7 @@ use core_buffer::{Buffer, Selection};
 use core_lsp::lsp_types;
 use core_syntax::{Highlight, HighlightKind, InputEdit, SyntaxTree, point_at};
 use core_workspace::LineChange;
+use gpui_kit::base::StyledExt as _;
 use gpui_kit::component::{ActiveTheme as _, Sizable as _, h_flex};
 use gpui_kit::*;
 use gpui_kit::prelude::FluentBuilder as _;
@@ -511,23 +512,24 @@ impl EditorView {
         highlights: &[Highlight],
         selection: Option<Range<usize>>,
         diagnostics_by_line: &std::collections::HashMap<u32, lsp_types::DiagnosticSeverity>,
+        diagnostic_messages: &std::collections::HashMap<
+            u32,
+            (lsp_types::DiagnosticSeverity, String),
+        >,
         line_changes: &std::collections::HashMap<u32, LineChange>,
         indent_width: usize,
         current_word: Option<&str>,
+        bracket_pair: Option<(usize, usize)>,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let is_active_line = cursor_line == Some(index);
         let diagnostic_severity = diagnostics_by_line.get(&(index as u32)).copied();
-        // A warm amber rather than a plain gray — line numbers get their
-        // own identity instead of borrowing the theme's generic muted
-        // color, the same way the `cutoff-studio`/reference editors both
-        // give the gutter a distinct hue instead of flattening it into
-        // "just dim text".
+        let diagnostic_msg = diagnostic_messages.get(&(index as u32));
         let gutter_color: Hsla = match diagnostic_severity {
             Some(sev) if sev == lsp_types::DiagnosticSeverity::ERROR => cx.theme().danger,
             Some(sev) if sev == lsp_types::DiagnosticSeverity::WARNING => cx.theme().warning,
-            _ if is_active_line => cx.theme().foreground.opacity(0.8),
-            _ => cx.theme().muted_foreground.opacity(0.55),
+            _ if is_active_line => cx.theme().foreground.opacity(0.95),
+            _ => cx.theme().muted_foreground.opacity(0.45),
         };
         let gutter = h_flex()
             .w(px(GUTTER_WIDTH))
@@ -536,6 +538,7 @@ impl EditorView {
             .items_center()
             .text_size(px(GUTTER_FONT_SIZE))
             .text_color(gutter_color)
+            .when(is_active_line, |el| el.font_medium())
             .child(
                 div()
                     .w(px(30.))
@@ -646,7 +649,7 @@ impl EditorView {
                 .rounded(px(0.75))
         };
 
-        let word_matches: Vec<Range<usize>> = current_word
+        let mut word_matches: Vec<Range<usize>> = current_word
             .map(|word| {
                 Self::word_occurrences(display_text, word)
                     .into_iter()
@@ -654,6 +657,14 @@ impl EditorView {
                     .collect()
             })
             .unwrap_or_default();
+        if let Some((b1, b2)) = bracket_pair {
+            let line_end = line_start + display_text.len();
+            for b in [b1, b2] {
+                if b >= line_start && b < line_end {
+                    word_matches.push(b..(b + 1));
+                }
+            }
+        }
 
         let mut content = div().flex().items_center();
         let mut cursor_inserted = false;
@@ -674,6 +685,29 @@ impl EditorView {
         }
         if cursor_col.is_some() && !cursor_inserted {
             content = content.child(cursor_el());
+        }
+        if let Some((sev, msg)) = diagnostic_msg {
+            let diag_color = match *sev {
+                s if s == lsp_types::DiagnosticSeverity::ERROR => cx.theme().danger,
+                s if s == lsp_types::DiagnosticSeverity::WARNING => cx.theme().warning,
+                _ => cx.theme().info,
+            };
+            content = content.child(
+                h_flex()
+                    .ml_4()
+                    .px_2()
+                    .h(px(17.))
+                    .items_center()
+                    .gap_1()
+                    .rounded(px(4.))
+                    .bg(diag_color.opacity(0.12))
+                    .border_1()
+                    .border_color(diag_color.opacity(0.28))
+                    .text_size(px(11.))
+                    .text_color(diag_color)
+                    .child("\u{25cf}")
+                    .child(msg.clone()),
+            );
         }
 
         // Faint vertical indent guides, drawn at multiples of the file's
@@ -1009,8 +1043,20 @@ impl Render for EditorView {
         }
         let highlights = self.syntax_tree.highlights(&text);
         let diagnostics_by_line = self.diagnostics_by_line();
+        let diagnostic_messages = self.diagnostic_messages_by_line();
         let line_changes = self.buffer.path().map(core_workspace::line_changes).unwrap_or_default();
         let indent_width = indent_width(&lines);
+        let bracket_pair = self
+            .syntax_tree
+            .matching_bracket(&text, head)
+            .map(|other| (head, other))
+            .or_else(|| {
+                (head > 0).then(|| {
+                    self.syntax_tree
+                        .matching_bracket(&text, head - 1)
+                        .map(|other| (head - 1, other))
+                })?
+            });
 
         let rendered_lines: Vec<_> = lines
             .iter()
@@ -1023,9 +1069,11 @@ impl Render for EditorView {
                     &highlights,
                     selection_range.clone(),
                     &diagnostics_by_line,
+                    &diagnostic_messages,
                     &line_changes,
                     indent_width,
                     current_word.as_deref(),
+                    bracket_pair,
                     cx,
                 )
                     .into_any_element()

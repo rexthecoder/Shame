@@ -1,9 +1,9 @@
+use gpui_kit::base::StyledExt as _;
 use gpui_kit::component::{
     ActiveTheme as _, Icon, Sizable as _,
     button::{Button, ButtonVariants as _},
     h_flex,
 };
-use gpui_kit::base::StyledExt as _;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
@@ -28,10 +28,6 @@ impl DartIde {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        // macOS hides the traffic lights once the window is actually in
-        // native fullscreen, so the space this titlebar reserves for them
-        // is wasted there — drop the inset in that state instead of
-        // leaving a permanent gap, the same thing Zed does.
         let traffic_light_inset = if window.is_fullscreen() { px(12.) } else { px(78.) };
 
         let root_name = self
@@ -52,6 +48,7 @@ impl DartIde {
         let muted = cx.theme().muted_foreground;
         let green = cx.theme().green;
         let info = cx.theme().info;
+        let has_changes = !self.git_status.is_empty();
 
         h_flex()
             .w_full()
@@ -129,9 +126,18 @@ impl DartIde {
             )
             .child(
                 h_flex()
+                    .id("titlebar-project-pill")
                     .flex_shrink_0()
+                    .h(px(26.))
+                    .px(px(tokens::SPACE_4))
+                    .rounded(px(tokens::RADIUS_PILL))
+                    .bg(rgba(0xffffff05))
+                    .border_1()
+                    .border_color(cx.theme().border.opacity(0.6))
                     .items_center()
                     .gap_2()
+                    .cursor_pointer()
+                    .hover(|s| s.bg(rgba(0xffffff0c)))
                     .child(
                         div()
                             .text_size(px(tokens::UI))
@@ -154,6 +160,14 @@ impl DartIde {
                                         .text_color(green),
                                 )
                                 .child(div().text_color(fg).child(branch))
+                                .when(has_changes, |el| {
+                                    el.child(
+                                        div()
+                                            .text_size(px(8.))
+                                            .text_color(cx.theme().primary)
+                                            .child("\u{25cf}"),
+                                    )
+                                })
                                 .when(ahead > 0, |el| {
                                     el.child(
                                         div()
@@ -162,7 +176,14 @@ impl DartIde {
                                     )
                                 }),
                         )
-                    }),
+                    })
+                    .on_click(cx.listener(|this, _event, window, cx| {
+                        this.palette_open = true;
+                        this.palette_selected = 0;
+                        this.palette_input
+                            .update(cx, |state, cx| state.focus(window, cx));
+                        cx.notify();
+                    })),
             )
             .child(
                 h_flex()
@@ -183,13 +204,15 @@ impl DartIde {
                     .when_some(active_file_name, |el, file| {
                         el.child(
                             div()
-                                .h(px(22.))
+                                .h(px(24.))
                                 .px(px(tokens::SPACE_3))
                                 .flex()
                                 .items_center()
                                 .gap(px(tokens::SPACE_2))
                                 .rounded(px(tokens::RADIUS_PILL))
                                 .bg(cx.theme().secondary)
+                                .border_1()
+                                .border_color(cx.theme().border)
                                 .text_size(px(tokens::UI_SM))
                                 .text_color(fg)
                                 .child(
@@ -200,18 +223,36 @@ impl DartIde {
                                 .child(file),
                         )
                     })
-                    .child(icon_button(
-                        "run",
-                        gpui_kit::assets::IconName::Play,
-                        Some(green),
-                        "Run project",
-                    ))
-                    .child(icon_button(
-                        "debug",
-                        gpui_kit::assets::IconName::Bug,
-                        Some(muted),
-                        "Debug project",
-                    ))
+                    .child(
+                        h_flex()
+                            .h(px(28.))
+                            .px(px(tokens::SPACE_1))
+                            .items_center()
+                            .gap(px(tokens::SPACE_1))
+                            .rounded(px(tokens::RADIUS_PANEL))
+                            .bg(rgba(0xffffff05))
+                            .border_1()
+                            .border_color(cx.theme().border.opacity(0.6))
+                            .child(icon_button(
+                                "run",
+                                gpui_kit::assets::IconName::Play,
+                                Some(green),
+                                "Run project",
+                            ))
+                            .child(icon_button(
+                                "debug",
+                                gpui_kit::assets::IconName::Bug,
+                                Some(muted),
+                                "Debug project",
+                            ))
+                            .child(div().w(px(1.)).h(px(12.)).bg(cx.theme().border))
+                            .child(icon_button(
+                                "fast",
+                                gpui_kit::assets::IconName::Zap,
+                                Some(green),
+                                "Hot reload",
+                            )),
+                    )
                     .child(icon_button(
                         "agent-wand",
                         gpui_kit::assets::IconName::WandSparkles,
@@ -235,12 +276,6 @@ impl DartIde {
                             })),
                     )
                     .child(icon_button(
-                        "fast",
-                        gpui_kit::assets::IconName::Zap,
-                        Some(green),
-                        "Hot reload",
-                    ))
-                    .child(icon_button(
                         "settings",
                         gpui_kit::assets::IconName::Settings,
                         Some(muted),
@@ -249,4 +284,3 @@ impl DartIde {
             )
     }
 }
-
