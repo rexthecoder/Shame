@@ -42,7 +42,8 @@ use gpui_kit::Context;
 use smol::Timer;
 use lsp_types::{
     ApplyWorkspaceEditParams, ClientCapabilities, CodeAction, CodeActionContext,
-    CodeActionOrCommand, CodeActionParams, Command, Diagnostic, DiagnosticSeverity,
+    CodeActionOrCommand, CodeActionParams, Command, CompletionItem, CompletionItemKind,
+    CompletionParams, CompletionResponse, CompletionTextEdit, Diagnostic, DiagnosticSeverity,
     DidChangeTextDocumentParams, DidOpenTextDocumentParams, DocumentFormattingParams,
     ExecuteCommandParams, FormattingOptions, GotoDefinitionParams, GotoDefinitionResponse, Hover,
     HoverContents, HoverParams, InitializeParams, LanguageString, Location, MarkedString,
@@ -52,6 +53,24 @@ use lsp_types::{
 };
 
 use crate::{EditorEvent, EditorView};
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CompletionKindBadge {
+    Function,
+    Property,
+    Type,
+    Variable,
+    Keyword,
+    Constant,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct CompletionEntry {
+    pub(crate) label: String,
+    pub(crate) insert_text: String,
+    pub(crate) detail: Option<String>,
+    pub(crate) kind: CompletionKindBadge,
+}
 
 pub(crate) struct LspState {
     client: LspClient,
@@ -65,6 +84,7 @@ pub(crate) struct LspState {
     pending_format_id: Option<i64>,
     pending_rename_id: Option<i64>,
     pending_code_action_id: Option<i64>,
+    pending_completion_id: Option<i64>,
 }
 
 impl EditorView {
@@ -124,6 +144,7 @@ impl EditorView {
             pending_format_id: None,
             pending_rename_id: None,
             pending_code_action_id: None,
+            pending_completion_id: None,
         });
     }
 
@@ -315,6 +336,36 @@ impl EditorView {
         }
     }
 
+    /// Send `textDocument/completion` for the current cursor position.
+    pub(crate) fn request_lsp_completion(&mut self, line: usize, column: usize) {
+        let Some(lsp) = &mut self.lsp else {
+            return;
+        };
+        if !lsp.ready {
+            return;
+        };
+        let params = CompletionParams {
+            text_document_position: TextDocumentPositionParams {
+                text_document: TextDocumentIdentifier {
+                    uri: lsp.uri.clone(),
+                },
+                position: Position {
+                    line: line as u32,
+                    character: column as u32,
+                },
+            },
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+            context: None,
+        };
+        if let Ok(id) = lsp.client.request(
+            "textDocument/completion",
+            serde_json::to_value(params).unwrap_or_default(),
+        ) {
+            lsp.pending_completion_id = Some(id);
+        }
+    }
+
     /// Apply a chosen code action: a direct edit if it has one, otherwise
     /// a server command (most Dart quick-fixes are commands — the
     /// server replies with its own `workspace/applyEdit` *request*,
@@ -496,6 +547,20 @@ impl EditorView {
                     _ => cx.emit(EditorEvent::ShowCodeActions { actions }),
                 }
             }
+            ServerMessage::Response { id, result } if lsp.pending_completion_id == Some(id) => {
+                lsp.pending_completion_id = None;
+                let Ok(value) = result else {
+                    return;
+                };
+                let Ok(Some(resp)) = serde_json::from_value::<Option<CompletionResponse>>(value) else {
+                    return;
+                };
+                let items = match resp {
+                    CompletionResponse::Array(items) => items,
+                    CompletionResponse::List(list) => list.items,
+                };
+                self.merge_lsp_completions(items, cx);
+            }
             // A request *from* the server, not a reply to one of ours.
             // So far just workspace/applyEdit, sent after we ask it to
             // run a Dart quick-fix command — apply the edit to our own
@@ -618,6 +683,95 @@ fn first_definition_target(response: &GotoDefinitionResponse) -> Option<(Uri, u3
 /// only kind this app ever constructs or expects back from the server).
 fn uri_to_path(uri: &Uri) -> Option<PathBuf> {
     uri.as_str().strip_prefix("file://").map(PathBuf::from)
+}
+
+pub(crate) fn completion_item_to_entry(item: CompletionItem) -> Option<CompletionEntry> {
+    let label = item.label.trim().to_string();
+    if label.is_empty() {
+        return None;
+    }
+    let raw_insert = item
+        .text_edit
+        .and_then(|te| match te {
+            CompletionTextEdit::Edit(e) => Some(e.new_text),
+            CompletionTextEdit::InsertAndReplace(e) => Some(e.new_text),
+        })
+        .or(item.insert_text)
+        .unwrap_or_else(|| label.clone());
+    let insert_text = strip_lsp_snippet(&raw_insert);
+    if insert_text.is_empty() {
+        return None;
+    }
+    let kind = match item.kind {
+        Some(
+            CompletionItemKind::FUNCTION
+            | CompletionItemKind::METHOD
+            | CompletionItemKind::CONSTRUCTOR,
+        ) => CompletionKindBadge::Function,
+        Some(CompletionItemKind::FIELD | CompletionItemKind::PROPERTY) => {
+            CompletionKindBadge::Property
+        }
+        Some(
+            CompletionItemKind::CLASS
+            | CompletionItemKind::INTERFACE
+            | CompletionItemKind::STRUCT
+            | CompletionItemKind::ENUM
+            | CompletionItemKind::TYPE_PARAMETER,
+        ) => CompletionKindBadge::Type,
+        Some(CompletionItemKind::KEYWORD) => CompletionKindBadge::Keyword,
+        Some(CompletionItemKind::CONSTANT | CompletionItemKind::ENUM_MEMBER) => {
+            CompletionKindBadge::Constant
+        }
+        _ => CompletionKindBadge::Variable,
+    };
+    let detail = item
+        .detail
+        .map(|d| d.lines().next().unwrap_or(&d).trim().to_string())
+        .filter(|d| !d.is_empty());
+    Some(CompletionEntry {
+        label,
+        insert_text,
+        detail,
+        kind,
+    })
+}
+
+/// Strip LSP snippet placeholders (`$0`, `$1`, `${1:default}`) so inserting a
+/// completion never leaves raw `$0` syntax in the buffer.
+pub(crate) fn strip_lsp_snippet(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    let chars: Vec<char> = raw.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] == '$' && i + 1 < chars.len() {
+            if chars[i + 1].is_ascii_digit() {
+                i += 2;
+                while i < chars.len() && chars[i].is_ascii_digit() {
+                    i += 1;
+                }
+                continue;
+            } else if chars[i + 1] == '{' {
+                i += 2;
+                while i < chars.len() && chars[i].is_ascii_digit() {
+                    i += 1;
+                }
+                if i < chars.len() && chars[i] == ':' {
+                    i += 1;
+                    while i < chars.len() && chars[i] != '}' {
+                        out.push(chars[i]);
+                        i += 1;
+                    }
+                }
+                if i < chars.len() && chars[i] == '}' {
+                    i += 1;
+                }
+                continue;
+            }
+        }
+        out.push(chars[i]);
+        i += 1;
+    }
+    out
 }
 
 #[cfg(test)]

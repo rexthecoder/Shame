@@ -34,7 +34,9 @@ use core_workspace::LineChange;
 use gpui_kit::component::{ActiveTheme as _, Sizable as _, h_flex, v_flex};
 use gpui_kit::*;
 use gpui_kit::prelude::FluentBuilder as _;
-use lsp_integration::LspState;
+use lsp_integration::{
+    CompletionEntry, CompletionKindBadge, LspState, completion_item_to_entry,
+};
 
 /// Second pass on this editor's look. The first pass piled on chrome —
 /// a bordered gutter column with its own background tint, a left-edge
@@ -117,6 +119,9 @@ pub struct EditorView {
     search_query: String,
     search_matches: Vec<Range<usize>>,
     active_search_match: usize,
+    /// Active autocomplete candidates and selected row index.
+    completions: Vec<CompletionEntry>,
+    completion_selected: usize,
 }
 
 impl EditorView {
@@ -154,6 +159,8 @@ impl EditorView {
             search_query: String::new(),
             search_matches: Vec::new(),
             active_search_match: 0,
+            completions: Vec::new(),
+            completion_selected: 0,
         };
         this.maybe_start_lsp(cx);
         this
@@ -429,6 +436,9 @@ impl EditorView {
         }
         self.buffer.remove(start..head);
         self.set_cursor(start, cx);
+        if !self.completions.is_empty() {
+            self.trigger_completions(false, cx);
+        }
     }
 
     /// Smart newline on `Enter`: preserves the current line's leading
@@ -538,6 +548,215 @@ impl EditorView {
         }
 
         self.insert_at_cursor(text, cx);
+
+        let is_trigger = text == "."
+            || text
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'_');
+        if is_trigger {
+            self.trigger_completions(false, cx);
+        } else {
+            self.dismiss_completions(cx);
+        }
+    }
+
+    pub(crate) fn dismiss_completions(&mut self, cx: &mut Context<Self>) {
+        if !self.completions.is_empty() {
+            self.completions.clear();
+            self.completion_selected = 0;
+            cx.notify();
+        }
+    }
+
+    /// Return `(prefix_byte_range_in_buffer, prefix_string, is_after_dot)` at
+    /// the current primary cursor.
+    fn current_completion_prefix(&self) -> (Range<usize>, String, bool) {
+        let head = self.buffer.selections().primary().head;
+        let line_idx = self.buffer.byte_to_line(head);
+        let line_start = self.buffer.line_to_byte(line_idx);
+        let before = self.buffer.slice(line_start..head);
+        let bytes = before.as_bytes();
+        let mut word_start = bytes.len();
+        while word_start > 0 && is_word_byte(bytes[word_start - 1]) {
+            word_start -= 1;
+        }
+        let prefix = before[word_start..].to_string();
+        let after_dot = word_start > 0 && bytes[word_start - 1] == b'.';
+        ((line_start + word_start)..head, prefix, after_dot)
+    }
+
+    pub(crate) fn trigger_completions(&mut self, manual: bool, cx: &mut Context<Self>) {
+        let (_range, prefix, after_dot) = self.current_completion_prefix();
+        if !manual && prefix.is_empty() && !after_dot {
+            self.dismiss_completions(cx);
+            return;
+        }
+
+        // Sync buffer text to LSP immediately so `textDocument/completion`
+        // sees the newly typed character before the next frame's `render()`.
+        if should_parse_syntax(&self.buffer) {
+            let text = self.buffer.text();
+            self.sync_lsp_text(&text);
+            let head = self.buffer.selections().primary().head;
+            let line = self.buffer.byte_to_line(head);
+            let col = head - self.buffer.line_to_byte(line);
+            self.request_lsp_completion(line, col);
+        }
+
+        self.completions = self.compute_local_completions(&prefix, after_dot);
+        self.completion_selected = 0;
+        cx.notify();
+    }
+
+    pub(crate) fn merge_lsp_completions(
+        &mut self,
+        items: Vec<core_lsp::lsp_types::CompletionItem>,
+        cx: &mut Context<Self>,
+    ) {
+        let (_range, prefix, after_dot) = self.current_completion_prefix();
+        if prefix.is_empty() && !after_dot {
+            return;
+        }
+        let prefix_lower = prefix.to_lowercase();
+        let mut entries: Vec<CompletionEntry> = items
+            .into_iter()
+            .filter_map(completion_item_to_entry)
+            .filter(|e| {
+                e.label != prefix
+                    && (prefix_lower.is_empty()
+                        || e.label.to_lowercase().contains(&prefix_lower))
+            })
+            .collect();
+
+        entries.sort_by_key(|e| {
+            let lower = e.label.to_lowercase();
+            let starts = lower.starts_with(&prefix_lower);
+            (!starts, e.label.len(), e.label.clone())
+        });
+
+        let mut seen = std::collections::HashSet::new();
+        let mut merged = Vec::new();
+        for entry in entries
+            .into_iter()
+            .chain(self.compute_local_completions(&prefix, after_dot))
+        {
+            if seen.insert(entry.label.clone()) {
+                merged.push(entry);
+                if merged.len() >= 24 {
+                    break;
+                }
+            }
+        }
+        self.completions = merged;
+        self.completion_selected = 0;
+        cx.notify();
+    }
+
+    fn compute_local_completions(&self, prefix: &str, after_dot: bool) -> Vec<CompletionEntry> {
+        if prefix.is_empty() && !after_dot {
+            return Vec::new();
+        }
+        let prefix_lower = prefix.to_lowercase();
+        let mut seen = std::collections::HashSet::new();
+        let mut results: Vec<CompletionEntry> = Vec::new();
+
+        const KEYWORDS: &[&str] = &[
+            "abstract", "async", "await", "break", "case", "catch", "class", "const", "continue",
+            "covariant", "default", "deferred", "do", "dynamic", "else", "enum", "export",
+            "extends", "extension", "external", "factory", "false", "final", "finally", "for",
+            "Function", "get", "hide", "if", "implements", "import", "in", "interface", "is",
+            "late", "library", "mixin", "new", "null", "on", "operator", "part", "required",
+            "rethrow", "return", "sealed", "set", "show", "static", "super", "switch", "sync",
+            "this", "throw", "true", "try", "typedef", "var", "void", "when", "while", "with",
+            "yield", "Widget", "BuildContext", "StatelessWidget", "StatefulWidget", "State",
+            "Future", "Stream", "List", "Map", "Set", "String", "int", "double", "bool",
+            "override", "fn", "pub", "struct", "impl", "let", "mut", "match", "Some", "None",
+            "Ok", "Err",
+        ];
+
+        if !after_dot && !prefix.is_empty() {
+            for &kw in KEYWORDS {
+                if kw != prefix && kw.to_lowercase().starts_with(&prefix_lower) && seen.insert(kw.to_string()) {
+                    let is_type = kw.bytes().next().is_some_and(|b| b.is_ascii_uppercase());
+                    results.push(CompletionEntry {
+                        label: kw.to_string(),
+                        insert_text: kw.to_string(),
+                        detail: Some(if is_type { "type" } else { "keyword" }.to_string()),
+                        kind: if is_type {
+                            CompletionKindBadge::Type
+                        } else {
+                            CompletionKindBadge::Keyword
+                        },
+                    });
+                }
+            }
+        }
+
+        // Scan buffer identifiers (when buffer <= 256 KiB)
+        if should_parse_syntax(&self.buffer) {
+            let text = self.buffer.text();
+            let bytes = text.as_bytes();
+            let mut i = 0;
+            while i < bytes.len() {
+                if is_word_byte(bytes[i]) && !bytes[i].is_ascii_digit() {
+                    let start = i;
+                    let preceded_by_dot = start > 0 && bytes[start - 1] == b'.';
+                    while i < bytes.len() && is_word_byte(bytes[i]) {
+                        i += 1;
+                    }
+                    let word = &text[start..i];
+                    if word.len() >= 2
+                        && word != prefix
+                        && (prefix_lower.is_empty()
+                            || word.to_lowercase().starts_with(&prefix_lower))
+                        && (!after_dot || preceded_by_dot || !prefix.is_empty())
+                        && seen.insert(word.to_string())
+                    {
+                        let followed_by_paren = i < bytes.len() && bytes[i] == b'(';
+                        let is_type = word.bytes().next().is_some_and(|b| b.is_ascii_uppercase());
+                        let kind = if followed_by_paren {
+                            CompletionKindBadge::Function
+                        } else if preceded_by_dot {
+                            CompletionKindBadge::Property
+                        } else if is_type {
+                            CompletionKindBadge::Type
+                        } else {
+                            CompletionKindBadge::Variable
+                        };
+                        results.push(CompletionEntry {
+                            label: word.to_string(),
+                            insert_text: word.to_string(),
+                            detail: None,
+                            kind,
+                        });
+                    }
+                } else {
+                    i += 1;
+                }
+            }
+        }
+
+        results.sort_by_key(|e| {
+            let lower = e.label.to_lowercase();
+            let exact_prefix = e.label.starts_with(prefix);
+            let ci_prefix = lower.starts_with(&prefix_lower);
+            (!exact_prefix, !ci_prefix, e.label.len(), e.label.clone())
+        });
+        results.truncate(20);
+        results
+    }
+
+    pub(crate) fn accept_completion(&mut self, ix: usize, cx: &mut Context<Self>) {
+        let Some(entry) = self.completions.get(ix).cloned() else {
+            return;
+        };
+        let (prefix_range, _prefix, _after_dot) = self.current_completion_prefix();
+        let insert_at = prefix_range.start;
+        self.buffer.edit(prefix_range, &entry.insert_text);
+        self.completions.clear();
+        self.completion_selected = 0;
+        self.set_cursor(insert_at + entry.insert_text.len(), cx);
+        self.ensure_cursor_visible();
     }
 
     /// Toggle `// ` line comments across the current line or selected lines (`⌘/`).
@@ -691,6 +910,42 @@ impl EditorView {
         let keystroke = &event.keystroke;
         let primary_mod = keystroke.modifiers.platform || keystroke.modifiers.control;
 
+        // `Ctrl+Space` manually triggers autocomplete
+        if keystroke.modifiers.control && keystroke.key.as_str() == "space" {
+            self.trigger_completions(true, cx);
+            return;
+        }
+
+        // Navigate / accept / dismiss active autocomplete popup
+        if !self.completions.is_empty() && !primary_mod {
+            match keystroke.key.as_str() {
+                "down" => {
+                    self.completion_selected =
+                        (self.completion_selected + 1) % self.completions.len();
+                    cx.notify();
+                    return;
+                }
+                "up" => {
+                    self.completion_selected = if self.completion_selected == 0 {
+                        self.completions.len() - 1
+                    } else {
+                        self.completion_selected - 1
+                    };
+                    cx.notify();
+                    return;
+                }
+                "tab" | "enter" => {
+                    self.accept_completion(self.completion_selected, cx);
+                    return;
+                }
+                "escape" => {
+                    self.dismiss_completions(cx);
+                    return;
+                }
+                _ => {}
+            }
+        }
+
         if primary_mod {
             match keystroke.key.as_str() {
                 "c" => self.copy(cx),
@@ -734,12 +989,30 @@ impl EditorView {
                 let spaces = " ".repeat(self.indent_width);
                 self.insert_at_cursor(&spaces, cx);
             }
-            "left" => self.move_left(extend, cx),
-            "right" => self.move_right(extend, cx),
-            "up" => self.move_vertical(-1, extend, cx),
-            "down" => self.move_vertical(1, extend, cx),
-            "home" => self.move_home(extend, cx),
-            "end" => self.move_end(extend, cx),
+            "left" => {
+                self.dismiss_completions(cx);
+                self.move_left(extend, cx);
+            }
+            "right" => {
+                self.dismiss_completions(cx);
+                self.move_right(extend, cx);
+            }
+            "up" => {
+                self.dismiss_completions(cx);
+                self.move_vertical(-1, extend, cx);
+            }
+            "down" => {
+                self.dismiss_completions(cx);
+                self.move_vertical(1, extend, cx);
+            }
+            "home" => {
+                self.dismiss_completions(cx);
+                self.move_home(extend, cx);
+            }
+            "end" => {
+                self.dismiss_completions(cx);
+                self.move_end(extend, cx);
+            }
             _ => {
                 if let Some(text) = &keystroke.key_char {
                     self.handle_char_input(text, cx);
@@ -1182,6 +1455,7 @@ impl EditorView {
                     let click_count = event.click_count;
                     down_view.update(cx, |this, cx| {
                         this.clear_hover(cx);
+                        this.dismiss_completions(cx);
                         if go_to_definition {
                             this.request_definition(index, column);
                         } else if click_count >= 3 {
@@ -1267,8 +1541,29 @@ impl EditorView {
                                 .child(pill),
                         )
                     })
+                    .when(
+                        is_active_line && !self.completions.is_empty(),
+                        |el| {
+                            let col = cursor_col.unwrap_or(0);
+                            let left_offset = px((col as f32 * 7.5).min(360.));
+                            let popup = self.render_completion_popup(&mono_family, cx);
+                            el.child(
+                                deferred(
+                                    div()
+                                        .occlude()
+                                        .absolute()
+                                        .top(px(LINE_HEIGHT + 2.))
+                                        .left(left_offset)
+                                        .w(px(340.))
+                                        .child(popup),
+                                )
+                                .with_priority(20),
+                            )
+                        },
+                    )
                     .when_some(
-                        self.hover_to_render().filter(|(line, _)| *line == index),
+                        self.hover_to_render()
+                            .filter(|(line, _)| *line == index && self.completions.is_empty()),
                         |el, (_, text)| {
                             let hover_col = self
                                 .hover_point
@@ -1432,6 +1727,148 @@ impl EditorView {
             i += 1;
         }
         out
+    }
+
+    fn render_completion_popup(
+        &self,
+        mono_family: &SharedString,
+        cx: &mut Context<Self>,
+    ) -> Div {
+        let view = cx.entity();
+        let total = self.completions.len();
+        let selected = self.completion_selected.min(total.saturating_sub(1));
+        let window_size = 8usize;
+        let start_ix = if selected >= window_size {
+            selected + 1 - window_size
+        } else {
+            0
+        };
+        let end_ix = (start_ix + window_size).min(total);
+
+        let fg = cx.theme().popover_foreground;
+        let muted = cx.theme().muted_foreground;
+        let border = cx.theme().border;
+        let primary = cx.theme().primary;
+
+        let rows: Vec<AnyElement> = (start_ix..end_ix)
+            .map(|ix| {
+                let entry = &self.completions[ix];
+                let is_sel = ix == selected;
+                let (badge_text, badge_color) = match entry.kind {
+                    CompletionKindBadge::Function => ("fn", rgb(0x61afef)),
+                    CompletionKindBadge::Property => ("pr", rgb(0xe06c75)),
+                    CompletionKindBadge::Type => ("ty", rgb(0xe5c07b)),
+                    CompletionKindBadge::Variable => ("vr", rgb(0x56b6c2)),
+                    CompletionKindBadge::Keyword => ("kw", rgb(0xc678dd)),
+                    CompletionKindBadge::Constant => ("ct", rgb(0xd19a66)),
+                };
+                let badge_hsla: Hsla = badge_color.into();
+                let view_click = view.clone();
+
+                h_flex()
+                    .id(("completion-item", ix))
+                    .relative()
+                    .w_full()
+                    .h(px(24.))
+                    .px_2()
+                    .gap_2()
+                    .items_center()
+                    .justify_between()
+                    .rounded(px(5.))
+                    .border_1()
+                    .border_color(if is_sel {
+                        rgba(0xea7a3c40)
+                    } else {
+                        rgba(0x00000000)
+                    })
+                    .when(is_sel, |el| {
+                        el.bg(rgba(0xea7a3c1a)).child(
+                            div()
+                                .absolute()
+                                .left(px(1.5))
+                                .top(px(4.))
+                                .bottom(px(4.))
+                                .w(px(2.))
+                                .rounded(px(1.))
+                                .bg(primary),
+                        )
+                    })
+                    .when(!is_sel, |el| el.hover(|s| s.bg(rgba(0xffffff08))))
+                    .cursor_pointer()
+                    .on_mouse_down(MouseButton::Left, move |_event, _window, cx| {
+                        cx.stop_propagation();
+                        view_click.update(cx, |this, cx| {
+                            this.accept_completion(ix, cx);
+                        });
+                    })
+                    .child(
+                        h_flex()
+                            .items_center()
+                            .gap_2()
+                            .min_w(px(0.))
+                            .child(
+                                div()
+                                    .w(px(18.))
+                                    .h(px(15.))
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .rounded(px(3.))
+                                    .bg(badge_hsla.opacity(0.16))
+                                    .font_family(mono_family.clone())
+                                    .text_size(px(9.5))
+                                    .text_color(badge_hsla)
+                                    .child(badge_text),
+                            )
+                            .child(
+                                div()
+                                    .font_family(mono_family.clone())
+                                    .text_size(px(12.))
+                                    .text_color(fg)
+                                    . truncate()
+                                    .child(entry.label.clone()),
+                            ),
+                    )
+                    .when_some(entry.detail.clone(), |el, detail| {
+                        el.child(
+                            div()
+                                .max_w(px(120.))
+                                .truncate()
+                                .font_family(mono_family.clone())
+                                .text_size(px(10.5))
+                                .text_color(muted)
+                                .child(detail),
+                        )
+                    })
+                    .into_any_element()
+            })
+            .collect();
+
+        v_flex()
+            .w_full()
+            .p_1()
+            .gap_0p5()
+            .rounded(px(8.))
+            .bg(cx.theme().popover)
+            .border_1()
+            .border_color(border)
+            .shadow_xl()
+            .children(rows)
+            .child(
+                h_flex()
+                    .w_full()
+                    .pt_1()
+                    .px_2()
+                    .border_t_1()
+                    .border_color(border.opacity(0.6))
+                    .items_center()
+                    .justify_between()
+                    .font_family(cx.theme().font_family.clone())
+                    .text_size(px(10.))
+                    .text_color(muted)
+                    .child("\u{2191}\u{2193} select   \u{21e5}/\u{21b5} accept   esc close")
+                    .child(format!("{}/{}", selected + 1, total)),
+            )
     }
 }
 

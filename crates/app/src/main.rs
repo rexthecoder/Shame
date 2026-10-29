@@ -464,6 +464,30 @@ impl DartIde {
     }
 
     fn set_root(&mut self, root: PathBuf, cx: &mut Context<Self>) {
+        // Close tabs and overlays from the previous project workspace
+        self.tabs.clear();
+        self.active_tab = 0;
+        self.tab_overflow_open = false;
+        self.palette_open = false;
+        self.find_open = false;
+        self.go_to_line_open = false;
+        self.rename_target = None;
+        self.code_actions = None;
+
+        // Kill any running terminal child processes from the old project and
+        // start a fresh terminal session rooted at the new workspace
+        for session in &mut self.terminals {
+            if let Some(pid) = session.running_pid.take() {
+                let _ = std::process::Command::new("kill")
+                    .args(["-TERM", &pid.to_string()])
+                    .status();
+            }
+        }
+        let id = self.next_terminal_id;
+        self.next_terminal_id += 1;
+        self.terminals = vec![editor::dock::TerminalSession::new(id, root.clone(), true)];
+        self.active_terminal = 0;
+
         let items = build_tree_items(&root, self.show_hidden);
         self.all_files = flatten_files(&root);
         self.tree_state.update(cx, |state, cx| {
@@ -471,9 +495,6 @@ impl DartIde {
         });
         self.git_branch = core_workspace::current_branch(&root);
         self.git_status = core_workspace::status_map(&root);
-        if let Some(term) = self.active_terminal_mut() {
-            term.cwd = root.clone();
-        }
         self.root = root;
         cx.notify();
     }
