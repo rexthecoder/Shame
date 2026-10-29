@@ -77,7 +77,18 @@ impl SyntaxTree {
             for capture in m.captures() {
                 let name = capture_names[capture.index as usize];
                 let range = capture.node.start_byte()..capture.node.end_byte();
-                let kind = HighlightKind::from_capture_name(name);
+                let mut kind = HighlightKind::from_capture_name(name);
+                // In Dart, PascalCase function calls (`Divider(...)`, `StatelessWidget(...)`)
+                // are widget/class constructor invocations and should highlight as `Type`.
+                if kind == HighlightKind::Function && name == "function.call" {
+                    if source[range.clone()]
+                        .bytes()
+                        .next()
+                        .is_some_and(|b| b.is_ascii_uppercase())
+                    {
+                        kind = HighlightKind::Type;
+                    }
+                }
                 highlights.push(Highlight {
                     range: range.clone(),
                     kind,

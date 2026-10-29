@@ -31,7 +31,6 @@ use core_buffer::{Buffer, Selection};
 use core_lsp::lsp_types;
 use core_syntax::{Highlight, HighlightKind, InputEdit, SyntaxTree, point_at};
 use core_workspace::LineChange;
-use gpui_kit::base::StyledExt as _;
 use gpui_kit::component::{ActiveTheme as _, Sizable as _, h_flex};
 use gpui_kit::*;
 use gpui_kit::prelude::FluentBuilder as _;
@@ -45,7 +44,7 @@ use lsp_integration::LspState;
 /// which is the actual throughline in the `cutoff-studio` reference this
 /// crate is meant to be learning from ("a flat, quiet ... layout") rather
 /// than any specific color or border it draws.
-const GUTTER_WIDTH: f32 = 48.;
+const GUTTER_WIDTH: f32 = 68.;
 const LINE_FONT_SIZE: f32 = 12.5;
 /// Numbers run one step smaller than the code they label, the way every
 /// reference editor's gutter does.
@@ -59,6 +58,8 @@ const ACTIVE_LINE_BG: u32 = 0x15161a;
 /// SF Mono over Menlo: still the system monospace macOS ships, but with
 /// tighter, more even letterforms — the difference a long file's worth
 /// of code actually shows, where a typeface pass alone wouldn't.
+/// Fallback monospace family if theme is not initialized.
+#[allow(dead_code)]
 const FONT_FAMILY: &str = "SF Mono";
 
 /// Emitted when this editor wants something handled above it that it has
@@ -881,23 +882,24 @@ impl EditorView {
             _ if is_active_line => cx.theme().foreground.opacity(0.95),
             _ => cx.theme().muted_foreground.opacity(0.45),
         };
+        let mono_family = cx.theme().mono_font_family.clone();
         let gutter = h_flex()
             .w(px(GUTTER_WIDTH))
             .h_full()
             .flex_shrink_0()
             .items_center()
+            .font_family(mono_family.clone())
             .text_size(px(GUTTER_FONT_SIZE))
             .text_color(gutter_color)
-            .when(is_active_line, |el| el.font_medium())
             .child(
                 div()
-                    .w(px(30.))
+                    .w(px(38.))
                     .text_right()
                     .child((index + 1).to_string()),
             )
             .child(
                 div()
-                    .w(px(GUTTER_WIDTH - 30.))
+                    .w(px(GUTTER_WIDTH - 38.))
                     .flex()
                     .items_center()
                     .justify_center()
@@ -981,7 +983,7 @@ impl EditorView {
             .into_iter()
             .filter(|(range, _)| !range.is_empty())
             .map(|(range, kind)| {
-                let mut run_font = font(FONT_FAMILY);
+                let mut run_font = font(mono_family.clone());
                 if let Some(k) = kind {
                     if k == HighlightKind::Comment
                         || (is_doc_line && k == HighlightKind::Attribute)
@@ -1235,7 +1237,7 @@ impl EditorView {
             .w_full()
             .h(px(LINE_HEIGHT))
             .flex_shrink_0()
-            .font_family(FONT_FAMILY)
+            .font_family(mono_family)
             .text_size(px(LINE_FONT_SIZE))
             // The active line gets a full-width, flat wash of colour —
             // subtle enough to read as a highlight, not a second panel.
@@ -1350,6 +1352,7 @@ fn highlight_color(kind: HighlightKind) -> Rgba {
     match kind {
         HighlightKind::Keyword => rgb(0xc678dd),
         HighlightKind::Type => rgb(0xe5c07b),
+        HighlightKind::BuiltinType => rgb(0x56b6c2),
         HighlightKind::Function => rgb(0x61afef),
         HighlightKind::Attribute => rgb(0x56b6c2),
         HighlightKind::Property => rgb(0xe06c75),

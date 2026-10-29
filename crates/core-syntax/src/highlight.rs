@@ -13,6 +13,7 @@ pub enum HighlightKind {
     Number,
     Function,
     Type,
+    BuiltinType,
     Constant,
     Property,
     Variable,
@@ -24,6 +25,12 @@ pub enum HighlightKind {
 
 impl HighlightKind {
     pub fn from_capture_name(name: &str) -> Self {
+        if name == "type.builtin" {
+            return Self::BuiltinType;
+        }
+        if name == "variable.builtin" {
+            return Self::Keyword;
+        }
         let base = name.split('.').next().unwrap_or(name);
         match base {
             "keyword" => Self::Keyword,

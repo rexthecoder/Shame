@@ -2,8 +2,45 @@
 //! blue-grey surfaces, hairline borders, and a single warm accent instead of a
 //! bright primary hue.
 
+use std::borrow::Cow;
+
 use gpui_kit::component::Theme;
 use gpui_kit::*;
+
+/// Load macOS's genuine `SF Mono` font faces from `Terminal.app`'s font bundle
+/// into GPUI's in-memory font source (`cx.text_system().add_fonts(...)`).
+///
+/// Why this is needed: Apple keeps `SF-Mono-*.otf` inside
+/// `/System/Applications/Utilities/Terminal.app/Contents/Resources/Fonts/`
+/// rather than `/System/Library/Fonts/`. Without registering them in
+/// `text_system()`, CoreText's `select_family_by_name("SF Mono")` fails and
+/// GPUI silently falls back to `.AppleSystemUIFont` (a proportional UI font!).
+fn load_sf_mono_fonts(cx: &App) -> bool {
+    const SF_MONO_DIR: &str =
+        "/System/Applications/Utilities/Terminal.app/Contents/Resources/Fonts";
+    const FACES: &[&str] = &[
+        "SF-Mono-Regular.otf",
+        "SF-Mono-RegularItalic.otf",
+        "SF-Mono-Medium.otf",
+        "SF-Mono-MediumItalic.otf",
+        "SF-Mono-Semibold.otf",
+        "SF-Mono-SemiboldItalic.otf",
+        "SF-Mono-Bold.otf",
+        "SF-Mono-BoldItalic.otf",
+    ];
+
+    let mut font_bytes: Vec<Cow<'static, [u8]>> = Vec::new();
+    for face in FACES {
+        let path = std::path::Path::new(SF_MONO_DIR).join(face);
+        if let Ok(bytes) = std::fs::read(path) {
+            font_bytes.push(Cow::Owned(bytes));
+        }
+    }
+    if font_bytes.is_empty() {
+        return false;
+    }
+    cx.text_system().add_fonts(font_bytes).is_ok()
+}
 
 // Values match `docs/design-spec.md` §2. Only these constants may change to
 // retheme; widgets never carry their own hex.
@@ -37,6 +74,11 @@ fn a(hex: u32) -> Hsla {
 }
 
 pub fn apply(cx: &mut App) {
+    let mono_family = if load_sf_mono_fonts(cx) {
+        "SF Mono"
+    } else {
+        "Menlo"
+    };
     Theme::update(cx, |theme| {
         let col = &mut theme.colors;
 
@@ -142,7 +184,7 @@ pub fn apply(cx: &mut App) {
 
         theme.radius = px(6.);
         theme.radius_lg = px(10.);
-        theme.mono_font_family = "SF Mono".into();
-        theme.mono_font_size = px(13.);
+        theme.mono_font_family = mono_family.into();
+        theme.mono_font_size = px(12.5);
     });
 }
