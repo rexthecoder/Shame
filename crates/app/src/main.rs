@@ -124,6 +124,7 @@ pub struct DartIde {
     pub(crate) git_status: HashMap<PathBuf, char>,
     pub(crate) sidebar_open: bool,
     pub(crate) terminal_open: bool,
+    pub(crate) terminal_maximized: bool,
     pub(crate) agent_open: bool,
     pub(crate) show_hidden: bool,
     pub(crate) tree_state: Entity<TreeState>,
@@ -142,6 +143,11 @@ pub struct DartIde {
     pub(crate) rename_target: Option<(Entity<EditorView>, u32, u32)>,
     pub(crate) rename_input: Entity<InputState>,
     pub(crate) code_actions: Option<(Entity<EditorView>, Vec<lsp_types::CodeActionOrCommand>)>,
+    pub(crate) terminals: Vec<editor::dock::TerminalSession>,
+    pub(crate) active_terminal: usize,
+    pub(crate) next_terminal_id: usize,
+    pub(crate) terminal_focus: FocusHandle,
+    pub(crate) terminal_tx: async_channel::Sender<editor::dock::TerminalEvent>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -164,12 +170,29 @@ impl DartIde {
 
         let git_branch = core_workspace::current_branch(&root);
         let git_status = core_workspace::status_map(&root);
+        let (terminal_tx, terminal_rx) = async_channel::unbounded();
+        let initial_terminal = editor::dock::TerminalSession::new(0, root.clone(), true);
+        let terminal_focus = cx.focus_handle();
+
+        cx.spawn(async move |weak, cx| {
+            while let Ok(evt) = terminal_rx.recv().await {
+                if weak
+                    .update(cx, |this, cx| this.handle_terminal_event(evt, cx))
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        })
+        .detach();
+
         let mut this = Self {
             root,
             git_branch,
             git_status,
             sidebar_open: true,
             terminal_open: true,
+            terminal_maximized: false,
             agent_open: true,
             show_hidden,
             tree_state,
@@ -188,6 +211,11 @@ impl DartIde {
             rename_target: None,
             rename_input,
             code_actions: None,
+            terminals: vec![initial_terminal],
+            active_terminal: 0,
+            next_terminal_id: 1,
+            terminal_focus,
+            terminal_tx,
             _subscriptions: Vec::new(),
         };
 
@@ -443,6 +471,9 @@ impl DartIde {
         });
         self.git_branch = core_workspace::current_branch(&root);
         self.git_status = core_workspace::status_map(&root);
+        if let Some(term) = self.active_terminal_mut() {
+            term.cwd = root.clone();
+        }
         self.root = root;
         cx.notify();
     }
@@ -1008,7 +1039,7 @@ impl Render for DartIde {
             .bg(cx.theme().background)
             .text_color(cx.theme().foreground)
             .child(self.render_titlebar(window, cx))
-            .child(self.render_shell(&view, cx))
+            .child(self.render_shell(&view, window, cx))
             .child(self.render_status_bar(cx))
             .when_some(self.render_palette(&view, cx), |el, palette| el.child(palette))
             .when_some(self.render_go_to_line_prompt(&view, cx), |el, prompt| {

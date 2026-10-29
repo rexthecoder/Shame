@@ -12,6 +12,7 @@ path = "src/main.rs"
 [dependencies]
 gpui-kit.workspace = true
 anyhow.workspace = true
+async-channel.workspace = true
 core-buffer = { path = "../core-buffer" }
 core-lsp = { path = "../core-lsp" }
 core-workspace = { path = "../core-workspace" }

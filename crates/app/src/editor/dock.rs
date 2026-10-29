@@ -1,22 +1,1079 @@
+use std::collections::HashMap;
+use std::io::{BufRead, BufReader};
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+
+use gpui_kit::base::StyledExt as _;
 use gpui_kit::component::{
     ActiveTheme as _, Icon, IconName, Sizable as _,
     button::{Button, ButtonVariants as _},
     h_flex, v_flex,
 };
+use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 use crate::{DartIde, tokens};
 
+const MAX_SCROLLBACK_LINES: usize = 2_000;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum AnsiColor {
+    Default,
+    Muted,
+    Red,
+    Green,
+    Yellow,
+    Blue,
+    Magenta,
+    Cyan,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct AnsiSpan {
+    pub(crate) text: String,
+    pub(crate) color: AnsiColor,
+    pub(crate) bold: bool,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) enum TerminalLine {
+    Command {
+        user_host: String,
+        dir: String,
+        command: String,
+    },
+    Output {
+        spans: Vec<AnsiSpan>,
+        file_link: Option<(PathBuf, u32, u32)>,
+    },
+}
+
+pub(crate) enum TerminalEvent {
+    Started { session_id: usize, pid: u32 },
+    Line { session_id: usize, raw: String },
+    Finished { session_id: usize },
+}
+
+pub(crate) struct TerminalSession {
+    pub(crate) id: usize,
+    pub(crate) shell_name: String,
+    pub(crate) user_host: String,
+    pub(crate) cwd: PathBuf,
+    pub(crate) env_overrides: HashMap<String, String>,
+    pub(crate) lines: Vec<TerminalLine>,
+    pub(crate) input: String,
+    pub(crate) cursor: usize,
+    pub(crate) history: Vec<String>,
+    pub(crate) history_index: Option<usize>,
+    pub(crate) running_pid: Option<u32>,
+    pub(crate) running_cmd: Option<String>,
+    pub(crate) scroll_handle: ScrollHandle,
+}
+
+impl TerminalSession {
+    pub(crate) fn new(id: usize, cwd: PathBuf, seed_git_log: bool) -> Self {
+        let shell_path = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".to_string());
+        let shell_name = Path::new(&shell_path)
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("bash")
+            .to_string();
+        let user = std::env::var("USER")
+            .or_else(|_| std::env::var("USERNAME"))
+            .unwrap_or_else(|_| "dev".to_string());
+        let host = Command::new("hostname")
+            .arg("-s")
+            .output()
+            .ok()
+            .and_then(|o| String::from_utf8(o.stdout).ok())
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "mac".to_string());
+        let user_host = format!("{user}@{host}");
+
+        let mut session = Self {
+            id,
+            shell_name,
+            user_host,
+            cwd,
+            env_overrides: HashMap::new(),
+            lines: Vec::new(),
+            input: String::new(),
+            cursor: 0,
+            history: Vec::new(),
+            history_index: None,
+            running_pid: None,
+            running_cmd: None,
+            scroll_handle: ScrollHandle::new(),
+        };
+
+        if seed_git_log {
+            session.seed_initial_git_log();
+        }
+        session
+    }
+
+    pub(crate) fn dir_label(&self) -> String {
+        self.cwd
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("/")
+            .to_string()
+    }
+
+    pub(crate) fn tab_title(&self) -> String {
+        format!("{} \u{2014} {}", self.dir_label(), self.shell_name)
+    }
+
+    fn seed_initial_git_log(&mut self) {
+        let cmd = "git --no-pager log --oneline -6".to_string();
+        self.lines.push(TerminalLine::Command {
+            user_host: self.user_host.clone(),
+            dir: self.dir_label(),
+            command: cmd.clone(),
+        });
+        self.history.push(cmd);
+
+        if let Ok(output) = Command::new("git")
+            .current_dir(&self.cwd)
+            .args([
+                "--no-pager",
+                "log",
+                "--color=always",
+                "--decorate=short",
+                "--oneline",
+                "-6",
+            ])
+            .output()
+        {
+            if output.status.success() {
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                for raw_line in stdout.lines() {
+                    self.push_output_line(raw_line);
+                }
+            }
+        }
+    }
+
+    pub(crate) fn reset(&mut self, root_cwd: PathBuf) {
+        if let Some(pid) = self.running_pid.take() {
+            let _ = Command::new("kill").args(["-TERM", &pid.to_string()]).status();
+        }
+        self.running_cmd = None;
+        self.cwd = root_cwd;
+        self.env_overrides.clear();
+        self.lines.clear();
+        self.input.clear();
+        self.cursor = 0;
+        self.history_index = None;
+        self.seed_initial_git_log();
+    }
+
+    pub(crate) fn push_output_line(&mut self, raw: &str) {
+        let spans = parse_ansi_line(raw);
+        let plain: String = spans.iter().map(|s| s.text.as_str()).collect();
+        let file_link = extract_file_link(&plain, &self.cwd);
+        self.lines.push(TerminalLine::Output { spans, file_link });
+        if self.lines.len() > MAX_SCROLLBACK_LINES {
+            let drain = self.lines.len() - MAX_SCROLLBACK_LINES;
+            self.lines.drain(0..drain);
+        }
+    }
+}
+
+/// Parse ANSI SGR escape sequences (`\x1b[...m`) into styled [`AnsiSpan`]s while
+/// stripping non-SGR control sequences.
+pub(crate) fn parse_ansi_line(raw: &str) -> Vec<AnsiSpan> {
+    let cleaned = raw.replace('\r', "");
+    let mut spans = Vec::new();
+    let mut cur_color = AnsiColor::Default;
+    let mut cur_bold = false;
+    let mut buf = String::new();
+
+    let bytes = cleaned.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == 0x1b {
+            if i + 1 < bytes.len() && bytes[i + 1] == b'[' {
+                if !buf.is_empty() {
+                    spans.push(AnsiSpan {
+                        text: std::mem::take(&mut buf),
+                        color: cur_color,
+                        bold: cur_bold,
+                    });
+                }
+                i += 2;
+                let param_start = i;
+                while i < bytes.len() && (bytes[i].is_ascii_digit() || bytes[i] == b';' || bytes[i] == b'?') {
+                    i += 1;
+                }
+                let final_byte = if i < bytes.len() {
+                    let b = bytes[i];
+                    i += 1;
+                    b
+                } else {
+                    b'm'
+                };
+                if final_byte == b'm' {
+                    let params = &cleaned[param_start..(i - 1)];
+                    if params.is_empty() {
+                        cur_color = AnsiColor::Default;
+                        cur_bold = false;
+                    } else {
+                        for code_str in params.split(';') {
+                            match code_str.parse::<u16>().unwrap_or(0) {
+                                0 => {
+                                    cur_color = AnsiColor::Default;
+                                    cur_bold = false;
+                                }
+                                1 => cur_bold = true,
+                                2 => cur_color = AnsiColor::Muted,
+                                22 => cur_bold = false,
+                                30 | 90 => cur_color = AnsiColor::Muted,
+                                31 | 91 => cur_color = AnsiColor::Red,
+                                32 | 92 => cur_color = AnsiColor::Green,
+                                33 | 93 => cur_color = AnsiColor::Yellow,
+                                34 | 94 => cur_color = AnsiColor::Blue,
+                                35 | 95 => cur_color = AnsiColor::Magenta,
+                                36 | 96 => cur_color = AnsiColor::Cyan,
+                                37 | 97 | 39 => cur_color = AnsiColor::Default,
+                                _ => {}
+                            }
+                        }
+                    }
+                }
+                continue;
+            } else if i + 1 < bytes.len() && bytes[i + 1] == b']' {
+                // Skip OSC sequence until BEL (\x07) or ST (\x1b\\)
+                i += 2;
+                while i < bytes.len() {
+                    if bytes[i] == 0x07 {
+                        i += 1;
+                        break;
+                    }
+                    if bytes[i] == 0x1b && i + 1 < bytes.len() && bytes[i + 1] == b'\\' {
+                        i += 2;
+                        break;
+                    }
+                    i += 1;
+                }
+                continue;
+            }
+        }
+        let ch = cleaned[i..].chars().next().unwrap_or(' ');
+        buf.push(ch);
+        i += ch.len_utf8();
+    }
+
+    if !buf.is_empty() || spans.is_empty() {
+        spans.push(AnsiSpan {
+            text: buf,
+            color: cur_color,
+            bold: cur_bold,
+        });
+    }
+    spans
+}
+
+/// Detect `path/to/file.rs:line[:col]` tokens inside a terminal output line so
+/// compiler diagnostics (`--> crates/app/src/main.rs:42:5`) are one-click links.
+fn extract_file_link(plain: &str, cwd: &Path) -> Option<(PathBuf, u32, u32)> {
+    for raw_token in plain.split_whitespace() {
+        let token = raw_token.trim_matches(|c: char| {
+            matches!(c, '(' | ')' | '[' | ']' | ',' | '\'' | '"' | ':')
+        });
+        let mut parts = token.split(':');
+        let path_part = parts.next()?;
+        let line_part = parts.next();
+        let Some(line_str) = line_part else {
+            continue;
+        };
+        let Ok(line_1) = line_str.parse::<u32>() else {
+            continue;
+        };
+        if line_1 == 0 {
+            continue;
+        }
+        let col_1 = parts
+            .next()
+            .and_then(|s| s.parse::<u32>().ok())
+            .unwrap_or(1)
+            .max(1);
+        let candidate = if Path::new(path_part).is_absolute() {
+            PathBuf::from(path_part)
+        } else {
+            cwd.join(path_part)
+        };
+        if candidate.is_file() {
+            return Some((candidate, line_1 - 1, col_1 - 1));
+        }
+    }
+    None
+}
+
+fn prev_char_boundary(s: &str, byte_idx: usize) -> usize {
+    let mut idx = byte_idx.min(s.len());
+    while idx > 0 {
+        idx -= 1;
+        if s.is_char_boundary(idx) {
+            return idx;
+        }
+    }
+    0
+}
+
+fn next_char_boundary(s: &str, byte_idx: usize) -> usize {
+    let mut idx = byte_idx.min(s.len());
+    if idx >= s.len() {
+        return s.len();
+    }
+    idx += 1;
+    while idx < s.len() && !s.is_char_boundary(idx) {
+        idx += 1;
+    }
+    idx
+}
+
 impl DartIde {
-    /// Bottom dock of the center column. Phase 1 draws the card and its
-    /// header; Phase 5 supplies real scrollback.
-    pub(crate) fn render_terminal(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    pub(crate) fn active_terminal(&self) -> Option<&TerminalSession> {
+        self.terminals.get(self.active_terminal)
+    }
+
+    pub(crate) fn active_terminal_mut(&mut self) -> Option<&mut TerminalSession> {
+        self.terminals.get_mut(self.active_terminal)
+    }
+
+    pub(crate) fn new_terminal_tab(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let cwd = self
+            .active_terminal()
+            .map(|t| t.cwd.clone())
+            .unwrap_or_else(|| self.root.clone());
+        let id = self.next_terminal_id;
+        self.next_terminal_id += 1;
+        self.terminals.push(TerminalSession::new(id, cwd, false));
+        self.active_terminal = self.terminals.len() - 1;
+        self.terminal_open = true;
+        window.focus(&self.terminal_focus, cx);
+        cx.notify();
+    }
+
+    pub(crate) fn close_terminal_tab(&mut self, ix: usize, cx: &mut Context<Self>) {
+        if ix >= self.terminals.len() {
+            return;
+        }
+        if let Some(pid) = self.terminals[ix].running_pid {
+            let _ = Command::new("kill").args(["-TERM", &pid.to_string()]).status();
+        }
+        self.terminals.remove(ix);
+        if self.terminals.is_empty() {
+            let id = self.next_terminal_id;
+            self.next_terminal_id += 1;
+            self.terminals
+                .push(TerminalSession::new(id, self.root.clone(), false));
+            self.active_terminal = 0;
+            self.terminal_open = false;
+        } else if self.active_terminal > ix {
+            self.active_terminal -= 1;
+        } else {
+            self.active_terminal = self.active_terminal.min(self.terminals.len() - 1);
+        }
+        cx.notify();
+    }
+
+    pub(crate) fn handle_terminal_event(&mut self, event: TerminalEvent, cx: &mut Context<Self>) {
+        match event {
+            TerminalEvent::Started { session_id, pid } => {
+                if let Some(session) = self.terminals.iter_mut().find(|t| t.id == session_id) {
+                    session.running_pid = Some(pid);
+                    cx.notify();
+                }
+            }
+            TerminalEvent::Line { session_id, raw } => {
+                if let Some(session) = self.terminals.iter_mut().find(|t| t.id == session_id) {
+                    session.push_output_line(&raw);
+                    session.scroll_handle.scroll_to_item(session.lines.len());
+                    cx.notify();
+                }
+            }
+            TerminalEvent::Finished { session_id } => {
+                if let Some(session) = self.terminals.iter_mut().find(|t| t.id == session_id) {
+                    session.running_pid = None;
+                    session.running_cmd = None;
+                    session.scroll_handle.scroll_to_item(session.lines.len());
+                }
+                self.git_branch = core_workspace::current_branch(&self.root);
+                self.git_status = core_workspace::status_map(&self.root);
+                cx.notify();
+            }
+        }
+    }
+
+    pub(crate) fn execute_terminal_command(
+        &mut self,
+        raw_cmd: String,
+        cx: &mut Context<Self>,
+    ) {
+        let tx = self.terminal_tx.clone();
+        let Some(session) = self.active_terminal_mut() else {
+            return;
+        };
+        let cmd = raw_cmd.trim().to_string();
+        let user_host = session.user_host.clone();
+        let dir_label = session.dir_label();
+        session.lines.push(TerminalLine::Command {
+            user_host,
+            dir: dir_label,
+            command: raw_cmd.clone(),
+        });
+
+        if !cmd.is_empty() {
+            if session.history.last() != Some(&cmd) {
+                session.history.push(cmd.clone());
+            }
+        }
+        session.history_index = None;
+
+        if cmd.is_empty() {
+            session.scroll_handle.scroll_to_item(session.lines.len());
+            cx.notify();
+            return;
+        }
+
+        // Built-in: `clear` / `cls`
+        if matches!(cmd.as_str(), "clear" | "cls") {
+            session.lines.clear();
+            cx.notify();
+            return;
+        }
+
+        // Built-in: `reset` (kills any hung state, restores root cwd & env)
+        if cmd == "reset" {
+            let root = self.root.clone();
+            if let Some(session) = self.active_terminal_mut() {
+                session.reset(root);
+            }
+            cx.notify();
+            return;
+        }
+
+        // Built-in: `exit`
+        if cmd == "exit" {
+            let ix = self.active_terminal;
+            self.close_terminal_tab(ix, cx);
+            return;
+        }
+
+        // Built-in: `cd [dir]`
+        if cmd == "cd" || cmd.starts_with("cd ") {
+            let arg = cmd.strip_prefix("cd").unwrap_or("").trim();
+            let target = if arg.is_empty() || arg == "~" {
+                std::env::var("HOME")
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|_| session.cwd.clone())
+            } else if let Some(rest) = arg.strip_prefix("~/") {
+                std::env::var("HOME")
+                    .map(|h| PathBuf::from(h).join(rest))
+                    .unwrap_or_else(|_| session.cwd.join(arg))
+            } else {
+                session.cwd.join(arg)
+            };
+
+            match std::fs::canonicalize(&target) {
+                Ok(canon) if canon.is_dir() => {
+                    session.cwd = canon;
+                }
+                _ => {
+                    session.push_output_line(&format!(
+                        "\x1b[31mcd: no such file or directory: {arg}\x1b[0m"
+                    ));
+                }
+            }
+            session.scroll_handle.scroll_to_item(session.lines.len());
+            cx.notify();
+            return;
+        }
+
+        // Built-in: `export KEY=VALUE`
+        if let Some(rest) = cmd.strip_prefix("export ") {
+            if let Some((k, v)) = rest.trim().split_once('=') {
+                let key = k.trim().to_string();
+                let val = v.trim().trim_matches(['"', '\'']).to_string();
+                if !key.is_empty() {
+                    session.env_overrides.insert(key, val);
+                    session.scroll_handle.scroll_to_item(session.lines.len());
+                    cx.notify();
+                    return;
+                }
+            }
+        }
+
+        let session_id = session.id;
+        let cwd = session.cwd.clone();
+        let envs = session.env_overrides.clone();
+        session.running_cmd = Some(cmd.clone());
+        session.scroll_handle.scroll_to_item(session.lines.len());
+        cx.notify();
+
+        std::thread::spawn(move || {
+            let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".to_string());
+            let mut command = Command::new(shell);
+            command
+                .arg("-c")
+                .arg(&cmd)
+                .current_dir(&cwd)
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .env("CLICOLOR_FORCE", "1")
+                .env("FORCE_COLOR", "1")
+                .env("CARGO_TERM_COLOR", "always")
+                .env("GIT_PAGER", "cat")
+                .env("PAGER", "cat")
+                .env("TERM", "xterm-256color")
+                .envs(&envs);
+
+            let mut child = match command.spawn() {
+                Ok(c) => c,
+                Err(err) => {
+                    let _ = tx.send_blocking(TerminalEvent::Line {
+                        session_id,
+                        raw: format!("\x1b[31m{err}\x1b[0m"),
+                    });
+                    let _ = tx.send_blocking(TerminalEvent::Finished { session_id });
+                    return;
+                }
+            };
+
+            let _ = tx.send_blocking(TerminalEvent::Started {
+                session_id,
+                pid: child.id(),
+            });
+
+            let stdout = child.stdout.take();
+            let stderr = child.stderr.take();
+
+            let tx_out = tx.clone();
+            let out_handle = stdout.map(|out| {
+                std::thread::spawn(move || {
+                    let reader = BufReader::new(out);
+                    for line in reader.lines().map_while(Result::ok) {
+                        let _ = tx_out.send_blocking(TerminalEvent::Line {
+                            session_id,
+                            raw: line,
+                        });
+                    }
+                })
+            });
+
+            let tx_err = tx.clone();
+            let err_handle = stderr.map(|err| {
+                std::thread::spawn(move || {
+                    let reader = BufReader::new(err);
+                    for line in reader.lines().map_while(Result::ok) {
+                        let _ = tx_err.send_blocking(TerminalEvent::Line {
+                            session_id,
+                            raw: line,
+                        });
+                    }
+                })
+            });
+
+            if let Some(h) = out_handle {
+                let _ = h.join();
+            }
+            if let Some(h) = err_handle {
+                let _ = h.join();
+            }
+            let _ = child.wait();
+            let _ = tx.send_blocking(TerminalEvent::Finished { session_id });
+        });
+    }
+
+    fn on_terminal_key_down(
+        &mut self,
+        event: &KeyDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let keystroke = &event.keystroke;
+        let key = keystroke.key.as_str();
+        let modifiers = &keystroke.modifiers;
+        let primary_mod = modifiers.platform || modifiers.control;
+
+        // Let global IDE shortcuts (`⌘P`, `⌘B`, `⌘J`, `⌘O`, `⌘N`, `⌘F`) bubble up
+        if modifiers.platform && matches!(key, "p" | "b" | "j" | "o" | "n" | "f" | "l" | "g") {
+            return;
+        }
+
+        cx.stop_propagation();
+
+        // `⌘K` or `Ctrl+L` clears terminal scrollback
+        if (modifiers.platform && key == "k") || (modifiers.control && key == "l") {
+            if let Some(session) = self.active_terminal_mut() {
+                session.lines.clear();
+                cx.notify();
+            }
+            return;
+        }
+
+        // `⌘T` opens a new terminal tab when focused in the terminal
+        if modifiers.platform && key == "t" {
+            self.new_terminal_tab(window, cx);
+            return;
+        }
+
+        // `Ctrl+C` interrupts running command or cancels current input line
+        if modifiers.control && key == "c" {
+            if let Some(session) = self.active_terminal_mut() {
+                if let Some(pid) = session.running_pid.take() {
+                    let _ = Command::new("kill").args(["-INT", &pid.to_string()]).status();
+                    session.push_output_line("^C");
+                    session.running_cmd = None;
+                } else {
+                    let user_host = session.user_host.clone();
+                    let dir = session.dir_label();
+                    let aborted = format!("{}^C", session.input);
+                    session.lines.push(TerminalLine::Command {
+                        user_host,
+                        dir,
+                        command: aborted,
+                    });
+                    session.input.clear();
+                    session.cursor = 0;
+                    session.history_index = None;
+                }
+                session.scroll_handle.scroll_to_item(session.lines.len());
+                cx.notify();
+            }
+            return;
+        }
+
+        // `⌘V` pastes from clipboard
+        if primary_mod && key == "v" {
+            if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
+                let clean = text.replace(['\r', '\n'], " ");
+                if let Some(session) = self.active_terminal_mut() {
+                    let idx = session.cursor.min(session.input.len());
+                    session.input.insert_str(idx, &clean);
+                    session.cursor = idx + clean.len();
+                    cx.notify();
+                }
+            }
+            return;
+        }
+
+        // `Ctrl+U` clears current input line
+        if modifiers.control && key == "u" {
+            if let Some(session) = self.active_terminal_mut() {
+                session.input.clear();
+                session.cursor = 0;
+                cx.notify();
+            }
+            return;
+        }
+
+        match key {
+            "enter" => {
+                let raw_cmd = if let Some(session) = self.active_terminal_mut() {
+                    let taken = std::mem::take(&mut session.input);
+                    session.cursor = 0;
+                    taken
+                } else {
+                    return;
+                };
+                self.execute_terminal_command(raw_cmd, cx);
+            }
+            "backspace" => {
+                if let Some(session) = self.active_terminal_mut() {
+                    if session.cursor > 0 {
+                        if modifiers.alt {
+                            let bytes = session.input.as_bytes();
+                            let mut start = session.cursor;
+                            while start > 0 && bytes[start - 1].is_ascii_whitespace() {
+                                start -= 1;
+                            }
+                            while start > 0 && !bytes[start - 1].is_ascii_whitespace() {
+                                start -= 1;
+                            }
+                            session.input.replace_range(start..session.cursor, "");
+                            session.cursor = start;
+                        } else {
+                            let prev = prev_char_boundary(&session.input, session.cursor);
+                            session.input.replace_range(prev..session.cursor, "");
+                            session.cursor = prev;
+                        }
+                        cx.notify();
+                    }
+                }
+            }
+            "delete" => {
+                if let Some(session) = self.active_terminal_mut() {
+                    if session.cursor < session.input.len() {
+                        let next = next_char_boundary(&session.input, session.cursor);
+                        session.input.replace_range(session.cursor..next, "");
+                        cx.notify();
+                    }
+                }
+            }
+            "left" => {
+                if let Some(session) = self.active_terminal_mut() {
+                    session.cursor = prev_char_boundary(&session.input, session.cursor);
+                    cx.notify();
+                }
+            }
+            "right" => {
+                if let Some(session) = self.active_terminal_mut() {
+                    session.cursor = next_char_boundary(&session.input, session.cursor);
+                    cx.notify();
+                }
+            }
+            "home" => {
+                if let Some(session) = self.active_terminal_mut() {
+                    session.cursor = 0;
+                    cx.notify();
+                }
+            }
+            "end" => {
+                if let Some(session) = self.active_terminal_mut() {
+                    session.cursor = session.input.len();
+                    cx.notify();
+                }
+            }
+            "up" => {
+                if let Some(session) = self.active_terminal_mut() {
+                    if !session.history.is_empty() {
+                        let next_ix = match session.history_index {
+                            Some(ix) => ix.saturating_sub(1),
+                            None => session.history.len() - 1,
+                        };
+                        session.history_index = Some(next_ix);
+                        session.input = session.history[next_ix].clone();
+                        session.cursor = session.input.len();
+                        cx.notify();
+                    }
+                }
+            }
+            "down" => {
+                if let Some(session) = self.active_terminal_mut() {
+                    if let Some(ix) = session.history_index {
+                        if ix + 1 < session.history.len() {
+                            session.history_index = Some(ix + 1);
+                            session.input = session.history[ix + 1].clone();
+                            session.cursor = session.input.len();
+                        } else {
+                            session.history_index = None;
+                            session.input.clear();
+                            session.cursor = 0;
+                        }
+                        cx.notify();
+                    }
+                }
+            }
+            "tab" => {
+                if let Some(session) = self.active_terminal_mut() {
+                    let prefix = &session.input[..session.cursor];
+                    if let Some(last_word) = prefix.split_whitespace().last() {
+                        let (dir_part, file_prefix) = match last_word.rfind('/') {
+                            Some(slash) => (&last_word[..=slash], &last_word[(slash + 1)..]),
+                            None => ("", last_word),
+                        };
+                        let search_dir = if dir_part.is_empty() {
+                            session.cwd.clone()
+                        } else {
+                            session.cwd.join(dir_part)
+                        };
+                        if let Ok(entries) = std::fs::read_dir(search_dir) {
+                            let mut matches: Vec<String> = entries
+                                .flatten()
+                                .filter_map(|e| {
+                                    let name = e.file_name().to_str()?.to_string();
+                                    if name.starts_with(file_prefix) {
+                                        let suffix = if e.path().is_dir() { "/" } else { "" };
+                                        Some(format!("{dir_part}{name}{suffix}"))
+                                    } else {
+                                        None
+                                    }
+                                })
+                                .collect();
+                            matches.sort();
+                            if let Some(first) = matches.first() {
+                                let word_start = session.cursor - last_word.len();
+                                session
+                                    .input
+                                    .replace_range(word_start..session.cursor, first);
+                                session.cursor = word_start + first.len();
+                                cx.notify();
+                            }
+                        }
+                    }
+                }
+            }
+            "space" => {
+                if let Some(session) = self.active_terminal_mut() {
+                    let idx = session.cursor.min(session.input.len());
+                    session.input.insert(idx, ' ');
+                    session.cursor = idx + 1;
+                    cx.notify();
+                }
+            }
+            _ => {
+                if modifiers.control && key == "a" {
+                    if let Some(session) = self.active_terminal_mut() {
+                        session.cursor = 0;
+                        cx.notify();
+                    }
+                    return;
+                }
+                if modifiers.control && key == "e" {
+                    if let Some(session) = self.active_terminal_mut() {
+                        session.cursor = session.input.len();
+                        cx.notify();
+                    }
+                    return;
+                }
+                if !modifiers.platform && !modifiers.control {
+                    let text_to_insert = keystroke
+                        .key_char
+                        .as_deref()
+                        .or_else(|| (key.chars().count() == 1).then_some(key));
+                    if let Some(ch_str) = text_to_insert {
+                        if let Some(session) = self.active_terminal_mut() {
+                            let idx = session.cursor.min(session.input.len());
+                            session.input.insert_str(idx, ch_str);
+                            session.cursor = idx + ch_str.len();
+                            session.scroll_handle.scroll_to_item(session.lines.len());
+                            cx.notify();
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Bottom dock of the center column (`docs/design-spec.md` §3.20–3.22).
+    pub(crate) fn render_terminal(
+        &self,
+        view: &Entity<Self>,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         let muted = cx.theme().muted_foreground;
+        let fg = cx.theme().foreground;
+        let green = cx.theme().success;
+        let blue = cx.theme().info;
+        let yellow = cx.theme().warning;
+        let red = cx.theme().danger;
+        let magenta = cx.theme().magenta;
+        let cyan = cx.theme().cyan;
+        let primary = cx.theme().primary;
+        let is_focused = self.terminal_focus.is_focused(window);
+
+        let active_ix = self.active_terminal.min(self.terminals.len().saturating_sub(1));
+
+        // Render tab pills in the dock header
+        let tabs: Vec<AnyElement> = self
+            .terminals
+            .iter()
+            .enumerate()
+            .map(|(ix, session)| {
+                let is_active = ix == active_ix;
+                let title = session.tab_title();
+                let is_running = session.running_pid.is_some();
+                let view_select = view.clone();
+                let view_close = view.clone();
+
+                h_flex()
+                    .id(("terminal-tab", ix))
+                    .items_center()
+                    .gap(px(tokens::SPACE_2))
+                    .px(px(tokens::SPACE_3))
+                    .h(px(28.))
+                    .rounded(px(tokens::RADIUS_PANEL))
+                    .border_1()
+                    .border_color(if is_active {
+                        tokens::accent_dim()
+                    } else {
+                        gpui_kit::transparent_black()
+                    })
+                    .when(is_active, |el| {
+                        el.bg(cx.theme().tab_active).text_color(fg)
+                    })
+                    .when(!is_active, |el| {
+                        el.text_color(muted)
+                            .hover(move |s| s.bg(rgba(0xffffff08)).text_color(fg))
+                    })
+                    .text_size(px(tokens::UI_SM))
+                    .cursor_pointer()
+                    .on_click(move |_event, window, cx| {
+                        view_select.update(cx, |this, cx| {
+                            this.active_terminal = ix;
+                            window.focus(&this.terminal_focus, cx);
+                            cx.notify();
+                        });
+                    })
+                    .child(
+                        div()
+                            .font_family("SF Mono")
+                            .text_size(px(tokens::UI_SM))
+                            .text_color(if is_running { green } else { primary })
+                            .child(">_"),
+                    )
+                    .child(title)
+                    .child(
+                        div()
+                            .id(("close-terminal-tab", ix))
+                            .cursor_pointer()
+                            .text_color(muted)
+                            .hover(move |s| s.text_color(fg))
+                            .child(Icon::new(gpui_kit::assets::IconName::X).xsmall())
+                            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                            .on_click(move |_event, _window, cx| {
+                                view_close.update(cx, |this, cx| {
+                                    this.close_terminal_tab(ix, cx);
+                                });
+                            }),
+                    )
+                    .into_any_element()
+            })
+            .collect();
+
+        let body_element = if let Some(session) = self.terminals.get(active_ix) {
+            let line_elements: Vec<AnyElement> = session
+                .lines
+                .iter()
+                .enumerate()
+                .map(|(line_ix, line)| match line {
+                    TerminalLine::Command {
+                        user_host,
+                        dir,
+                        command,
+                    } => h_flex()
+                        .w_full()
+                        .min_h(px(20.))
+                        .items_center()
+                        .font_family("SF Mono")
+                        .text_size(px(tokens::MONO))
+                        .child(div().text_color(green).child(user_host.clone()))
+                        .child(div().text_color(muted).child(":"))
+                        .child(div().text_color(blue).child(dir.clone()))
+                        .child(div().text_color(fg).child("$ "))
+                        .child(div().text_color(fg).child(command.clone()))
+                        .into_any_element(),
+                    TerminalLine::Output { spans, file_link } => {
+                        let span_children: Vec<AnyElement> = spans
+                            .iter()
+                            .map(|span| {
+                                let color = match span.color {
+                                    AnsiColor::Default => fg,
+                                    AnsiColor::Muted => muted,
+                                    AnsiColor::Red => red,
+                                    AnsiColor::Green => green,
+                                    AnsiColor::Yellow => yellow,
+                                    AnsiColor::Blue => blue,
+                                    AnsiColor::Magenta => magenta,
+                                    AnsiColor::Cyan => cyan,
+                                };
+                                div()
+                                    .text_color(color)
+                                    .when(span.bold, |el| el.font_semibold())
+                                    .child(span.text.clone())
+                                    .into_any_element()
+                            })
+                            .collect();
+
+                        let row = h_flex()
+                            .id(("term-line", line_ix))
+                            .w_full()
+                            .min_h(px(20.))
+                            .items_center()
+                            .font_family("SF Mono")
+                            .text_size(px(tokens::MONO))
+                            .children(span_children);
+
+                        if let Some((path, line_0, col_0)) = file_link.clone() {
+                            let view = view.clone();
+                            row.cursor_pointer()
+                                .rounded(px(3.))
+                                .hover(|s| s.bg(rgba(0xffffff08)))
+                                .on_click(move |_event, window, cx| {
+                                    view.update(cx, |this, cx| {
+                                        this.open_path(path.clone(), window, cx);
+                                        if let Some(ed) = this.active_editor().cloned() {
+                                            ed.update(cx, |editor, cx| {
+                                                editor.set_cursor_to_position(line_0, col_0, cx);
+                                            });
+                                        }
+                                    });
+                                })
+                                .into_any_element()
+                        } else {
+                            row.into_any_element()
+                        }
+                    }
+                })
+                .collect();
+
+            // Active prompt line at the bottom of the scrollback
+            let cursor_idx = session.cursor.min(session.input.len());
+            let before_cursor = session.input[..cursor_idx].to_string();
+            let after_cursor = session.input[cursor_idx..].to_string();
+
+            let prompt_row = h_flex()
+                .w_full()
+                .min_h(px(20.))
+                .items_center()
+                .font_family("SF Mono")
+                .text_size(px(tokens::MONO))
+                .child(div().text_color(green).child(session.user_host.clone()))
+                .child(div().text_color(muted).child(":"))
+                .child(div().text_color(blue).child(session.dir_label()))
+                .child(div().text_color(fg).child("$ "))
+                .when(!before_cursor.is_empty(), |el| {
+                    el.child(div().text_color(fg).child(before_cursor))
+                })
+                .child(
+                    div()
+                        .w(px(7.5))
+                        .h(px(15.))
+                        .border_1()
+                        .border_color(primary)
+                        .when(is_focused, |el| el.bg(primary))
+                        .when(!is_focused, |el| el.bg(rgba(0xea7a3c18))),
+                )
+                .when(!after_cursor.is_empty(), |el| {
+                    el.child(div().text_color(fg).child(after_cursor))
+                });
+
+            v_flex()
+                .id("terminal-scrollback")
+                .flex_1()
+                .w_full()
+                .min_h(px(0.))
+                .px(px(tokens::SPACE_5))
+                .py(px(tokens::SPACE_4))
+                .bg(cx.theme().background)
+                .overflow_y_scroll()
+                .track_scroll(&session.scroll_handle)
+                .children(line_elements)
+                .child(prompt_row)
+                .into_any_element()
+        } else {
+            div().flex_1().into_any_element()
+        };
 
         v_flex()
-            .w_full()
-            .h(px(tokens::TERMINAL_H))
-            .flex_shrink_0()
+            .id("terminal-dock")
+            .key_context("Terminal")
+            .track_focus(&self.terminal_focus)
+            .on_key_down(cx.listener(Self::on_terminal_key_down))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _event, window, cx| {
+                    window.focus(&this.terminal_focus, cx);
+                    cx.notify();
+                }),
+            )
+            .size_full()
             .bg(cx.theme().sidebar)
             .border_1()
             .border_color(cx.theme().border)
@@ -28,7 +1085,7 @@ impl DartIde {
                     .h(px(tokens::TABSTRIP_H))
                     .flex_shrink_0()
                     .items_center()
-                    .gap(px(tokens::SPACE_2))
+                    .justify_between()
                     .px(px(tokens::SPACE_4))
                     .border_b_1()
                     .border_color(cx.theme().border)
@@ -36,53 +1093,98 @@ impl DartIde {
                         h_flex()
                             .items_center()
                             .gap(px(tokens::SPACE_2))
-                            .px(px(tokens::SPACE_3))
-                            .h(px(30.))
-                            .rounded(px(tokens::RADIUS_PANEL))
-                            .bg(cx.theme().tab_active)
-                            .border_1()
-                            .border_color(tokens::accent_dim())
-                            .text_size(px(tokens::UI))
-                            .text_color(cx.theme().foreground)
+                            .children(tabs)
                             .child(
-                                div()
-                                    .font_family("SF Mono")
-                                    .text_size(px(tokens::UI_SM))
-                                    .text_color(cx.theme().primary)
-                                    .child(">_"),
-                            )
-                            .child("panes \u{2014} bash")
-                            .child(
-                                div()
-                                    .id("close-terminal")
-                                    .cursor_pointer()
-                                    .text_color(muted)
-                                    .hover(|s| s.text_color(cx.theme().foreground))
-                                    .child(Icon::new(gpui_kit::assets::IconName::X).xsmall())
-                                    .on_click(cx.listener(|this, _event, _window, cx| {
-                                        this.terminal_open = false;
-                                        cx.notify();
+                                Button::new("new-terminal-tab")
+                                    .ghost()
+                                    .small()
+                                    .icon(Icon::new(IconName::Plus).text_color(muted))
+                                    .tooltip("New terminal tab (cmd+T)")
+                                    .on_click(cx.listener(|this, _event, window, cx| {
+                                        this.new_terminal_tab(window, cx);
                                     })),
                             ),
                     )
                     .child(
-                        Button::new("new-terminal-tab")
-                            .ghost()
-                            .small()
-                            .icon(Icon::new(IconName::Plus).text_color(muted))
-                            .tooltip("New terminal tab"),
+                        h_flex()
+                            .items_center()
+                            .gap(px(tokens::SPACE_1))
+                            .child(
+                                Button::new("reset-terminal")
+                                    .ghost()
+                                    .xsmall()
+                                    .icon(
+                                        Icon::new(gpui_kit::assets::IconName::RotateCcw)
+                                            .xsmall()
+                                            .text_color(muted),
+                                    )
+                                    .tooltip("Reset terminal session")
+                                    .on_click(cx.listener(|this, _event, _window, cx| {
+                                        let root = this.root.clone();
+                                        if let Some(session) = this.active_terminal_mut() {
+                                            session.reset(root);
+                                            cx.notify();
+                                        }
+                                    })),
+                            )
+                            .child(
+                                Button::new("clear-terminal")
+                                    .ghost()
+                                    .xsmall()
+                                    .icon(
+                                        Icon::new(gpui_kit::assets::IconName::Trash)
+                                            .xsmall()
+                                            .text_color(muted),
+                                    )
+                                    .tooltip("Clear terminal (cmd+K)")
+                                    .on_click(cx.listener(|this, _event, _window, cx| {
+                                        if let Some(session) = this.active_terminal_mut() {
+                                            session.lines.clear();
+                                            cx.notify();
+                                        }
+                                    })),
+                            )
+                            .child(
+                                Button::new("maximize-terminal")
+                                    .ghost()
+                                    .xsmall()
+                                    .icon(
+                                        Icon::new(if self.terminal_maximized {
+                                            gpui_kit::assets::IconName::Minimize2
+                                        } else {
+                                            gpui_kit::assets::IconName::Maximize2
+                                        })
+                                        .xsmall()
+                                        .text_color(muted),
+                                    )
+                                    .tooltip(if self.terminal_maximized {
+                                        "Restore terminal size"
+                                    } else {
+                                        "Maximize terminal"
+                                    })
+                                    .on_click(cx.listener(|this, _event, _window, cx| {
+                                        this.terminal_maximized = !this.terminal_maximized;
+                                        cx.notify();
+                                    })),
+                            ),
                     ),
             )
-            .child(
-                div()
-                    .flex_1()
-                    .w_full()
-                    .min_h(px(0.))
-                    .p(px(tokens::SPACE_5))
-                    .text_size(px(tokens::MONO))
-                    .text_color(muted)
-                    .child("Terminal dock \u{2014} Phase 5"),
-            )
+            .child(body_element)
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::{AnsiColor, parse_ansi_line};
+
+    #[core::prelude::v1::test]
+    fn parses_git_log_ansi_colors_and_resets() {
+        let raw = "\x1b[33mce029d1\x1b[m\x1b[33m (\x1b[m\x1b[1;36mHEAD -> \x1b[m\x1b[1;32mdevelop\x1b[m\x1b[33m)\x1b[m Add changelog";
+        let spans = parse_ansi_line(raw);
+        let joined: String = spans.iter().map(|s| s.text.as_str()).collect();
+        assert_eq!(joined, "ce029d1 (HEAD -> develop) Add changelog");
+        assert_eq!(spans[0].color, AnsiColor::Yellow);
+        assert!(spans.iter().any(|s| s.color == AnsiColor::Cyan && s.bold));
+        assert!(spans.iter().any(|s| s.color == AnsiColor::Green && s.bold));
+    }
+}

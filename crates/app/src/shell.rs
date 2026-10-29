@@ -2,7 +2,7 @@ use gpui_kit::component::{
     ActiveTheme as _, Icon, Sizable as _,
     h_flex,
     input::Input,
-    resizable::{h_resizable, resizable_panel},
+    resizable::{h_resizable, resizable_panel, v_resizable},
     text::markdown,
     v_flex,
 };
@@ -406,6 +406,7 @@ impl DartIde {
     pub(crate) fn render_shell(
         &self,
         view: &Entity<Self>,
+        window: &Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let active_tab = self.tabs.get(self.active_tab);
@@ -470,16 +471,49 @@ impl DartIde {
             })
             .into_any_element();
 
-        let editor_column = v_flex()
-            .flex_1()
-            .w_full()
-            .h(relative(1.))
-            .min_h(px(0.))
-            .px(px(tokens::GUTTER / 2.))
-            .gap(px(tokens::GUTTER))
-            .child(editor_card)
-            .when(self.terminal_open, |el| el.child(self.render_terminal(cx)))
-            .into_any_element();
+        let editor_column = if self.terminal_open && !self.terminal_maximized {
+            div()
+                .flex_1()
+                .w_full()
+                .h(relative(1.))
+                .min_h(px(0.))
+                .px(px(tokens::GUTTER / 2.))
+                .child(
+                    v_resizable("center-vertical-split")
+                        .child(
+                            resizable_panel()
+                                .pb(px(tokens::GUTTER / 2.))
+                                .child(editor_card),
+                        )
+                        .child(
+                            resizable_panel()
+                                .size(px(tokens::TERMINAL_H))
+                                .size_range(px(tokens::TERMINAL_MIN)..px(tokens::TERMINAL_MAX))
+                                .fixed()
+                                .pt(px(tokens::GUTTER / 2.))
+                                .child(self.render_terminal(view, window, cx)),
+                        ),
+                )
+                .into_any_element()
+        } else if self.terminal_open && self.terminal_maximized {
+            v_flex()
+                .flex_1()
+                .w_full()
+                .h(relative(1.))
+                .min_h(px(0.))
+                .px(px(tokens::GUTTER / 2.))
+                .child(self.render_terminal(view, window, cx))
+                .into_any_element()
+        } else {
+            v_flex()
+                .flex_1()
+                .w_full()
+                .h(relative(1.))
+                .min_h(px(0.))
+                .px(px(tokens::GUTTER / 2.))
+                .child(editor_card)
+                .into_any_element()
+        };
 
         let split_id = match (self.sidebar_open, self.agent_open) {
             (true, true) => "shell-split-both",

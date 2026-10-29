@@ -233,12 +233,26 @@ impl DartIde {
                             .bg(rgba(0xffffff05))
                             .border_1()
                             .border_color(cx.theme().border.opacity(0.6))
-                            .child(icon_button(
-                                "run",
-                                gpui_kit::assets::IconName::Play,
-                                Some(green),
-                                "Run project",
-                            ))
+                            .child(
+                                icon_button(
+                                    "run",
+                                    gpui_kit::assets::IconName::Play,
+                                    Some(green),
+                                    "Run project",
+                                )
+                                .on_click(cx.listener(|this, _event, window, cx| {
+                                    this.terminal_open = true;
+                                    window.focus(&this.terminal_focus, cx);
+                                    let cmd = if this.root.join("pubspec.yaml").is_file() {
+                                        "flutter run".to_string()
+                                    } else if this.root.join("Cargo.toml").is_file() {
+                                        "cargo check".to_string()
+                                    } else {
+                                        "ls -la".to_string()
+                                    };
+                                    this.execute_terminal_command(cmd, cx);
+                                })),
+                            )
                             .child(icon_button(
                                 "debug",
                                 gpui_kit::assets::IconName::Bug,
