@@ -31,7 +31,7 @@ use core_buffer::{Buffer, Selection};
 use core_lsp::lsp_types;
 use core_syntax::{Highlight, HighlightKind, InputEdit, SyntaxTree, point_at};
 use core_workspace::LineChange;
-use gpui_kit::component::{ActiveTheme as _, Sizable as _, h_flex};
+use gpui_kit::component::{ActiveTheme as _, Sizable as _, h_flex, v_flex};
 use gpui_kit::*;
 use gpui_kit::prelude::FluentBuilder as _;
 use lsp_integration::LspState;
@@ -1181,6 +1181,7 @@ impl EditorView {
                     let go_to_definition = event.modifiers.platform || event.modifiers.control;
                     let click_count = event.click_count;
                     down_view.update(cx, |this, cx| {
+                        this.clear_hover(cx);
                         if go_to_definition {
                             this.request_definition(index, column);
                         } else if click_count >= 3 {
@@ -1237,7 +1238,7 @@ impl EditorView {
             .w_full()
             .h(px(LINE_HEIGHT))
             .flex_shrink_0()
-            .font_family(mono_family)
+            .font_family(mono_family.clone())
             .text_size(px(LINE_FONT_SIZE))
             // The active line gets a full-width, flat wash of colour —
             // subtle enough to read as a highlight, not a second panel.
@@ -1269,25 +1270,168 @@ impl EditorView {
                     .when_some(
                         self.hover_to_render().filter(|(line, _)| *line == index),
                         |el, (_, text)| {
+                            let hover_col = self
+                                .hover_point
+                                .filter(|(l, _)| *l == index)
+                                .map(|(_, c)| c)
+                                .unwrap_or(0);
+                            let left_offset = px((hover_col as f32 * 7.5).min(280.));
+                            let card = Self::render_hover_card(text, &mono_family, cx);
                             el.child(
-                                div()
-                                    .absolute()
-                                    .top(px(LINE_HEIGHT))
-                                    .left_0()
-                                    .max_w(px(480.))
-                                    .p_2()
-                                    .rounded(cx.theme().radius)
-                                    .shadow_lg()
-                                    .bg(cx.theme().popover)
-                                    .border_1()
-                                    .border_color(cx.theme().border)
-                                    .text_size(px(12.))
-                                    .text_color(cx.theme().popover_foreground)
-                                    .child(text.to_string()),
+                                deferred(
+                                    div()
+                                        .occlude()
+                                        .absolute()
+                                        .top(px(LINE_HEIGHT + 2.))
+                                        .left(left_offset)
+                                        .w(px(500.))
+                                        .child(card),
+                                )
+                                .with_priority(10),
                             )
                         },
                     ),
             )
+    }
+
+    /// Format an LSP markdown hover payload (` ```dart ... ``` `, `Type: ...`,
+    /// `---`, doc prose) into a structured, opaque popover card with syntax-
+    /// highlighted code signatures and clean inline code pills.
+    fn render_hover_card(
+        raw: &str,
+        mono_family: &SharedString,
+        cx: &Context<Self>,
+    ) -> Div {
+        let mut code_blocks: Vec<String> = Vec::new();
+        let mut sections: Vec<Vec<String>> = vec![Vec::new()];
+        let mut in_fence = false;
+        let mut current_code = Vec::new();
+
+        for line in raw.lines() {
+            let trimmed = line.trim();
+            if trimmed.starts_with("```") {
+                if in_fence {
+                    let block = current_code.join("\n");
+                    if !block.trim().is_empty() {
+                        code_blocks.push(block);
+                    }
+                    current_code.clear();
+                    in_fence = false;
+                } else {
+                    in_fence = true;
+                }
+                continue;
+            }
+            if in_fence {
+                current_code.push(line.to_string());
+            } else if trimmed == "---" || trimmed == "***" {
+                sections.push(Vec::new());
+            } else if let Some(last) = sections.last_mut() {
+                last.push(line.to_string());
+            }
+        }
+
+        let fg = cx.theme().popover_foreground;
+        let muted = cx.theme().muted_foreground;
+        let cyan = cx.theme().cyan;
+        let border = cx.theme().border;
+        let code_bg = cx.theme().background;
+        let ui_family = cx.theme().font_family.clone();
+
+        let mut card = v_flex()
+            .w_full()
+            .p_3()
+            .gap_2()
+            .rounded(px(8.))
+            .bg(cx.theme().popover)
+            .border_1()
+            .border_color(border)
+            .shadow_xl()
+            .font_family(ui_family)
+            .text_size(px(12.))
+            .text_color(fg);
+
+        for block in code_blocks {
+            let tree = SyntaxTree::parse(&block);
+            let highlights = tree.highlights(&block);
+            let mut block_el = v_flex()
+                .w_full()
+                .px_2p5()
+                .py_2()
+                .gap_0p5()
+                .rounded(px(6.))
+                .bg(code_bg)
+                .border_1()
+                .border_color(border)
+                .font_family(mono_family.clone())
+                .text_size(px(12.));
+
+            let mut byte_offset = 0;
+            for code_line in block.split('\n') {
+                let runs = Self::line_runs(byte_offset, code_line, &highlights);
+                let mut row = h_flex().w_full().flex_wrap().items_center();
+                for (range, kind) in runs {
+                    if range.is_empty() {
+                        continue;
+                    }
+                    let slice = code_line[range].to_string();
+                    let color: Hsla = kind.map(|k| highlight_color(k).into()).unwrap_or(fg);
+                    row = row.child(div().text_color(color).child(slice));
+                }
+                block_el = block_el.child(row);
+                byte_offset += code_line.len() + 1;
+            }
+            card = card.child(block_el);
+        }
+
+        let non_empty_sections: Vec<Vec<String>> = sections
+            .into_iter()
+            .map(|sec| {
+                sec.into_iter()
+                    .map(|l| l.trim().to_string())
+                    .filter(|l| !l.is_empty())
+                    .collect::<Vec<_>>()
+            })
+            .filter(|sec| !sec.is_empty())
+            .collect();
+
+        for (sec_ix, sec) in non_empty_sections.into_iter().enumerate() {
+            if sec_ix > 0 {
+                card = card.child(div().w_full().h(px(1.)).bg(border));
+            }
+            let mut sec_col = v_flex().w_full().gap_1();
+            for line in sec {
+                let clean = Self::clean_hover_markdown_line(&line);
+                let is_meta = clean.starts_with("Type:") || clean.starts_with("Declared in");
+                sec_col = sec_col.child(
+                    div()
+                        .w_full()
+                        .text_size(px(if is_meta { 11.5 } else { 12. }))
+                        .text_color(if is_meta { muted } else { fg })
+                        .when(clean.contains('['), |el| el.text_color(fg))
+                        .child(clean),
+                );
+            }
+            let _ = cyan;
+            card = card.child(sec_col);
+        }
+
+        card
+    }
+
+    fn clean_hover_markdown_line(line: &str) -> String {
+        let mut out = String::with_capacity(line.len());
+        let chars: Vec<char> = line.chars().collect();
+        let mut i = 0;
+        while i < chars.len() {
+            if chars[i] == '`' || chars[i] == '*' {
+                i += 1;
+                continue;
+            }
+            out.push(chars[i]);
+            i += 1;
+        }
+        out
     }
 }
 
