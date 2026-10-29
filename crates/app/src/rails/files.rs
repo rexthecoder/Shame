@@ -316,9 +316,7 @@ impl DartIde {
                     let view = view.clone();
                     let active_path = self
                         .active_editor()
-                        .read(cx)
-                        .buffer()
-                        .path()
+                        .and_then(|ed| ed.read(cx).buffer().path())
                         .map(|path| path.to_string_lossy().to_string());
                     let git_status = self.git_status.clone();
                     move |ix, entry, _selected, _window, cx| {

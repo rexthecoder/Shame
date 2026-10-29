@@ -115,18 +115,6 @@ impl DartIde {
             cx.new(|cx| InputState::new(window, cx).placeholder("Go to file..."));
         let rename_input = cx.new(|cx| InputState::new(window, cx).placeholder("New name..."));
 
-        let buffer = Buffer::from_str(
-            "// Lightweight Dart/Flutter IDE — M1\n\
-             //\n\
-             // This is our own editor-view (core-buffer + a from-scratch\n\
-             // GPUI element), not gpui-component's Textarea. Try typing,\n\
-             // arrow keys, backspace/delete, Home/End, and cmd+Z/cmd+Shift+Z.\n\
-             // Click a file in the tree (or cmd+P to go to one) to open it.\n\
-             // cmd+O to open a different folder. cmd+click a symbol to go\n\
-             // to its definition.\n",
-        );
-        let editor = cx.new(|cx| EditorView::from_buffer(buffer, cx));
-
         let git_branch = core_workspace::current_branch(&root);
         let git_status = core_workspace::status_map(&root);
         let mut this = Self {
@@ -138,10 +126,7 @@ impl DartIde {
             agent_open: true,
             show_hidden,
             tree_state,
-            tabs: vec![Tab {
-                path: None,
-                editor: editor.clone(),
-            }],
+            tabs: Vec::new(),
             active_tab: 0,
             all_files,
             palette_open: false,
@@ -152,7 +137,6 @@ impl DartIde {
             code_actions: None,
             _subscriptions: Vec::new(),
         };
-        this.watch_editor(&editor, window, cx);
 
         let palette_changes = cx.subscribe(
             &this.palette_input,
@@ -200,10 +184,11 @@ impl DartIde {
                 EditorEvent::OpenAt { path, line, column } => {
                     let (line, column) = (*line, *column);
                     this.open_path(path.clone(), window, cx);
-                    let target = this.active_editor().clone();
-                    target.update(cx, |editor, cx| {
-                        editor.set_cursor_to_position(line, column, cx)
-                    });
+                    if let Some(target) = this.active_editor().cloned() {
+                        target.update(cx, |editor, cx| {
+                            editor.set_cursor_to_position(line, column, cx)
+                        });
+                    }
                 }
                 EditorEvent::RequestRename { line, column } => {
                     this.rename_target = Some((editor.clone(), *line, *column));
@@ -391,6 +376,18 @@ impl DartIde {
             return;
         }
 
+        if primary_mod && keystroke.key.as_str() == "n" {
+            self.new_scratch_tab(window, cx);
+            return;
+        }
+
+        if primary_mod && keystroke.key.as_str() == "w" {
+            if !self.tabs.is_empty() {
+                self.close_tab(self.active_tab, cx);
+            }
+            return;
+        }
+
         if primary_mod && keystroke.key.as_str() == "p" {
             self.palette_open = true;
             self.palette_selected = 0;
@@ -548,8 +545,8 @@ impl DartIde {
         )
     }
 
-    pub(crate) fn active_editor(&self) -> &Entity<EditorView> {
-        &self.tabs[self.active_tab].editor
+    pub(crate) fn active_editor(&self) -> Option<&Entity<EditorView>> {
+        self.tabs.get(self.active_tab).map(|t| &t.editor)
     }
 
     pub(crate) fn open_path(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
@@ -576,8 +573,10 @@ impl DartIde {
             self.active_tab = self.tabs.len() - 1;
         }
 
-        let focus_handle = self.active_editor().read(cx).focus_handle(cx);
-        window.focus(&focus_handle, cx);
+        if let Some(editor) = self.active_editor() {
+            let focus_handle = editor.read(cx).focus_handle(cx);
+            window.focus(&focus_handle, cx);
+        }
         cx.notify();
     }
 
@@ -587,8 +586,10 @@ impl DartIde {
         self.tabs.push(Tab { path: None, editor });
         self.active_tab = self.tabs.len() - 1;
 
-        let focus_handle = self.active_editor().read(cx).focus_handle(cx);
-        window.focus(&focus_handle, cx);
+        if let Some(editor) = self.active_editor() {
+            let focus_handle = editor.read(cx).focus_handle(cx);
+            window.focus(&focus_handle, cx);
+        }
         cx.notify();
     }
 
@@ -598,8 +599,6 @@ impl DartIde {
         }
         self.tabs.remove(ix);
         if self.tabs.is_empty() {
-            let editor = cx.new(|cx| EditorView::new(cx));
-            self.tabs.push(Tab { path: None, editor });
             self.active_tab = 0;
         } else if self.active_tab > ix {
             self.active_tab -= 1;

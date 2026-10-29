@@ -43,9 +43,7 @@ impl DartIde {
 
         let active_file_name = self
             .active_editor()
-            .read(cx)
-            .buffer()
-            .path()
+            .and_then(|ed| ed.read(cx).buffer().path())
             .and_then(|path| path.file_name())
             .and_then(|name| name.to_str())
             .map(str::to_string);

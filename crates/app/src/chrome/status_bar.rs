@@ -10,28 +10,24 @@ use crate::{DartIde, tokens};
 /// the reference status bar breadcrumb (`docs/design-spec.md` §3.32).
 fn breadcrumb_segments(root: &Path, path: &Path) -> Vec<String> {
     let relative = path.strip_prefix(root).unwrap_or(path);
-    let segments: Vec<String> = relative
+    relative
         .components()
         .filter_map(|c| c.as_os_str().to_str().map(str::to_string))
-        .collect();
-    if segments.is_empty() {
-        vec!["untitled".to_string()]
-    } else {
-        segments
-    }
+        .collect()
 }
 
 impl DartIde {
     pub(crate) fn render_status_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let editor = self.active_editor().read(cx);
-        let buffer = editor.buffer();
-        let segments = match buffer.path() {
-            Some(path) => breadcrumb_segments(&self.root, &path),
-            None => vec!["untitled".to_string()],
-        };
-        let is_dirty = buffer.is_dirty();
-        let (line, column) = editor.cursor_position();
-        let (errors, warnings) = editor.diagnostic_summary();
+        let active_editor = self.active_editor().map(|ed| ed.read(cx));
+        let segments: Vec<String> = active_editor
+            .and_then(|ed| ed.buffer().path())
+            .map(|path| breadcrumb_segments(&self.root, &path))
+            .unwrap_or_default();
+        let is_dirty = active_editor.is_some_and(|ed| ed.buffer().is_dirty());
+        let cursor_pos = active_editor.map(|ed| ed.cursor_position());
+        let (errors, warnings) = active_editor
+            .map(|ed| ed.diagnostic_summary())
+            .unwrap_or((0, 0));
         let total_issues = errors + warnings;
         let muted = cx.theme().muted_foreground;
 
@@ -66,7 +62,7 @@ impl DartIde {
                     .when(is_dirty, |el| {
                         el.child(div().text_color(cx.theme().primary).child("\u{25cf}"))
                     })
-                    .child(breadcrumb)
+                    .when(!segments.is_empty(), |el| el.child(breadcrumb))
                     .child(
                         h_flex()
                             .gap_1()
@@ -129,10 +125,11 @@ impl DartIde {
                             .xsmall()
                             .text_color(muted),
                     )
-                    .child(format!("{line}:{column}"))
-                    .child("LF")
-                    .child("UTF-8"),
+                    .when_some(cursor_pos, |el, (line, column)| {
+                        el.child(format!("{line}:{column}"))
+                            .child("LF")
+                            .child("UTF-8")
+                    }),
             )
     }
 }
-
