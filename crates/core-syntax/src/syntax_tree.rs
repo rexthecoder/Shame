@@ -61,8 +61,15 @@ impl SyntaxTree {
     /// Run the grammar's highlights query against `source` (which must be
     /// the same text this tree was parsed/reparsed from).
     pub fn highlights(&self, source: &str) -> Vec<Highlight> {
+        self.highlights_in_range(source, 0..source.len())
+    }
+
+    /// Run the grammar's highlights query restricted to `byte_range` so
+    /// virtualized editor rendering only queries the visible viewport lines.
+    pub fn highlights_in_range(&self, source: &str, byte_range: Range<usize>) -> Vec<Highlight> {
         let capture_names = self.query.capture_names();
         let mut cursor = QueryCursor::new();
+        cursor.set_byte_range(byte_range);
         let mut matches = cursor.matches(&self.query, self.tree.root_node(), source.as_bytes());
 
         let mut highlights = Vec::new();
@@ -114,6 +121,9 @@ impl SyntaxTree {
 
         let bytes = source.as_bytes();
         let at = *bytes.get(offset)?;
+        if !PAIRS.iter().any(|&(open, close)| at == open || at == close) {
+            return None;
+        }
 
         let skip: Vec<Range<usize>> = self
             .highlights(source)

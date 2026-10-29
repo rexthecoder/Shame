@@ -93,15 +93,35 @@ fn column_for_x(window: &mut Window, text: &SharedString, x: Pixels) -> usize {
     shaped.closest_index_for_x(x.max(px(0.)))
 }
 
+/// Maximum file size (256 KiB) for tree-sitter parsing and syntax queries.
+/// Files above this threshold or non-code lockfiles open in fast plain-text mode.
+const MAX_SYNTAX_BYTES: usize = 256 * 1024;
+
+fn should_parse_syntax(buffer: &Buffer) -> bool {
+    if buffer.len_bytes() > MAX_SYNTAX_BYTES {
+        return false;
+    }
+    let Some(ext) = buffer.path().and_then(|p| p.extension()).and_then(|e| e.to_str()) else {
+        return true;
+    };
+    !matches!(
+        ext.to_ascii_lowercase().as_str(),
+        "lock" | "txt" | "log" | "csv" | "tsv" | "svg" | "map"
+    )
+}
+
 pub struct EditorView {
     buffer: Buffer,
     focus_handle: FocusHandle,
-    scroll_handle: ScrollHandle,
-    syntax_tree: SyntaxTree,
+    scroll_handle: UniformListScrollHandle,
+    syntax_tree: Option<SyntaxTree>,
     /// The text `syntax_tree` was last parsed/reparsed from, so `render`
     /// can diff against the buffer's current text to build a single
     /// [`InputEdit`] rather than reparsing from scratch every frame.
     synced_text: String,
+    synced_revision: u64,
+    indent_width: usize,
+    line_changes: std::collections::HashMap<u32, LineChange>,
     /// `dart language-server` state for this buffer, if it's a `.dart`
     /// file. See `lsp_integration.rs`.
     lsp: Option<LspState>,
@@ -118,14 +138,28 @@ impl EditorView {
     }
 
     pub fn from_buffer(buffer: Buffer, cx: &mut Context<Self>) -> Self {
-        let text = buffer.text();
-        let syntax_tree = SyntaxTree::parse(&text);
+        let parse_syntax = should_parse_syntax(&buffer);
+        let synced_text = if parse_syntax {
+            buffer.text()
+        } else {
+            String::new()
+        };
+        let syntax_tree = parse_syntax.then(|| SyntaxTree::parse(&synced_text));
+        let synced_revision = buffer.revision();
+        let indent_width = buffer.detect_indent_width();
+        let line_changes = buffer
+            .path()
+            .map(core_workspace::line_changes)
+            .unwrap_or_default();
         let mut this = Self {
             buffer,
             focus_handle: cx.focus_handle(),
-            scroll_handle: ScrollHandle::new(),
+            scroll_handle: UniformListScrollHandle::new(),
             syntax_tree,
-            synced_text: text,
+            synced_text,
+            synced_revision,
+            indent_width,
+            line_changes,
             lsp: None,
             hover_point: None,
             hover_sequence: 0,
@@ -153,9 +187,22 @@ impl EditorView {
     /// history and resetting the cursor to the start of the file.
     pub fn open_file(&mut self, path: impl AsRef<Path>, cx: &mut Context<Self>) -> io::Result<()> {
         self.buffer = Buffer::open(path)?;
-        let text = self.buffer.text();
-        self.syntax_tree = SyntaxTree::parse(&text);
-        self.synced_text = text;
+        let parse_syntax = should_parse_syntax(&self.buffer);
+        if parse_syntax {
+            let text = self.buffer.text();
+            self.syntax_tree = Some(SyntaxTree::parse(&text));
+            self.synced_text = text;
+        } else {
+            self.syntax_tree = None;
+            self.synced_text.clear();
+        }
+        self.synced_revision = self.buffer.revision();
+        self.indent_width = self.buffer.detect_indent_width();
+        self.line_changes = self
+            .buffer
+            .path()
+            .map(core_workspace::line_changes)
+            .unwrap_or_default();
         self.lsp = None;
         self.maybe_start_lsp(cx);
         cx.notify();
@@ -164,12 +211,19 @@ impl EditorView {
 
     fn save(&mut self) {
         let _ = self.buffer.save();
+        self.line_changes = self
+            .buffer
+            .path()
+            .map(core_workspace::line_changes)
+            .unwrap_or_default();
     }
 
     fn set_cursor(&mut self, offset: usize, cx: &mut Context<Self>) {
         self.buffer
             .selections_mut()
             .set_primary(Selection::cursor(offset));
+        let line = self.buffer.byte_to_line(offset);
+        self.scroll_handle.scroll_to_item(line, ScrollStrategy::Top);
         cx.notify();
     }
 
@@ -189,6 +243,8 @@ impl EditorView {
         self.buffer
             .selections_mut()
             .set_primary(Selection::new(anchor, offset));
+        let line = self.buffer.byte_to_line(offset);
+        self.scroll_handle.scroll_to_item(line, ScrollStrategy::Top);
         cx.notify();
     }
 
@@ -895,26 +951,6 @@ fn is_word_byte(b: u8) -> bool {
     b.is_ascii_alphanumeric() || b == b'_' || b >= 0x80
 }
 
-/// The file's own indentation width — the smallest positive leading-space
-/// count, clamped to a sane range. Guides are drawn at multiples of it,
-/// which keeps a 2-space Dart file and a 4-space Rust file correct without
-/// letting an oddly aligned continuation line invent a new guide column.
-fn indent_width(lines: &[String]) -> usize {
-    lines
-        .iter()
-        .filter_map(|line| {
-            let trimmed = line.trim_start_matches(' ');
-            if trimmed.is_empty() {
-                return None;
-            }
-            let indent = line.len() - trimmed.len();
-            (indent > 0).then_some(indent)
-        })
-        .min()
-        .unwrap_or(4)
-        .clamp(2, 8)
-}
-
 /// A quiet, One Dark-derived palette: each kind gets its own hue family
 /// (purple/gold/blue/cyan/red/green/orange) so two unrelated kinds never
 /// compete for the same colour the way the previous pass's keyword and
@@ -995,17 +1031,35 @@ impl EventEmitter<EditorEvent> for EditorView {}
 
 impl Render for EditorView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let text = self.buffer.text();
+        // Only touch the full buffer string or re-run tree-sitter when an edit
+        // actually incremented `buffer.revision()`. Hovering, scrolling, or
+        // moving the cursor does zero full-buffer work.
+        if self.buffer.revision() != self.synced_revision {
+            self.synced_revision = self.buffer.revision();
+            self.indent_width = self.buffer.detect_indent_width();
+
+            if should_parse_syntax(&self.buffer) {
+                let text = self.buffer.text();
+                if let Some(tree) = &mut self.syntax_tree {
+                    if let Some(edit) = diff_as_edit(&self.synced_text, &text) {
+                        tree.reparse(&text, edit);
+                    }
+                } else {
+                    self.syntax_tree = Some(SyntaxTree::parse(&text));
+                }
+                self.sync_lsp_text(&text);
+                self.synced_text = text;
+            } else {
+                self.syntax_tree = None;
+                self.synced_text.clear();
+            }
+        }
+
         let primary = self.buffer.selections().primary();
         let head = primary.head;
         let cursor_line = Some(self.buffer.byte_to_line(head));
         let selection_range = (!primary.is_empty()).then(|| primary.range());
 
-        // The word under a bare caret (no active selection) gets every
-        // other occurrence of itself picked out across the whole file —
-        // computed once here, up front, so every line below just asks
-        // "does this range fall inside a match" instead of each
-        // reaching back into the buffer separately.
         let current_word = if selection_range.is_none() {
             let line_idx = self.buffer.byte_to_line(head);
             let line_start = self.buffer.line_to_byte(line_idx);
@@ -1017,74 +1071,77 @@ impl Render for EditorView {
             None
         };
 
-        let lines: Vec<String> = if text.is_empty() {
-            vec![String::new()]
-        } else {
-            let mut v = Vec::with_capacity(self.buffer.line_count());
-            for i in 0..self.buffer.line_count() {
-                v.push(self.buffer.line(i));
-            }
-            v
-        };
-
-        // Incrementally reparse: diff the text we last parsed against the
-        // buffer's current text (common-prefix/common-suffix trim) to get
-        // a single InputEdit, rather than reparsing from scratch every
-        // frame. Whatever changed between renders — one keystroke or a
-        // whole-file open — collapses to one edit either way.
-        if text != self.synced_text {
-            if let Some(edit) = diff_as_edit(&self.synced_text, &text) {
-                self.syntax_tree.reparse(&text, edit);
-            } else {
-                self.syntax_tree = SyntaxTree::parse(&text);
-            }
-            self.sync_lsp_text(&text);
-            self.synced_text = text.clone();
-        }
-        let highlights = self.syntax_tree.highlights(&text);
         let diagnostics_by_line = self.diagnostics_by_line();
         let diagnostic_messages = self.diagnostic_messages_by_line();
-        let line_changes = self.buffer.path().map(core_workspace::line_changes).unwrap_or_default();
-        let indent_width = indent_width(&lines);
-        let bracket_pair = self
-            .syntax_tree
-            .matching_bracket(&text, head)
-            .map(|other| (head, other))
-            .or_else(|| {
-                (head > 0).then(|| {
-                    self.syntax_tree
-                        .matching_bracket(&text, head - 1)
-                        .map(|other| (head - 1, other))
-                })?
-            });
+        let indent_width = self.indent_width;
+        let bracket_pair = self.syntax_tree.as_ref().and_then(|tree| {
+            tree.matching_bracket(&self.synced_text, head)
+                .map(|other| (head, other))
+                .or_else(|| {
+                    (head > 0).then(|| {
+                        tree.matching_bracket(&self.synced_text, head - 1)
+                            .map(|other| (head - 1, other))
+                    })?
+                })
+        });
 
-        let rendered_lines: Vec<_> = lines
-            .iter()
-            .enumerate()
-            .map(|(ix, line)| {
-                self.render_line(
-                    ix,
-                    line,
-                    cursor_line,
-                    &highlights,
-                    selection_range.clone(),
-                    &diagnostics_by_line,
-                    &diagnostic_messages,
-                    &line_changes,
-                    indent_width,
-                    current_word.as_deref(),
-                    bracket_pair,
-                    cx,
-                )
-                    .into_any_element()
-            })
-            .collect();
+        let line_count = self.buffer.line_count().max(1);
+        let list = uniform_list(
+            "editor-lines",
+            line_count,
+            cx.processor(move |this, visible_range: Range<usize>, _window, cx| {
+                if visible_range.is_empty() {
+                    return Vec::new();
+                }
+                let start_line = visible_range.start;
+                let end_line = visible_range.end.min(this.buffer.line_count());
+                let start_byte = this.buffer.line_to_byte(start_line);
+                let end_byte = if end_line < this.buffer.line_count() {
+                    this.buffer.line_to_byte(end_line)
+                } else {
+                    this.buffer.len_bytes()
+                };
 
-        let rows = div()
-            .relative()
-            .flex()
-            .flex_col()
-            .children(rendered_lines);
+                let highlights = this
+                    .syntax_tree
+                    .as_ref()
+                    .map(|tree| {
+                        let clamped_start = start_byte.min(this.synced_text.len());
+                        let clamped_end = end_byte.min(this.synced_text.len()).max(clamped_start);
+                        tree.highlights_in_range(&this.synced_text, clamped_start..clamped_end)
+                    })
+                    .unwrap_or_default();
+
+                visible_range
+                    .map(|ix| {
+                        let line = if this.buffer.is_empty() && ix == 0 {
+                            String::new()
+                        } else if ix < this.buffer.line_count() {
+                            this.buffer.line(ix)
+                        } else {
+                            String::new()
+                        };
+                        this.render_line(
+                            ix,
+                            &line,
+                            cursor_line,
+                            &highlights,
+                            selection_range.clone(),
+                            &diagnostics_by_line,
+                            &diagnostic_messages,
+                            &this.line_changes,
+                            indent_width,
+                            current_word.as_deref(),
+                            bracket_pair,
+                            cx,
+                        )
+                        .into_any_element()
+                    })
+                    .collect()
+            }),
+        )
+        .track_scroll(&self.scroll_handle)
+        .size_full();
 
         div()
             .id("editor-view")
@@ -1092,15 +1149,9 @@ impl Render for EditorView {
             .track_focus(&self.focus_handle)
             .on_key_down(cx.listener(Self::on_key_down))
             .size_full()
-            .overflow_y_scroll()
-            .track_scroll(&self.scroll_handle)
             .bg(cx.theme().background)
             .text_color(cx.theme().foreground)
-            // A little breathing room above the first line and below the
-            // last, so code never sits flush against the tab bar or the
-            // status bar.
-            .pt_3()
-            .pb_8()
-            .child(rows)
+            .pt_2()
+            .child(list)
     }
 }

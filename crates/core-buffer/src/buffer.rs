@@ -24,6 +24,7 @@ pub struct Buffer {
     undo_tree: UndoTree,
     path: Option<PathBuf>,
     dirty: bool,
+    revision: u64,
 }
 
 impl Default for Buffer {
@@ -34,6 +35,7 @@ impl Default for Buffer {
             undo_tree: UndoTree::default(),
             path: None,
             dirty: false,
+            revision: 0,
         }
     }
 }
@@ -86,8 +88,35 @@ impl Buffer {
         self.dirty
     }
 
+    pub fn revision(&self) -> u64 {
+        self.revision
+    }
+
     pub fn len_bytes(&self) -> usize {
         self.rope.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.rope.len() == 0
+    }
+
+    /// Detect the file's indentation width (clamped to `2..=8`) by inspecting
+    /// up to the first 100 lines, avoiding a full-buffer allocation.
+    pub fn detect_indent_width(&self) -> usize {
+        let limit = self.line_count().min(100);
+        (0..limit)
+            .filter_map(|i| {
+                let line = self.line(i);
+                let trimmed = line.trim_start_matches(' ');
+                if trimmed.trim_end_matches(['\n', '\r']).is_empty() {
+                    return None;
+                }
+                let indent = line.len() - trimmed.len();
+                (indent > 0).then_some(indent)
+            })
+            .min()
+            .unwrap_or(4)
+            .clamp(2, 8)
     }
 
     pub fn text(&self) -> String {
@@ -126,9 +155,17 @@ impl Buffer {
 
     /// The byte offset one full UTF-8 character before `byte` (clamped to 0).
     pub fn prev_char_boundary(&self, byte: usize) -> usize {
-        let text = self.text();
-        match text[..byte.min(text.len())].chars().next_back() {
-            Some(c) => byte - c.len_utf8(),
+        let end = byte.min(self.len_bytes());
+        if end == 0 {
+            return 0;
+        }
+        let mut start = end.saturating_sub(4);
+        while start > 0 && !self.rope.is_char_boundary(start) {
+            start -= 1;
+        }
+        let window = self.slice(start..end);
+        match window.chars().next_back() {
+            Some(c) => end - c.len_utf8(),
             None => 0,
         }
     }
@@ -136,10 +173,19 @@ impl Buffer {
     /// The byte offset one full UTF-8 character after `byte` (clamped to the
     /// buffer's length).
     pub fn next_char_boundary(&self, byte: usize) -> usize {
-        let text = self.text();
-        match text.get(byte..).and_then(|s| s.chars().next()) {
-            Some(c) => byte + c.len_utf8(),
-            None => text.len(),
+        let len = self.len_bytes();
+        let start = byte.min(len);
+        if start >= len {
+            return len;
+        }
+        let mut end = (start + 4).min(len);
+        while end < len && !self.rope.is_char_boundary(end) {
+            end += 1;
+        }
+        let window = self.slice(start..end);
+        match window.chars().next() {
+            Some(c) => start + c.len_utf8(),
+            None => len,
         }
     }
 
@@ -202,6 +248,7 @@ impl Buffer {
         self.selections
             .apply_edit(op.start, op.removed.len(), op.inserted.len());
         self.dirty = true;
+        self.revision = self.revision.wrapping_add(1);
     }
 }
 

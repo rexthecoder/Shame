@@ -1,15 +1,15 @@
-use gpui_kit::base::StyledExt as _;
 use gpui_kit::component::{
     ActiveTheme as _, Icon, Sizable as _,
     h_flex,
     resizable::{h_resizable, resizable_panel},
+    text::markdown,
     v_flex,
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 use crate::rails::files::{file_icon_color, icon_for_file};
-use crate::{DartIde, tokens};
+use crate::{DartIde, MarkdownMode, tokens};
 
 fn keycap(label: &'static str, cx: &App) -> Div {
     div()
@@ -31,12 +31,6 @@ impl DartIde {
         view: &Entity<Self>,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        let root_name = self
-            .root
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("Workspace")
-            .to_string();
         let muted = cx.theme().muted_foreground;
         let fg = cx.theme().foreground;
 
@@ -56,40 +50,7 @@ impl DartIde {
             .size_full()
             .items_center()
             .justify_center()
-            .gap(px(tokens::SPACE_6))
-            .child(
-                v_flex()
-                    .items_center()
-                    .gap(px(tokens::SPACE_3))
-                    .child(
-                        div()
-                            .size(px(42.))
-                            .rounded(px(tokens::RADIUS_CARD))
-                            .bg(rgba(0xea7a3c14))
-                            .border_1()
-                            .border_color(rgba(0xea7a3c38))
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .child(
-                                Icon::new(gpui_kit::assets::IconName::Feather)
-                                    .text_color(cx.theme().primary),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .text_size(px(14.))
-                            .font_medium()
-                            .text_color(fg)
-                            .child(root_name),
-                    )
-                    .child(
-                        div()
-                            .text_size(px(tokens::UI_SM))
-                            .text_color(muted)
-                            .child("Select a file from the sidebar or jump anywhere with \u{2318}P"),
-                    ),
-            )
+            .gap(px(tokens::SPACE_5))
             .child(
                 v_flex()
                     .w(px(280.))
@@ -273,8 +234,49 @@ impl DartIde {
         view: &Entity<Self>,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        let active_editor = self.active_editor().cloned();
+        let active_tab = self.tabs.get(self.active_tab);
+        let active_editor = active_tab.map(|t| t.editor.clone());
+        let active_md_mode = active_tab
+            .filter(|t| t.is_markdown())
+            .map(|t| t.md_mode)
+            .unwrap_or(MarkdownMode::Code);
         let has_tabs = !self.tabs.is_empty();
+
+        let render_md_pane = |editor: &Entity<editor_view::EditorView>, cx: &App| {
+            let source: SharedString = editor.read(cx).buffer().text().into();
+            div()
+                .flex_1()
+                .h_full()
+                .min_w(px(0.))
+                .min_h(px(0.))
+                .bg(cx.theme().background)
+                .p(px(tokens::SPACE_6))
+                .child(markdown(source).scrollable(true).selectable(true))
+        };
+
+        let editor_body = match (active_editor, active_md_mode) {
+            (Some(editor), MarkdownMode::Code) => editor.into_any_element(),
+            (Some(editor), MarkdownMode::Preview) => render_md_pane(&editor, cx).into_any_element(),
+            (Some(editor), MarkdownMode::Split) => {
+                let preview = render_md_pane(&editor, cx);
+                h_flex()
+                    .size_full()
+                    .min_h(px(0.))
+                    .child(
+                        div()
+                            .flex_1()
+                            .h_full()
+                            .min_w(px(0.))
+                            .min_h(px(0.))
+                            .border_r_1()
+                            .border_color(cx.theme().border)
+                            .child(editor),
+                    )
+                    .child(preview)
+                    .into_any_element()
+            }
+            (None, _) => self.render_empty_editor(view, cx).into_any_element(),
+        };
 
         let editor_card = v_flex()
             .flex_1()
@@ -286,16 +288,7 @@ impl DartIde {
             .rounded(px(tokens::RADIUS_CARD))
             .overflow_hidden()
             .when(has_tabs, |el| el.child(self.render_tabs(view, cx)))
-            .child(
-                div()
-                    .flex_1()
-                    .w_full()
-                    .min_h(px(0.))
-                    .child(match active_editor {
-                        Some(editor) => editor.into_any_element(),
-                        None => self.render_empty_editor(view, cx).into_any_element(),
-                    }),
-            )
+            .child(div().flex_1().w_full().min_h(px(0.)).child(editor_body))
             .into_any_element();
 
         let editor_column = v_flex()

@@ -62,11 +62,19 @@ fn flatten_files(dir: &Path) -> Vec<PathBuf> {
     files
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MarkdownMode {
+    Code,
+    Split,
+    Preview,
+}
+
 pub(crate) struct Tab {
     /// `None` for the initial scratch buffer; every file opened from the
     /// tree gets a path, which also doubles as the tab's dedup key.
     pub(crate) path: Option<PathBuf>,
     pub(crate) editor: Entity<EditorView>,
+    pub(crate) md_mode: MarkdownMode,
 }
 
 impl Tab {
@@ -79,6 +87,14 @@ impl Tab {
                 .to_string(),
             None => "untitled".to_string(),
         }
+    }
+
+    pub(crate) fn is_markdown(&self) -> bool {
+        self.path
+            .as_ref()
+            .and_then(|p| p.extension())
+            .and_then(|e| e.to_str())
+            .is_some_and(|ext| matches!(ext.to_ascii_lowercase().as_str(), "md" | "markdown"))
     }
 }
 
@@ -410,6 +426,20 @@ impl DartIde {
             return;
         }
 
+        if primary_mod && keystroke.modifiers.shift && keystroke.key.as_str() == "v" {
+            if let Some(tab) = self.tabs.get_mut(self.active_tab) {
+                if tab.is_markdown() {
+                    tab.md_mode = match tab.md_mode {
+                        MarkdownMode::Code => MarkdownMode::Split,
+                        MarkdownMode::Split => MarkdownMode::Preview,
+                        MarkdownMode::Preview => MarkdownMode::Code,
+                    };
+                    cx.notify();
+                    return;
+                }
+            }
+        }
+
         if self.palette_open {
             match keystroke.key.as_str() {
                 "escape" => {
@@ -605,6 +635,7 @@ impl DartIde {
             self.tabs.push(Tab {
                 path: Some(path),
                 editor,
+                md_mode: MarkdownMode::Code,
             });
             self.active_tab = self.tabs.len() - 1;
         }
@@ -619,7 +650,11 @@ impl DartIde {
     pub(crate) fn new_scratch_tab(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let editor = cx.new(|cx| EditorView::new(cx));
         self.watch_editor(&editor, window, cx);
-        self.tabs.push(Tab { path: None, editor });
+        self.tabs.push(Tab {
+            path: None,
+            editor,
+            md_mode: MarkdownMode::Code,
+        });
         self.active_tab = self.tabs.len() - 1;
 
         if let Some(editor) = self.active_editor() {

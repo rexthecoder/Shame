@@ -7,7 +7,7 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 use crate::rails::files::{file_icon_color, icon_for_file};
-use crate::{DartIde, tokens};
+use crate::{DartIde, MarkdownMode, tokens};
 
 impl DartIde {
     pub(crate) fn render_tabs(
@@ -19,6 +19,11 @@ impl DartIde {
         let muted = cx.theme().muted_foreground;
         let active_fg = cx.theme().tab_active_foreground;
         let inactive_fg = cx.theme().tab_foreground;
+        let active_md_mode = self
+            .tabs
+            .get(self.active_tab)
+            .filter(|t| t.is_markdown())
+            .map(|t| t.md_mode);
 
         h_flex()
             .w_full()
@@ -139,6 +144,83 @@ impl DartIde {
                     .flex_shrink_0()
                     .items_center()
                     .gap(px(tokens::SPACE_1))
+                    .when_some(active_md_mode, |el, md_mode| {
+                        let primary = cx.theme().primary;
+                        let mode_pill = |id: &'static str,
+                                         label: &'static str,
+                                         icon: gpui_kit::assets::IconName,
+                                         target: MarkdownMode,
+                                         view: &Entity<Self>| {
+                            let is_current = md_mode == target;
+                            let view = view.clone();
+                            h_flex()
+                                .id(id)
+                                .h(px(24.))
+                                .px(px(tokens::SPACE_3))
+                                .gap(px(tokens::SPACE_1))
+                                .items_center()
+                                .rounded(px(tokens::RADIUS_SM))
+                                .cursor_pointer()
+                                .when(is_current, |s| {
+                                    s.bg(rgba(0xea7a3c22))
+                                        .border_1()
+                                        .border_color(rgba(0xea7a3c55))
+                                        .text_color(active_fg)
+                                })
+                                .when(!is_current, |s| {
+                                    s.text_color(muted).hover(|h| h.bg(rgba(0xffffff08)))
+                                })
+                                .child(
+                                    Icon::new(icon).xsmall().text_color(if is_current {
+                                        primary
+                                    } else {
+                                        muted
+                                    }),
+                                )
+                                .child(div().text_size(px(tokens::UI_XS)).child(label))
+                                .on_click(move |_event, _window, cx| {
+                                    view.update(cx, |this, cx| {
+                                        if let Some(tab) = this.tabs.get_mut(this.active_tab) {
+                                            tab.md_mode = target;
+                                            cx.notify();
+                                        }
+                                    });
+                                })
+                        };
+
+                        el.child(
+                            h_flex()
+                                .mr(px(tokens::SPACE_2))
+                                .p(px(2.))
+                                .gap(px(2.))
+                                .items_center()
+                                .rounded(px(tokens::RADIUS_PANEL))
+                                .bg(cx.theme().background)
+                                .border_1()
+                                .border_color(cx.theme().border)
+                                .child(mode_pill(
+                                    "md-mode-code",
+                                    "Code",
+                                    gpui_kit::assets::IconName::File,
+                                    MarkdownMode::Code,
+                                    view,
+                                ))
+                                .child(mode_pill(
+                                    "md-mode-split",
+                                    "Split",
+                                    gpui_kit::assets::IconName::Columns2,
+                                    MarkdownMode::Split,
+                                    view,
+                                ))
+                                .child(mode_pill(
+                                    "md-mode-preview",
+                                    "Preview",
+                                    gpui_kit::assets::IconName::Eye,
+                                    MarkdownMode::Preview,
+                                    view,
+                                )),
+                        )
+                    })
                     .child(
                         Button::new("tab-code-actions")
                             .ghost()
