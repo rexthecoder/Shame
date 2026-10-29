@@ -1,14 +1,13 @@
 use std::path::{Path, PathBuf};
 
+use gpui_kit::base::{StyledExt as _, Tree};
 use gpui_kit::component::{
     ActiveTheme as _, Icon, IconName, Sizable as _,
     button::{Button, ButtonVariants as _},
     h_flex,
-    list::ListItem,
-    tree::{TreeItem, tree},
+    tree::TreeItem,
     v_flex,
 };
-use gpui_kit::base::StyledExt as _;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
@@ -312,111 +311,154 @@ impl DartIde {
                     ),
             )
             .child(
-                tree(&self.tree_state, {
-                    let view = view.clone();
-                    let active_path = self
-                        .active_editor()
-                        .and_then(|ed| ed.read(cx).buffer().path())
-                        .map(|path| path.to_string_lossy().to_string());
-                    let git_status = self.git_status.clone();
-                    move |ix, entry, _selected, _window, cx| {
-                        let item = entry.item();
-                        let item_path = PathBuf::from(item.id.as_str());
-                        let is_folder = entry.is_folder();
-                        let icon = if !is_folder {
-                            icon_for_file(&item.label)
-                        } else if entry.is_expanded() {
-                            Icon::new(IconName::FolderOpen)
-                        } else {
-                            Icon::new(IconName::Folder)
-                        };
-                        let icon_color: Hsla = if is_folder {
-                            cx.theme().muted_foreground
-                        } else {
-                            file_icon_color(&item.label).into()
-                        };
-                        let is_active_file =
-                            active_path.as_deref() == Some(item.id.as_str());
-
-                        let badge = if is_folder {
-                            git_status
-                                .keys()
-                                .any(|changed| changed.starts_with(&item_path))
-                                .then_some('M')
-                        } else {
-                            git_status.get(&item_path).copied()
-                        };
-
-                        let chevron = is_folder.then(|| {
-                            Icon::new(if entry.is_expanded() {
-                                gpui_kit::assets::IconName::ChevronDown
+                Tree::new(&self.tree_state)
+                    .item({
+                        let view = view.clone();
+                        let active_path = self
+                            .active_editor()
+                            .and_then(|ed| ed.read(cx).buffer().path())
+                            .map(|path| path.to_string_lossy().to_string());
+                        let git_status = self.git_status.clone();
+                        move |ix, entry, _entry_state, _window, cx| {
+                            let item = entry.item();
+                            let item_path = PathBuf::from(item.id.as_str());
+                            let is_folder = entry.is_folder();
+                            let depth = entry.depth();
+                            let icon = if !is_folder {
+                                icon_for_file(&item.label)
+                            } else if entry.is_expanded() {
+                                Icon::new(IconName::FolderOpen)
                             } else {
-                                gpui_kit::assets::IconName::ChevronRight
-                            })
-                            .xsmall()
-                            .text_color(cx.theme().muted_foreground)
-                        });
+                                Icon::new(IconName::Folder)
+                            };
+                            let icon_color: Hsla = if is_folder {
+                                cx.theme().muted_foreground
+                            } else {
+                                file_icon_color(&item.label).into()
+                            };
+                            let is_active_file =
+                                active_path.as_deref() == Some(item.id.as_str());
 
-                        ListItem::new(ix)
-                            .relative()
-                            .w_full()
-                            .h(px(tokens::TREE_ROW_H))
-                            .rounded(px(tokens::RADIUS_SM))
-                            .text_color(cx.theme().sidebar_foreground)
-                            .px(px(tokens::SPACE_2))
-                            .py_0()
-                            .pl(px(16.) * entry.depth() + px(tokens::SPACE_4))
-                            .selected(is_active_file)
-                            .when(is_active_file, |el| {
-                                el.font_medium()
-                                    .bg(tokens::accent_dim())
-                                    .child(
-                                        div()
-                                            .absolute()
-                                            .left_0()
-                                            .top(px(4.))
-                                            .bottom(px(4.))
-                                            .w(px(2.))
-                                            .rounded(px(1.))
-                                            .bg(cx.theme().primary),
-                                    )
-                            })
-                            .child(
-                                h_flex()
-                                    .w_full()
-                                    .items_center()
-                                    .gap(px(tokens::SPACE_2))
-                                    .when_some(chevron, |el, ch| el.child(ch))
-                                    .child(icon.text_color(icon_color).small())
-                                    .child(
-                                        div()
-                                            .flex_1()
-                                            .min_w(px(0.))
-                                            .truncate()
-                                            .text_size(px(tokens::UI))
-                                            .child(item.label.clone()),
-                                    )
-                                    .when_some(badge, |el, letter| {
-                                        el.child(status_badge(letter, &*cx))
-                                    }),
-                            )
-                            .on_click({
-                                let view = view.clone();
-                                let path = PathBuf::from(item.id.as_str());
-                                move |_event, window, cx| {
-                                    if is_folder {
-                                        return;
+                            let badge = if is_folder {
+                                git_status
+                                    .keys()
+                                    .any(|changed| changed.starts_with(&item_path))
+                                    .then_some('M')
+                            } else {
+                                git_status.get(&item_path).copied()
+                            };
+
+                            // Subtle vertical indent guides for nested levels
+                            let guides: Vec<AnyElement> = (0..depth)
+                                .map(|lvl| {
+                                    div()
+                                        .absolute()
+                                        .top_0()
+                                        .bottom_0()
+                                        .left(px(14. + lvl as f32 * 16.))
+                                        .w(px(1.))
+                                        .bg(cx.theme().border.opacity(0.45))
+                                        .into_any_element()
+                                })
+                                .collect();
+
+                            let fg = cx.theme().foreground;
+                            let row_fg = if is_active_file {
+                                fg
+                            } else {
+                                cx.theme().sidebar_foreground
+                            };
+
+                            div()
+                                .id(("tree-row", ix))
+                                .w_full()
+                                .h(px(tokens::TREE_ROW_H))
+                                .px(px(tokens::SPACE_3))
+                                .flex()
+                                .items_center()
+                                .child(
+                                    h_flex()
+                                        .relative()
+                                        .w_full()
+                                        .h(px(26.))
+                                        .px(px(tokens::SPACE_3))
+                                        .pl(px(depth as f32 * 16. + tokens::SPACE_3))
+                                        .items_center()
+                                        .gap(px(tokens::SPACE_2))
+                                        .rounded(px(tokens::RADIUS_SM))
+                                        .cursor_pointer()
+                                        .text_color(row_fg)
+                                        .children(guides)
+                                        .when(is_active_file, |el| {
+                                            el.font_medium()
+                                                .bg(rgba(0xea7a3c16))
+                                                .border_1()
+                                                .border_color(rgba(0xea7a3c36))
+                                                .child(
+                                                    div()
+                                                        .absolute()
+                                                        .left(px(2.))
+                                                        .top(px(5.))
+                                                        .bottom(px(5.))
+                                                        .w(px(2.5))
+                                                        .rounded(px(2.))
+                                                        .bg(cx.theme().primary),
+                                                )
+                                        })
+                                        .when(!is_active_file, |el| {
+                                            el.hover(move |s| {
+                                                s.bg(rgba(0xffffff08)).text_color(fg)
+                                            })
+                                        })
+                                        .child(
+                                            div()
+                                                .w(px(12.))
+                                                .flex_shrink_0()
+                                                .flex()
+                                                .items_center()
+                                                .justify_center()
+                                                .when(is_folder, |el| {
+                                                    el.child(
+                                                        Icon::new(if entry.is_expanded() {
+                                                            gpui_kit::assets::IconName::ChevronDown
+                                                        } else {
+                                                            gpui_kit::assets::IconName::ChevronRight
+                                                        })
+                                                        .xsmall()
+                                                        .text_color(cx.theme().muted_foreground),
+                                                    )
+                                                }),
+                                        )
+                                        .child(icon.text_color(icon_color).small())
+                                        .child(
+                                            div()
+                                                .flex_1()
+                                                .min_w(px(0.))
+                                                .truncate()
+                                                .text_size(px(tokens::UI))
+                                                .child(item.label.clone()),
+                                        )
+                                        .when_some(badge, |el, letter| {
+                                            el.child(status_badge(letter, cx))
+                                        }),
+                                )
+                                .on_click({
+                                    let view = view.clone();
+                                    let path = PathBuf::from(item.id.as_str());
+                                    move |_event, window, cx| {
+                                        if is_folder {
+                                            return;
+                                        }
+                                        view.update(cx, |this, cx| {
+                                            this.open_path(path.clone(), window, cx);
+                                        });
                                     }
-                                    view.update(cx, |this, cx| {
-                                        this.open_path(path.clone(), window, cx);
-                                    });
-                                }
-                            })
-                    }
-                })
-                .flex_1()
-                .w_full(),
+                                })
+                                .into_any_element()
+                        }
+                    })
+                    .flex_1()
+                    .w_full(),
             )
     }
 }
-
