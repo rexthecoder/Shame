@@ -69,6 +69,12 @@ pub(crate) enum MarkdownMode {
     Preview,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RightRailTab {
+    Simulator,
+    Agent,
+}
+
 pub(crate) struct Tab {
     /// `None` for the initial scratch buffer; every file opened from the
     /// tree gets a path, which also doubles as the tab's dedup key.
@@ -115,6 +121,14 @@ impl Tab {
             .and_then(|e| e.to_str())
             .is_some_and(|ext| matches!(ext.to_ascii_lowercase().as_str(), "md" | "markdown"))
     }
+
+    pub(crate) fn is_pubspec(&self) -> bool {
+        self.path
+            .as_ref()
+            .and_then(|p| p.file_name())
+            .and_then(|n| n.to_str())
+            .is_some_and(|name| name.eq_ignore_ascii_case("pubspec.yaml"))
+    }
 }
 
 pub struct DartIde {
@@ -126,6 +140,7 @@ pub struct DartIde {
     pub(crate) terminal_open: bool,
     pub(crate) terminal_maximized: bool,
     pub(crate) agent_open: bool,
+    pub(crate) right_rail_tab: RightRailTab,
     pub(crate) show_hidden: bool,
     pub(crate) tree_state: Entity<TreeState>,
     pub(crate) tabs: Vec<Tab>,
@@ -148,6 +163,20 @@ pub struct DartIde {
     pub(crate) next_terminal_id: usize,
     pub(crate) terminal_focus: FocusHandle,
     pub(crate) terminal_tx: async_channel::Sender<editor::dock::TerminalEvent>,
+    /// Flutter devices, running daemon, and Attached Simulator state.
+    pub(crate) devices: Vec<core_flutter::Device>,
+    pub(crate) ios_simulators: Vec<core_flutter::IosSimulator>,
+    pub(crate) selected_device: Option<core_flutter::Device>,
+    pub(crate) device_picker_open: bool,
+    pub(crate) flutter_daemon: Option<std::sync::Arc<std::sync::Mutex<core_flutter::FlutterDaemon>>>,
+    pub(crate) flutter_app_id: Option<String>,
+    pub(crate) flutter_status: Option<String>,
+    pub(crate) simulator_attached: bool,
+    pub(crate) simulator_live_sync: bool,
+    pub(crate) simulator_frame_path: Option<PathBuf>,
+    pub(crate) simulator_frame_seq: u64,
+    pub(crate) add_package_open: bool,
+    pub(crate) add_package_input: Entity<InputState>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -167,6 +196,10 @@ impl DartIde {
             InputState::new(window, cx).placeholder("Line[:Column] (e.g. 42 or 42:8)...")
         });
         let rename_input = cx.new(|cx| InputState::new(window, cx).placeholder("New name..."));
+        let add_package_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("Package name (e.g. provider, http, dev:build_runner)...")
+        });
 
         let git_branch = core_workspace::current_branch(&root);
         let git_status = core_workspace::status_map(&root);
@@ -186,6 +219,14 @@ impl DartIde {
         })
         .detach();
 
+        let default_device = core_flutter::Device {
+            id: "macos".to_string(),
+            name: "macOS".to_string(),
+            target_platform: "darwin".to_string(),
+            emulator: false,
+            is_supported: true,
+        };
+
         let mut this = Self {
             root,
             git_branch,
@@ -194,6 +235,7 @@ impl DartIde {
             terminal_open: true,
             terminal_maximized: false,
             agent_open: true,
+            right_rail_tab: RightRailTab::Simulator,
             show_hidden,
             tree_state,
             tabs: Vec::new(),
@@ -216,8 +258,24 @@ impl DartIde {
             next_terminal_id: 1,
             terminal_focus,
             terminal_tx,
+            devices: vec![default_device.clone()],
+            ios_simulators: Vec::new(),
+            selected_device: Some(default_device),
+            device_picker_open: false,
+            flutter_daemon: None,
+            flutter_app_id: None,
+            flutter_status: None,
+            simulator_attached: true,
+            simulator_live_sync: true,
+            simulator_frame_path: None,
+            simulator_frame_seq: 0,
+            add_package_open: false,
+            add_package_input,
             _subscriptions: Vec::new(),
         };
+
+        this.refresh_devices(cx);
+        this.start_simulator_live_loop(cx);
 
         let palette_changes = cx.subscribe(
             &this.palette_input,
@@ -294,6 +352,17 @@ impl DartIde {
                 }
                 EditorEvent::ShowCodeActions { actions } => {
                     this.code_actions = Some((editor.clone(), actions.clone()));
+                    cx.notify();
+                }
+                EditorEvent::Saved { path } => {
+                    this.git_status = core_workspace::status_map(&this.root);
+                    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+                    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                    if ext == "dart" && this.flutter_app_id.is_some() {
+                        this.trigger_hot_reload(cx);
+                    } else if name.eq_ignore_ascii_case("pubspec.yaml") {
+                        this.run_pub_get(cx);
+                    }
                     cx.notify();
                 }
             });
@@ -464,10 +533,15 @@ impl DartIde {
     }
 
     fn set_root(&mut self, root: PathBuf, cx: &mut Context<Self>) {
+        // Stop any running Flutter daemon from the previous project
+        self.stop_flutter_run(cx);
+
         // Close tabs and overlays from the previous project workspace
         self.tabs.clear();
         self.active_tab = 0;
         self.tab_overflow_open = false;
+        self.device_picker_open = false;
+        self.add_package_open = false;
         self.palette_open = false;
         self.find_open = false;
         self.go_to_line_open = false;
@@ -1044,7 +1118,879 @@ impl DartIde {
         } else {
             self.active_tab = self.active_tab.min(self.tabs.len() - 1);
         }
+        self.notify_tab_change(cx);
+    }
+
+    fn notify_tab_change(&mut self, cx: &mut Context<Self>) {
         cx.notify();
+    }
+
+    /// Push a plain or ANSI-styled line into the active terminal session's scrollback.
+    pub(crate) fn push_flutter_log(&mut self, line: &str) {
+        if let Some(session) = self.terminals.get_mut(self.active_terminal) {
+            session.push_output_line(line);
+            let last = session.lines.len().saturating_sub(1);
+            session.scroll_handle.scroll_to_item(last);
+        }
+    }
+
+    /// Discover connected Flutter devices (`flutter devices --machine`) and
+    /// available macOS iOS Simulators (`xcrun simctl list devices available -j`)
+    /// on a background thread so UI startup and frame rendering never block.
+    pub(crate) fn refresh_devices(&mut self, cx: &mut Context<Self>) {
+        let (tx, rx) = async_channel::bounded(1);
+        std::thread::spawn(move || {
+            let devices = core_flutter::list_devices().unwrap_or_default();
+            let sims = core_flutter::list_ios_simulators().unwrap_or_default();
+            let _ = tx.send_blocking((devices, sims));
+        });
+
+        cx.spawn(async move |weak, cx| {
+            let Ok((devices, sims)) = rx.recv().await else {
+                return;
+            };
+            let _ = weak.update(cx, |this, cx| {
+                if !devices.is_empty() {
+                    this.devices = devices;
+                    let current_valid = this.selected_device.as_ref().is_some_and(|sel| {
+                        this.devices.iter().any(|d| d.id == sel.id)
+                    });
+                    if !current_valid {
+                        // Prefer a booted iOS Simulator if one is running, otherwise macOS or first device
+                        let preferred = this
+                            .devices
+                            .iter()
+                            .find(|d| d.target_platform.contains("ios") && d.emulator)
+                            .or_else(|| this.devices.iter().find(|d| d.id == "macos"))
+                            .or_else(|| this.devices.first())
+                            .cloned();
+                        this.selected_device = preferred;
+                    }
+                }
+                this.ios_simulators = sims;
+                this.refresh_simulator_screenshot(cx);
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Start or restart `flutter run --machine -d <device_id>` on the selected device.
+    pub(crate) fn start_flutter_run(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.root.join("pubspec.yaml").is_file() {
+            self.terminal_open = true;
+            window.focus(&self.terminal_focus, cx);
+            let cmd = if self.root.join("Cargo.toml").is_file() {
+                "cargo check".to_string()
+            } else {
+                "ls -la".to_string()
+            };
+            self.execute_terminal_command(cmd, cx);
+            return;
+        }
+
+        // Stop any existing Flutter daemon first
+        self.stop_flutter_run(cx);
+
+        let device = self.selected_device.clone().unwrap_or(core_flutter::Device {
+            id: "macos".to_string(),
+            name: "macOS".to_string(),
+            target_platform: "darwin".to_string(),
+            emulator: false,
+            is_supported: true,
+        });
+
+        // If targeting an iOS simulator, ensure it is booted and open in Simulator.app
+        if device.target_platform.contains("ios") || device.id.contains('-') {
+            let _ = core_flutter::boot_ios_simulator(&device.id);
+            if self.simulator_attached {
+                self.agent_open = true;
+                self.right_rail_tab = RightRailTab::Simulator;
+                self.snap_simulator_window(window);
+            }
+        }
+
+        self.terminal_open = true;
+        if let Some(session) = self.terminals.get_mut(self.active_terminal) {
+            let cmd_str = format!("flutter run -d {}", device.id);
+            session.lines.push(editor::dock::TerminalLine::Command {
+                user_host: session.user_host.clone(),
+                dir: session.dir_label(),
+                command: cmd_str,
+            });
+        }
+
+        match core_flutter::FlutterDaemon::spawn(&self.root, &device.id) {
+            Ok(daemon) => {
+                let events = daemon.events.clone();
+                let daemon_arc = std::sync::Arc::new(std::sync::Mutex::new(daemon));
+                self.flutter_daemon = Some(daemon_arc);
+                self.flutter_app_id = None;
+                self.flutter_status = Some(format!("Launching on {}\u{2026}", device.name));
+                self.push_flutter_log(&format!(
+                    "\x1b[36m\u{25b6} Starting Flutter on {} ({})...\x1b[0m",
+                    device.name, device.id
+                ));
+                cx.notify();
+
+                cx.spawn(async move |weak, cx| {
+                    while let Ok(output) = events.recv().await {
+                        let keep_going = weak
+                            .update(cx, |this, cx| {
+                                this.handle_flutter_daemon_output(output, cx);
+                            })
+                            .is_ok();
+                        if !keep_going {
+                            break;
+                        }
+                    }
+                    let _ = weak.update(cx, |this, cx| {
+                        this.flutter_daemon = None;
+                        this.flutter_app_id = None;
+                        this.flutter_status = None;
+                        cx.notify();
+                    });
+                })
+                .detach();
+            }
+            Err(err) => {
+                self.flutter_status = None;
+                self.push_flutter_log(&format!(
+                    "\x1b[31mFailed to spawn `flutter run --machine`: {err}\x1b[0m"
+                ));
+                cx.notify();
+            }
+        }
+    }
+
+    fn handle_flutter_daemon_output(
+        &mut self,
+        output: core_flutter::DaemonOutput,
+        cx: &mut Context<Self>,
+    ) {
+        match output {
+            core_flutter::DaemonOutput::Event { event, params } => match event.as_str() {
+                "app.start" => {
+                    if let Some(app_id) = params.get("appId").and_then(|v| v.as_str()) {
+                        self.flutter_app_id = Some(app_id.to_string());
+                    }
+                    self.flutter_status = Some("Starting\u{2026}".to_string());
+                    cx.notify();
+                }
+                "app.progress" => {
+                    let finished = params
+                        .get("finished")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false);
+                    if !finished {
+                        if let Some(msg) = params.get("message").and_then(|v| v.as_str()) {
+                            self.flutter_status = Some(msg.to_string());
+                            self.push_flutter_log(&format!("\x1b[33m\u{25d0} {msg}\x1b[0m"));
+                        }
+                    } else if self.flutter_app_id.is_some() {
+                        self.flutter_status = Some("Running".to_string());
+                    }
+                    cx.notify();
+                }
+                "app.started" => {
+                    if let Some(app_id) = params.get("appId").and_then(|v| v.as_str()) {
+                        self.flutter_app_id = Some(app_id.to_string());
+                    }
+                    self.flutter_status = Some("Running".to_string());
+                    self.push_flutter_log(
+                        "\x1b[32m\u{2713} Flutter app running \u{2014} Save (\u{2318}S) or click \u{26a1} to Hot Reload\x1b[0m",
+                    );
+                    self.refresh_simulator_screenshot(cx);
+                    cx.notify();
+                }
+                "app.log" => {
+                    if let Some(log) = params.get("log").and_then(|v| v.as_str()) {
+                        for line in log.lines() {
+                            self.push_flutter_log(line);
+                        }
+                        cx.notify();
+                    }
+                }
+                "app.stop" => {
+                    self.flutter_app_id = None;
+                    self.flutter_daemon = None;
+                    self.flutter_status = None;
+                    self.push_flutter_log("\x1b[90m\u{25a0} Flutter app stopped.\x1b[0m");
+                    cx.notify();
+                }
+                _ => {}
+            },
+            core_flutter::DaemonOutput::Response { result, .. } => {
+                if let Ok(val) = result {
+                    if let Some(msg) = val.get("message").and_then(|v| v.as_str()) {
+                        if !msg.is_empty() {
+                            self.push_flutter_log(&format!("\x1b[32m\u{26a1} {msg}\x1b[0m"));
+                        }
+                    }
+                }
+                if self.flutter_app_id.is_some() {
+                    self.flutter_status = Some("Running".to_string());
+                }
+                self.refresh_simulator_screenshot(cx);
+                cx.notify();
+            }
+            core_flutter::DaemonOutput::Log(line) => {
+                if !line.trim().is_empty() {
+                    self.push_flutter_log(&line);
+                    cx.notify();
+                }
+            }
+        }
+    }
+
+    /// Trigger sub-second stateful Hot Reload (`fullRestart: false`) on the active `FlutterDaemon`.
+    pub(crate) fn trigger_hot_reload(&mut self, cx: &mut Context<Self>) {
+        let (Some(daemon), Some(app_id)) = (self.flutter_daemon.clone(), self.flutter_app_id.clone()) else {
+            self.push_flutter_log(
+                "\x1b[33mNo running Flutter session \u{2014} click \u{25b6} Run first.\x1b[0m",
+            );
+            cx.notify();
+            return;
+        };
+        if let Ok(guard) = daemon.lock() {
+            if guard.hot_reload(&app_id).is_ok() {
+                self.flutter_status = Some("Hot reloading\u{2026}".to_string());
+                self.push_flutter_log("\x1b[33m\u{26a1} Hot reloading...\x1b[0m");
+                cx.notify();
+            }
+        }
+    }
+
+    /// Trigger a full Hot Restart (`fullRestart: true`) on the active `FlutterDaemon`.
+    pub(crate) fn trigger_hot_restart(&mut self, cx: &mut Context<Self>) {
+        let (Some(daemon), Some(app_id)) = (self.flutter_daemon.clone(), self.flutter_app_id.clone()) else {
+            return;
+        };
+        if let Ok(guard) = daemon.lock() {
+            if guard.hot_restart(&app_id).is_ok() {
+                self.flutter_status = Some("Restarting\u{2026}".to_string());
+                self.push_flutter_log("\x1b[36m\u{21bb} Hot restarting app...\x1b[0m");
+                cx.notify();
+            }
+        }
+    }
+
+    /// Gracefully stop the active `FlutterDaemon` session.
+    pub(crate) fn stop_flutter_run(&mut self, cx: &mut Context<Self>) {
+        if let Some(daemon) = self.flutter_daemon.take() {
+            if let Ok(mut guard) = daemon.lock() {
+                if let Some(app_id) = self.flutter_app_id.take() {
+                    let _ = guard.stop(&app_id);
+                }
+                let _ = guard.kill();
+            }
+            self.flutter_status = None;
+            self.push_flutter_log("\x1b[90m\u{25a0} Stopped Flutter run session.\x1b[0m");
+            cx.notify();
+        }
+    }
+
+    /// Run `flutter pub get` in `self.root` asynchronously and stream output to the terminal.
+    pub(crate) fn run_pub_get(&mut self, cx: &mut Context<Self>) {
+        if !self.root.join("pubspec.yaml").is_file() {
+            return;
+        }
+        let root = self.root.clone();
+        self.flutter_status = Some("Running pub get\u{2026}".to_string());
+        self.terminal_open = true;
+        self.push_flutter_log("\x1b[36m\u{21bb} Running `flutter pub get`...\x1b[0m");
+        cx.notify();
+
+        let (tx, rx) = async_channel::bounded(1);
+        std::thread::spawn(move || {
+            let res = core_flutter::pub_get(&root);
+            let _ = tx.send_blocking(res);
+        });
+
+        cx.spawn(async move |weak, cx| {
+            let Ok(res) = rx.recv().await else { return };
+            let _ = weak.update(cx, |this, cx| {
+                match res {
+                    Ok(out) => {
+                        for line in out.stdout.lines().chain(out.stderr.lines()) {
+                            if !line.trim().is_empty() {
+                                this.push_flutter_log(line);
+                            }
+                        }
+                        if out.success {
+                            this.push_flutter_log(
+                                "\x1b[32m\u{2713} `flutter pub get` succeeded.\x1b[0m",
+                            );
+                        } else {
+                            this.push_flutter_log(
+                                "\x1b[31m\u{2717} `flutter pub get` exited with errors.\x1b[0m",
+                            );
+                        }
+                    }
+                    Err(err) => {
+                        this.push_flutter_log(&format!(
+                            "\x1b[31mFailed to run `flutter pub get`: {err}\x1b[0m"
+                        ));
+                    }
+                }
+                this.flutter_status = this.flutter_app_id.as_ref().map(|_| "Running".to_string());
+                this.git_status = core_workspace::status_map(&this.root);
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    pub(crate) fn open_add_package(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.add_package_open = true;
+        self.add_package_input.update(cx, |state, cx| {
+            state.set_value("", window, cx);
+            state.focus(window, cx);
+        });
+        cx.notify();
+    }
+
+    pub(crate) fn submit_add_package(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        let raw = self.add_package_input.read(cx).value().trim().to_string();
+        self.add_package_open = false;
+        if raw.is_empty() {
+            cx.notify();
+            return;
+        }
+        let (dev, pkg) = if let Some(rest) = raw.strip_prefix("dev:") {
+            (true, rest.trim().to_string())
+        } else {
+            (false, raw)
+        };
+        let root = self.root.clone();
+        self.terminal_open = true;
+        self.flutter_status = Some(format!("Adding {pkg}\u{2026}"));
+        self.push_flutter_log(&format!(
+            "\x1b[36m+ Running `flutter pub add {}{pkg}`...\x1b[0m",
+            if dev { "--dev " } else { "" }
+        ));
+        cx.notify();
+
+        let (tx, rx) = async_channel::bounded(1);
+        std::thread::spawn(move || {
+            let res = core_flutter::add_package(&root, &pkg, dev);
+            let _ = tx.send_blocking(res);
+        });
+
+        cx.spawn(async move |weak, cx| {
+            let Ok(res) = rx.recv().await else { return };
+            let _ = weak.update(cx, |this, cx| {
+                if let Ok(out) = res {
+                    for line in out.stdout.lines().chain(out.stderr.lines()) {
+                        if !line.trim().is_empty() {
+                            this.push_flutter_log(line);
+                        }
+                    }
+                }
+                this.flutter_status = this.flutter_app_id.as_ref().map(|_| "Running".to_string());
+                this.git_status = core_workspace::status_map(&this.root);
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Open and attach the Simulator panel inside the IDE AND magnetically snap
+    /// the native `Simulator.app` window alongside the editor.
+    pub(crate) fn attach_simulator(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.agent_open = true;
+        self.right_rail_tab = RightRailTab::Simulator;
+        self.simulator_attached = true;
+
+        // Pick a booted simulator or the first available iPhone simulator
+        let sim_udid = self
+            .selected_device
+            .as_ref()
+            .filter(|d| d.target_platform.contains("ios") || d.id.contains('-'))
+            .map(|d| d.id.clone())
+            .or_else(|| {
+                self.ios_simulators
+                    .iter()
+                    .find(|s| s.is_booted())
+                    .or_else(|| self.ios_simulators.first())
+                    .map(|s| {
+                        self.selected_device = Some(core_flutter::Device {
+                            id: s.udid.clone(),
+                            name: s.name.clone(),
+                            target_platform: "ios".to_string(),
+                            emulator: true,
+                            is_supported: true,
+                        });
+                        s.udid.clone()
+                    })
+            });
+
+        if let Some(udid) = sim_udid {
+            let _ = core_flutter::boot_ios_simulator(&udid);
+        }
+        self.snap_simulator_window(window);
+        self.refresh_simulator_screenshot(cx);
+        cx.notify();
+    }
+
+    /// Magnetically dock the native macOS `Simulator.app` window to the right
+    /// edge of the IDE window.
+    pub(crate) fn snap_simulator_window(&self, window: &Window) {
+        let bounds = window.bounds();
+        let x: f32 = bounds.origin.x.into();
+        let y: f32 = bounds.origin.y.into();
+        let w: f32 = bounds.size.width.into();
+        let h: f32 = bounds.size.height.into();
+        std::thread::spawn(move || {
+            let _ = core_flutter::attach_simulator_window(
+                x as i32,
+                y as i32,
+                w as i32,
+                h as i32,
+            );
+        });
+    }
+
+    /// Capture a fresh PNG frame from the running iOS Simulator (`xcrun simctl io screenshot`)
+    /// into a rotating temp file so GPUI's `img(path)` reloads the texture without stale caching.
+    pub(crate) fn refresh_simulator_screenshot(&mut self, cx: &mut Context<Self>) {
+        let udid = self
+            .selected_device
+            .as_ref()
+            .filter(|d| d.target_platform.contains("ios") || d.id.contains('-'))
+            .map(|d| d.id.clone())
+            .or_else(|| {
+                self.ios_simulators
+                    .iter()
+                    .find(|s| s.is_booted())
+                    .map(|s| s.udid.clone())
+            });
+
+        self.simulator_frame_seq = self.simulator_frame_seq.wrapping_add(1);
+        let seq = self.simulator_frame_seq;
+        let out_path = std::env::temp_dir().join(format!("dart_ide_sim_frame_{}.png", seq % 6));
+        let prev_path = self.simulator_frame_path.clone();
+
+        let (tx, rx) = async_channel::bounded(1);
+        std::thread::spawn(move || {
+            let ok = core_flutter::capture_simulator_screenshot(udid.as_deref(), &out_path).is_ok();
+            if ok {
+                if let Some(prev) = prev_path {
+                    if prev != out_path {
+                        let _ = std::fs::remove_file(prev);
+                    }
+                }
+            }
+            let _ = tx.send_blocking(ok.then_some(out_path));
+        });
+
+        cx.spawn(async move |weak, cx| {
+            let Ok(path_opt) = rx.recv().await else { return };
+            let _ = weak.update(cx, |this, cx| {
+                if let Some(p) = path_opt {
+                    this.simulator_frame_path = Some(p);
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// Periodically refresh the Attached Simulator frame when the Simulator rail
+    /// is open and `simulator_live_sync` is enabled.
+    fn start_simulator_live_loop(&mut self, cx: &mut Context<Self>) {
+        let (tx, rx) = async_channel::bounded::<()>(1);
+        std::thread::spawn(move || {
+            loop {
+                std::thread::sleep(std::time::Duration::from_millis(1400));
+                if tx.send_blocking(()).is_err() {
+                    break;
+                }
+            }
+        });
+        cx.spawn(async move |weak, cx| {
+            while rx.recv().await.is_ok() {
+                let keep_going = weak
+                    .update(cx, |this, cx| {
+                        if this.agent_open
+                            && this.right_rail_tab == RightRailTab::Simulator
+                            && this.simulator_live_sync
+                        {
+                            this.refresh_simulator_screenshot(cx);
+                        }
+                    })
+                    .is_ok();
+                if !keep_going {
+                    break;
+                }
+            }
+        })
+        .detach();
+    }
+
+    fn render_add_package_prompt(&self, view: &Entity<Self>, cx: &mut Context<Self>) -> Option<Div> {
+        if !self.add_package_open {
+            return None;
+        }
+
+        Some(
+            div()
+                .absolute()
+                .inset_0()
+                .flex()
+                .justify_center()
+                .pt(px(84.))
+                .bg(rgba(0x00000066))
+                .child(
+                    v_flex()
+                        .w(px(400.))
+                        .bg(cx.theme().popover)
+                        .border_1()
+                        .border_color(cx.theme().border)
+                        .rounded(px(tokens::RADIUS_CARD))
+                        .shadow_xl()
+                        .child(
+                            h_flex()
+                                .px_3()
+                                .py_2()
+                                .items_center()
+                                .justify_between()
+                                .text_size(px(tokens::UI_SM))
+                                .text_color(cx.theme().muted_foreground)
+                                .child("Add Flutter / Dart Package (pub.dev)")
+                                .child(
+                                    div()
+                                        .font_family("SF Mono")
+                                        .text_size(px(tokens::UI_XS))
+                                        .child("prefix `dev:` for dev_dependencies"),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .px_3()
+                                .pb_3()
+                                .on_key_down({
+                                    let view = view.clone();
+                                    move |event, window, cx| {
+                                        let key = event.keystroke.key.as_str();
+                                        if key == "escape" {
+                                            view.update(cx, |this, cx| {
+                                                this.add_package_open = false;
+                                                cx.notify();
+                                            });
+                                        } else if key == "enter" {
+                                            view.update(cx, |this, cx| {
+                                                this.submit_add_package(window, cx)
+                                            });
+                                        }
+                                    }
+                                })
+                                .child(
+                                    h_flex()
+                                        .h(px(28.))
+                                        .px_2p5()
+                                        .items_center()
+                                        .rounded(px(tokens::RADIUS_SM))
+                                        .bg(cx.theme().background)
+                                        .border_1()
+                                        .border_color(cx.theme().border)
+                                        .child(
+                                            Input::new(&self.add_package_input)
+                                                .appearance(false)
+                                                .small(),
+                                        ),
+                                ),
+                        ),
+                ),
+        )
+    }
+
+    fn render_device_picker_popover(
+        &self,
+        view: &Entity<Self>,
+        cx: &mut Context<Self>,
+    ) -> Option<Stateful<Div>> {
+        if !self.device_picker_open {
+            return None;
+        }
+
+        let fg = cx.theme().foreground;
+        let muted = cx.theme().muted_foreground;
+        let green = cx.theme().green;
+        let info = cx.theme().info;
+        let primary = cx.theme().primary;
+        let list_hover = cx.theme().list_hover;
+        let selected_id = self.selected_device.as_ref().map(|d| d.id.clone());
+
+        // Simulators that aren't already listed in `self.devices`
+        let extra_sims: Vec<_> = self
+            .ios_simulators
+            .iter()
+            .filter(|sim| !self.devices.iter().any(|d| d.id == sim.udid))
+            .take(8)
+            .cloned()
+            .collect();
+
+        Some(
+            div()
+                .id("device-picker-backdrop")
+                .absolute()
+                .inset_0()
+                .on_mouse_down(MouseButton::Left, {
+                    let view = view.clone();
+                    move |_event, _window, cx| {
+                        view.update(cx, |this, cx| {
+                            this.device_picker_open = false;
+                            cx.notify();
+                        });
+                    }
+                })
+                .child(
+                    v_flex()
+                        .id("device-picker-card")
+                        .absolute()
+                        .top(px(tokens::TITLEBAR_H + 4.))
+                        .right(px(140.))
+                        .w(px(310.))
+                        .p(px(tokens::SPACE_2))
+                        .gap(px(tokens::SPACE_1))
+                        .bg(cx.theme().popover)
+                        .border_1()
+                        .border_color(cx.theme().border)
+                        .rounded(px(tokens::RADIUS_CARD))
+                        .shadow_xl()
+                        .on_mouse_down(MouseButton::Left, |_event, _window, cx| {
+                            cx.stop_propagation();
+                        })
+                        .child(
+                            h_flex()
+                                .px(px(tokens::SPACE_2))
+                                .py(px(2.))
+                                .items_center()
+                                .justify_between()
+                                .child(
+                                    div()
+                                        .text_size(px(tokens::UI_XS))
+                                        .font_medium()
+                                        .text_color(muted)
+                                        .child("ACTIVE TARGETS"),
+                                )
+                                .child({
+                                    let view = view.clone();
+                                    h_flex()
+                                        .id("refresh-devices-btn")
+                                        .px_1p5()
+                                        .py_0p5()
+                                        .gap_1()
+                                        .items_center()
+                                        .rounded(px(tokens::RADIUS_SM))
+                                        .cursor_pointer()
+                                        .text_size(px(tokens::UI_XS))
+                                        .text_color(info)
+                                        .hover(move |s| s.bg(list_hover))
+                                        .child(
+                                            gpui_kit::component::Icon::new(
+                                                gpui_kit::assets::IconName::RotateCw,
+                                            )
+                                            .with_size(px(10.)),
+                                        )
+                                        .child("Refresh")
+                                        .on_click(move |_event, _window, cx| {
+                                            view.update(cx, |this, cx| {
+                                                this.refresh_devices(cx);
+                                            });
+                                        })
+                                }),
+                        )
+                        .children(self.devices.iter().enumerate().map(|(ix, dev)| {
+                            let is_sel = selected_id.as_deref() == Some(dev.id.as_str());
+                            let icon = if dev.target_platform.contains("ios")
+                                || dev.target_platform.contains("android")
+                            {
+                                gpui_kit::assets::IconName::Smartphone
+                            } else if dev.target_platform.contains("web") || dev.id == "chrome" {
+                                gpui_kit::assets::IconName::Globe
+                            } else {
+                                gpui_kit::assets::IconName::Monitor
+                            };
+                            let dev_clone = dev.clone();
+                            let view = view.clone();
+
+                            h_flex()
+                                .id(("device-item", ix))
+                                .w_full()
+                                .h(px(28.))
+                                .px(px(tokens::SPACE_3))
+                                .items_center()
+                                .justify_between()
+                                .rounded(px(tokens::RADIUS_SM))
+                                .border_1()
+                                .border_color(if is_sel {
+                                    rgba(0xea7a3c44)
+                                } else {
+                                    rgba(0x00000000)
+                                })
+                                .when(is_sel, |el| el.bg(rgba(0xea7a3c18)))
+                                .when(!is_sel, |el| el.hover(move |s| s.bg(list_hover)))
+                                .cursor_pointer()
+                                .on_click(move |_event, _window, cx| {
+                                    view.update(cx, |this, cx| {
+                                        this.selected_device = Some(dev_clone.clone());
+                                        this.device_picker_open = false;
+                                        this.refresh_simulator_screenshot(cx);
+                                        cx.notify();
+                                    });
+                                })
+                                .child(
+                                    h_flex()
+                                        .items_center()
+                                        .gap_2()
+                                        .child(
+                                            gpui_kit::component::Icon::new(icon)
+                                                .with_size(px(13.))
+                                                .text_color(if is_sel { primary } else { green }),
+                                        )
+                                        .child(
+                                            div()
+                                                .text_size(px(tokens::UI_SM))
+                                                .text_color(fg)
+                                                .child(dev.name.clone()),
+                                        ),
+                                )
+                                .child(
+                                    div()
+                                        .font_family("SF Mono")
+                                        .text_size(px(10.))
+                                        .text_color(muted)
+                                        .child(if dev.emulator {
+                                            "sim".to_string()
+                                        } else {
+                                            dev.id.clone()
+                                        }),
+                                )
+                        }))
+                        .when(!extra_sims.is_empty(), |el| {
+                            el.child(div().h(px(1.)).w_full().my_1().bg(cx.theme().border))
+                                .child(
+                                    div()
+                                        .px(px(tokens::SPACE_2))
+                                        .py(px(2.))
+                                        .text_size(px(tokens::UI_XS))
+                                        .font_medium()
+                                        .text_color(muted)
+                                        .child("IOS SIMULATORS (CLICK TO BOOT & ATTACH)"),
+                                )
+                                .children(extra_sims.into_iter().enumerate().map(|(ix, sim)| {
+                                    let view = view.clone();
+                                    let booted = sim.is_booted();
+                                    let sim_name = sim.name.clone();
+                                    let sim_runtime = sim.runtime.clone();
+                                    let sim_for_click = sim.clone();
+                                    h_flex()
+                                        .id(("ios-sim-item", ix))
+                                        .w_full()
+                                        .h(px(28.))
+                                        .px(px(tokens::SPACE_3))
+                                        .items_center()
+                                        .justify_between()
+                                        .rounded(px(tokens::RADIUS_SM))
+                                        .cursor_pointer()
+                                        .hover(move |s| s.bg(list_hover))
+                                        .on_click(move |_event, window, cx| {
+                                            let sim_clone = sim_for_click.clone();
+                                            view.update(cx, |this, cx| {
+                                                let _ =
+                                                    core_flutter::boot_ios_simulator(&sim_clone.udid);
+                                                this.selected_device = Some(core_flutter::Device {
+                                                    id: sim_clone.udid.clone(),
+                                                    name: sim_clone.name.clone(),
+                                                    target_platform: "ios".to_string(),
+                                                    emulator: true,
+                                                    is_supported: true,
+                                                });
+                                                this.device_picker_open = false;
+                                                this.attach_simulator(window, cx);
+                                                this.refresh_devices(cx);
+                                            });
+                                        })
+                                        .child(
+                                            h_flex()
+                                                .items_center()
+                                                .gap_2()
+                                                .child(
+                                                    gpui_kit::component::Icon::new(
+                                                        gpui_kit::assets::IconName::Smartphone,
+                                                    )
+                                                    .with_size(px(13.))
+                                                    .text_color(if booted { green } else { muted }),
+                                                )
+                                                .child(
+                                                    div()
+                                                        .text_size(px(tokens::UI_SM))
+                                                        .text_color(fg)
+                                                        .child(sim_name),
+                                                ),
+                                        )
+                                        .child(
+                                            div()
+                                                .font_family("SF Mono")
+                                                .text_size(px(10.))
+                                                .text_color(if booted { green } else { muted })
+                                                .child(if booted {
+                                                    "Booted".to_string()
+                                                } else {
+                                                    sim_runtime
+                                                }),
+                                        )
+                                }))
+                        })
+                        .child(div().h(px(1.)).w_full().my_1().bg(cx.theme().border))
+                        .child({
+                            let view = view.clone();
+                            h_flex()
+                                .id("device-picker-attach-sim")
+                                .w_full()
+                                .h(px(28.))
+                                .px(px(tokens::SPACE_3))
+                                .items_center()
+                                .justify_between()
+                                .rounded(px(tokens::RADIUS_SM))
+                                .cursor_pointer()
+                                .hover(move |s| s.bg(list_hover))
+                                .child(
+                                    h_flex()
+                                        .items_center()
+                                        .gap_2()
+                                        .child(
+                                            gpui_kit::component::Icon::new(
+                                                gpui_kit::assets::IconName::Columns2,
+                                            )
+                                            .with_size(px(13.))
+                                            .text_color(primary),
+                                        )
+                                        .child(
+                                            div()
+                                                .text_size(px(tokens::UI_SM))
+                                                .text_color(fg)
+                                                .child("Attach Simulator to Editor"),
+                                        ),
+                                )
+                                .child(
+                                    div()
+                                        .font_family("SF Mono")
+                                        .text_size(px(10.))
+                                        .text_color(info)
+                                        .child("Dock"),
+                                )
+                                .on_click(move |_event, window, cx| {
+                                    view.update(cx, |this, cx| {
+                                        this.device_picker_open = false;
+                                        this.attach_simulator(window, cx);
+                                    });
+                                })
+                        }),
+                )
+        )
     }
 }
 
@@ -1062,8 +2008,14 @@ impl Render for DartIde {
             .child(self.render_titlebar(window, cx))
             .child(self.render_shell(&view, window, cx))
             .child(self.render_status_bar(cx))
+            .when_some(self.render_device_picker_popover(&view, cx), |el, pop| {
+                el.child(pop)
+            })
             .when_some(self.render_palette(&view, cx), |el, palette| el.child(palette))
             .when_some(self.render_go_to_line_prompt(&view, cx), |el, prompt| {
+                el.child(prompt)
+            })
+            .when_some(self.render_add_package_prompt(&view, cx), |el, prompt| {
                 el.child(prompt)
             })
             .when_some(self.render_rename_prompt(&view, cx), |el, prompt| {

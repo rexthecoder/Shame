@@ -33,7 +33,7 @@
 //!   do yet (it saves synchronously, immediately).
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::time::Duration;
 
@@ -44,12 +44,14 @@ use lsp_types::{
     ApplyWorkspaceEditParams, ClientCapabilities, CodeAction, CodeActionContext,
     CodeActionOrCommand, CodeActionParams, Command, CompletionItem, CompletionItemKind,
     CompletionParams, CompletionResponse, CompletionTextEdit, Diagnostic, DiagnosticSeverity,
-    DidChangeTextDocumentParams, DidOpenTextDocumentParams, DocumentFormattingParams,
-    ExecuteCommandParams, FormattingOptions, GotoDefinitionParams, GotoDefinitionResponse, Hover,
-    HoverContents, HoverParams, InitializeParams, LanguageString, Location, MarkedString,
-    Position, PublishDiagnosticsParams, Range, RenameParams, TextDocumentContentChangeEvent,
+    DidChangeTextDocumentParams, DidOpenTextDocumentParams, DocumentChangeOperation,
+    DocumentChanges, DocumentFormattingParams, ExecuteCommandParams, FormattingOptions,
+    GotoDefinitionParams, GotoDefinitionResponse, Hover, HoverContents, HoverParams,
+    InitializeParams, LanguageString, Location, MarkedString, OneOf, Position,
+    PublishDiagnosticsParams, Range, RenameParams, TextDocumentContentChangeEvent,
     TextDocumentIdentifier, TextDocumentItem, TextDocumentPositionParams, TextEdit, Uri,
-    VersionedTextDocumentIdentifier, WorkspaceEdit,
+    VersionedTextDocumentIdentifier, WorkspaceClientCapabilities, WorkspaceEdit,
+    WorkspaceEditClientCapabilities, WorkspaceFolder,
 };
 
 use crate::{EditorEvent, EditorView};
@@ -70,6 +72,40 @@ pub(crate) struct CompletionEntry {
     pub(crate) insert_text: String,
     pub(crate) detail: Option<String>,
     pub(crate) kind: CompletionKindBadge,
+    pub(crate) additional_edits: Vec<TextEdit>,
+}
+
+/// Walk upward from `file_path` to find the enclosing Dart/Flutter project root
+/// (the nearest ancestor containing `pubspec.yaml` or `.dart_tool/package_config.json`).
+fn find_dart_project_root(file_path: &Path) -> Option<PathBuf> {
+    for ancestor in file_path.ancestors().skip(1) {
+        if ancestor.join("pubspec.yaml").is_file()
+            || ancestor.join(".dart_tool/package_config.json").is_file()
+        {
+            return Some(ancestor.to_path_buf());
+        }
+    }
+    for ancestor in file_path.ancestors().skip(1) {
+        if ancestor.join(".git").exists() {
+            return Some(ancestor.to_path_buf());
+        }
+    }
+    file_path.parent().map(Path::to_path_buf)
+}
+
+/// Prefer a project-pinned FVM Dart binary if present, falling back to `dart` on `PATH`.
+fn resolve_dart_binary(project_root: Option<&Path>) -> String {
+    if let Some(root) = project_root {
+        let fvm_cache_dart = root.join(".fvm/flutter_sdk/bin/cache/dart-sdk/bin/dart");
+        if fvm_cache_dart.is_file() {
+            return fvm_cache_dart.to_string_lossy().into_owned();
+        }
+        let fvm_dart = root.join(".fvm/flutter_sdk/bin/dart");
+        if fvm_dart.is_file() {
+            return fvm_dart.to_string_lossy().into_owned();
+        }
+    }
+    "dart".to_string()
 }
 
 pub(crate) struct LspState {
@@ -104,13 +140,44 @@ impl EditorView {
         let Ok(uri) = Uri::from_str(&format!("file://{}", path.display())) else {
             return;
         };
-        let Ok(client) = LspClient::spawn("dart", &["language-server"]) else {
+        let project_root = find_dart_project_root(&path);
+        let dart_bin = resolve_dart_binary(project_root.as_deref());
+        let Ok(client) = LspClient::spawn(&dart_bin, &["language-server"]) else {
             return;
         };
 
+        let root_uri = project_root
+            .as_ref()
+            .and_then(|root| Uri::from_str(&format!("file://{}", root.display())).ok());
+        let workspace_folders = project_root.as_ref().and_then(|root| {
+            let folder_uri = root_uri.clone()?;
+            let name = root
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("workspace")
+                .to_string();
+            Some(vec![WorkspaceFolder {
+                uri: folder_uri,
+                name,
+            }])
+        });
+
+        #[allow(deprecated)]
         let init_params = InitializeParams {
             process_id: Some(std::process::id()),
-            capabilities: ClientCapabilities::default(),
+            root_uri,
+            workspace_folders,
+            capabilities: ClientCapabilities {
+                workspace: Some(WorkspaceClientCapabilities {
+                    apply_edit: Some(true),
+                    workspace_edit: Some(WorkspaceEditClientCapabilities {
+                        document_changes: Some(true),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
             ..Default::default()
         };
         let Ok(initialize_id) =
@@ -397,9 +464,9 @@ impl EditorView {
             lsp.client.request("workspace/executeCommand", serde_json::to_value(params).unwrap_or_default());
     }
 
-    /// Apply a `WorkspaceEdit`'s changes to this buffer's own file only.
-    /// An edit touching other files leaves them unchanged — see the
-    /// module docs; the same gap rename already has.
+    /// Apply a `WorkspaceEdit`'s changes (`changes` or `document_changes`) to
+    /// this buffer's own file, including Dart auto-import quick fixes and
+    /// widget refactors.
     fn apply_workspace_edit(&mut self, edit: WorkspaceEdit, cx: &mut Context<Self>) {
         let Some(own_uri) = self.lsp.as_ref().map(|lsp| lsp.uri.clone()) else {
             return;
@@ -408,6 +475,42 @@ impl EditorView {
             for (uri, edits) in changes {
                 if uri.as_str() == own_uri.as_str() {
                     self.apply_text_edits(edits, cx);
+                }
+            }
+        }
+        if let Some(doc_changes) = edit.document_changes {
+            match doc_changes {
+                DocumentChanges::Edits(text_doc_edits) => {
+                    for tde in text_doc_edits {
+                        if tde.text_document.uri.as_str() == own_uri.as_str() {
+                            let edits = tde
+                                .edits
+                                .into_iter()
+                                .map(|e| match e {
+                                    OneOf::Left(te) => te,
+                                    OneOf::Right(ate) => ate.text_edit,
+                                })
+                                .collect();
+                            self.apply_text_edits(edits, cx);
+                        }
+                    }
+                }
+                DocumentChanges::Operations(ops) => {
+                    for op in ops {
+                        if let DocumentChangeOperation::Edit(tde) = op {
+                            if tde.text_document.uri.as_str() == own_uri.as_str() {
+                                let edits = tde
+                                    .edits
+                                    .into_iter()
+                                    .map(|e| match e {
+                                        OneOf::Left(te) => te,
+                                        OneOf::Right(ate) => ate.text_edit,
+                                    })
+                                    .collect();
+                                self.apply_text_edits(edits, cx);
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -728,11 +831,13 @@ pub(crate) fn completion_item_to_entry(item: CompletionItem) -> Option<Completio
         .detail
         .map(|d| d.lines().next().unwrap_or(&d).trim().to_string())
         .filter(|d| !d.is_empty());
+    let additional_edits = item.additional_text_edits.unwrap_or_default();
     Some(CompletionEntry {
         label,
         insert_text,
         detail,
         kind,
+        additional_edits,
     })
 }
 

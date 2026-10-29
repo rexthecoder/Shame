@@ -14,6 +14,7 @@ gpui-kit.workspace = true
 anyhow.workspace = true
 async-channel.workspace = true
 core-buffer = { path = "../core-buffer" }
+core-flutter = { path = "../core-flutter" }
 core-lsp = { path = "../core-lsp" }
 core-workspace = { path = "../core-workspace" }
 editor-view = { path = "../editor-view" }

@@ -70,25 +70,44 @@ pub struct FlutterDaemon {
 }
 
 impl FlutterDaemon {
-    /// Spawn `flutter run --machine -d <device_id>` in `project_dir`.
+    /// Spawn `flutter run --machine -d <device_id>` in `project_dir`,
+    /// preferring `.fvm/flutter_sdk/bin/flutter` if the project uses FVM.
     pub fn spawn(project_dir: &Path, device_id: &str) -> io::Result<Self> {
-        let mut child = Command::new("flutter")
+        let fvm_flutter = project_dir.join(".fvm/flutter_sdk/bin/flutter");
+        let flutter_bin = if fvm_flutter.is_file() {
+            fvm_flutter.to_string_lossy().into_owned()
+        } else {
+            "flutter".to_string()
+        };
+
+        let mut child = Command::new(&flutter_bin)
             .args(["run", "--machine", "-d", device_id])
             .current_dir(project_dir)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
+            .stderr(Stdio::piped())
             .spawn()?;
 
         let stdin = child.stdin.take().expect("spawned with Stdio::piped()");
         let stdout = child.stdout.take().expect("spawned with Stdio::piped()");
+        let stderr = child.stderr.take().expect("spawned with Stdio::piped()");
 
         let (tx, rx) = unbounded();
+        let tx_err = tx.clone();
         thread::spawn(move || {
             let reader = BufReader::new(stdout);
             for line in reader.lines() {
                 let Ok(line) = line else { break };
                 if tx.send_blocking(parse_line(&line)).is_err() {
+                    break;
+                }
+            }
+        });
+        thread::spawn(move || {
+            let reader = BufReader::new(stderr);
+            for line in reader.lines() {
+                let Ok(line) = line else { break };
+                if tx_err.send_blocking(DaemonOutput::Log(line)).is_err() {
                     break;
                 }
             }

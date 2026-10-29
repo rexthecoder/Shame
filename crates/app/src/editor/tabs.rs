@@ -28,6 +28,10 @@ impl DartIde {
             .get(self.active_tab)
             .filter(|t| t.is_markdown())
             .map(|t| t.md_mode);
+        let active_is_pubspec = self
+            .tabs
+            .get(self.active_tab)
+            .is_some_and(|t| t.is_pubspec());
 
         // Count duplicate file basenames so two open `mod.rs` or `lib.rs` tabs
         // automatically show their parent folder chip (Zed-style disambiguation).
@@ -316,6 +320,59 @@ impl DartIde {
                                     MarkdownMode::Preview,
                                     view,
                                 )),
+                        )
+                    })
+                    .when(active_is_pubspec, |el| {
+                        let green = cx.theme().green;
+                        el.child(
+                            h_flex()
+                                .id("pubspec-pub-get")
+                                .h(px(24.))
+                                .px(px(tokens::SPACE_3))
+                                .gap(px(tokens::SPACE_1))
+                                .items_center()
+                                .rounded(px(tokens::RADIUS_SM))
+                                .bg(green.opacity(0.14))
+                                .border_1()
+                                .border_color(green.opacity(0.35))
+                                .cursor_pointer()
+                                .hover(move |s| s.bg(green.opacity(0.22)))
+                                .text_size(px(tokens::UI_XS))
+                                .text_color(active_fg)
+                                .child(
+                                    Icon::new(gpui_kit::assets::IconName::RotateCw)
+                                        .with_size(px(10.5))
+                                        .text_color(green),
+                                )
+                                .child("Pub Get")
+                                .on_click(cx.listener(|this, _event, _window, cx| {
+                                    this.run_pub_get(cx);
+                                })),
+                        )
+                        .child(
+                            h_flex()
+                                .id("pubspec-add-pkg")
+                                .h(px(24.))
+                                .px(px(tokens::SPACE_3))
+                                .gap(px(tokens::SPACE_1))
+                                .items_center()
+                                .rounded(px(tokens::RADIUS_SM))
+                                .bg(cx.theme().background)
+                                .border_1()
+                                .border_color(cx.theme().border)
+                                .cursor_pointer()
+                                .hover(move |s| s.bg(list_hover).text_color(active_fg))
+                                .text_size(px(tokens::UI_XS))
+                                .text_color(muted)
+                                .child(
+                                    Icon::new(gpui_kit::assets::IconName::Plus)
+                                        .with_size(px(10.5))
+                                        .text_color(info),
+                                )
+                                .child("Package")
+                                .on_click(cx.listener(|this, _event, window, cx| {
+                                    this.open_add_package(window, cx);
+                                })),
                         )
                     })
                     .child(

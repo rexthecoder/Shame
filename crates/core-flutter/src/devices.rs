@@ -1,7 +1,9 @@
 use std::io;
+use std::path::Path;
 use std::process::Command;
 
 use serde::Deserialize;
+use serde_json::Value;
 
 /// A device or emulator `flutter devices` can see, enough to populate a
 /// device picker.
@@ -14,6 +16,23 @@ pub struct Device {
     pub emulator: bool,
     #[serde(rename = "isSupported")]
     pub is_supported: bool,
+}
+
+/// An iOS Simulator discovered via `xcrun simctl list devices available -j`
+/// (including simulators that are currently `"Shutdown"` so the user can
+/// boot and attach them directly from the IDE).
+#[derive(Debug, Clone, PartialEq)]
+pub struct IosSimulator {
+    pub udid: String,
+    pub name: String,
+    pub state: String,
+    pub runtime: String,
+}
+
+impl IosSimulator {
+    pub fn is_booted(&self) -> bool {
+        self.state.eq_ignore_ascii_case("Booted")
+    }
 }
 
 /// Run `flutter devices --machine` and parse its output. Unlike the
@@ -29,6 +48,130 @@ pub fn list_devices() -> io::Result<Vec<Device>> {
         ));
     }
     serde_json::from_slice(&output.stdout).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+}
+
+/// Query `xcrun simctl list devices available -j` on macOS for available
+/// iPhone/iPad simulators (both Booted and Shutdown).
+pub fn list_ios_simulators() -> io::Result<Vec<IosSimulator>> {
+    let output = Command::new("xcrun")
+        .args(["simctl", "list", "devices", "available", "-j"])
+        .output()?;
+    if !output.status.success() {
+        return Ok(Vec::new());
+    }
+    let root: Value = serde_json::from_slice(&output.stdout)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    let mut sims = Vec::new();
+    if let Some(devices_by_runtime) = root.get("devices").and_then(Value::as_object) {
+        for (runtime_key, list) in devices_by_runtime {
+            if !runtime_key.contains("iOS") {
+                continue;
+            }
+            let runtime_label = runtime_key
+                .rsplit('.')
+                .next()
+                .unwrap_or(runtime_key)
+                .replace('-', ".");
+            let Some(arr) = list.as_array() else {
+                continue;
+            };
+            for item in arr {
+                let is_available = item
+                    .get("isAvailable")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(true);
+                if !is_available {
+                    continue;
+                }
+                let Some(udid) = item.get("udid").and_then(Value::as_str) else {
+                    continue;
+                };
+                let Some(name) = item.get("name").and_then(Value::as_str) else {
+                    continue;
+                };
+                let state = item
+                    .get("state")
+                    .and_then(Value::as_str)
+                    .unwrap_or("Shutdown")
+                    .to_string();
+                sims.push(IosSimulator {
+                    udid: udid.to_string(),
+                    name: name.to_string(),
+                    state,
+                    runtime: runtime_label.clone(),
+                });
+            }
+        }
+    }
+    // Sort booted simulators first, then iPhones before iPads, then by name.
+    sims.sort_by(|a, b| {
+        b.is_booted()
+            .cmp(&a.is_booted())
+            .then_with(|| b.name.starts_with("iPhone").cmp(&a.name.starts_with("iPhone")))
+            .then_with(|| a.name.cmp(&b.name))
+    });
+    Ok(sims)
+}
+
+/// Boot an iOS Simulator by UDID (if not already booted) and open `Simulator.app`.
+pub fn boot_ios_simulator(udid: &str) -> io::Result<()> {
+    let _ = Command::new("xcrun").args(["simctl", "boot", udid]).status();
+    let _ = Command::new("open")
+        .args(["-a", "Simulator", "--args", "-CurrentDeviceUDID", udid])
+        .status();
+    Ok(())
+}
+
+/// Magnetically dock/attach the native macOS `Simulator.app` window flush
+/// against the right edge of our IDE window (or inside its right rail bounds)
+/// and raise it cleanly alongside the editor.
+pub fn attach_simulator_window(ide_x: i32, ide_y: i32, ide_w: i32, ide_h: i32) -> io::Result<()> {
+    // Ensure Simulator.app is open
+    let _ = Command::new("open").args(["-a", "Simulator"]).status();
+    let target_x = (ide_x + ide_w - 400).max(40);
+    let target_y = ide_y.max(28);
+    let target_h = ide_h.max(680);
+    let script = format!(
+        r#"tell application "System Events"
+            if exists process "Simulator" then
+                tell process "Simulator"
+                    set frontmost to true
+                    if (count of windows) > 0 then
+                        set position of window 1 to {{{target_x}, {target_y}}}
+                        try
+                            set size of window 1 to {{390, {target_h}}}
+                        end try
+                    end if
+                end tell
+            end if
+        end tell"#
+    );
+    let _ = Command::new("osascript").args(["-e", &script]).status();
+    Ok(())
+}
+
+/// Capture a live PNG screenshot of the booted (or specified UDID) iOS Simulator
+/// into `out_path` using `xcrun simctl io <target> screenshot`.
+pub fn capture_simulator_screenshot(udid: Option<&str>, out_path: &Path) -> io::Result<()> {
+    let target = udid
+        .filter(|id| !id.is_empty() && *id != "macos" && *id != "chrome")
+        .unwrap_or("booted");
+    let status = Command::new("xcrun")
+        .args([
+            "simctl",
+            "io",
+            target,
+            "screenshot",
+            &out_path.to_string_lossy(),
+        ])
+        .status()?;
+    if !status.success() {
+        return Err(io::Error::new(
+            io::ErrorKind::Other,
+            "simctl screenshot failed (no booted simulator)",
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(test)]

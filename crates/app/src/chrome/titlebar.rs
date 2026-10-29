@@ -190,17 +190,149 @@ impl DartIde {
                     .flex_1()
                     .justify_end()
                     .items_center()
-                    .gap_1()
-                    .child(
+                    .gap_1p5()
+                    .when_some(self.flutter_status.clone(), |el, status| {
+                        let is_running = status == "Running";
+                        let dot_color = if is_running {
+                            green
+                        } else {
+                            cx.theme().warning
+                        };
+                        el.child(
+                            h_flex()
+                                .h(px(24.))
+                                .px(px(tokens::SPACE_3))
+                                .gap(px(tokens::SPACE_2))
+                                .items_center()
+                                .rounded(px(tokens::RADIUS_PILL))
+                                .bg(dot_color.opacity(0.12))
+                                .border_1()
+                                .border_color(dot_color.opacity(0.32))
+                                .font_family("SF Mono")
+                                .text_size(px(10.5))
+                                .text_color(fg)
+                                .child(
+                                    div()
+                                        .w(px(6.))
+                                        .h(px(6.))
+                                        .rounded(px(3.))
+                                        .bg(dot_color),
+                                )
+                                .child(
+                                    div()
+                                        .max_w(px(160.))
+                                        .truncate()
+                                        .child(status),
+                                ),
+                        )
+                    })
+                    .child({
+                        let dev_name = self
+                            .selected_device
+                            .as_ref()
+                            .map(|d| d.name.clone())
+                            .unwrap_or_else(|| "macOS".to_string());
+                        let dev_icon = self
+                            .selected_device
+                            .as_ref()
+                            .map(|d| {
+                                if d.target_platform.contains("ios")
+                                    || d.target_platform.contains("android")
+                                    || d.emulator
+                                {
+                                    gpui_kit::assets::IconName::Smartphone
+                                } else if d.target_platform.contains("web") || d.id == "chrome" {
+                                    gpui_kit::assets::IconName::Globe
+                                } else {
+                                    gpui_kit::assets::IconName::Monitor
+                                }
+                            })
+                            .unwrap_or(gpui_kit::assets::IconName::Monitor);
+                        let is_open = self.device_picker_open;
+
                         h_flex()
+                            .id("titlebar-device-picker")
+                            .h(px(24.))
+                            .px(px(tokens::SPACE_3))
                             .items_center()
                             .gap(px(tokens::SPACE_2))
-                            .px(px(tokens::SPACE_2))
+                            .rounded(px(tokens::RADIUS_PILL))
+                            .border_1()
+                            .border_color(if is_open {
+                                rgba(0xea7a3c55).into()
+                            } else {
+                                cx.theme().border
+                            })
+                            .bg(if is_open {
+                                rgba(0xea7a3c1a)
+                            } else {
+                                rgba(0xffffff05)
+                            })
+                            .cursor_pointer()
+                            .hover(|s| s.bg(rgba(0xffffff0f)))
                             .text_size(px(tokens::UI_SM))
-                            .text_color(muted)
-                            .child(Icon::new(gpui_kit::assets::IconName::Monitor).small())
-                            .child("macOS"),
-                    )
+                            .text_color(fg)
+                            .child(Icon::new(dev_icon).xsmall().text_color(green))
+                            .child(dev_name)
+                            .child(
+                                Icon::new(gpui_kit::assets::IconName::ChevronDown)
+                                    .with_size(px(10.))
+                                    .text_color(muted),
+                            )
+                            .on_click(cx.listener(|this, _event, _window, cx| {
+                                this.device_picker_open = !this.device_picker_open;
+                                if this.device_picker_open {
+                                    this.refresh_devices(cx);
+                                }
+                                cx.notify();
+                            }))
+                    })
+                    .child({
+                        let sim_active = self.agent_open
+                            && self.right_rail_tab == crate::RightRailTab::Simulator;
+                        h_flex()
+                            .id("titlebar-sim-attach")
+                            .h(px(24.))
+                            .px(px(tokens::SPACE_2))
+                            .gap(px(4.))
+                            .items_center()
+                            .rounded(px(tokens::RADIUS_PILL))
+                            .border_1()
+                            .border_color(if sim_active {
+                                rgba(0xea7a3c55).into()
+                            } else {
+                                cx.theme().border
+                            })
+                            .bg(if sim_active {
+                                rgba(0xea7a3c1c)
+                            } else {
+                                rgba(0xffffff05)
+                            })
+                            .cursor_pointer()
+                            .hover(|s| s.bg(rgba(0xffffff0f)))
+                            .text_size(px(tokens::UI_XS))
+                            .text_color(if sim_active { fg } else { muted })
+                            .child(
+                                Icon::new(gpui_kit::assets::IconName::Smartphone)
+                                    .with_size(px(11.))
+                                    .text_color(if sim_active {
+                                        cx.theme().primary
+                                    } else {
+                                        muted
+                                    }),
+                            )
+                            .child("Simulator")
+                            .on_click(cx.listener(|this, _event, window, cx| {
+                                if this.agent_open
+                                    && this.right_rail_tab == crate::RightRailTab::Simulator
+                                {
+                                    this.snap_simulator_window(window);
+                                    this.refresh_simulator_screenshot(cx);
+                                } else {
+                                    this.attach_simulator(window, cx);
+                                }
+                            }))
+                    })
                     .when_some(active_file_name, |el, file| {
                         el.child(
                             div()
@@ -238,34 +370,56 @@ impl DartIde {
                                     "run",
                                     gpui_kit::assets::IconName::Play,
                                     Some(green),
-                                    "Run project",
+                                    "Run Flutter project on selected device",
                                 )
                                 .on_click(cx.listener(|this, _event, window, cx| {
-                                    this.terminal_open = true;
-                                    window.focus(&this.terminal_focus, cx);
-                                    let cmd = if this.root.join("pubspec.yaml").is_file() {
-                                        "flutter run".to_string()
-                                    } else if this.root.join("Cargo.toml").is_file() {
-                                        "cargo check".to_string()
-                                    } else {
-                                        "ls -la".to_string()
-                                    };
-                                    this.execute_terminal_command(cmd, cx);
+                                    this.start_flutter_run(window, cx);
                                 })),
                             )
-                            .child(icon_button(
-                                "debug",
-                                gpui_kit::assets::IconName::Bug,
-                                Some(muted),
-                                "Debug project",
-                            ))
+                            .child(
+                                icon_button(
+                                    "hot-restart",
+                                    gpui_kit::assets::IconName::RotateCw,
+                                    Some(if self.flutter_app_id.is_some() {
+                                        info
+                                    } else {
+                                        muted
+                                    }),
+                                    "Hot restart Flutter app",
+                                )
+                                .on_click(cx.listener(|this, _event, _window, cx| {
+                                    this.trigger_hot_restart(cx);
+                                })),
+                            )
                             .child(div().w(px(1.)).h(px(12.)).bg(cx.theme().border))
-                            .child(icon_button(
-                                "fast",
-                                gpui_kit::assets::IconName::Zap,
-                                Some(green),
-                                "Hot reload",
-                            )),
+                            .child(
+                                icon_button(
+                                    "fast",
+                                    gpui_kit::assets::IconName::Zap,
+                                    Some(if self.flutter_app_id.is_some() {
+                                        cx.theme().warning
+                                    } else {
+                                        green
+                                    }),
+                                    "Hot reload (also auto-triggers on Save \u{2318}S)",
+                                )
+                                .on_click(cx.listener(|this, _event, _window, cx| {
+                                    this.trigger_hot_reload(cx);
+                                })),
+                            )
+                            .when(self.flutter_daemon.is_some(), |el| {
+                                el.child(
+                                    icon_button(
+                                        "stop-flutter",
+                                        gpui_kit::assets::IconName::X,
+                                        Some(cx.theme().danger),
+                                        "Stop running Flutter app",
+                                    )
+                                    .on_click(cx.listener(|this, _event, _window, cx| {
+                                        this.stop_flutter_run(cx);
+                                    })),
+                                )
+                            }),
                     )
                     .child(icon_button(
                         "agent-wand",

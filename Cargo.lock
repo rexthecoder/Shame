@@ -194,6 +194,7 @@ dependencies = [
  "anyhow",
  "async-channel",
  "core-buffer",
+ "core-flutter",
  "core-lsp",
  "core-workspace",
  "editor-view",

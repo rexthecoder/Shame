@@ -75,6 +75,7 @@ pub enum EditorEvent {
     OpenAt { path: PathBuf, line: u32, column: u32 },
     RequestRename { line: u32, column: u32 },
     ShowCodeActions { actions: Vec<lsp_types::CodeActionOrCommand> },
+    Saved { path: PathBuf },
 }
 
 /// Maximum file size (256 KiB) for tree-sitter parsing and syntax queries.
@@ -206,8 +207,12 @@ impl EditorView {
         Ok(())
     }
 
-    fn save(&mut self) {
-        let _ = self.buffer.save();
+    pub fn save(&mut self, cx: &mut Context<Self>) {
+        if self.buffer.save().is_ok() {
+            if let Some(path) = self.buffer.path().map(Path::to_path_buf) {
+                cx.emit(EditorEvent::Saved { path });
+            }
+        }
         self.line_changes = self
             .buffer
             .path()
@@ -687,6 +692,7 @@ impl EditorView {
                         } else {
                             CompletionKindBadge::Keyword
                         },
+                        additional_edits: Vec::new(),
                     });
                 }
             }
@@ -728,6 +734,7 @@ impl EditorView {
                             insert_text: word.to_string(),
                             detail: None,
                             kind,
+                            additional_edits: Vec::new(),
                         });
                     }
                 } else {
@@ -753,9 +760,31 @@ impl EditorView {
         let (prefix_range, _prefix, _after_dot) = self.current_completion_prefix();
         let insert_at = prefix_range.start;
         self.buffer.edit(prefix_range, &entry.insert_text);
+        let mut cursor_pos = insert_at + entry.insert_text.len();
+
+        // Apply any additional edits (e.g. Dart LSP auto-import headers)
+        if !entry.additional_edits.is_empty() {
+            let mut edits = entry.additional_edits;
+            edits.sort_by_key(|edit| (edit.range.start.line, edit.range.start.character));
+            for edit in edits.into_iter().rev() {
+                let start = self.buffer.line_to_byte(edit.range.start.line as usize)
+                    + edit.range.start.character as usize;
+                let end = self.buffer.line_to_byte(edit.range.end.line as usize)
+                    + edit.range.end.character as usize;
+                let end = end.min(self.buffer.len_bytes());
+                let start = start.min(end);
+                self.buffer.edit(start..end, &edit.new_text);
+                if end <= insert_at {
+                    let removed = end - start;
+                    let added = edit.new_text.len();
+                    cursor_pos = cursor_pos.saturating_sub(removed) + added;
+                }
+            }
+        }
+
         self.completions.clear();
         self.completion_selected = 0;
-        self.set_cursor(insert_at + entry.insert_text.len(), cx);
+        self.set_cursor(cursor_pos.min(self.buffer.len_bytes()), cx);
         self.ensure_cursor_visible();
     }
 
@@ -953,7 +982,7 @@ impl EditorView {
                 "v" => self.paste(cx),
                 "a" => self.select_all(cx),
                 "s" => {
-                    self.save();
+                    self.save(cx);
                     cx.notify();
                 }
                 "f" if keystroke.modifiers.shift => {
