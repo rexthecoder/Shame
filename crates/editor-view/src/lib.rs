@@ -31,7 +31,7 @@ use core_buffer::{Buffer, Selection};
 use core_lsp::lsp_types;
 use core_syntax::{Highlight, HighlightKind, InputEdit, SyntaxTree, point_at};
 use core_workspace::LineChange;
-use gpui_kit::component::ActiveTheme as _;
+use gpui_kit::component::{ActiveTheme as _, Sizable as _, h_flex};
 use gpui_kit::*;
 use gpui_kit::prelude::FluentBuilder as _;
 use lsp_integration::LspState;
@@ -529,33 +529,79 @@ impl EditorView {
             _ if is_active_line => cx.theme().foreground.opacity(0.8),
             _ => cx.theme().muted_foreground.opacity(0.55),
         };
-        // Numbers only — color is what marks the current line and any
-        // diagnostics, not an extra border or panel fill competing for
-        // attention next to it.
-        let gutter = div()
+        let gutter = h_flex()
             .w(px(GUTTER_WIDTH))
+            .h_full()
             .flex_shrink_0()
+            .items_center()
             .text_size(px(GUTTER_FONT_SIZE))
             .text_color(gutter_color)
-            .text_right()
-            .pr_3()
-            .child((index + 1).to_string());
+            .child(
+                div()
+                    .w(px(30.))
+                    .text_right()
+                    .child((index + 1).to_string()),
+            )
+            .child(
+                div()
+                    .w(px(GUTTER_WIDTH - 30.))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .when(is_active_line, |el| {
+                        let view = cx.entity();
+                        el.cursor_pointer()
+                            .child(
+                                gpui_kit::component::Icon::new(
+                                    gpui_kit::assets::IconName::Lightbulb,
+                                )
+                                .xsmall()
+                                .text_color(cx.theme().warning),
+                            )
+                            .on_mouse_down(MouseButton::Left, move |_event, _window, cx| {
+                                view.update(cx, |this, _cx| this.request_code_actions());
+                            })
+                    }),
+            );
 
         // A thin bar flush against the window's left edge for a line
         // that differs from `HEAD` — green for a new line, blue for an
         // edited one, and a short amber notch at the top of the line
-        // that now sits where something was deleted. The same cue every
-        // editor with git integration gives, and the one thing in the
-        // gutter that isn't about navigation at all.
-        let change_marker = line_changes.get(&(index as u32)).map(|change| {
-            let (color, full_height) = match change {
-                LineChange::Added => (cx.theme().success, true),
-                LineChange::Modified => (cx.theme().info, true),
-                LineChange::Removed => (cx.theme().warning, false),
-            };
-            let mut marker = div().absolute().left_0().top_0().w(px(2.)).bg(color);
-            marker = if full_height { marker.bottom_0() } else { marker.h(px(5.)) };
-            marker
+        // that now sits where something was deleted. On the active line,
+        // fall back to a 2px accent bar (`docs/design-spec.md` §3.19).
+        let change_marker = line_changes
+            .get(&(index as u32))
+            .map(|change| {
+                let (color, full_height) = match change {
+                    LineChange::Added => (cx.theme().success, true),
+                    LineChange::Modified => (cx.theme().info, true),
+                    LineChange::Removed => (cx.theme().warning, false),
+                };
+                let mut marker = div().absolute().left_0().top_0().w(px(2.)).bg(color);
+                marker = if full_height { marker.bottom_0() } else { marker.h(px(5.)) };
+                marker
+            })
+            .or_else(|| {
+                is_active_line.then(|| {
+                    div()
+                        .absolute()
+                        .left_0()
+                        .top_0()
+                        .bottom_0()
+                        .w(px(2.))
+                        .bg(cx.theme().primary)
+                })
+            });
+
+        let active_right_marker = is_active_line.then(|| {
+            div()
+                .absolute()
+                .right(px(2.))
+                .top(px(2.))
+                .bottom(px(2.))
+                .w(px(3.))
+                .rounded(px(1.5))
+                .bg(cx.theme().success.opacity(0.75))
         });
 
         let line_start = self.buffer.line_to_byte(index);
@@ -574,10 +620,14 @@ impl EditorView {
         // show up" cue every mature editor gives for free, and one of
         // the first things a code editor gets asked why it's missing.
         let word_match_bg = cx.theme().blue.opacity(0.14);
+        let is_doc_line = display_text.trim_start().starts_with("///");
         let span = move |text: &str, kind: Option<HighlightKind>, selected: bool, word_match: bool| {
             let mut el = div();
             if let Some(kind) = kind {
                 el = el.text_color(highlight_color(kind));
+                if kind == HighlightKind::Comment || (is_doc_line && kind == HighlightKind::Attribute) {
+                    el = el.italic();
+                }
             }
             if selected {
                 el = el.bg(selection_bg);
@@ -730,6 +780,7 @@ impl EditorView {
             // competing for the same job.
             .when(is_active_line, |el| el.bg(rgb(ACTIVE_LINE_BG)))
             .when_some(change_marker, |el, marker| el.child(marker))
+            .when_some(active_right_marker, |el, marker| el.child(marker))
             .child(gutter)
             .child(
                 div()
@@ -843,14 +894,14 @@ fn indent_width(lines: &[String]) -> usize {
 /// blue-gray instead of competing with any of it.
 fn highlight_color(kind: HighlightKind) -> Rgba {
     match kind {
-        HighlightKind::Keyword => rgb(0xd19a66),
+        HighlightKind::Keyword => rgb(0xc678dd),
         HighlightKind::Type => rgb(0xe5c07b),
         HighlightKind::Function => rgb(0x61afef),
         HighlightKind::Attribute => rgb(0x56b6c2),
-        HighlightKind::Property => rgb(0xe5c07b),
+        HighlightKind::Property => rgb(0xe06c75),
         HighlightKind::String => rgb(0x98c379),
         HighlightKind::Number | HighlightKind::Constant => rgb(0xd19a66),
-        HighlightKind::Comment => rgb(0x5c6670),
+        HighlightKind::Comment => rgb(0x6c7686),
         HighlightKind::Variable => rgb(0xc8ccd4),
         HighlightKind::Operator | HighlightKind::Punctuation | HighlightKind::Other => rgb(0x9aa3b2),
     }

@@ -69,13 +69,39 @@ impl SyntaxTree {
         while let Some(m) = matches.next() {
             for capture in m.captures() {
                 let name = capture_names[capture.index as usize];
+                let range = capture.node.start_byte()..capture.node.end_byte();
+                let kind = HighlightKind::from_capture_name(name);
                 highlights.push(Highlight {
-                    range: capture.node.start_byte()..capture.node.end_byte(),
-                    kind: HighlightKind::from_capture_name(name),
+                    range: range.clone(),
+                    kind,
                 });
+                // Highlight `[identifier]` references inside `///` doc comments.
+                if kind == HighlightKind::Comment {
+                    let slice = &source[range.clone()];
+                    if slice.trim_start().starts_with("///") {
+                        let bytes = slice.as_bytes();
+                        let mut i = 0;
+                        while i < bytes.len() {
+                            if bytes[i] == b'[' {
+                                if let Some(close) = slice[i + 1..].find(']') {
+                                    let end = i + 1 + close;
+                                    if end > i + 1 {
+                                        highlights.push(Highlight {
+                                            range: (range.start + i)..(range.start + end + 1),
+                                            kind: HighlightKind::Attribute,
+                                        });
+                                    }
+                                    i = end + 1;
+                                    continue;
+                                }
+                            }
+                            i += 1;
+                        }
+                    }
+                }
             }
         }
-        highlights.sort_by_key(|h| h.range.start);
+        highlights.sort_by_key(|h| (h.range.start, h.kind != HighlightKind::Comment));
         highlights
     }
 
