@@ -197,6 +197,7 @@ mod tests {
         git(dir, &["init", "--quiet"]);
         git(dir, &["config", "user.email", "test@example.com"]);
         git(dir, &["config", "user.name", "Test"]);
+        git(dir, &["config", "commit.gpgsign", "false"]);
         std::fs::write(dir.join("a.txt"), "hello").unwrap();
         git(dir, &["add", "a.txt"]);
         git(dir, &["commit", "--quiet", "-m", "initial"]);
@@ -327,6 +328,7 @@ mod line_changes_tests {
         git(dir, &["init", "--quiet"]);
         git(dir, &["config", "user.email", "test@example.com"]);
         git(dir, &["config", "user.name", "Test"]);
+        git(dir, &["config", "commit.gpgsign", "false"]);
         let file = dir.join("a.txt");
         std::fs::write(&file, contents).unwrap();
         git(dir, &["add", "a.txt"]);
@@ -383,6 +385,7 @@ mod line_changes_tests {
         git(&dir, &["init", "--quiet"]);
         git(&dir, &["config", "user.email", "test@example.com"]);
         git(&dir, &["config", "user.name", "Test"]);
+        git(&dir, &["config", "commit.gpgsign", "false"]);
         let file = dir.join("a.txt");
         std::fs::write(&file, "unchanged\n").unwrap();
         git(&dir, &["add", "a.txt"]);

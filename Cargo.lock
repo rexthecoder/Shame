@@ -196,6 +196,7 @@ dependencies = [
  "core-buffer",
  "core-flutter",
  "core-lsp",
+ "core-syntax",
  "core-workspace",
  "editor-view",
  "gpui-kit",

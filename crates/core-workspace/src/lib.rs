@@ -14,10 +14,17 @@
 //! than through here, and nothing calls `search_text` yet (a results
 //! panel is UI work, staying deferred like everything else UI-shaped).
 
+mod diff;
 mod git;
+mod repo;
 mod search;
 
+pub use diff::{DiffCell, DiffRow, FileDiff, RowKind, file_diff, parse_unified};
 pub use git::{
     LineChange, ahead_behind, current_branch, has_uncommitted_changes, line_changes, status_map,
+};
+pub use repo::{
+    BranchInfo, ChangeKind, ChangedFile, RepoStatus, branches, checkout, commit, create_branch, discard, fetch,
+    init, last_commit_message, pull, push, repo_root, repo_status, stage, stage_all, unstage, unstage_all,
 };
 pub use search::{SearchMatch, search_text};

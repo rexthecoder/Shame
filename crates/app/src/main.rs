@@ -9,7 +9,9 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 mod chrome;
+mod diff_view;
 mod editor;
+mod git_panel;
 mod rails;
 mod shell;
 mod simulator;
@@ -150,6 +152,10 @@ pub struct DartIde {
     pub(crate) dock_tab: DockTab,
     pub(crate) debug_lines: Vec<editor::dock::TerminalLine>,
     pub(crate) debug_scroll: ScrollHandle,
+    pub(crate) diff: Option<diff_view::DiffState>,
+    pub(crate) diff_seq: u64,
+    pub(crate) sidebar_tab: git_panel::SidebarTab,
+    pub(crate) git: git_panel::GitState,
     pub(crate) sim: crate::simulator::SimulatorState,
     pub(crate) agent_open: bool,
     pub(crate) right_rail_tab: RightRailTab,
@@ -249,6 +255,10 @@ impl DartIde {
             dock_tab: DockTab::Terminal,
             debug_lines: Vec::new(),
             debug_scroll: ScrollHandle::new(),
+            diff: None,
+            diff_seq: 0,
+            sidebar_tab: git_panel::SidebarTab::Files,
+            git: git_panel::GitState::new(window, cx),
             sim: Default::default(),
             agent_open: false,
             right_rail_tab: RightRailTab::Simulator,
@@ -293,6 +303,10 @@ impl DartIde {
         this.reload_launch_configs(cx);
         this.refresh_devices(cx);
         this.start_simulator_live_loop(cx);
+        this.start_git_refresh_loop(cx);
+        this.refresh_git(cx);
+        // The Commit button depends on whether the message box is empty.
+        cx.observe(&this.git.message, |_, _, cx| cx.notify()).detach();
 
         let palette_changes = cx.subscribe(
             &this.palette_input,
@@ -1016,6 +1030,7 @@ impl DartIde {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.diff = None;
         let canonical = std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
 
         //Promote any existing tab that has been edited so `is_preview` stays accurate.

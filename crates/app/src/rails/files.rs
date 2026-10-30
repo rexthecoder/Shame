@@ -296,61 +296,7 @@ impl DartIde {
             .border_color(cx.theme().border)
             .rounded(px(tokens::RADIUS_CARD))
             .overflow_hidden()
-            .child(
-                h_flex()
-                    .w_full()
-                    .h(px(tokens::TABSTRIP_H))
-                    .flex_shrink_0()
-                    .items_center()
-                    .gap(px(tokens::SPACE_2))
-                    .px(px(tokens::SPACE_4))
-                    .border_b_1()
-                    .border_color(cx.theme().border)
-                    .child(
-                        h_flex()
-                            .items_center()
-                            .gap(px(tokens::SPACE_2))
-                            .h(px(30.))
-                            .px(px(tokens::SPACE_3))
-                            .rounded(px(tokens::RADIUS_PANEL))
-                            .bg(cx.theme().tab_active)
-                            .border_1()
-                            .border_color(tokens::accent_dim())
-                            .child(
-                                Icon::new(IconName::Folder)
-                                    .small()
-                                    .text_color(cx.theme().primary),
-                            )
-                            .child(
-                                div()
-                                    .text_size(px(tokens::UI))
-                                    .text_color(cx.theme().foreground)
-                                    .child("Files"),
-                            )
-                            .child(
-                                div()
-                                    .id("close-rail")
-                                    .cursor_pointer()
-                                    .text_color(muted)
-                                    .hover(|s| s.text_color(cx.theme().foreground))
-                                    .child(Icon::new(gpui_kit::assets::IconName::X).xsmall())
-                                    .on_click(cx.listener(|this, _event, _window, cx| {
-                                        this.sidebar_open = false;
-                                        cx.notify();
-                                    })),
-                            ),
-                    )
-                    .child(
-                        Button::new("rail-new")
-                            .ghost()
-                            .small()
-                            .icon(Icon::new(IconName::Plus).text_color(muted))
-                            .tooltip("New panel tab")
-                            .on_click(cx.listener(|this, _event, window, cx| {
-                                this.new_scratch_tab(window, cx);
-                            })),
-                    ),
-            )
+            .child(self.render_sidebar_tabs(cx))
             .child(
                 h_flex()
                     .w_full()

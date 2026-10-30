@@ -430,6 +430,7 @@ impl DartIde {
         };
 
         let editor_body = match (active_editor, active_md_mode) {
+            _ if self.diff.is_some() => self.render_diff_view(cx),
             (Some(editor), MarkdownMode::Code) => editor.into_any_element(),
             (Some(editor), MarkdownMode::Preview) => render_md_pane(&editor, cx).into_any_element(),
             (Some(editor), MarkdownMode::Split) => {
@@ -530,7 +531,12 @@ impl DartIde {
                     .size_range(px(tokens::RAIL_LEFT_MIN)..px(tokens::RAIL_LEFT_MAX))
                     .fixed()
                     .pr(px(tokens::GUTTER / 2.))
-                    .child(self.render_files_rail(view, cx)),
+                    .child(match self.sidebar_tab {
+                        crate::git_panel::SidebarTab::Files => {
+                            self.render_files_rail(view, cx).into_any_element()
+                        }
+                        crate::git_panel::SidebarTab::Git => self.render_git_rail(cx).into_any_element(),
+                    }),
             );
         }
 

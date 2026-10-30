@@ -172,6 +172,10 @@ impl DartIde {
     /// show stale or black frames. Identical frames (byte hash) are skipped so static screens
     /// cause no texture uploads, and the replaced frame's atlas texture is dropped.
     pub(crate) fn refresh_simulator_screenshot(&mut self, cx: &mut Context<Self>) {
+        // Nothing touches the simulator until the developer attaches it.
+        if !self.sim.attached {
+            return;
+        }
         // The live stream already keeps the frame current; screenshots are only the fallback.
         if self.sim.streaming {
             return;

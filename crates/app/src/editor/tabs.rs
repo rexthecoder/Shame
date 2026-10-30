@@ -94,6 +94,7 @@ impl DartIde {
                                         move |event, window, cx| {
                                             let double_clicked = event.click_count() >= 2;
                                             view.update(cx, |this, cx| {
+                                                this.diff = None;
                                                 this.active_tab = ix;
                                                 if double_clicked {
                                                     if let Some(t) = this.tabs.get_mut(ix) {

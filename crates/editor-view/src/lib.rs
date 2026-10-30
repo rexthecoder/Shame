@@ -2202,7 +2202,7 @@ fn is_word_byte(b: u8) -> bool {
 /// as cyan, member access as a warm red, literals as green/orange, and
 /// everything structural (operators, punctuation) recedes to a dim
 /// blue-gray instead of competing with any of it.
-fn highlight_color(kind: HighlightKind) -> Rgba {
+pub fn highlight_color(kind: HighlightKind) -> Rgba {
     match kind {
         HighlightKind::Keyword => rgb(0xc678dd),
         HighlightKind::Type => rgb(0xe5c07b),

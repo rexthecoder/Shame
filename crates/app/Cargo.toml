@@ -16,6 +16,7 @@ image = { version = "0.25", default-features = false, features = ["jpeg"] }
 async-channel.workspace = true
 core-buffer = { path = "../core-buffer" }
 core-flutter = { path = "../core-flutter" }
+core-syntax = { path = "../core-syntax" }
 core-lsp = { path = "../core-lsp" }
 core-workspace = { path = "../core-workspace" }
 editor-view = { path = "../editor-view" }
