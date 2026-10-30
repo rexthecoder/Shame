@@ -363,7 +363,7 @@ impl DartIde {
                             }))
                     })
                     .child({
-                        let sim_active = self.simulator_attached;
+                        let sim_active = self.sim.attached;
                         h_flex()
                             .id("titlebar-sim-attach")
                             .h(px(24.))
@@ -397,7 +397,7 @@ impl DartIde {
                             )
                             .child("Simulator")
                             .on_click(cx.listener(|this, _event, window, cx| {
-                                if this.simulator_attached {
+                                if this.sim.attached {
                                     this.detach_simulator(cx);
                                 } else {
                                     this.attach_simulator(window, cx);

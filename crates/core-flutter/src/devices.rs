@@ -18,6 +18,14 @@ pub struct Device {
     pub is_supported: bool,
 }
 
+impl Device {
+    /// Whether this is an iOS device target. A bare simulator UDID (it contains `-`) counts
+    /// even when only its id is known, e.g. one taken from a launch config.
+    pub fn is_ios(&self) -> bool {
+        self.target_platform.contains("ios") || self.id.contains('-')
+    }
+}
+
 /// An iOS Simulator discovered via `xcrun simctl list devices available -j`
 /// (including simulators that are currently `"Shutdown"` so the user can
 /// boot and attach them directly from the IDE).
