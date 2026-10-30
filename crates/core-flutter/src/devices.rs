@@ -352,6 +352,11 @@ pub fn simulator_frame_stream(udid: Option<&str>) -> io::Result<SimFrameStream> 
         .ok_or_else(|| io::Error::new(io::ErrorKind::BrokenPipe, "shame-sim exited"))
 }
 
+/// Stop the helper (if running). It exits when its stdin closes, ending the frame stream.
+pub fn simulator_detach() {
+    *SIM_SESSION.lock().unwrap_or_else(|e| e.into_inner()) = None;
+}
+
 /// Start the input helper for `udid` ahead of the first touch, so its warm-up isn't felt.
 pub fn simulator_prewarm(udid: Option<&str>) -> io::Result<()> {
     send_sim_command(udid, || SimCommand::Noop)

@@ -32,7 +32,7 @@ pub use daemon::{DaemonOutput, FlutterDaemon};
 pub use devices::{
     Device, IosSimulator, boot_ios_simulator,
     capture_simulator_screenshot, find_sim_helper, list_devices, list_ios_simulators,
-    simulator_input_available, simulator_frame_stream, simulator_prewarm, SimFrame, SimFrameStream, simulator_press_home, simulator_touch, TouchPhase,
+    simulator_input_available, simulator_detach, simulator_frame_stream, simulator_prewarm, SimFrame, SimFrameStream, simulator_press_home, simulator_touch, TouchPhase,
 };
 pub use launch::{
     LaunchCodeLens, LaunchConfig, LaunchFile, expand_workspace_vars, load_launch_file,

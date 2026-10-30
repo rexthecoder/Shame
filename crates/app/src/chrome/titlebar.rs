@@ -363,8 +363,7 @@ impl DartIde {
                             }))
                     })
                     .child({
-                        let sim_active = self.agent_open
-                            && self.right_rail_tab == crate::RightRailTab::Simulator;
+                        let sim_active = self.simulator_attached;
                         h_flex()
                             .id("titlebar-sim-attach")
                             .h(px(24.))
@@ -398,10 +397,8 @@ impl DartIde {
                             )
                             .child("Simulator")
                             .on_click(cx.listener(|this, _event, window, cx| {
-                                if this.agent_open
-                                    && this.right_rail_tab == crate::RightRailTab::Simulator
-                                {
-                                    this.refresh_simulator_screenshot(cx);
+                                if this.simulator_attached {
+                                    this.detach_simulator(cx);
                                 } else {
                                     this.attach_simulator(window, cx);
                                 }

@@ -257,7 +257,7 @@ impl DartIde {
             dock_tab: DockTab::Terminal,
             debug_lines: Vec::new(),
             debug_scroll: ScrollHandle::new(),
-            agent_open: true,
+            agent_open: false,
             right_rail_tab: RightRailTab::Simulator,
             show_hidden,
             tree_state,
@@ -1485,12 +1485,6 @@ impl DartIde {
         // If targeting an iOS simulator, ensure it is booted and open in Simulator.app
         if device.target_platform.contains("ios") || device.id.contains('-') {
             let _ = core_flutter::boot_ios_simulator(&device.id);
-            {
-                // Running on an iOS simulator is an explicit request to see it.
-                self.simulator_attached = true;
-                self.agent_open = true;
-                self.right_rail_tab = RightRailTab::Simulator;
-            }
         }
 
         let rel_cwd = project_dir
@@ -1869,6 +1863,20 @@ impl DartIde {
         }
         self.start_simulator_stream(cx);
         self.refresh_simulator_screenshot(cx);
+        cx.notify();
+    }
+
+    /// Detach the embedded simulator: stop the helper and its stream, clear the frame and close
+    /// the panel. Attaching is always an explicit action (the titlebar Simulator button).
+    pub(crate) fn detach_simulator(&mut self, cx: &mut Context<Self>) {
+        core_flutter::simulator_detach();
+        self.simulator_attached = false;
+        self.simulator_touching = false;
+        self.simulator_status = None;
+        self.agent_open = false;
+        if let Some(old) = self.simulator_frame.take() {
+            cx.drop_image(old, None);
+        }
         cx.notify();
     }
 
@@ -2701,7 +2709,7 @@ impl DartIde {
                                         .rounded(px(tokens::RADIUS_SM))
                                         .cursor_pointer()
                                         .hover(move |s| s.bg(list_hover))
-                                        .on_click(move |_event, window, cx| {
+                                        .on_click(move |_event, _window, cx| {
                                             let sim_clone = sim_for_click.clone();
                                             view.update(cx, |this, cx| {
                                                 let _ =
@@ -2714,7 +2722,6 @@ impl DartIde {
                                                     is_supported: true,
                                                 });
                                                 this.device_picker_open = false;
-                                                this.attach_simulator(window, cx);
                                                 this.refresh_devices(cx);
                                             });
                                         })
