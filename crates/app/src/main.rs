@@ -187,9 +187,12 @@ pub struct DartIde {
     pub(crate) flutter_status: Option<String>,
     pub(crate) simulator_attached: bool,
     pub(crate) simulator_live_sync: bool,
-    pub(crate) simulator_frame_path: Option<PathBuf>,
-    pub(crate) simulator_prev_frame_path: Option<PathBuf>,
-    pub(crate) simulator_frame_seq: u64,
+    pub(crate) simulator_frame: Option<std::sync::Arc<RenderImage>>,
+    pub(crate) simulator_touching: bool,
+    pub(crate) simulator_streaming: bool,
+    /// What the simulator panel is waiting on ("Booting…", "Connecting…") until the first frame.
+    pub(crate) simulator_status: Option<String>,
+    pub(crate) simulator_stream_retry_at: Option<std::time::Instant>,
     pub(crate) simulator_last_hash: u64,
     pub(crate) simulator_capturing: std::sync::Arc<std::sync::atomic::AtomicBool>,
     pub(crate) add_package_open: bool,
@@ -289,11 +292,13 @@ impl DartIde {
             flutter_daemon: None,
             flutter_app_id: None,
             flutter_status: None,
-            simulator_attached: true,
+            simulator_attached: false,
             simulator_live_sync: true,
-            simulator_frame_path: None,
-            simulator_prev_frame_path: None,
-            simulator_frame_seq: 0,
+            simulator_frame: None,
+            simulator_touching: false,
+            simulator_streaming: false,
+            simulator_status: None,
+            simulator_stream_retry_at: None,
             simulator_last_hash: 0,
             simulator_capturing: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             add_package_open: false,
@@ -1480,10 +1485,11 @@ impl DartIde {
         // If targeting an iOS simulator, ensure it is booted and open in Simulator.app
         if device.target_platform.contains("ios") || device.id.contains('-') {
             let _ = core_flutter::boot_ios_simulator(&device.id);
-            if self.simulator_attached {
+            {
+                // Running on an iOS simulator is an explicit request to see it.
+                self.simulator_attached = true;
                 self.agent_open = true;
                 self.right_rail_tab = RightRailTab::Simulator;
-                self.snap_simulator_window(window);
             }
         }
 
@@ -1803,9 +1809,9 @@ impl DartIde {
         .detach();
     }
 
-    /// Open and attach the Simulator panel inside the IDE AND magnetically snap
-    /// the native `Simulator.app` window alongside the editor.
-    pub(crate) fn attach_simulator(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    /// Open and attach the embedded Simulator panel inside the IDE (headless;
+    /// `Simulator.app` is not opened or moved).
+    pub(crate) fn attach_simulator(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
         self.agent_open = true;
         self.right_rail_tab = RightRailTab::Simulator;
         self.simulator_attached = true;
@@ -1834,36 +1840,90 @@ impl DartIde {
             });
 
         if let Some(udid) = sim_udid {
-            let _ = core_flutter::boot_ios_simulator(&udid);
+            let sim = self.ios_simulators.iter().find(|s| s.udid == udid);
+            let name = sim.map_or("simulator".to_string(), |s| s.name.clone());
+            let booted = sim.is_some_and(|s| s.is_booted());
+            self.simulator_status = Some(if booted {
+                format!("Connecting to {name}…")
+            } else {
+                format!("Booting {name}…")
+            });
+            // `simctl boot` can take seconds on a shut-down device; never block the UI on it.
+            let (tx, rx) = async_channel::bounded(1);
+            std::thread::spawn(move || {
+                let _ = tx.send_blocking(core_flutter::boot_ios_simulator(&udid));
+            });
+            cx.spawn(async move |weak, cx| {
+                let Ok(res) = rx.recv().await else { return };
+                let _ = weak.update(cx, |this, cx| {
+                    if let Err(err) = res {
+                        this.push_flutter_log(&format!("[simulator] {err}"));
+                        this.simulator_status = Some(format!("Couldn't boot the simulator: {err}"));
+                    }
+                    this.simulator_stream_retry_at = None;
+                    this.start_simulator_stream(cx);
+                    this.refresh_simulator_screenshot(cx);
+                });
+            })
+            .detach();
         }
-        self.snap_simulator_window(window);
+        self.start_simulator_stream(cx);
         self.refresh_simulator_screenshot(cx);
         cx.notify();
     }
 
-    /// Magnetically dock the native macOS `Simulator.app` window to the right
-    /// edge of the IDE window.
-    pub(crate) fn snap_simulator_window(&self, window: &Window) {
-        let bounds = window.bounds();
-        let x: f32 = bounds.origin.x.into();
-        let y: f32 = bounds.origin.y.into();
-        let w: f32 = bounds.size.width.into();
-        let h: f32 = bounds.size.height.into();
-        std::thread::spawn(move || {
-            let _ = core_flutter::attach_simulator_window(
-                x as i32,
-                y as i32,
-                w as i32,
-                h as i32,
-            );
-        });
+    /// Start mirroring the simulator from `shame-sim`'s live framebuffer stream. Retried (at most
+    /// every few seconds) from the live loop, e.g. when the simulator was still booting; until it
+    /// is up the panel falls back to `simctl` screenshots.
+    pub(crate) fn start_simulator_stream(&mut self, cx: &mut Context<Self>) {
+        let now = std::time::Instant::now();
+        if self.simulator_streaming || self.simulator_stream_retry_at.is_some_and(|t| now < t) {
+            return;
+        }
+        self.simulator_stream_retry_at = Some(now + std::time::Duration::from_secs(1));
+        let udid = self.active_simulator_udid();
+        let Ok(stream) = core_flutter::simulator_frame_stream(udid.as_deref()) else {
+            return;
+        };
+        self.simulator_streaming = true;
+        cx.spawn(async move |weak, cx| {
+            while stream.ready.recv().await.is_ok() {
+                let frame = stream.latest.lock().unwrap_or_else(|e| e.into_inner()).take();
+                // The helper sends BGRA, which is what GPUI wants, so the bytes go in as-is.
+                let Some(frame) = frame.and_then(|f| {
+                    image::RgbaImage::from_raw(f.width, f.height, f.bgra)
+                        .map(|img| RenderImage::new(vec![image::Frame::new(img)]))
+                }) else {
+                    continue;
+                };
+                let alive = weak
+                    .update(cx, |this, cx| {
+                        if let Some(old) = this.simulator_frame.replace(std::sync::Arc::new(frame)) {
+                            cx.drop_image(old, None);
+                        }
+                        this.simulator_status = None;
+                        cx.notify();
+                    })
+                    .is_ok();
+                if !alive {
+                    return;
+                }
+            }
+            let _ = weak.update(cx, |this, _| this.simulator_streaming = false);
+        })
+        .detach();
     }
 
-    /// Capture a fresh PNG frame from the running iOS Simulator (`xcrun simctl io screenshot`)
-    /// with single-flight guarding, FNV-1a byte-hash deduplication (so static screens never
-    /// trigger texture reloads), and double-buffered `simulator_prev_frame_path` preservation
-    /// so GPUI's async PNG decoder never flashes a blank frame!
+    /// Capture a fresh frame from the running iOS Simulator (`xcrun simctl io screenshot`),
+    /// single-flight guarded. The JPEG is decoded off the UI thread straight into a GPUI
+    /// `RenderImage` — no per-frame files and no path-keyed image cache, which is what used to
+    /// show stale or black frames. Identical frames (byte hash) are skipped so static screens
+    /// cause no texture uploads, and the replaced frame's atlas texture is dropped.
     pub(crate) fn refresh_simulator_screenshot(&mut self, cx: &mut Context<Self>) {
+        // The live stream already keeps the frame current; screenshots are only the fallback.
+        if self.simulator_streaming {
+            return;
+        }
         if self
             .simulator_capturing
             .compare_exchange(
@@ -1877,32 +1937,18 @@ impl DartIde {
             return;
         }
 
-        let udid = self
-            .selected_device
-            .as_ref()
-            .filter(|d| d.target_platform.contains("ios") || d.id.contains('-'))
-            .map(|d| d.id.clone())
-            .or_else(|| {
-                self.ios_simulators
-                    .iter()
-                    .find(|s| s.is_booted())
-                    .map(|s| s.udid.clone())
-            });
-
-        self.simulator_frame_seq = self.simulator_frame_seq.wrapping_add(1);
-        let seq = self.simulator_frame_seq;
+        let udid = self.active_simulator_udid();
         let last_hash = self.simulator_last_hash;
-        let has_frame = self.simulator_frame_path.is_some();
+        let has_frame = self.simulator_frame.is_some();
         let capturing_flag = self.simulator_capturing.clone();
 
         let (tx, rx) = async_channel::bounded(1);
         std::thread::spawn(move || {
-            let temp_dir = std::env::temp_dir();
-            let stage_path = temp_dir.join("dart_ide_sim_stage.jpg");
-            let ok =
-                core_flutter::capture_simulator_screenshot(udid.as_deref(), &stage_path).is_ok();
-            let result = if ok {
-                if let Ok(bytes) = std::fs::read(&stage_path) {
+            let stage_path = std::env::temp_dir().join("dart_ide_sim_stage.jpg");
+            let result = core_flutter::capture_simulator_screenshot(udid.as_deref(), &stage_path)
+                .ok()
+                .and_then(|_| std::fs::read(&stage_path).ok())
+                .and_then(|bytes| {
                     let mut hash: u64 = 0xcbf29ce484222325;
                     for &b in bytes.iter().step_by(4) {
                         hash ^= b as u64;
@@ -1910,30 +1956,18 @@ impl DartIde {
                     }
                     hash ^= bytes.len() as u64;
                     if has_frame && hash == last_hash {
-                        let _ = std::fs::remove_file(&stage_path);
-                        None
-                    } else {
-                        let out_path =
-                            temp_dir.join(format!("dart_ide_sim_frame_{}.jpg", seq % 16));
-                        if std::fs::rename(&stage_path, &out_path).is_ok() {
-                            if seq >= 6 {
-                                let old_path = temp_dir.join(format!(
-                                    "dart_ide_sim_frame_{}.jpg",
-                                    seq.wrapping_sub(6) % 16
-                                ));
-                                let _ = std::fs::remove_file(old_path);
-                            }
-                            Some((out_path, hash))
-                        } else {
-                            None
-                        }
+                        return None;
                     }
-                } else {
-                    None
-                }
-            } else {
-                None
-            };
+                    let mut rgba =
+                        image::load_from_memory_with_format(&bytes, image::ImageFormat::Jpeg)
+                            .ok()?
+                            .into_rgba8();
+                    // GPUI renders BGRA.
+                    for px in rgba.pixels_mut() {
+                        px.0.swap(0, 2);
+                    }
+                    Some((RenderImage::new(vec![image::Frame::new(rgba)]), hash))
+                });
             capturing_flag.store(false, std::sync::atomic::Ordering::SeqCst);
             let _ = tx.send_blocking(result);
         });
@@ -1941,13 +1975,12 @@ impl DartIde {
         cx.spawn(async move |weak, cx| {
             let Ok(frame_opt) = rx.recv().await else { return };
             let _ = weak.update(cx, |this, cx| {
-                if let Some((new_path, new_hash)) = frame_opt {
-                    this.simulator_last_hash = new_hash;
-                    if this.simulator_frame_path.as_ref() != Some(&new_path) {
-                        if let Some(prev) = this.simulator_frame_path.replace(new_path) {
-                            this.simulator_prev_frame_path = Some(prev);
-                        }
+                if let Some((frame, hash)) = frame_opt {
+                    this.simulator_last_hash = hash;
+                    if let Some(old) = this.simulator_frame.replace(std::sync::Arc::new(frame)) {
+                        cx.drop_image(old, None);
                     }
+                    this.simulator_status = None;
                     cx.notify();
                 }
             });
@@ -1955,29 +1988,47 @@ impl DartIde {
         .detach();
     }
 
-    /// Forward a normalized click `(norm_x, norm_y)` inside the embedded iPhone screen
-    /// to the simulator (via `idb` HID injection) and refresh the frame several times
-    /// afterwards to capture the resulting animation.
-    pub(crate) fn tap_simulator(&mut self, norm_x: f32, norm_y: f32, cx: &mut Context<Self>) {
+    /// Forward one phase of a touch at normalized `(norm_x, norm_y)` inside the embedded iPhone
+    /// screen to the simulator (via the long-running `shame-sim` helper). `Down` → `Move`… → `Up`
+    /// is a drag; `Down` → `Up` is a tap. Frames are refreshed while the finger is down and for
+    /// a short while after lifting, to catch the resulting animation.
+    pub(crate) fn simulator_touch(
+        &mut self,
+        phase: core_flutter::TouchPhase,
+        norm_x: f32,
+        norm_y: f32,
+        cx: &mut Context<Self>,
+    ) {
+        use core_flutter::TouchPhase;
+        match phase {
+            TouchPhase::Down => self.simulator_touching = true,
+            TouchPhase::Up if !self.simulator_touching => return,
+            TouchPhase::Up => self.simulator_touching = false,
+            TouchPhase::Move if !self.simulator_touching => return,
+            TouchPhase::Move => {}
+        }
         let udid = self.active_simulator_udid();
-        std::thread::spawn(move || {
-            let _ = core_flutter::tap_simulator_window(udid.as_deref(), norm_x, norm_y);
-        });
-        let (tx, rx) = async_channel::bounded::<()>(6);
-        std::thread::spawn(move || {
-            for delay_ms in [120u64, 200, 300, 500] {
-                std::thread::sleep(std::time::Duration::from_millis(delay_ms));
-                let _ = tx.send_blocking(());
-            }
-        });
-        cx.spawn(async move |weak, cx| {
-            while rx.recv().await.is_ok() {
-                let _ = weak.update(cx, |this, cx| {
-                    this.refresh_simulator_screenshot(cx);
-                });
-            }
-        })
-        .detach();
+        if let Err(err) = core_flutter::simulator_touch(udid.as_deref(), phase, norm_x, norm_y) {
+            self.simulator_touching = false;
+            self.push_flutter_log(&format!("[simulator] touch failed: {err}"));
+            return;
+        }
+        self.refresh_simulator_screenshot(cx);
+        if phase == TouchPhase::Up {
+            let (tx, rx) = async_channel::bounded::<()>(6);
+            std::thread::spawn(move || {
+                for delay_ms in [60u64, 120, 200, 300, 500] {
+                    std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+                    let _ = tx.send_blocking(());
+                }
+            });
+            cx.spawn(async move |weak, cx| {
+                while rx.recv().await.is_ok() {
+                    let _ = weak.update(cx, |this, cx| this.refresh_simulator_screenshot(cx));
+                }
+            })
+            .detach();
+        }
     }
 
     /// UDID of the simulator currently mirrored in the rail (selected iOS device, else the first booted one).
@@ -2023,7 +2074,7 @@ impl DartIde {
         let (tx, rx) = async_channel::bounded::<()>(1);
         std::thread::spawn(move || {
             loop {
-                std::thread::sleep(std::time::Duration::from_millis(160));
+                std::thread::sleep(std::time::Duration::from_millis(80));
                 if tx.send_blocking(()).is_err() {
                     break;
                 }
@@ -2036,7 +2087,9 @@ impl DartIde {
                         if this.agent_open
                             && this.right_rail_tab == RightRailTab::Simulator
                             && this.simulator_live_sync
+                            && this.simulator_attached
                         {
+                            this.start_simulator_stream(cx);
                             this.refresh_simulator_screenshot(cx);
                         }
                     })

@@ -20,7 +20,7 @@ impl DartIde {
         let primary = cx.theme().primary;
         let list_hover = cx.theme().list_hover;
         let is_sim_tab = self.right_rail_tab == RightRailTab::Simulator;
-        let has_sim_frame = self.simulator_frame_path.is_some();
+        let has_sim_frame = self.simulator_frame.is_some();
 
         v_flex()
             .size_full()
@@ -367,27 +367,10 @@ impl DartIde {
                                                     .rounded(px(38.))
                                                     .overflow_hidden()
                                                     .bg(rgb(0x000000))
-                                                    // 0. Double-buffered previous frame underneath so async PNG decode NEVER flashes black!
-                                                    // IMPORTANT: `.rounded(px(38.))` MUST be on `img(...)` itself so GPUI's quad shader
-                                                    // clips the texture's 4 corners rather than letting square corners poke out of the bezel.
-                                                    .when_some(
-                                                        self.simulator_prev_frame_path.clone(),
-                                                        |el, prev_path| {
-                                                            el.child(
-                                                                img(prev_path)
-                                                                    .absolute()
-                                                                    .top_0()
-                                                                    .left_0()
-                                                                    .size_full()
-                                                                    .rounded(px(38.))
-                                                                    .object_fit(ObjectFit::Fill),
-                                                            )
-                                                        },
-                                                    )
                                                     // 1. Edge-to-edge current screen content + interactive tap forwarding
                                                     .child(
-                                                        if let Some(frame_path) =
-                                                            self.simulator_frame_path.clone()
+                                                        if let Some(frame) =
+                                                            self.simulator_frame.clone()
                                                         {
                                                             let tap_view = cx.entity();
                                                             div()
@@ -397,7 +380,7 @@ impl DartIde {
                                                                 .overflow_hidden()
                                                                 .cursor_pointer()
                                                                 .child(
-                                                                    img(frame_path)
+                                                                    img(frame)
                                                                         .size_full()
                                                                         .rounded(px(38.))
                                                                         .object_fit(ObjectFit::Fill),
@@ -406,27 +389,59 @@ impl DartIde {
                                                                     canvas(
                                                                         move |bounds, _window, _cx| bounds,
                                                                         move |bounds, _, window, _cx| {
+                                                                            // Normalized position inside the screen, clamped to it.
+                                                                            let norm = move |pos: Point<Pixels>| -> Option<(f32, f32)> {
+                                                                                let w: f32 = bounds.size.width.into();
+                                                                                let h: f32 = bounds.size.height.into();
+                                                                                if w <= 1.0 || h <= 1.0 {
+                                                                                    return None;
+                                                                                }
+                                                                                let rx: f32 = (pos.x - bounds.origin.x).into();
+                                                                                let ry: f32 = (pos.y - bounds.origin.y).into();
+                                                                                Some(((rx / w).clamp(0.0, 1.0), (ry / h).clamp(0.0, 1.0)))
+                                                                            };
                                                                             let view = tap_view.clone();
                                                                             window.on_mouse_event(
-                                                                                move |event: &MouseDownEvent,
-                                                                                      phase,
-                                                                                      _window,
-                                                                                      cx| {
+                                                                                move |event: &MouseDownEvent, phase, _window, cx| {
                                                                                     if phase != DispatchPhase::Bubble
                                                                                         || event.button != MouseButton::Left
                                                                                         || !bounds.contains(&event.position)
                                                                                     {
                                                                                         return;
                                                                                     }
-                                                                                    let w: f32 = bounds.size.width.into();
-                                                                                    let h: f32 = bounds.size.height.into();
-                                                                                    if w > 1.0 && h > 1.0 {
-                                                                                        let rx: f32 = (event.position.x - bounds.origin.x).into();
-                                                                                        let ry: f32 = (event.position.y - bounds.origin.y).into();
-                                                                                        let nx = (rx / w).clamp(0.0, 1.0);
-                                                                                        let ny = (ry / h).clamp(0.0, 1.0);
+                                                                                    if let Some((nx, ny)) = norm(event.position) {
                                                                                         view.update(cx, |this, cx| {
-                                                                                            this.tap_simulator(nx, ny, cx);
+                                                                                            this.simulator_touch(core_flutter::TouchPhase::Down, nx, ny, cx);
+                                                                                        });
+                                                                                    }
+                                                                                },
+                                                                            );
+                                                                            let view = tap_view.clone();
+                                                                            window.on_mouse_event(
+                                                                                move |event: &MouseMoveEvent, phase, _window, cx| {
+                                                                                    if phase != DispatchPhase::Bubble
+                                                                                        || event.pressed_button != Some(MouseButton::Left)
+                                                                                    {
+                                                                                        return;
+                                                                                    }
+                                                                                    if let Some((nx, ny)) = norm(event.position) {
+                                                                                        view.update(cx, |this, cx| {
+                                                                                            this.simulator_touch(core_flutter::TouchPhase::Move, nx, ny, cx);
+                                                                                        });
+                                                                                    }
+                                                                                },
+                                                                            );
+                                                                            let view = tap_view.clone();
+                                                                            window.on_mouse_event(
+                                                                                move |event: &MouseUpEvent, phase, _window, cx| {
+                                                                                    if phase != DispatchPhase::Bubble
+                                                                                        || event.button != MouseButton::Left
+                                                                                    {
+                                                                                        return;
+                                                                                    }
+                                                                                    if let Some((nx, ny)) = norm(event.position) {
+                                                                                        view.update(cx, |this, cx| {
+                                                                                            this.simulator_touch(core_flutter::TouchPhase::Up, nx, ny, cx);
                                                                                         });
                                                                                     }
                                                                                 },
@@ -485,7 +500,10 @@ impl DartIde {
                                                                         ))
                                                                         .text_color(muted)
                                                                         .child(
-                                                                            "Tap an iPhone below to boot & stream inside the bezel.",
+                                                                            self.simulator_status.clone().unwrap_or_else(|| {
+                                                                                "Tap an iPhone below to boot & stream inside the bezel."
+                                                                                    .to_string()
+                                                                            }),
                                                                         ),
                                                                 )
                                                                 .child(
@@ -524,9 +542,6 @@ impl DartIde {
                                                                                         })
                                                                                         .on_click(cx.listener(
                                                                                             move |this, _event, window, cx| {
-                                                                                                let _ = core_flutter::boot_ios_simulator(
-                                                                                                    &sim_clone.udid,
-                                                                                                );
                                                                                                 this.selected_device =
                                                                                                     Some(core_flutter::Device {
                                                                                                         id: sim_clone.udid.clone(),
@@ -587,7 +602,7 @@ impl DartIde {
                                                                     .font_semibold()
                                                                     .text_color(rgb(0xffffff))
                                                                     .when(
-                                                                        self.simulator_frame_path
+                                                                        self.simulator_frame
                                                                             .is_none(),
                                                                         |el| el.child("9:41"),
                                                                     ),
@@ -624,7 +639,7 @@ impl DartIde {
                                                                     .justify_end()
                                                                     .gap(px(4.))
                                                                     .when(
-                                                                        self.simulator_frame_path
+                                                                        self.simulator_frame
                                                                             .is_none(),
                                                                         |el| {
                                                                             el.child(
@@ -663,7 +678,7 @@ impl DartIde {
                                                     )
                                                     // 3. Overlaid iOS Home Indicator bar floating at the bottom of the screen
                                                     .when(
-                                                        self.simulator_frame_path.is_none(),
+                                                        self.simulator_frame.is_none(),
                                                         |el| {
                                                             el.child(
                                                                 h_flex()

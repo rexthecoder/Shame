@@ -401,7 +401,6 @@ impl DartIde {
                                 if this.agent_open
                                     && this.right_rail_tab == crate::RightRailTab::Simulator
                                 {
-                                    this.snap_simulator_window(window);
                                     this.refresh_simulator_screenshot(cx);
                                 } else {
                                     this.attach_simulator(window, cx);

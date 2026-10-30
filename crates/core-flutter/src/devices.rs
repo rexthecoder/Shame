@@ -1,5 +1,5 @@
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use serde::Deserialize;
@@ -113,40 +113,23 @@ pub fn list_ios_simulators() -> io::Result<Vec<IosSimulator>> {
     Ok(sims)
 }
 
-/// Boot an iOS Simulator by UDID (if not already booted) and open `Simulator.app`.
+/// Boot an iOS Simulator by UDID (if not already booted), headlessly.
+///
+/// The embedded mirror reads frames via `simctl`, so `Simulator.app` is not opened.
+/// `simctl boot` exits non-zero when the device is already booted, which is fine.
 pub fn boot_ios_simulator(udid: &str) -> io::Result<()> {
-    let _ = Command::new("xcrun").args(["simctl", "boot", udid]).status();
-    let _ = Command::new("open")
-        .args(["-g", "-a", "Simulator", "--args", "-CurrentDeviceUDID", udid])
-        .status();
-    Ok(())
-}
-
-/// Magnetically dock/attach the native macOS `Simulator.app` window flush
-/// against the right edge of our IDE window (or inside its right rail bounds)
-/// and raise it cleanly alongside the editor.
-pub fn attach_simulator_window(ide_x: i32, ide_y: i32, ide_w: i32, ide_h: i32) -> io::Result<()> {
-    // Ensure Simulator.app is open (`-g`: don't steal focus from the IDE)
-    let _ = Command::new("open").args(["-g", "-a", "Simulator"]).status();
-    let target_x = (ide_x + ide_w - 400).max(40);
-    let target_y = ide_y.max(28);
-    let target_h = ide_h.max(680);
-    let script = format!(
-        r#"tell application "System Events"
-            if exists process "Simulator" then
-                tell process "Simulator"
-                    if (count of windows) > 0 then
-                        set position of window 1 to {{{target_x}, {target_y}}}
-                        try
-                            set size of window 1 to {{390, {target_h}}}
-                        end try
-                    end if
-                end tell
-            end if
-        end tell"#
-    );
-    let _ = Command::new("osascript").args(["-e", &script]).status();
-    Ok(())
+    let out = Command::new("xcrun")
+        .args(["simctl", "boot", udid])
+        .output()?;
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    if out.status.success() || stderr.contains("current state: Booted") {
+        Ok(())
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::Other,
+            format!("simctl boot failed: {}", stderr.trim()),
+        ))
+    }
 }
 
 /// Capture a live PNG screenshot of the booted (or specified UDID) iOS Simulator
@@ -175,184 +158,215 @@ pub fn capture_simulator_screenshot(udid: Option<&str>, out_path: &Path) -> io::
     Ok(())
 }
 
-/// Run a JXA (JavaScript for Automation) snippet via `osascript -l JavaScript`.
-/// Errors if the script throws (e.g. no Simulator window).
-fn run_jxa(script: &str) -> io::Result<()> {
-    let status = Command::new("osascript")
-        .args(["-l", "JavaScript", "-e", script])
-        .stderr(std::process::Stdio::null())
-        .status()?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err(io::Error::new(io::ErrorKind::NotFound, "no Simulator window"))
-    }
-}
-
-/// Run a JXA snippet, and if it fails because `Simulator.app` has no window yet,
-/// launch Simulator in the background and retry once.
-fn run_jxa_with_simulator(script: &str) -> io::Result<()> {
-    if run_jxa(script).is_ok() {
-        return Ok(());
-    }
-    let _ = Command::new("open").args(["-g", "-a", "Simulator"]).status();
-    for _ in 0..8 {
-        std::thread::sleep(std::time::Duration::from_millis(400));
-        if run_jxa(script).is_ok() {
-            return Ok(());
-        }
-    }
-    Err(io::Error::new(io::ErrorKind::NotFound, "no Simulator window"))
-}
-
-/// JXA prelude: finds the `Simulator` device window (`win`, with `win.kCGWindowBounds`)
-/// and its owner pid (`pid`) via CoreGraphics, without needing Accessibility APIs and
-/// without activating the app. Lists *all* windows (not only on-screen ones, which
-/// omits windows on other Spaces) and ignores the menu-bar-sized helper windows.
-const JXA_FIND_SIMULATOR: &str = r#"
-ObjC.import('CoreGraphics');
-const infos = ObjC.deepUnwrap(ObjC.castRefToObject($.CGWindowListCopyWindowInfo(0, 0)));
-const cands = infos.filter(w => w.kCGWindowOwnerName === 'Simulator'
-    && w.kCGWindowLayer === 0 && w.kCGWindowBounds.Height > 200 && w.kCGWindowBounds.Width > 150);
-const win = cands.find(w => w.kCGWindowIsOnscreen) || cands[0];
-if (!win) { throw new Error('no simulator window'); }
-const pid = win.kCGWindowOwnerPID;
-const b = win.kCGWindowBounds;
-"#;
-
-/// Locate Facebook's `idb` CLI (`brew install idb-companion && pip3 install fb-idb`).
-/// `idb` injects real HID touches into a booted simulator **headlessly** — no
-/// `Simulator.app` window needed — which is what makes the embedded view interactive.
-pub fn find_idb() -> Option<String> {
-    static IDB: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
-    IDB.get_or_init(|| {
-        let home = std::env::var("HOME").unwrap_or_default();
-        [
-            "/opt/homebrew/bin/idb".to_string(),
-            "/usr/local/bin/idb".to_string(),
-            format!("{home}/.local/bin/idb"),
-            format!("{home}/Library/Python/3.12/bin/idb"),
-            format!("{home}/Library/Python/3.11/bin/idb"),
-            format!("{home}/Library/Python/3.10/bin/idb"),
-            format!("{home}/Library/Python/3.9/bin/idb"),
-        ]
-        .into_iter()
-        .find(|p| Path::new(p).is_file())
-        .or_else(|| {
-            Command::new("which")
-                .arg("idb")
-                .output()
-                .ok()
-                .filter(|o| o.status.success())
-                .and_then(|o| String::from_utf8(o.stdout).ok())
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty())
-        })
-    })
-    .clone()
-}
-
-/// Whether taps can be injected into a headless simulator (i.e. `idb` is installed).
-pub fn simulator_input_available() -> bool {
-    find_idb().is_some()
-}
-
-/// Screen size in points of a simulator, via `idb describe` (cached per udid).
-fn simulator_screen_points(idb: &str, udid: &str) -> Option<(f32, f32)> {
-    static CACHE: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, (f32, f32)>>> =
-        std::sync::OnceLock::new();
-    let cache = CACHE.get_or_init(Default::default);
-    if let Some(v) = cache.lock().ok().and_then(|c| c.get(udid).copied()) {
-        return Some(v);
-    }
-    let out = Command::new(idb)
-        .args(["describe", "--udid", udid, "--json"])
-        .output()
-        .ok()?;
-    let json: Value = serde_json::from_slice(&out.stdout).ok()?;
-    let dims = json.get("screen_dimensions")?;
-    let w = dims.get("width_points").and_then(Value::as_f64)? as f32;
-    let h = dims.get("height_points").and_then(Value::as_f64)? as f32;
-    if let Ok(mut c) = cache.lock() {
-        c.insert(udid.to_string(), (w, h));
-    }
-    Some((w, h))
-}
-
-/// Forward a normalized `(norm_x, norm_y)` tap (`0.0..=1.0`) from the embedded
-/// iPhone screen to the simulator.
+/// Locate `shame-sim`, the headless touch/button helper built from `tools/simhelper`.
 ///
-/// Uses `idb` HID injection when available (works headless, never raises
-/// `Simulator.app`). Otherwise falls back to posting a click to the Simulator
-/// window, which only works while that window exists.
-pub fn tap_simulator_window(udid: Option<&str>, norm_x: f32, norm_y: f32) -> io::Result<()> {
-    let nx = norm_x.clamp(0.0, 1.0);
-    let ny = norm_y.clamp(0.0, 1.0);
-    if let (Some(idb), Some(udid)) = (find_idb(), udid.filter(|u| !u.is_empty())) {
-        if let Some((w, h)) = simulator_screen_points(&idb, udid) {
-            let status = Command::new(&idb)
-                .args([
-                    "ui",
-                    "tap",
-                    "--udid",
-                    udid,
-                    &format!("{}", (nx * w).round() as i32),
-                    &format!("{}", (ny * h).round() as i32),
-                ])
-                .status()?;
-            if status.success() {
-                return Ok(());
+/// Lookup order: `SHAME_SIM_HELPER` at runtime, a `shame-sim` next to the editor binary
+/// (for packaged builds), then the copy `build.rs` compiled for this checkout.
+pub fn find_sim_helper() -> Option<PathBuf> {
+    static HELPER: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
+    HELPER
+        .get_or_init(|| {
+            let beside_exe = std::env::current_exe()
+                .ok()
+                .and_then(|exe| exe.parent().map(|d| d.join("shame-sim")));
+            [
+                std::env::var_os("SHAME_SIM_HELPER").map(PathBuf::from),
+                beside_exe,
+                option_env!("SHAME_SIM_HELPER").map(PathBuf::from),
+            ]
+            .into_iter()
+            .flatten()
+            .find(|p| p.is_file())
+        })
+        .clone()
+}
+
+/// Whether taps can be injected into a headless simulator.
+pub fn simulator_input_available() -> bool {
+    find_sim_helper().is_some()
+}
+
+/// A phase of a single-finger touch on the embedded simulator screen.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TouchPhase {
+    Down,
+    Move,
+    Up,
+}
+
+enum SimCommand {
+    Touch(TouchPhase, f32, f32),
+    Home,
+    /// Does nothing on the device; only ensures the helper is running.
+    Noop,
+}
+
+/// One decoded simulator frame: half-resolution BGRA (what GPUI renders), top-left origin.
+pub struct SimFrame {
+    pub width: u32,
+    pub height: u32,
+    pub bgra: Vec<u8>,
+}
+
+/// Live frames from the helper. `latest` always holds the newest frame (older ones are
+/// overwritten, so a slow consumer never builds a backlog); `ready` is signalled when it
+/// changes and closes when the helper exits.
+#[derive(Clone)]
+pub struct SimFrameStream {
+    pub latest: std::sync::Arc<std::sync::Mutex<Option<SimFrame>>>,
+    pub ready: async_channel::Receiver<()>,
+}
+
+struct SimSession {
+    udid: String,
+    tx: std::sync::mpsc::Sender<SimCommand>,
+    frames: SimFrameStream,
+}
+
+static SIM_SESSION: std::sync::Mutex<Option<SimSession>> = std::sync::Mutex::new(None);
+
+/// Start a long-running `shame-sim serve` for `udid`. A writer thread owns the child's stdin,
+/// coalescing bursts of `Move`s so a fast drag never queues stale positions; it exits (killing
+/// the helper) when the write side breaks, and the next call starts a fresh one.
+fn start_sim_session(udid: &str) -> io::Result<SimSession> {
+    use std::io::Write;
+    use std::process::Stdio;
+    use std::sync::mpsc;
+
+    let helper = find_sim_helper().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            "shame-sim helper not built (Xcode is required to build it)",
+        )
+    })?;
+    let mut child = Command::new(helper)
+        .args(["serve", udid, "--stream"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .spawn()?;
+    let mut stdin = child.stdin.take().expect("piped stdin");
+    let mut stdout = child.stdout.take().expect("piped stdout");
+    let latest = std::sync::Arc::new(std::sync::Mutex::new(None));
+    let (ready_tx, ready_rx) = async_channel::bounded::<()>(1);
+    {
+        let latest = latest.clone();
+        std::thread::spawn(move || {
+            use std::io::Read;
+            let mut header = [0u8; 16];
+            while stdout.read_exact(&mut header).is_ok() {
+                let word = |i: usize| u32::from_le_bytes(header[i..i + 4].try_into().unwrap());
+                if word(0) != 0x4D52_4653 || word(12) as usize != word(4) as usize * word(8) as usize * 4 {
+                    break; // out of sync: give up, the session restarts on the next call
+                }
+                let mut bgra = vec![0u8; word(12) as usize];
+                if stdout.read_exact(&mut bgra).is_err() {
+                    break;
+                }
+                let frame = SimFrame { width: word(4), height: word(8), bgra };
+                *latest.lock().unwrap_or_else(|e| e.into_inner()) = Some(frame);
+                let _ = ready_tx.try_send(());
+            }
+            // Dropping `ready_tx` closes the stream.
+        });
+    }
+    let (tx, rx) = mpsc::channel::<SimCommand>();
+    std::thread::spawn(move || {
+        let line = |cmd: &SimCommand| match cmd {
+            SimCommand::Touch(phase, x, y) => {
+                let verb = match phase {
+                    TouchPhase::Down => "down",
+                    TouchPhase::Move => "move",
+                    TouchPhase::Up => "up",
+                };
+                format!("{verb} {x:.4} {y:.4}\n")
+            }
+            SimCommand::Home => "home\n".to_string(),
+            SimCommand::Noop => "\n".to_string(),
+        };
+        'outer: while let Ok(mut cmd) = rx.recv() {
+            loop {
+                if let SimCommand::Touch(TouchPhase::Move, ..) = cmd {
+                    match rx.try_recv() {
+                        Ok(next @ SimCommand::Touch(TouchPhase::Move, ..)) => {
+                            cmd = next;
+                            continue;
+                        }
+                        Ok(next) => {
+                            // A non-move follows: send this move, then the follower.
+                            if stdin.write_all(line(&cmd).as_bytes()).is_err() {
+                                break 'outer;
+                            }
+                            cmd = next;
+                            continue;
+                        }
+                        Err(_) => {}
+                    }
+                }
+                break;
+            }
+            if stdin
+                .write_all(line(&cmd).as_bytes())
+                .and_then(|_| stdin.flush())
+                .is_err()
+            {
+                break;
             }
         }
-    }
-    tap_simulator_window_via_events(nx, ny)
+        drop(stdin);
+        let _ = child.wait();
+    });
+    Ok(SimSession {
+        udid: udid.to_string(),
+        tx,
+        frames: SimFrameStream { latest, ready: ready_rx },
+    })
 }
 
-/// Fallback tap: post mouse events straight to a visible `Simulator.app` window's pid.
-fn tap_simulator_window_via_events(norm_x: f32, norm_y: f32) -> io::Result<()> {
-    let nx = norm_x.clamp(0.02, 0.98);
-    let ny = norm_y.clamp(0.02, 0.98);
-    let script = format!(
-        r#"{JXA_FIND_SIMULATOR}
-const p = {{ x: b.X + 18 + (b.Width - 36) * {nx:.4}, y: b.Y + 44 + (b.Height - 62) * {ny:.4} }};
-function post(type) {{
-    const e = $.CGEventCreateMouseEvent(null, type, p, 0);
-    $.CGEventSetIntegerValueField(e, 1, 1);
-    $.CGEventPostToPid(pid, e);
-}}
-post(5);
-delay(0.02);
-post(1);
-delay(0.05);
-post(2);
-"#
-    );
-    run_jxa_with_simulator(&script)
-}
-
-/// Press the iOS Home button on the simulator (`idb` when available, else `Cmd+Shift+H`).
-pub fn simulator_press_home(udid: Option<&str>) -> io::Result<()> {
-    if let (Some(idb), Some(udid)) = (find_idb(), udid.filter(|u| !u.is_empty())) {
-        if Command::new(&idb)
-            .args(["ui", "button", "--udid", udid, "HOME"])
-            .status()
-            .is_ok_and(|s| s.success())
-        {
+fn send_sim_command(udid: Option<&str>, make: impl Fn() -> SimCommand) -> io::Result<()> {
+    let udid = udid
+        .filter(|u| !u.is_empty() && *u != "macos" && *u != "chrome")
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no simulator selected"))?;
+    let mut guard = SIM_SESSION.lock().unwrap_or_else(|e| e.into_inner());
+    for _ in 0..2 {
+        if guard.as_ref().is_none_or(|s| s.udid != udid) {
+            *guard = Some(start_sim_session(udid)?);
+        }
+        if guard.as_ref().is_some_and(|s| s.tx.send(make()).is_ok()) {
             return Ok(());
         }
+        *guard = None; // helper died: restart once
     }
-    let script = format!(
-        r#"{JXA_FIND_SIMULATOR}
-function key(down) {{
-    const e = $.CGEventCreateKeyboardEvent(null, 4, down);
-    $.CGEventSetFlags(e, 0x100000 | 0x20000);
-    $.CGEventPostToPid(pid, e);
-}}
-key(true);
-key(false);
-"#
-    );
-    run_jxa_with_simulator(&script)
+    Err(io::Error::new(io::ErrorKind::BrokenPipe, "shame-sim exited"))
+}
+
+/// The live frame stream for `udid`, starting the helper if needed. When the stream's `ready`
+/// channel closes the helper has exited (e.g. the simulator shut down).
+pub fn simulator_frame_stream(udid: Option<&str>) -> io::Result<SimFrameStream> {
+    send_sim_command(udid, || SimCommand::Noop)?;
+    SIM_SESSION
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .map(|s| s.frames.clone())
+        .ok_or_else(|| io::Error::new(io::ErrorKind::BrokenPipe, "shame-sim exited"))
+}
+
+/// Start the input helper for `udid` ahead of the first touch, so its warm-up isn't felt.
+pub fn simulator_prewarm(udid: Option<&str>) -> io::Result<()> {
+    send_sim_command(udid, || SimCommand::Noop)
+}
+
+/// Send one phase of a touch at a normalized `(x, y)` (`0.0..=1.0`, top-left origin).
+/// `Down` then `Up` is a tap; `Down`, `Move`…, `Up` is a drag.
+pub fn simulator_touch(udid: Option<&str>, phase: TouchPhase, x: f32, y: f32) -> io::Result<()> {
+    let (x, y) = (x.clamp(0.0, 1.0), y.clamp(0.0, 1.0));
+    send_sim_command(udid, || SimCommand::Touch(phase, x, y))
+}
+
+/// Press the iOS Home button on the simulator.
+pub fn simulator_press_home(udid: Option<&str>) -> io::Result<()> {
+    send_sim_command(udid, || SimCommand::Home)
 }
 
 #[cfg(test)]
