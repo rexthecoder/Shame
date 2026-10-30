@@ -33,7 +33,7 @@
 //!   do yet (it saves synchronously, immediately).
 
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::str::FromStr;
 use std::time::Duration;
 
@@ -41,23 +41,24 @@ use core_lsp::{LspClient, ServerMessage, lsp_types};
 use gpui_kit::Context;
 use smol::Timer;
 use lsp_types::{
-    ApplyWorkspaceEditParams, ClientCapabilities, CodeAction, CodeActionContext,
-    CodeActionOrCommand, CodeActionParams, Command, CompletionItem, CompletionItemKind,
+    ApplyWorkspaceEditParams, ClientCapabilities, CodeAction, CodeActionClientCapabilities,
+    CodeActionContext, CodeActionLiteralSupport, CodeActionOrCommand, CodeActionParams, Command,
+    CompletionClientCapabilities, CompletionItem, CompletionItemCapability, CompletionItemKind,
     CompletionParams, CompletionResponse, CompletionTextEdit, Diagnostic, DiagnosticSeverity,
     DidChangeTextDocumentParams, DidOpenTextDocumentParams, DocumentChangeOperation,
     DocumentChanges, DocumentFormattingParams, ExecuteCommandParams, FormattingOptions,
     GotoDefinitionParams, GotoDefinitionResponse, Hover, HoverContents, HoverParams,
     InitializeParams, LanguageString, Location, MarkedString, OneOf, Position,
-    PublishDiagnosticsParams, Range, RenameParams, TextDocumentContentChangeEvent,
-    TextDocumentIdentifier, TextDocumentItem, TextDocumentPositionParams, TextEdit, Uri,
-    VersionedTextDocumentIdentifier, WorkspaceClientCapabilities, WorkspaceEdit,
-    WorkspaceEditClientCapabilities, WorkspaceFolder,
+    PublishDiagnosticsParams, Range, RenameParams, TextDocumentClientCapabilities,
+    TextDocumentContentChangeEvent, TextDocumentIdentifier, TextDocumentItem,
+    TextDocumentPositionParams, TextEdit, Uri, VersionedTextDocumentIdentifier,
+    WorkspaceClientCapabilities, WorkspaceEdit, WorkspaceEditClientCapabilities, WorkspaceFolder,
 };
 
 use crate::{EditorEvent, EditorView};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum CompletionKindBadge {
+pub enum CompletionKindBadge {
     Function,
     Property,
     Type,
@@ -67,51 +68,19 @@ pub(crate) enum CompletionKindBadge {
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct CompletionEntry {
-    pub(crate) label: String,
-    pub(crate) insert_text: String,
-    pub(crate) detail: Option<String>,
-    pub(crate) kind: CompletionKindBadge,
-    pub(crate) additional_edits: Vec<TextEdit>,
-}
-
-/// Walk upward from `file_path` to find the enclosing Dart/Flutter project root
-/// (the nearest ancestor containing `pubspec.yaml` or `.dart_tool/package_config.json`).
-fn find_dart_project_root(file_path: &Path) -> Option<PathBuf> {
-    for ancestor in file_path.ancestors().skip(1) {
-        if ancestor.join("pubspec.yaml").is_file()
-            || ancestor.join(".dart_tool/package_config.json").is_file()
-        {
-            return Some(ancestor.to_path_buf());
-        }
-    }
-    for ancestor in file_path.ancestors().skip(1) {
-        if ancestor.join(".git").exists() {
-            return Some(ancestor.to_path_buf());
-        }
-    }
-    file_path.parent().map(Path::to_path_buf)
-}
-
-/// Prefer a project-pinned FVM Dart binary if present, falling back to `dart` on `PATH`.
-fn resolve_dart_binary(project_root: Option<&Path>) -> String {
-    if let Some(root) = project_root {
-        let fvm_cache_dart = root.join(".fvm/flutter_sdk/bin/cache/dart-sdk/bin/dart");
-        if fvm_cache_dart.is_file() {
-            return fvm_cache_dart.to_string_lossy().into_owned();
-        }
-        let fvm_dart = root.join(".fvm/flutter_sdk/bin/dart");
-        if fvm_dart.is_file() {
-            return fvm_dart.to_string_lossy().into_owned();
-        }
-    }
-    "dart".to_string()
+pub struct CompletionEntry {
+    pub label: String,
+    pub insert_text: String,
+    pub detail: Option<String>,
+    pub kind: CompletionKindBadge,
+    pub additional_edits: Vec<TextEdit>,
 }
 
 pub(crate) struct LspState {
     client: LspClient,
     uri: Uri,
     version: i32,
+    last_synced_revision: u64,
     initialize_id: i64,
     ready: bool,
     diagnostics: Vec<Diagnostic>,
@@ -124,9 +93,8 @@ pub(crate) struct LspState {
 }
 
 impl EditorView {
-    /// Start `dart language-server` for this buffer if it's a `.dart`
-    /// file and one isn't already running for it. Safe to call on every
-    /// edit/open; it's a no-op once `self.lsp` is set.
+    /// Start the configured LSP server for this buffer's `LanguageAdapter`
+    /// if the adapter provides one and a server isn't already running.
     pub(crate) fn maybe_start_lsp(&mut self, cx: &mut Context<Self>) {
         if self.lsp.is_some() {
             return;
@@ -134,15 +102,15 @@ impl EditorView {
         let Some(path) = self.buffer.path() else {
             return;
         };
-        if path.extension().and_then(|e| e.to_str()) != Some("dart") {
+        let project_root = self.language.find_project_root(&path);
+        let Some((program, args)) = self.language.lsp_command(project_root.as_deref()) else {
             return;
-        }
+        };
         let Ok(uri) = Uri::from_str(&format!("file://{}", path.display())) else {
             return;
         };
-        let project_root = find_dart_project_root(&path);
-        let dart_bin = resolve_dart_binary(project_root.as_deref());
-        let Ok(client) = LspClient::spawn(&dart_bin, &["language-server"]) else {
+        let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+        let Ok(client) = LspClient::spawn(&program, &arg_refs) else {
             return;
         };
 
@@ -176,6 +144,20 @@ impl EditorView {
                     }),
                     ..Default::default()
                 }),
+                text_document: Some(TextDocumentClientCapabilities {
+                    completion: Some(CompletionClientCapabilities {
+                        completion_item: Some(CompletionItemCapability {
+                            snippet_support: Some(true),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    }),
+                    code_action: Some(CodeActionClientCapabilities {
+                        code_action_literal_support: Some(CodeActionLiteralSupport::default()),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
                 ..Default::default()
             },
             ..Default::default()
@@ -203,6 +185,7 @@ impl EditorView {
             client,
             uri,
             version: 1,
+            last_synced_revision: self.buffer.revision(),
             initialize_id,
             ready: false,
             diagnostics: Vec::new(),
@@ -373,34 +356,78 @@ impl EditorView {
     /// Send `textDocument/codeAction` for the cursor's current line,
     /// including whatever diagnostics on that line the server already
     /// told us about (so quick-fixes for a visible error/warning show
-    /// up). No-op if there's no ready LSP server for this buffer.
-    pub fn request_code_actions(&mut self) {
-        let Some(lsp) = &mut self.lsp else {
-            return;
-        };
-        if !lsp.ready {
-            return;
-        }
+    /// up), and fallback/merge with built-in Flutter Widget Assists (`Wrap with Column`,
+    /// `Wrap with Padding`, etc.) so `⌘.` and the gutter lightbulb always respond immediately.
+    pub fn request_code_actions(&mut self, cx: &mut Context<Self>) {
         let head = self.buffer.selections().primary().head;
         let line = self.buffer.byte_to_line(head) as u32;
         let column = (head - self.buffer.line_to_byte(line as usize)) as u32;
         let position = Position { line, character: column };
 
-        let diagnostics: Vec<Diagnostic> =
-            lsp.diagnostics.iter().filter(|d| d.range.start.line == line).cloned().collect();
+        if let Some(lsp) = &mut self.lsp {
+            if lsp.ready {
+                let diagnostics: Vec<Diagnostic> = lsp
+                    .diagnostics
+                    .iter()
+                    .filter(|d| d.range.start.line == line)
+                    .cloned()
+                    .collect();
 
-        let params = CodeActionParams {
-            text_document: TextDocumentIdentifier { uri: lsp.uri.clone() },
-            range: Range { start: position, end: position },
-            context: CodeActionContext { diagnostics, only: None, trigger_kind: None },
-            work_done_progress_params: Default::default(),
-            partial_result_params: Default::default(),
-        };
-        if let Ok(id) =
-            lsp.client.request("textDocument/codeAction", serde_json::to_value(params).unwrap_or_default())
-        {
-            lsp.pending_code_action_id = Some(id);
+                let params = CodeActionParams {
+                    text_document: TextDocumentIdentifier {
+                        uri: lsp.uri.clone(),
+                    },
+                    range: Range {
+                        start: position,
+                        end: position,
+                    },
+                    context: CodeActionContext {
+                        diagnostics,
+                        only: None,
+                        trigger_kind: None,
+                    },
+                    work_done_progress_params: Default::default(),
+                    partial_result_params: Default::default(),
+                };
+                if let Ok(id) = lsp.client.request(
+                    "textDocument/codeAction",
+                    serde_json::to_value(params).unwrap_or_default(),
+                ) {
+                    lsp.pending_code_action_id = Some(id);
+                    return;
+                }
+            }
         }
+
+        // If LSP isn't ready yet, show the language adapter's built-in code actions immediately
+        let builtin = self.builtin_language_code_actions(line);
+        if !builtin.is_empty() {
+            cx.emit(EditorEvent::ShowCodeActions { actions: builtin });
+        }
+    }
+
+    /// Delegate to the buffer's `LanguageAdapter::builtin_code_actions` for
+    /// language-specific AST/text code assists on `line`.
+    pub(crate) fn builtin_language_code_actions(&self, line: u32) -> Vec<CodeActionOrCommand> {
+        let Some(own_uri) = self
+            .lsp
+            .as_ref()
+            .map(|lsp| lsp.uri.clone())
+            .or_else(|| {
+                let path = self.buffer.path()?;
+                Uri::from_str(&format!("file://{}", path.display())).ok()
+            })
+        else {
+            return Vec::new();
+        };
+        let text = self.buffer.text();
+        self.language.builtin_code_actions(
+            &text,
+            &self.buffer,
+            line,
+            self.indent_width,
+            &own_uri,
+        )
     }
 
     /// Send `textDocument/completion` for the current cursor position.
@@ -535,16 +562,19 @@ impl EditorView {
     }
 
     /// Tell the server about the buffer's current text, if a server is
-    /// running and past its `initialize` handshake. Called whenever the
-    /// buffer's text actually changed (same check `render` already does
-    /// for incremental syntax reparsing).
+    /// running and past its `initialize` handshake. Deduplicated by
+    /// `buffer.revision()` so calling `sync_lsp_text` in `trigger_completions`
+    /// never triggers a second `didChange` on the next `render()` frame that
+    /// would cause `dart language-server` to cancel the in-flight completion!
     pub(crate) fn sync_lsp_text(&mut self, text: &str) {
+        let rev = self.buffer.revision();
         let Some(lsp) = &mut self.lsp else {
             return;
         };
-        if !lsp.ready {
+        if !lsp.ready || lsp.last_synced_revision == rev {
             return;
         }
+        lsp.last_synced_revision = rev;
         lsp.version += 1;
         let params = DidChangeTextDocumentParams {
             text_document: VersionedTextDocumentIdentifier {
@@ -574,7 +604,7 @@ impl EditorView {
                     let params = DidOpenTextDocumentParams {
                         text_document: TextDocumentItem {
                             uri: lsp.uri.clone(),
-                            language_id: "dart".to_string(),
+                            language_id: self.language.language_id().to_string(),
                             version: lsp.version,
                             text: self.buffer.text(),
                         },
@@ -638,16 +668,32 @@ impl EditorView {
             }
             ServerMessage::Response { id, result } if lsp.pending_code_action_id == Some(id) => {
                 lsp.pending_code_action_id = None;
-                let Ok(Some(actions)) = result
-                    .map(|v| serde_json::from_value::<Option<Vec<CodeActionOrCommand>>>(v).unwrap_or(None))
-                else {
-                    return;
-                };
-                let mut actions = actions;
-                match actions.len() {
-                    0 => {}
-                    1 => self.apply_code_action(actions.remove(0), cx),
-                    _ => cx.emit(EditorEvent::ShowCodeActions { actions }),
+                let head = self.buffer.selections().primary().head;
+                let line = self.buffer.byte_to_line(head) as u32;
+                let mut actions: Vec<CodeActionOrCommand> = result
+                    .ok()
+                    .and_then(|v| serde_json::from_value::<Option<Vec<CodeActionOrCommand>>>(v).ok())
+                    .flatten()
+                    .unwrap_or_default();
+                let builtin = self.builtin_flutter_widget_assists(line);
+                for b in builtin {
+                    let b_title = match &b {
+                        CodeActionOrCommand::Command(c) => &c.title,
+                        CodeActionOrCommand::CodeAction(a) => &a.title,
+                    };
+                    let already = actions.iter().any(|existing| {
+                        let t = match existing {
+                            CodeActionOrCommand::Command(c) => &c.title,
+                            CodeActionOrCommand::CodeAction(a) => &a.title,
+                        };
+                        t.eq_ignore_ascii_case(b_title)
+                    });
+                    if !already {
+                        actions.push(b);
+                    }
+                }
+                if !actions.is_empty() {
+                    cx.emit(EditorEvent::ShowCodeActions { actions });
                 }
             }
             ServerMessage::Response { id, result } if lsp.pending_completion_id == Some(id) => {
@@ -655,26 +701,26 @@ impl EditorView {
                 let Ok(value) = result else {
                     return;
                 };
-                let Ok(Some(resp)) = serde_json::from_value::<Option<CompletionResponse>>(value) else {
-                    return;
-                };
-                let items = match resp {
-                    CompletionResponse::Array(items) => items,
-                    CompletionResponse::List(list) => list.items,
-                };
-                self.merge_lsp_completions(items, cx);
+                let entries = parse_completion_entries_from_value(value);
+                if !entries.is_empty() {
+                    self.merge_lsp_completion_entries(entries, cx);
+                }
             }
             // A request *from* the server, not a reply to one of ours.
-            // So far just workspace/applyEdit, sent after we ask it to
-            // run a Dart quick-fix command — apply the edit to our own
-            // file (see apply_workspace_edit's own gap note) and tell
-            // the server we did, which it expects a reply to.
             ServerMessage::Request { id, method, params } if method == "workspace/applyEdit" => {
                 if let Ok(apply_params) = serde_json::from_value::<ApplyWorkspaceEditParams>(params) {
                     self.apply_workspace_edit(apply_params.edit, cx);
                 }
                 if let Some(lsp) = &self.lsp {
                     let _ = lsp.client.respond(id, serde_json::json!({"applied": true}));
+                }
+            }
+            ServerMessage::Request { id, .. } => {
+                // Always reply to server-initiated requests (`client/registerCapability`,
+                // `window/workDoneProgress/create`, `workspace/configuration`) so
+                // `dart language-server` never stalls awaiting a response.
+                if let Some(lsp) = &self.lsp {
+                    let _ = lsp.client.respond(id, serde_json::Value::Null);
                 }
             }
             _ => {}
@@ -829,6 +875,13 @@ pub(crate) fn completion_item_to_entry(item: CompletionItem) -> Option<Completio
     };
     let detail = item
         .detail
+        .or_else(|| {
+            item.label_details.and_then(|ld| {
+                ld.description
+                    .filter(|s| !s.trim().is_empty())
+                    .or_else(|| ld.detail.filter(|s| !s.trim().is_empty()))
+            })
+        })
         .map(|d| d.lines().next().unwrap_or(&d).trim().to_string())
         .filter(|d| !d.is_empty());
     let additional_edits = item.additional_text_edits.unwrap_or_default();
@@ -839,6 +892,202 @@ pub(crate) fn completion_item_to_entry(item: CompletionItem) -> Option<Completio
         kind,
         additional_edits,
     })
+}
+
+/// Fault-tolerantly parse completion entries from an LSP `textDocument/completion`
+/// JSON response, supporting both strict `CompletionResponse` and per-item fallback
+/// when `dart language-server` sends extended `itemDefaults` or `labelDetails` fields.
+pub(crate) fn parse_completion_entries_from_value(value: serde_json::Value) -> Vec<CompletionEntry> {
+    if let Ok(Some(resp)) = serde_json::from_value::<Option<CompletionResponse>>(value.clone()) {
+        let items = match resp {
+            CompletionResponse::Array(items) => items,
+            CompletionResponse::List(list) => list.items,
+        };
+        let entries: Vec<CompletionEntry> =
+            items.into_iter().filter_map(completion_item_to_entry).collect();
+        if !entries.is_empty() {
+            return entries;
+        }
+    }
+
+    let raw_items = value
+        .as_array()
+        .or_else(|| value.get("items").and_then(|v| v.as_array()));
+    let Some(arr) = raw_items else {
+        return Vec::new();
+    };
+    let mut entries = Vec::with_capacity(arr.len().min(60));
+    for raw in arr.iter().take(80) {
+        if let Ok(item) = serde_json::from_value::<CompletionItem>(raw.clone()) {
+            if let Some(entry) = completion_item_to_entry(item) {
+                entries.push(entry);
+                continue;
+            }
+        }
+        let Some(label) = raw.get("label").and_then(|v| v.as_str()).map(str::trim) else {
+            continue;
+        };
+        if label.is_empty() {
+            continue;
+        }
+        let insert_raw = raw
+            .get("textEdit")
+            .and_then(|te| te.get("newText"))
+            .and_then(|v| v.as_str())
+            .or_else(|| raw.get("insertText").and_then(|v| v.as_str()))
+            .unwrap_or(label);
+        let insert_text = strip_lsp_snippet(insert_raw);
+        if insert_text.is_empty() {
+            continue;
+        }
+        let detail = raw
+            .get("detail")
+            .and_then(|v| v.as_str())
+            .or_else(|| {
+                raw.get("labelDetails")
+                    .and_then(|ld| ld.get("description").or_else(|| ld.get("detail")))
+                    .and_then(|v| v.as_str())
+            })
+            .map(|s| s.lines().next().unwrap_or(s).trim().to_string())
+            .filter(|s| !s.is_empty());
+        let kind_num = raw.get("kind").and_then(|v| v.as_u64()).unwrap_or(6);
+        let kind = match kind_num {
+            2 | 3 | 4 => CompletionKindBadge::Function,
+            5 | 10 => CompletionKindBadge::Property,
+            7 | 8 | 13 | 22 | 25 => CompletionKindBadge::Type,
+            14 => CompletionKindBadge::Keyword,
+            20 | 21 => CompletionKindBadge::Constant,
+            _ => CompletionKindBadge::Variable,
+        };
+        entries.push(CompletionEntry {
+            label: label.to_string(),
+            insert_text,
+            detail,
+            kind,
+            additional_edits: Vec::new(),
+        });
+    }
+    entries
+}
+
+/// Locate the widget call expression starting on `line_idx` (e.g. `return Padding(...);`,
+/// `child: Column(...),`, or `Divider(...)`) so built-in Flutter widget assists can wrap
+/// the entire balanced `(...)` expression cleanly.
+fn find_widget_call_range(
+    text: &str,
+    buffer: &core_buffer::Buffer,
+    line_idx: usize,
+    line_start_byte: usize,
+    display_line: &str,
+) -> (Range, String, String) {
+    let indent_len = display_line.len() - display_line.trim_start().len();
+    let indent_str = display_line[..indent_len].to_string();
+    let trimmed = &display_line[indent_len..];
+
+    // Look for an uppercase widget constructor call on this line (e.g. `child: Text(`, `return Column(`, `=> Divider(`)
+    let mut widget_rel_start: Option<usize> = None;
+    let mut open_paren_rel: Option<usize> = None;
+    let bytes = trimmed.as_bytes();
+    let mut idx = 0;
+    while idx < bytes.len() {
+        if bytes[idx].is_ascii_uppercase()
+            && (idx == 0 || !(bytes[idx - 1].is_ascii_alphanumeric() || bytes[idx - 1] == b'_'))
+        {
+            let start = idx;
+            while idx < bytes.len()
+                && (bytes[idx].is_ascii_alphanumeric()
+                    || bytes[idx] == b'_'
+                    || bytes[idx] == b'.'
+                    || bytes[idx] == b'<'
+                    || bytes[idx] == b'>')
+            {
+                idx += 1;
+            }
+            if idx < bytes.len() && bytes[idx] == b'(' {
+                // Skip optional `const ` immediately preceding the widget constructor
+                let before = &trimmed[..start];
+                let adj_start = if let Some(stripped) = before.strip_suffix("const ") {
+                    stripped.len()
+                } else {
+                    start
+                };
+                widget_rel_start = Some(indent_len + adj_start);
+                open_paren_rel = Some(indent_len + idx);
+                break;
+            }
+        } else {
+            idx += 1;
+        }
+    }
+
+    if let (Some(w_rel), Some(p_rel)) = (widget_rel_start, open_paren_rel) {
+        let abs_start = line_start_byte + w_rel;
+        let abs_paren = line_start_byte + p_rel;
+        let all_bytes = text.as_bytes();
+        let mut depth = 0i32;
+        let mut in_single = false;
+        let mut in_double = false;
+        let mut k = abs_paren;
+        while k < all_bytes.len() {
+            let b = all_bytes[k];
+            if b == b'\\' {
+                k += 2;
+                continue;
+            }
+            if !in_double && b == b'\'' {
+                in_single = !in_single;
+            } else if !in_single && b == b'"' {
+                in_double = !in_double;
+            } else if !in_single && !in_double {
+                if b == b'(' {
+                    depth += 1;
+                } else if b == b')' {
+                    depth -= 1;
+                    if depth == 0 {
+                        let abs_end = k + 1;
+                        let end_line = buffer.byte_to_line(abs_end) as u32;
+                        let end_col =
+                            (abs_end - buffer.line_to_byte(end_line as usize)) as u32;
+                        let expr = text[abs_start..abs_end].to_string();
+                        return (
+                            Range {
+                                start: Position {
+                                    line: line_idx as u32,
+                                    character: w_rel as u32,
+                                },
+                                end: Position {
+                                    line: end_line,
+                                    character: end_col,
+                                },
+                            },
+                            expr,
+                            indent_str,
+                        );
+                    }
+                }
+            }
+            k += 1;
+        }
+    }
+
+    // Fallback: single-line expression without trailing comma/semicolon
+    let stripped_end = trimmed.trim_end_matches([',', ';']).trim_end();
+    let start_col = indent_len as u32;
+    let end_col = (indent_len + stripped_end.len()) as u32;
+    (
+        Range {
+            start: Position {
+                line: line_idx as u32,
+                character: start_col,
+            },
+            end: Position {
+                line: line_idx as u32,
+                character: end_col,
+            },
+        },
+        stripped_end.to_string(),
+        indent_str,
+    )
 }
 
 /// Strip LSP snippet placeholders (`$0`, `$1`, `${1:default}`) so inserting a

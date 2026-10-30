@@ -30,7 +30,8 @@ mod sdk;
 pub use daemon::{DaemonOutput, FlutterDaemon};
 pub use devices::{
     Device, IosSimulator, attach_simulator_window, boot_ios_simulator,
-    capture_simulator_screenshot, list_devices, list_ios_simulators,
+    capture_simulator_screenshot, list_devices, list_ios_simulators, simulator_press_home,
+    tap_simulator_window,
 };
 pub use pubspec::{PubOutput, add_package, pub_get};
 pub use sdk::{FlutterSdk, detect_sdk};

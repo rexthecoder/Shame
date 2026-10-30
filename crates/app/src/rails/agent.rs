@@ -281,165 +281,471 @@ impl DartIde {
                     ),
             )
             .child(
-                // Centered iPhone Simulator Hardware Bezel
+                // Centered iPhone 16 Pro Hardware Frame (exact 19.5:9 aspect ratio,
+                // Natural Titanium outer ring, physical Action/Volume/Side buttons,
+                // uniform 7px edge-to-edge bezel, and Dynamic Island + Home Indicator
+                // overlaid INSIDE the full-bleed display).
                 v_flex()
                     .flex_1()
                     .w_full()
                     .min_h(px(0.))
-                    .p(px(tokens::SPACE_4))
+                    .p(px(tokens::SPACE_3))
                     .items_center()
                     .justify_center()
                     .child(
-                        v_flex()
-                            .w(px(284.))
-                            .h_full()
-                            .max_h(px(610.))
-                            .p(px(8.))
-                            .gap(px(6.))
-                            .items_center()
-                            .rounded(px(34.))
-                            .bg(rgb(0x08090c))
-                            .border_2()
-                            .border_color(rgba(0xffffff22))
-                            .shadow_xl()
+                        div()
+                            .relative()
+                            .w(px(278.))
+                            .h(px(592.))
+                            .flex_shrink_0()
+                            // Left hardware buttons: Action Button + Volume Up + Volume Down
                             .child(
-                                // Dynamic Island capsule
                                 div()
-                                    .w(px(74.))
-                                    .h(px(14.))
-                                    .flex_shrink_0()
-                                    .rounded(px(7.))
-                                    .bg(rgb(0x000000))
-                                    .border_1()
-                                    .border_color(rgba(0xffffff12)),
+                                    .absolute()
+                                    .left(px(-2.5))
+                                    .top(px(94.))
+                                    .w(px(3.))
+                                    .h(px(20.))
+                                    .rounded_l(px(2.))
+                                    .bg(rgb(0x4a4b52)),
                             )
-                            .child(if let Some(frame_path) = self.simulator_frame_path.clone() {
+                            .child(
                                 div()
-                                    .flex_1()
-                                    .w_full()
-                                    .min_h(px(0.))
-                                    .rounded(px(24.))
-                                    .overflow_hidden()
-                                    .bg(rgb(0x000000))
+                                    .absolute()
+                                    .left(px(-2.5))
+                                    .top(px(130.))
+                                    .w(px(3.))
+                                    .h(px(38.))
+                                    .rounded_l(px(2.))
+                                    .bg(rgb(0x4a4b52)),
+                            )
+                            .child(
+                                div()
+                                    .absolute()
+                                    .left(px(-2.5))
+                                    .top(px(178.))
+                                    .w(px(3.))
+                                    .h(px(38.))
+                                    .rounded_l(px(2.))
+                                    .bg(rgb(0x4a4b52)),
+                            )
+                            // Right hardware button: Side / Power Button
+                            .child(
+                                div()
+                                    .absolute()
+                                    .right(px(-2.5))
+                                    .top(px(146.))
+                                    .w(px(3.))
+                                    .h(px(56.))
+                                    .rounded_r(px(2.))
+                                    .bg(rgb(0x4a4b52)),
+                            )
+                            // Outer Natural Titanium band
+                            .child(
+                                div()
+                                    .size_full()
+                                    .p(px(2.5))
+                                    .rounded(px(48.))
+                                    .bg(rgb(0x38393f))
+                                    .border_1()
+                                    .border_color(rgba(0xffffff33))
+                                    .shadow_xl()
+                                    // Inner 7px uniform black glass bezel
                                     .child(
-                                        img(frame_path)
+                                        div()
                                             .size_full()
-                                            .object_fit(ObjectFit::Contain),
-                                    )
-                                    .into_any_element()
-                            } else {
-                                v_flex()
-                                    .flex_1()
-                                    .w_full()
-                                    .min_h(px(0.))
-                                    .px_4()
-                                    .py_5()
-                                    .gap_3()
-                                    .items_center()
-                                    .justify_center()
-                                    .rounded(px(24.))
-                                    .bg(cx.theme().background)
-                                    .child(
-                                        Icon::new(IconName::Smartphone)
-                                            .with_size(px(28.))
-                                            .text_color(primary),
-                                    )
-                                    .child(
-                                        div()
-                                            .text_size(px(tokens::UI))
-                                            .font_medium()
-                                            .text_color(fg)
-                                            .child("Simulator Attached"),
-                                    )
-                                    .child(
-                                        div()
-                                            .text_center()
-                                            .text_size(px(tokens::UI_XS))
-                                            .text_color(muted)
+                                            .p(px(7.))
+                                            .rounded(px(45.5))
+                                            .bg(rgb(0x050507))
+                                            .border_1()
+                                            .border_color(rgba(0x000000dd))
+                                            // Full-bleed edge-to-edge iOS OLED Display
                                             .child(
-                                                "Select an iOS Simulator below to boot, dock alongside the editor, and stream live frames.",
-                                            ),
-                                    )
-                                    .child(
-                                        v_flex()
-                                            .w_full()
-                                            .gap_1()
-                                            .mt_2()
-                                            .children(
-                                                self.ios_simulators.iter().take(5).enumerate().map(
-                                                    |(ix, sim)| {
-                                                        let sim_clone = sim.clone();
-                                                        let booted = sim.is_booted();
+                                                div()
+                                                    .relative()
+                                                    .size_full()
+                                                    .rounded(px(38.5))
+                                                    .overflow_hidden()
+                                                    .bg(rgb(0x000000))
+                                                    // 0. Double-buffered previous frame underneath so async PNG decode NEVER flashes black!
+                                                    .when_some(
+                                                        self.simulator_prev_frame_path.clone(),
+                                                        |el, prev_path| {
+                                                            el.child(
+                                                                img(prev_path)
+                                                                    .absolute()
+                                                                    .top_0()
+                                                                    .left_0()
+                                                                    .size_full()
+                                                                    .object_fit(ObjectFit::Cover),
+                                                            )
+                                                        },
+                                                    )
+                                                    // 1. Edge-to-edge current screen content + interactive tap forwarding
+                                                    .child(
+                                                        if let Some(frame_path) =
+                                                            self.simulator_frame_path.clone()
+                                                        {
+                                                            let tap_view = cx.entity();
+                                                            div()
+                                                                .relative()
+                                                                .size_full()
+                                                                .cursor_pointer()
+                                                                .child(
+                                                                    img(frame_path)
+                                                                        .size_full()
+                                                                        .object_fit(ObjectFit::Cover),
+                                                                )
+                                                                .child(
+                                                                    canvas(
+                                                                        move |bounds, _window, _cx| bounds,
+                                                                        move |bounds, _, window, _cx| {
+                                                                            let view = tap_view.clone();
+                                                                            window.on_mouse_event(
+                                                                                move |event: &MouseDownEvent,
+                                                                                      phase,
+                                                                                      _window,
+                                                                                      cx| {
+                                                                                    if phase != DispatchPhase::Bubble
+                                                                                        || event.button != MouseButton::Left
+                                                                                        || !bounds.contains(&event.position)
+                                                                                    {
+                                                                                        return;
+                                                                                    }
+                                                                                    let w: f32 = bounds.size.width.into();
+                                                                                    let h: f32 = bounds.size.height.into();
+                                                                                    if w > 1.0 && h > 1.0 {
+                                                                                        let rx: f32 = (event.position.x - bounds.origin.x).into();
+                                                                                        let ry: f32 = (event.position.y - bounds.origin.y).into();
+                                                                                        let nx = (rx / w).clamp(0.0, 1.0);
+                                                                                        let ny = (ry / h).clamp(0.0, 1.0);
+                                                                                        view.update(cx, |this, cx| {
+                                                                                            this.tap_simulator(nx, ny, cx);
+                                                                                        });
+                                                                                    }
+                                                                                },
+                                                                            );
+                                                                        },
+                                                                    )
+                                                                    .absolute()
+                                                                    .top_0()
+                                                                    .left_0()
+                                                                    .size_full(),
+                                                                )
+                                                                .into_any_element()
+                                                        } else {
+                                                            v_flex()
+                                                                .size_full()
+                                                                .pt(px(48.))
+                                                                .pb(px(28.))
+                                                                .px_4()
+                                                                .gap_2p5()
+                                                                .items_center()
+                                                                .justify_center()
+                                                                .bg(rgb(0x0c0d12))
+                                                                .child(
+                                                                    div()
+                                                                        .w(px(48.))
+                                                                        .h(px(48.))
+                                                                        .rounded(px(14.))
+                                                                        .bg(rgba(0xea7a3c18))
+                                                                        .border_1()
+                                                                        .border_color(rgba(
+                                                                            0xea7a3c44,
+                                                                        ))
+                                                                        .flex()
+                                                                        .items_center()
+                                                                        .justify_center()
+                                                                        .child(
+                                                                            Icon::new(
+                                                                                IconName::Smartphone,
+                                                                            )
+                                                                            .with_size(px(22.))
+                                                                            .text_color(primary),
+                                                                        ),
+                                                                )
+                                                                .child(
+                                                                    div()
+                                                                        .text_size(px(tokens::UI))
+                                                                        .font_medium()
+                                                                        .text_color(fg)
+                                                                        .child("iOS Simulator"),
+                                                                )
+                                                                .child(
+                                                                    div()
+                                                                        .text_center()
+                                                                        .text_size(px(
+                                                                            tokens::UI_XS,
+                                                                        ))
+                                                                        .text_color(muted)
+                                                                        .child(
+                                                                            "Tap an iPhone below to boot & stream inside the bezel.",
+                                                                        ),
+                                                                )
+                                                                .child(
+                                                                    v_flex()
+                                                                        .w_full()
+                                                                        .gap_1p5()
+                                                                        .mt_2()
+                                                                        .children(
+                                                                            self.ios_simulators
+                                                                                .iter()
+                                                                                .take(5)
+                                                                                .enumerate()
+                                                                                .map(|(ix, sim)| {
+                                                                                    let sim_clone =
+                                                                                        sim.clone();
+                                                                                    let booted = sim
+                                                                                        .is_booted();
+                                                                                    h_flex()
+                                                                                        .id((
+                                                                                            "bezel-sim-boot",
+                                                                                            ix,
+                                                                                        ))
+                                                                                        .w_full()
+                                                                                        .h(px(30.))
+                                                                                        .px_3()
+                                                                                        .items_center()
+                                                                                        .justify_between()
+                                                                                        .rounded(px(10.))
+                                                                                        .bg(rgba(0xffffff08))
+                                                                                        .border_1()
+                                                                                        .border_color(rgba(0xffffff12))
+                                                                                        .cursor_pointer()
+                                                                                        .hover(move |s| {
+                                                                                            s.bg(rgba(0xea7a3c22))
+                                                                                                .border_color(rgba(0xea7a3c55))
+                                                                                        })
+                                                                                        .on_click(cx.listener(
+                                                                                            move |this, _event, window, cx| {
+                                                                                                let _ = core_flutter::boot_ios_simulator(
+                                                                                                    &sim_clone.udid,
+                                                                                                );
+                                                                                                this.selected_device =
+                                                                                                    Some(core_flutter::Device {
+                                                                                                        id: sim_clone.udid.clone(),
+                                                                                                        name: sim_clone.name.clone(),
+                                                                                                        target_platform: "ios"
+                                                                                                            .to_string(),
+                                                                                                        emulator: true,
+                                                                                                        is_supported: true,
+                                                                                                    });
+                                                                                                this.attach_simulator(window, cx);
+                                                                                                this.refresh_devices(cx);
+                                                                                            },
+                                                                                        ))
+                                                                                        .child(
+                                                                                            div()
+                                                                                                .truncate()
+                                                                                                .text_size(px(tokens::UI_SM))
+                                                                                                .text_color(fg)
+                                                                                                .child(sim.name.clone()),
+                                                                                        )
+                                                                                        .child(
+                                                                                            div()
+                                                                                                .font_family("SF Mono")
+                                                                                                .text_size(px(9.5))
+                                                                                                .text_color(if booted {
+                                                                                                    green
+                                                                                                } else {
+                                                                                                    info
+                                                                                                })
+                                                                                                .child(if booted {
+                                                                                                    "Booted"
+                                                                                                } else {
+                                                                                                    "Boot"
+                                                                                                }),
+                                                                                        )
+                                                                                }),
+                                                                        ),
+                                                                )
+                                                                .into_any_element()
+                                                        },
+                                                    )
+                                                    // 2. Overlaid iOS Status Bar + Dynamic Island hardware cutout at top of display
+                                                    .child(
                                                         h_flex()
-                                                            .id(("bezel-sim-boot", ix))
-                                                            .w_full()
-                                                            .h(px(28.))
-                                                            .px_3()
+                                                            .absolute()
+                                                            .top(px(8.))
+                                                            .left_0()
+                                                            .right_0()
+                                                            .h(px(22.))
+                                                            .px(px(20.))
                                                             .items_center()
                                                             .justify_between()
-                                                            .rounded(px(tokens::RADIUS_SM))
-                                                            .bg(cx.theme().sidebar)
-                                                            .border_1()
-                                                            .border_color(cx.theme().border)
-                                                            .cursor_pointer()
-                                                            .hover(move |s| {
-                                                                s.bg(rgba(0xea7a3c1a))
-                                                                    .border_color(rgba(0xea7a3c44))
-                                                            })
-                                                            .on_click(cx.listener(
-                                                                move |this, _event, window, cx| {
-                                                                    let _ = core_flutter::boot_ios_simulator(
-                                                                        &sim_clone.udid,
-                                                                    );
-                                                                    this.selected_device =
-                                                                        Some(core_flutter::Device {
-                                                                            id: sim_clone.udid.clone(),
-                                                                            name: sim_clone.name.clone(),
-                                                                            target_platform: "ios"
-                                                                                .to_string(),
-                                                                            emulator: true,
-                                                                            is_supported: true,
-                                                                        });
-                                                                    this.attach_simulator(window, cx);
-                                                                    this.refresh_devices(cx);
-                                                                },
-                                                            ))
+                                                            // Left ear: iOS time ("9:41" when standby, empty spacer when screenshot provides it)
                                                             .child(
                                                                 div()
-                                                                    .truncate()
-                                                                    .text_size(px(tokens::UI_SM))
-                                                                    .text_color(fg)
-                                                                    .child(sim.name.clone()),
+                                                                    .w(px(44.))
+                                                                    .text_size(px(11.))
+                                                                    .font_semibold()
+                                                                    .text_color(rgb(0xffffff))
+                                                                    .when(
+                                                                        self.simulator_frame_path
+                                                                            .is_none(),
+                                                                        |el| el.child("9:41"),
+                                                                    ),
                                                             )
+                                                            // Center: Dynamic Island pill with TrueDepth camera lens
                                                             .child(
-                                                                div()
-                                                                    .font_family("SF Mono")
-                                                                    .text_size(px(9.5))
-                                                                    .text_color(if booted {
-                                                                        green
-                                                                    } else {
-                                                                        info
-                                                                    })
-                                                                    .child(if booted {
-                                                                        "Booted"
-                                                                    } else {
-                                                                        "Boot"
-                                                                    }),
+                                                                h_flex()
+                                                                    .w(px(80.))
+                                                                    .h(px(21.))
+                                                                    .px(px(7.))
+                                                                    .rounded(px(11.))
+                                                                    .bg(rgb(0x000000))
+                                                                    .border_1()
+                                                                    .border_color(rgba(0xffffff14))
+                                                                    .items_center()
+                                                                    .justify_end()
+                                                                    .child(
+                                                                        div()
+                                                                            .w(px(8.))
+                                                                            .h(px(8.))
+                                                                            .rounded(px(4.))
+                                                                            .bg(rgb(0x0b1021))
+                                                                            .border_1()
+                                                                            .border_color(rgba(
+                                                                                0x4a6fa544,
+                                                                            )),
+                                                                    ),
                                                             )
-                                                    },
-                                                ),
+                                                            // Right ear: iOS cellular/wifi/battery capsule in standby
+                                                            .child(
+                                                                h_flex()
+                                                                    .w(px(44.))
+                                                                    .items_center()
+                                                                    .justify_end()
+                                                                    .gap(px(4.))
+                                                                    .when(
+                                                                        self.simulator_frame_path
+                                                                            .is_none(),
+                                                                        |el| {
+                                                                            el.child(
+                                                                                div()
+                                                                                    .text_size(px(
+                                                                                        9.5,
+                                                                                    ))
+                                                                                    .font_semibold()
+                                                                                    .text_color(rgb(
+                                                                                        0xffffff,
+                                                                                    ))
+                                                                                    .child("5G"),
+                                                                            )
+                                                                            .child(
+                                                                                div()
+                                                                                    .w(px(16.))
+                                                                                    .h(px(8.5))
+                                                                                    .rounded(px(2.5))
+                                                                                    .border_1()
+                                                                                    .border_color(rgba(
+                                                                                        0xffffffaa,
+                                                                                    ))
+                                                                                    .p(px(1.))
+                                                                                    .child(
+                                                                                        div()
+                                                                                            .size_full()
+                                                                                            .rounded(px(1.))
+                                                                                            .bg(rgb(
+                                                                                                0xffffff,
+                                                                                            )),
+                                                                                    ),
+                                                                            )
+                                                                        },
+                                                                    ),
+                                                            ),
+                                                    )
+                                                    // 3. Overlaid iOS Home Indicator bar floating at the bottom of the screen
+                                                    .when(
+                                                        self.simulator_frame_path.is_none(),
+                                                        |el| {
+                                                            el.child(
+                                                                h_flex()
+                                                                    .absolute()
+                                                                    .bottom(px(6.))
+                                                                    .left_0()
+                                                                    .right_0()
+                                                                    .justify_center()
+                                                                    .child(
+                                                                        div()
+                                                                            .w(px(96.))
+                                                                            .h(px(4.))
+                                                                            .rounded(px(2.))
+                                                                            .bg(rgba(0xffffffcc)),
+                                                                    ),
+                                                            )
+                                                        },
+                                                    ),
                                             ),
-                                    )
-                                    .into_any_element()
-                            })
+                                    ),
+                            ),
+                    )
+                    // Bottom iOS Hardware Control Pill (Home, Hot Reload, Hot Restart, Dock Native Window)
+                    .child(
+                        h_flex()
+                            .mt_2()
+                            .h(px(26.))
+                            .px(px(tokens::SPACE_2))
+                            .gap_1()
+                            .items_center()
+                            .rounded(px(tokens::RADIUS_PILL))
+                            .bg(cx.theme().tab_bar)
+                            .border_1()
+                            .border_color(cx.theme().border)
                             .child(
-                                // iOS Home Indicator bar
-                                div()
-                                    .w(px(92.))
-                                    .h(px(4.))
-                                    .flex_shrink_0()
-                                    .rounded(px(2.))
-                                    .bg(rgba(0xffffff38)),
+                                h_flex()
+                                    .id("sim-hw-home")
+                                    .h(px(20.))
+                                    .px_2()
+                                    .items_center()
+                                    .rounded(px(tokens::RADIUS_PILL))
+                                    .cursor_pointer()
+                                    .hover(move |s| s.bg(list_hover).text_color(fg))
+                                    .text_size(px(tokens::UI_XS))
+                                    .text_color(muted)
+                                    .child("\u{2302} Home")
+                                    .on_click(cx.listener(|this, _event, _window, cx| {
+                                        this.press_simulator_home(cx);
+                                    })),
+                            )
+                            .child(div().w(px(1.)).h(px(12.)).bg(cx.theme().border))
+                            .child(
+                                h_flex()
+                                    .id("sim-hw-reload")
+                                    .h(px(20.))
+                                    .px_2()
+                                    .gap_1()
+                                    .items_center()
+                                    .rounded(px(tokens::RADIUS_PILL))
+                                    .cursor_pointer()
+                                    .hover(move |s| s.bg(list_hover).text_color(fg))
+                                    .text_size(px(tokens::UI_XS))
+                                    .text_color(warning)
+                                    .child(Icon::new(IconName::Zap).with_size(px(10.5)))
+                                    .child("Reload")
+                                    .on_click(cx.listener(|this, _event, _window, cx| {
+                                        this.trigger_hot_reload(cx);
+                                        this.refresh_simulator_screenshot(cx);
+                                    })),
+                            )
+                            .child(
+                                h_flex()
+                                    .id("sim-hw-restart")
+                                    .h(px(20.))
+                                    .px_2()
+                                    .gap_1()
+                                    .items_center()
+                                    .rounded(px(tokens::RADIUS_PILL))
+                                    .cursor_pointer()
+                                    .hover(move |s| s.bg(list_hover).text_color(fg))
+                                    .text_size(px(tokens::UI_XS))
+                                    .text_color(info)
+                                    .child(Icon::new(IconName::RotateCw).with_size(px(10.5)))
+                                    .child("Restart")
+                                    .on_click(cx.listener(|this, _event, _window, cx| {
+                                        this.trigger_hot_restart(cx);
+                                        this.refresh_simulator_screenshot(cx);
+                                    })),
                             ),
                     ),
             )

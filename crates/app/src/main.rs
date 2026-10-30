@@ -174,7 +174,10 @@ pub struct DartIde {
     pub(crate) simulator_attached: bool,
     pub(crate) simulator_live_sync: bool,
     pub(crate) simulator_frame_path: Option<PathBuf>,
+    pub(crate) simulator_prev_frame_path: Option<PathBuf>,
     pub(crate) simulator_frame_seq: u64,
+    pub(crate) simulator_last_hash: u64,
+    pub(crate) simulator_capturing: std::sync::Arc<std::sync::atomic::AtomicBool>,
     pub(crate) add_package_open: bool,
     pub(crate) add_package_input: Entity<InputState>,
     _subscriptions: Vec<Subscription>,
@@ -268,7 +271,10 @@ impl DartIde {
             simulator_attached: true,
             simulator_live_sync: true,
             simulator_frame_path: None,
+            simulator_prev_frame_path: None,
             simulator_frame_seq: 0,
+            simulator_last_hash: 0,
+            simulator_capturing: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             add_package_open: false,
             add_package_input,
             _subscriptions: Vec::new(),
@@ -1552,8 +1558,23 @@ impl DartIde {
     }
 
     /// Capture a fresh PNG frame from the running iOS Simulator (`xcrun simctl io screenshot`)
-    /// into a rotating temp file so GPUI's `img(path)` reloads the texture without stale caching.
+    /// with single-flight guarding, FNV-1a byte-hash deduplication (so static screens never
+    /// trigger texture reloads), and double-buffered `simulator_prev_frame_path` preservation
+    /// so GPUI's async PNG decoder never flashes a blank frame!
     pub(crate) fn refresh_simulator_screenshot(&mut self, cx: &mut Context<Self>) {
+        if self
+            .simulator_capturing
+            .compare_exchange(
+                false,
+                true,
+                std::sync::atomic::Ordering::SeqCst,
+                std::sync::atomic::Ordering::SeqCst,
+            )
+            .is_err()
+        {
+            return;
+        }
+
         let udid = self
             .selected_device
             .as_ref()
@@ -1568,30 +1589,107 @@ impl DartIde {
 
         self.simulator_frame_seq = self.simulator_frame_seq.wrapping_add(1);
         let seq = self.simulator_frame_seq;
-        let out_path = std::env::temp_dir().join(format!("dart_ide_sim_frame_{}.png", seq % 6));
-        let prev_path = self.simulator_frame_path.clone();
+        let last_hash = self.simulator_last_hash;
+        let has_frame = self.simulator_frame_path.is_some();
+        let capturing_flag = self.simulator_capturing.clone();
 
         let (tx, rx) = async_channel::bounded(1);
         std::thread::spawn(move || {
-            let ok = core_flutter::capture_simulator_screenshot(udid.as_deref(), &out_path).is_ok();
-            if ok {
-                if let Some(prev) = prev_path {
-                    if prev != out_path {
-                        let _ = std::fs::remove_file(prev);
+            let temp_dir = std::env::temp_dir();
+            let stage_path = temp_dir.join("dart_ide_sim_stage.png");
+            let ok =
+                core_flutter::capture_simulator_screenshot(udid.as_deref(), &stage_path).is_ok();
+            let result = if ok {
+                if let Ok(bytes) = std::fs::read(&stage_path) {
+                    let mut hash: u64 = 0xcbf29ce484222325;
+                    for &b in bytes.iter().step_by(4) {
+                        hash ^= b as u64;
+                        hash = hash.wrapping_mul(0x100000001b3);
                     }
+                    hash ^= bytes.len() as u64;
+                    if has_frame && hash == last_hash {
+                        let _ = std::fs::remove_file(&stage_path);
+                        None
+                    } else {
+                        let out_path =
+                            temp_dir.join(format!("dart_ide_sim_frame_{}.png", seq % 16));
+                        if std::fs::rename(&stage_path, &out_path).is_ok() {
+                            if seq >= 6 {
+                                let old_path = temp_dir.join(format!(
+                                    "dart_ide_sim_frame_{}.png",
+                                    seq.wrapping_sub(6) % 16
+                                ));
+                                let _ = std::fs::remove_file(old_path);
+                            }
+                            Some((out_path, hash))
+                        } else {
+                            None
+                        }
+                    }
+                } else {
+                    None
                 }
-            }
-            let _ = tx.send_blocking(ok.then_some(out_path));
+            } else {
+                None
+            };
+            capturing_flag.store(false, std::sync::atomic::Ordering::SeqCst);
+            let _ = tx.send_blocking(result);
         });
 
         cx.spawn(async move |weak, cx| {
-            let Ok(path_opt) = rx.recv().await else { return };
+            let Ok(frame_opt) = rx.recv().await else { return };
             let _ = weak.update(cx, |this, cx| {
-                if let Some(p) = path_opt {
-                    this.simulator_frame_path = Some(p);
+                if let Some((new_path, new_hash)) = frame_opt {
+                    this.simulator_last_hash = new_hash;
+                    if this.simulator_frame_path.as_ref() != Some(&new_path) {
+                        if let Some(prev) = this.simulator_frame_path.replace(new_path) {
+                            this.simulator_prev_frame_path = Some(prev);
+                        }
+                    }
                     cx.notify();
                 }
             });
+        })
+        .detach();
+    }
+
+    /// Forward a normalized click `(norm_x, norm_y)` inside the embedded iPhone screen
+    /// to `Simulator.app` and refresh the frame twice (180ms + 500ms) to capture animations.
+    pub(crate) fn tap_simulator(&mut self, norm_x: f32, norm_y: f32, cx: &mut Context<Self>) {
+        let (tx, rx) = async_channel::bounded::<()>(2);
+        std::thread::spawn(move || {
+            let _ = core_flutter::tap_simulator_window(norm_x, norm_y);
+            std::thread::sleep(std::time::Duration::from_millis(160));
+            let _ = tx.send_blocking(());
+            std::thread::sleep(std::time::Duration::from_millis(360));
+            let _ = tx.send_blocking(());
+        });
+        cx.spawn(async move |weak, cx| {
+            while rx.recv().await.is_ok() {
+                let _ = weak.update(cx, |this, cx| {
+                    this.refresh_simulator_screenshot(cx);
+                });
+            }
+        })
+        .detach();
+    }
+
+    /// Trigger the iOS Simulator Home gesture (`Cmd+Shift+H`) and capture the resulting frame.
+    pub(crate) fn press_simulator_home(&mut self, cx: &mut Context<Self>) {
+        let (tx, rx) = async_channel::bounded::<()>(2);
+        std::thread::spawn(move || {
+            let _ = core_flutter::simulator_press_home();
+            std::thread::sleep(std::time::Duration::from_millis(220));
+            let _ = tx.send_blocking(());
+            std::thread::sleep(std::time::Duration::from_millis(450));
+            let _ = tx.send_blocking(());
+        });
+        cx.spawn(async move |weak, cx| {
+            while rx.recv().await.is_ok() {
+                let _ = weak.update(cx, |this, cx| {
+                    this.refresh_simulator_screenshot(cx);
+                });
+            }
         })
         .detach();
     }
@@ -1602,7 +1700,7 @@ impl DartIde {
         let (tx, rx) = async_channel::bounded::<()>(1);
         std::thread::spawn(move || {
             loop {
-                std::thread::sleep(std::time::Duration::from_millis(1400));
+                std::thread::sleep(std::time::Duration::from_millis(650));
                 if tx.send_blocking(()).is_err() {
                     break;
                 }

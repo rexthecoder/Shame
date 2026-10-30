@@ -35,7 +35,7 @@ use gpui_kit::component::{ActiveTheme as _, Sizable as _, h_flex, v_flex};
 use gpui_kit::*;
 use gpui_kit::prelude::FluentBuilder as _;
 use lsp_integration::{
-    CompletionEntry, CompletionKindBadge, LspState, completion_item_to_entry,
+    CompletionEntry, CompletionKindBadge, LspState,
 };
 
 /// Second pass on this editor's look. The first pass piled on chrome —
@@ -123,6 +123,8 @@ pub struct EditorView {
     /// Active autocomplete candidates and selected row index.
     completions: Vec<CompletionEntry>,
     completion_selected: usize,
+    /// VS Code Flutter-style closing labels (`// WidgetName` on multi-line closing `),` / `);`).
+    closing_labels: std::collections::HashMap<usize, String>,
 }
 
 impl EditorView {
@@ -138,6 +140,11 @@ impl EditorView {
             String::new()
         };
         let syntax_tree = parse_syntax.then(|| SyntaxTree::parse(&synced_text));
+        let closing_labels = if parse_syntax {
+            Self::compute_closing_widget_labels(&synced_text)
+        } else {
+            std::collections::HashMap::new()
+        };
         let synced_revision = buffer.revision();
         let indent_width = buffer.detect_indent_width();
         let line_changes = buffer
@@ -162,6 +169,7 @@ impl EditorView {
             active_search_match: 0,
             completions: Vec::new(),
             completion_selected: 0,
+            closing_labels,
         };
         this.maybe_start_lsp(cx);
         this
@@ -547,6 +555,9 @@ impl EditorView {
                     self.buffer.edit(head..head, &pair);
                     self.set_cursor(head + text.len(), cx);
                     self.ensure_cursor_visible();
+                    if text == "(" {
+                        self.trigger_completions(true, cx);
+                    }
                     return;
                 }
             }
@@ -555,11 +566,12 @@ impl EditorView {
         self.insert_at_cursor(text, cx);
 
         let is_trigger = text == "."
+            || text == ":"
             || text
                 .bytes()
                 .all(|b| b.is_ascii_alphanumeric() || b == b'_');
         if is_trigger {
-            self.trigger_completions(false, cx);
+            self.trigger_completions(text == ":", cx);
         } else {
             self.dismiss_completions(cx);
         }
@@ -608,24 +620,20 @@ impl EditorView {
             self.request_lsp_completion(line, col);
         }
 
-        self.completions = self.compute_local_completions(&prefix, after_dot);
+        self.completions = self.compute_local_completions(&prefix, after_dot, manual);
         self.completion_selected = 0;
         cx.notify();
     }
 
-    pub(crate) fn merge_lsp_completions(
+    pub(crate) fn merge_lsp_completion_entries(
         &mut self,
-        items: Vec<core_lsp::lsp_types::CompletionItem>,
+        lsp_entries: Vec<CompletionEntry>,
         cx: &mut Context<Self>,
     ) {
         let (_range, prefix, after_dot) = self.current_completion_prefix();
-        if prefix.is_empty() && !after_dot {
-            return;
-        }
         let prefix_lower = prefix.to_lowercase();
-        let mut entries: Vec<CompletionEntry> = items
+        let mut entries: Vec<CompletionEntry> = lsp_entries
             .into_iter()
-            .filter_map(completion_item_to_entry)
             .filter(|e| {
                 e.label != prefix
                     && (prefix_lower.is_empty()
@@ -635,19 +643,20 @@ impl EditorView {
 
         entries.sort_by_key(|e| {
             let lower = e.label.to_lowercase();
+            let exact = e.label.starts_with(&prefix);
             let starts = lower.starts_with(&prefix_lower);
-            (!starts, e.label.len(), e.label.clone())
+            (!exact, !starts, e.label.len(), e.label.clone())
         });
 
         let mut seen = std::collections::HashSet::new();
         let mut merged = Vec::new();
         for entry in entries
             .into_iter()
-            .chain(self.compute_local_completions(&prefix, after_dot))
+            .chain(self.compute_local_completions(&prefix, after_dot, true))
         {
             if seen.insert(entry.label.clone()) {
                 merged.push(entry);
-                if merged.len() >= 24 {
+                if merged.len() >= 28 {
                     break;
                 }
             }
@@ -657,13 +666,153 @@ impl EditorView {
         cx.notify();
     }
 
-    fn compute_local_completions(&self, prefix: &str, after_dot: bool) -> Vec<CompletionEntry> {
-        if prefix.is_empty() && !after_dot {
+    fn compute_local_completions(
+        &self,
+        prefix: &str,
+        after_dot: bool,
+        manual: bool,
+    ) -> Vec<CompletionEntry> {
+        if prefix.is_empty() && !after_dot && !manual {
             return Vec::new();
         }
         let prefix_lower = prefix.to_lowercase();
         let mut seen = std::collections::HashSet::new();
         let mut results: Vec<CompletionEntry> = Vec::new();
+        let is_dart = self
+            .buffer
+            .path()
+            .and_then(|p| p.extension())
+            .and_then(|e| e.to_str())
+            == Some("dart");
+
+        // 1. VS Code Flutter Snippets (`stless`, `stful`, `build`)
+        if is_dart && !after_dot && !prefix.is_empty() {
+            let snippets: &[(&str, &str, &str)] = &[
+                (
+                    "stless",
+                    "Flutter StatelessWidget",
+                    "class MyWidget extends StatelessWidget {\n  const MyWidget({super.key});\n\n  @override\n  Widget build(BuildContext context) {\n    return const Placeholder();\n  }\n}",
+                ),
+                (
+                    "stful",
+                    "Flutter StatefulWidget",
+                    "class MyWidget extends StatefulWidget {\n  const MyWidget({super.key});\n\n  @override\n  State<MyWidget> createState() => _MyWidgetState();\n}\n\nclass _MyWidgetState extends State<MyWidget> {\n  @override\n  Widget build(BuildContext context) {\n    return const Placeholder();\n  }\n}",
+                ),
+                (
+                    "build",
+                    "@override Widget build(BuildContext context)",
+                    "@override\n  Widget build(BuildContext context) {\n    return const SizedBox.shrink();\n  }",
+                ),
+            ];
+            for &(trigger, desc, expansion) in snippets {
+                if trigger.starts_with(&prefix_lower) && seen.insert(trigger.to_string()) {
+                    results.push(CompletionEntry {
+                        label: trigger.to_string(),
+                        insert_text: expansion.to_string(),
+                        detail: Some(desc.to_string()),
+                        kind: CompletionKindBadge::Keyword,
+                        additional_edits: Vec::new(),
+                    });
+                }
+            }
+        }
+
+        // 2. Flutter Widget Constructors & Named Parameters (instant zero-latency suggestions)
+        if is_dart && !after_dot {
+            const FLUTTER_NAMED_ARGS: &[(&str, &str, &str)] = &[
+                ("child:", "child: ", "Widget?"),
+                ("children:", "children: [\n  \n],", "List<Widget>"),
+                ("padding:", "padding: const EdgeInsets.all(8.0),", "EdgeInsetsGeometry"),
+                ("margin:", "margin: const EdgeInsets.all(8.0),", "EdgeInsetsGeometry"),
+                ("mainAxisAlignment:", "mainAxisAlignment: MainAxisAlignment.center,", "MainAxisAlignment"),
+                ("crossAxisAlignment:", "crossAxisAlignment: CrossAxisAlignment.start,", "CrossAxisAlignment"),
+                ("mainAxisSize:", "mainAxisSize: MainAxisSize.min,", "MainAxisSize"),
+                ("onPressed:", "onPressed: () {},", "VoidCallback?"),
+                ("onTap:", "onTap: () {},", "GestureTapCallback?"),
+                ("color:", "color: ", "Color?"),
+                ("backgroundColor:", "backgroundColor: ", "Color?"),
+                ("decoration:", "decoration: const BoxDecoration(),", "Decoration?"),
+                ("style:", "style: const TextStyle(),", "TextStyle?"),
+                ("width:", "width: ", "double?"),
+                ("height:", "height: ", "double?"),
+                ("alignment:", "alignment: Alignment.center,", "AlignmentGeometry"),
+                ("builder:", "builder: (context) => ", "WidgetBuilder"),
+                ("itemCount:", "itemCount: ", "int?"),
+                ("itemBuilder:", "itemBuilder: (context, index) => ", "IndexedWidgetBuilder"),
+                ("appBar:", "appBar: AppBar(),", "PreferredSizeWidget?"),
+                ("body:", "body: ", "Widget?"),
+                ("floatingActionButton:", "floatingActionButton: ", "Widget?"),
+            ];
+            for &(label, insert, ty) in FLUTTER_NAMED_ARGS {
+                if (prefix_lower.is_empty() || label.to_lowercase().starts_with(&prefix_lower))
+                    && seen.insert(label.to_string())
+                {
+                    results.push(CompletionEntry {
+                        label: label.to_string(),
+                        insert_text: insert.to_string(),
+                        detail: Some(ty.to_string()),
+                        kind: CompletionKindBadge::Property,
+                        additional_edits: Vec::new(),
+                    });
+                }
+            }
+
+            const FLUTTER_WIDGETS: &[(&str, &str, &str)] = &[
+                ("Scaffold", "Scaffold(\n  body: \n)", "package:flutter/material.dart"),
+                ("Container", "Container(\n  child: \n)", "package:flutter/widgets.dart"),
+                ("Column", "Column(\n  children: [\n    \n  ],\n)", "package:flutter/widgets.dart"),
+                ("Row", "Row(\n  children: [\n    \n  ],\n)", "package:flutter/widgets.dart"),
+                ("Padding", "Padding(\n  padding: const EdgeInsets.all(8.0),\n  child: \n)", "package:flutter/widgets.dart"),
+                ("Center", "Center(\n  child: \n)", "package:flutter/widgets.dart"),
+                ("SizedBox", "SizedBox(\n  width: ,\n  height: ,\n)", "package:flutter/widgets.dart"),
+                ("SizedBox.shrink", "const SizedBox.shrink()", "package:flutter/widgets.dart"),
+                ("Expanded", "Expanded(\n  child: \n)", "package:flutter/widgets.dart"),
+                ("Flexible", "Flexible(\n  child: \n)", "package:flutter/widgets.dart"),
+                ("Text", "Text('')", "package:flutter/widgets.dart"),
+                ("Icon", "Icon(Icons.)", "package:flutter/widgets.dart"),
+                ("ElevatedButton", "ElevatedButton(\n  onPressed: () {},\n  child: const Text(''),\n)", "package:flutter/material.dart"),
+                ("TextButton", "TextButton(\n  onPressed: () {},\n  child: const Text(''),\n)", "package:flutter/material.dart"),
+                ("IconButton", "IconButton(\n  onPressed: () {},\n  icon: const Icon(Icons.add),\n)", "package:flutter/material.dart"),
+                ("ListView.builder", "ListView.builder(\n  itemCount: 0,\n  itemBuilder: (context, index) {\n    return const SizedBox();\n  },\n)", "package:flutter/widgets.dart"),
+                ("Stack", "Stack(\n  children: [\n    \n  ],\n)", "package:flutter/widgets.dart"),
+                ("Positioned", "Positioned(\n  child: \n)", "package:flutter/widgets.dart"),
+                ("SafeArea", "SafeArea(\n  child: \n)", "package:flutter/widgets.dart"),
+                ("GestureDetector", "GestureDetector(\n  onTap: () {},\n  child: \n)", "package:flutter/widgets.dart"),
+                ("InkWell", "InkWell(\n  onTap: () {},\n  child: \n)", "package:flutter/material.dart"),
+                ("Card", "Card(\n  child: \n)", "package:flutter/material.dart"),
+                ("Divider", "Divider()", "package:flutter/material.dart"),
+                ("CircularProgressIndicator", "const CircularProgressIndicator()", "package:flutter/material.dart"),
+                ("FutureBuilder", "FutureBuilder(\n  future: null,\n  builder: (context, snapshot) {\n    return const SizedBox();\n  },\n)", "package:flutter/widgets.dart"),
+                ("StreamBuilder", "StreamBuilder(\n  stream: null,\n  builder: (context, snapshot) {\n    return const SizedBox();\n  },\n)", "package:flutter/widgets.dart"),
+                ("EdgeInsets.all", "const EdgeInsets.all(8.0)", "package:flutter/painting.dart"),
+                ("EdgeInsets.symmetric", "const EdgeInsets.symmetric(horizontal: 16.0, vertical: 8.0)", "package:flutter/painting.dart"),
+                ("BoxDecoration", "BoxDecoration(\n  color: ,\n  borderRadius: BorderRadius.circular(8.0),\n)", "package:flutter/painting.dart"),
+                ("TextStyle", "TextStyle(\n  fontSize: 14.0,\n  fontWeight: FontWeight.w500,\n)", "package:flutter/painting.dart"),
+                ("MainAxisAlignment", "MainAxisAlignment.center", "package:flutter/rendering.dart"),
+                ("CrossAxisAlignment", "CrossAxisAlignment.start", "package:flutter/rendering.dart"),
+                ("Colors", "Colors.blue", "package:flutter/material.dart"),
+                ("Icons", "Icons.check", "package:flutter/material.dart"),
+                ("Theme.of", "Theme.of(context)", "package:flutter/material.dart"),
+                ("MediaQuery.of", "MediaQuery.of(context)", "package:flutter/widgets.dart"),
+                ("Navigator.of", "Navigator.of(context)", "package:flutter/widgets.dart"),
+            ];
+            if !prefix_lower.is_empty() {
+                for &(label, insert, pkg) in FLUTTER_WIDGETS {
+                    if label != prefix
+                        && label.to_lowercase().contains(&prefix_lower)
+                        && seen.insert(label.to_string())
+                    {
+                        results.push(CompletionEntry {
+                            label: label.to_string(),
+                            insert_text: insert.to_string(),
+                            detail: Some(pkg.to_string()),
+                            kind: CompletionKindBadge::Type,
+                            additional_edits: Vec::new(),
+                        });
+                    }
+                }
+            }
+        }
 
         const KEYWORDS: &[&str] = &[
             "abstract", "async", "await", "break", "case", "catch", "class", "const", "continue",
@@ -714,7 +863,7 @@ impl EditorView {
                     if word.len() >= 2
                         && word != prefix
                         && (prefix_lower.is_empty()
-                            || word.to_lowercase().starts_with(&prefix_lower))
+                            || word.to_lowercase().contains(&prefix_lower))
                         && (!after_dot || preceded_by_dot || !prefix.is_empty())
                         && seen.insert(word.to_string())
                     {
@@ -745,12 +894,124 @@ impl EditorView {
 
         results.sort_by_key(|e| {
             let lower = e.label.to_lowercase();
-            let exact_prefix = e.label.starts_with(prefix);
-            let ci_prefix = lower.starts_with(&prefix_lower);
+            let exact_prefix = !prefix.is_empty() && e.label.starts_with(prefix);
+            let ci_prefix = !prefix_lower.is_empty() && lower.starts_with(&prefix_lower);
             (!exact_prefix, !ci_prefix, e.label.len(), e.label.clone())
         });
-        results.truncate(20);
+        results.truncate(24);
         results
+    }
+
+    /// Compute VS Code Flutter extension style closing labels (`// WidgetName`)
+    /// for lines that close a multi-line PascalCase constructor call (`Divider(`,
+    /// `Scaffold(`, `Column(`, etc.).
+    fn compute_closing_widget_labels(text: &str) -> std::collections::HashMap<usize, String> {
+        let mut labels_by_line: std::collections::HashMap<usize, Vec<String>> =
+            std::collections::HashMap::new();
+        let bytes = text.as_bytes();
+        // Stack of `(open_line_idx, Option<widget_name>)` for each `(` or `[`
+        let mut stack: Vec<(usize, Option<String>, u8)> = Vec::new();
+        let mut line = 0usize;
+        let mut i = 0usize;
+        let mut in_single = false;
+        let mut in_double = false;
+        let mut in_line_comment = false;
+
+        while i < bytes.len() {
+            let b = bytes[i];
+            if b == b'\n' {
+                line += 1;
+                in_line_comment = false;
+                i += 1;
+                continue;
+            }
+            if in_line_comment {
+                i += 1;
+                continue;
+            }
+            if b == b'/' && i + 1 < bytes.len() && bytes[i + 1] == b'/' {
+                in_line_comment = true;
+                i += 2;
+                continue;
+            }
+            if (in_single || in_double) && b == b'\\' {
+                i += 2;
+                continue;
+            }
+            if !in_double && b == b'\'' {
+                in_single = !in_single;
+                i += 1;
+                continue;
+            }
+            if !in_single && b == b'"' {
+                in_double = !in_double;
+                i += 1;
+                continue;
+            }
+            if in_single || in_double {
+                i += 1;
+                continue;
+            }
+
+            if b == b'(' {
+                // Check if preceded by a PascalCase constructor name (`Divider(`, `ListView.builder(`)
+                let mut end = i;
+                // Skip optional `<TypeArgs>` before `(`
+                if end > 0 && bytes[end - 1] == b'>' {
+                    let mut angle = 1i32;
+                    end -= 1;
+                    while end > 0 && angle > 0 {
+                        end -= 1;
+                        if bytes[end] == b'>' {
+                            angle += 1;
+                        } else if bytes[end] == b'<' {
+                            angle -= 1;
+                        }
+                    }
+                }
+                let ident_end = end;
+                let mut start = ident_end;
+                while start > 0
+                    && (bytes[start - 1].is_ascii_alphanumeric()
+                        || bytes[start - 1] == b'_'
+                        || bytes[start - 1] == b'.')
+                {
+                    start -= 1;
+                }
+                let raw_name = &text[start..ident_end];
+                let first_seg = raw_name.split('.').next().unwrap_or("");
+                let is_widget = first_seg
+                    .bytes()
+                    .next()
+                    .is_some_and(|c| c.is_ascii_uppercase())
+                    && first_seg.bytes().any(|c| c.is_ascii_lowercase());
+                let widget_name = is_widget.then(|| raw_name.to_string());
+                stack.push((line, widget_name, b'('));
+            } else if b == b'[' {
+                // Check if preceded by `children:`
+                let before = text[..i].trim_end();
+                let is_children = before.ends_with("children:");
+                stack.push((line, is_children.then(|| "[]".to_string()), b'['));
+            } else if b == b')' || b == b']' {
+                let expected = if b == b')' { b'(' } else { b'[' };
+                if let Some((open_line, maybe_name, open_ch)) = stack.pop() {
+                    if open_ch == expected && line > open_line + 1 {
+                        if let Some(name) = maybe_name {
+                            labels_by_line.entry(line).or_default().push(name);
+                        }
+                    }
+                }
+            }
+            i += 1;
+        }
+
+        labels_by_line
+            .into_iter()
+            .map(|(ln, mut names)| {
+                names.reverse();
+                (ln, format!("// {}", names.join(", ")))
+            })
+            .collect()
     }
 
     pub(crate) fn accept_completion(&mut self, ix: usize, cx: &mut Context<Self>) {
@@ -989,7 +1250,7 @@ impl EditorView {
                     self.request_format();
                 }
                 "r" => self.start_rename(cx),
-                "." => self.request_code_actions(),
+                "." => self.request_code_actions(cx),
                 "/" => self.toggle_line_comment(cx),
                 "z" => {
                     if keystroke.modifiers.shift {
@@ -1215,8 +1476,11 @@ impl EditorView {
                                 .xsmall()
                                 .text_color(cx.theme().warning),
                             )
-                            .on_mouse_down(MouseButton::Left, move |_event, _window, cx| {
-                                view.update(cx, |this, _cx| this.request_code_actions());
+                            .on_mouse_down(MouseButton::Left, move |_event, window, cx| {
+                                view.update(cx, |this, cx| {
+                                    window.focus(&this.focus_handle, cx);
+                                    this.request_code_actions(cx);
+                                });
                             })
                     }),
             );
@@ -1374,6 +1638,17 @@ impl EditorView {
         let line_shared: SharedString = display_text.to_string().into();
         let line_len = line_shared.len();
         let leading_spaces = display_text.as_bytes().iter().take_while(|&&b| b == b' ').count();
+        let closing_label_shared: Option<SharedString> = self
+            .closing_labels
+            .get(&index)
+            .filter(|_| !display_text.contains("//"))
+            .map(|s| SharedString::from(s.clone()));
+        let closing_font = {
+            let mut f = font(mono_family.clone());
+            f.style = FontStyle::Italic;
+            f
+        };
+        let closing_color: Hsla = cx.theme().muted_foreground.opacity(0.42);
         let view = cx.entity();
         let line_canvas = canvas(
             move |bounds, window, _cx| {
@@ -1383,10 +1658,26 @@ impl EditorView {
                     &text_runs,
                     None,
                 );
+                let shaped_closing = closing_label_shared.as_ref().map(|lbl| {
+                    let run = TextRun {
+                        len: lbl.len(),
+                        font: closing_font.clone(),
+                        color: closing_color,
+                        background_color: None,
+                        underline: None,
+                        strikethrough: None,
+                    };
+                    window.text_system().shape_line(
+                        lbl.clone(),
+                        px(LINE_FONT_SIZE - 1.),
+                        &[run],
+                        None,
+                    )
+                });
                 let text_end_x = shaped.width;
-                (bounds, shaped, text_end_x)
+                (bounds, shaped, shaped_closing, text_end_x)
             },
-            move |bounds, (_, shaped, _text_end_x), window, cx| {
+            move |bounds, (_, shaped, shaped_closing, _text_end_x), window, cx| {
                 // 1. Faint vertical indent guides at exact shaped column offsets
                 for column in (indent_width..leading_spaces).step_by(indent_width).take(16) {
                     let x = shaped.x_for_index(column.min(line_len));
@@ -1447,7 +1738,7 @@ impl EditorView {
                     }
                 }
 
-                // 4. Paint syntax-highlighted text
+                // 4. Paint syntax-highlighted text & optional Flutter closing label (`// WidgetName`)
                 let text_y = bounds.origin.y + (bounds.size.height - px(LINE_HEIGHT)) * 0.5;
                 let _ = shaped.paint(
                     point(bounds.origin.x, text_y),
@@ -1457,6 +1748,16 @@ impl EditorView {
                     window,
                     cx,
                 );
+                if let Some(closing) = &shaped_closing {
+                    let _ = closing.paint(
+                        point(bounds.origin.x + shaped.width + px(12.), text_y),
+                        px(LINE_HEIGHT),
+                        TextAlign::Left,
+                        None,
+                        window,
+                        cx,
+                    );
+                }
 
                 // 5. Paint caret on top of text at the exact shaped glyph boundary
                 if let Some(col) = cursor_col {
@@ -1471,7 +1772,7 @@ impl EditorView {
                 // 6. Mouse interactions using the exact same `shaped` line
                 let down_shaped = shaped.clone();
                 let down_view = view.clone();
-                window.on_mouse_event(move |event: &MouseDownEvent, phase, _window, cx| {
+                window.on_mouse_event(move |event: &MouseDownEvent, phase, window, cx| {
                     if phase != DispatchPhase::Bubble
                         || event.button != MouseButton::Left
                         || !bounds.contains(&event.position)
@@ -1483,6 +1784,7 @@ impl EditorView {
                     let go_to_definition = event.modifiers.platform || event.modifiers.control;
                     let click_count = event.click_count;
                     down_view.update(cx, |this, cx| {
+                        window.focus(&this.focus_handle, cx);
                         this.clear_hover(cx);
                         this.dismiss_completions(cx);
                         if go_to_definition {
@@ -2047,10 +2349,12 @@ impl Render for EditorView {
                 } else {
                     self.syntax_tree = Some(SyntaxTree::parse(&text));
                 }
+                self.closing_labels = Self::compute_closing_widget_labels(&text);
                 self.sync_lsp_text(&text);
                 self.synced_text = text;
             } else {
                 self.syntax_tree = None;
+                self.closing_labels.clear();
                 self.synced_text.clear();
             }
         }
@@ -2147,6 +2451,12 @@ impl Render for EditorView {
             .id("editor-view")
             .key_context("Editor")
             .track_focus(&self.focus_handle)
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _event, window, cx| {
+                    window.focus(&this.focus_handle, cx);
+                }),
+            )
             .on_key_down(cx.listener(Self::on_key_down))
             .size_full()
             .bg(cx.theme().background)

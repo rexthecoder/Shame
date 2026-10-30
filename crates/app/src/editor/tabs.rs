@@ -91,7 +91,7 @@ impl DartIde {
                                     .text_color(if is_active { active_fg } else { inactive_fg })
                                     .on_click({
                                         let view = view.clone();
-                                        move |event, _window, cx| {
+                                        move |event, window, cx| {
                                             let double_clicked = event.click_count() >= 2;
                                             view.update(cx, |this, cx| {
                                                 this.active_tab = ix;
@@ -99,6 +99,10 @@ impl DartIde {
                                                     if let Some(t) = this.tabs.get_mut(ix) {
                                                         t.is_preview = false;
                                                     }
+                                                }
+                                                if let Some(t) = this.tabs.get(ix) {
+                                                    let fh = t.editor.read(cx).focus_handle(cx);
+                                                    window.focus(&fh, cx);
                                                 }
                                                 this.tab_overflow_open = false;
                                                 cx.notify();
@@ -387,7 +391,7 @@ impl DartIde {
                             .tooltip("Code actions (cmd/ctrl+.)")
                             .on_click(cx.listener(|this, _event, _window, cx| {
                                 if let Some(ed) = this.active_editor().cloned() {
-                                    ed.update(cx, |editor, _cx| editor.request_code_actions());
+                                    ed.update(cx, |editor, cx| editor.request_code_actions(cx));
                                 }
                             })),
                     )
@@ -476,11 +480,15 @@ impl DartIde {
                                         .border_color(rgba(0xea7a3c38))
                                 })
                                 .when(!is_active, |el| el.hover(move |s| s.bg(list_hover)))
-                                .on_click(move |_event, _window, cx| {
+                                .on_click(move |_event, window, cx| {
                                     view_select.update(cx, |this, cx| {
                                         this.active_tab = ix;
                                         this.tab_overflow_open = false;
                                         this.tab_scroll.scroll_to_item(ix);
+                                        if let Some(t) = this.tabs.get(ix) {
+                                            let fh = t.editor.read(cx).focus_handle(cx);
+                                            window.focus(&fh, cx);
+                                        }
                                         cx.notify();
                                     });
                                 })

@@ -174,6 +174,45 @@ pub fn capture_simulator_screenshot(udid: Option<&str>, out_path: &Path) -> io::
     Ok(())
 }
 
+/// Forward a normalized `(norm_x, norm_y)` tap (`0.0..=1.0`) from the embedded
+/// iPhone screen in the IDE rail to the native macOS `Simulator.app` window.
+pub fn tap_simulator_window(norm_x: f32, norm_y: f32) -> io::Result<()> {
+    let nx = norm_x.clamp(0.02, 0.98);
+    let ny = norm_y.clamp(0.02, 0.98);
+    let script = format!(
+        r#"tell application "System Events"
+            if exists process "Simulator" then
+                tell process "Simulator"
+                    set frontmost to true
+                    if (count of windows) > 0 then
+                        set {{wx, wy}} to position of window 1
+                        set {{ww, wh}} to size of window 1
+                        set tx to wx + 18 + ((ww - 36) * {nx:.4})
+                        set ty to wy + 44 + ((wh - 62) * {ny:.4})
+                        click at {{tx as integer, ty as integer}}
+                    end if
+                end tell
+            end if
+        end tell"#
+    );
+    let _ = Command::new("osascript").args(["-e", &script]).status();
+    Ok(())
+}
+
+/// Trigger the iOS Home gesture (`Cmd+Shift+H`) on the active `Simulator.app`.
+pub fn simulator_press_home() -> io::Result<()> {
+    let script = r#"tell application "System Events"
+        if exists process "Simulator" then
+            tell process "Simulator"
+                set frontmost to true
+                keystroke "h" using {command down, shift down}
+            end tell
+        end if
+    end tell"#;
+    let _ = Command::new("osascript").args(["-e", script]).status();
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
