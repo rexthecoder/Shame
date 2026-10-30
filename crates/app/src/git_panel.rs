@@ -68,8 +68,8 @@ impl GitState {
             notice: None,
             message: cx.new(|cx| {
                 TextareaState::new(window, cx)
-                    .placeholder("Describe this change\u{2026}")
-                    .auto_grow(1, 6)
+                    .placeholder("Commit message\u{2026}")
+                    .auto_grow(1, 5)
             }),
             branch_input: cx
                 .new(|cx| InputState::new(window, cx).placeholder("Filter or create branch…")),
@@ -557,21 +557,6 @@ impl DartIde {
                 .update(cx, |state, cx| state.set_value(text, window, cx));
             cx.notify();
         }
-    }
-
-    /// Set (or toggle off) a conventional-commit type on the message.
-    pub(crate) fn git_set_commit_type(
-        &mut self,
-        ty: &str,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let current = self.git.message.read(cx).value().to_string();
-        let text = core_workspace::apply_commit_type(&current, ty);
-        self.git
-            .message
-            .update(cx, |state, cx| state.set_value(text, window, cx));
-        cx.notify();
     }
 
     /// The composer's one button: commit what is staged, commit everything when nothing is

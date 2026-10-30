@@ -67,14 +67,15 @@ impl DartIde {
                 .gap(px(tokens::SPACE_2))
                 .h(px(28.))
                 .px(px(tokens::SPACE_2))
-                .rounded(px(tokens::RADIUS_PANEL))
+                .rounded(px(tokens::RADIUS_SM))
                 .border_1()
                 .border_color(if active {
-                    tokens::accent_dim()
+                    cx.theme().border
                 } else {
                     gpui_kit::transparent_black()
                 })
                 .when(active, |s| s.bg(cx.theme().tab_active))
+                .when(!active, |s| s.hover(|h| h.bg(cx.theme().list_hover)))
                 .cursor_pointer()
                 .child(Icon::new(icon).small().text_color(if active {
                     cx.theme().primary
@@ -83,7 +84,8 @@ impl DartIde {
                 }))
                 .child(
                     div()
-                        .text_size(px(tokens::UI))
+                        .text_size(px(tokens::UI_SM))
+                        .font_medium()
                         .text_color(if active { cx.theme().foreground } else { muted })
                         .child(label),
                 )
@@ -389,33 +391,36 @@ impl DartIde {
             status.upstream.is_none() && status.head.is_some() && status.branch.is_some();
         h_flex()
             .w_full()
-            .h(px(34.))
+            .h(px(30.))
             .flex_shrink_0()
             .items_center()
             .justify_between()
             .gap(px(tokens::SPACE_2))
             .px(px(tokens::SPACE_4))
+            .border_b_1()
+            .border_color(cx.theme().border.opacity(0.6))
             .child(
                 h_flex()
                     .id("git-branch-toggle")
                     .min_w(px(0.))
                     .items_center()
                     .gap(px(tokens::SPACE_2))
-                    .h(px(24.))
-                    .px(px(tokens::SPACE_4))
-                    .rounded(px(tokens::RADIUS_PILL))
-                    .bg(cx.theme().list_hover.opacity(0.55))
+                    .h(px(22.))
+                    .px(px(tokens::SPACE_2))
+                    .ml(px(-tokens::SPACE_2))
+                    .rounded(px(tokens::RADIUS_SM))
                     .cursor_pointer()
                     .hover(|s| s.bg(cx.theme().list_hover))
                     .child(
                         Icon::new(IconName::GitBranch)
-                            .small()
+                            .xsmall()
                             .text_color(cx.theme().green),
                     )
                     .child(
                         div()
                             .truncate()
                             .text_size(px(tokens::UI_SM))
+                            .font_medium()
                             .text_color(fg)
                             .child(name),
                     )
@@ -624,11 +629,14 @@ impl DartIde {
             )
     }
 
-    /// The commit composer: type chips, the message, a suggestion, and one button that always
-    /// offers the next sensible step (commit, commit all, amend) instead of a dead control.
+    /// Option A commit composer: clean input box with inline `☐ Amend` and `✦ Auto-fill` row,
+    /// followed by a full-width primary Commit button (`Commit N files   ⌘↵`).
     fn render_git_commit_box(&self, status: &RepoStatus, cx: &mut Context<Self>) -> Div {
         let muted = cx.theme().muted_foreground;
-        let theme_fg = cx.theme().foreground;
+        let fg = cx.theme().foreground;
+        let primary = cx.theme().primary;
+        let primary_hover = cx.theme().primary_hover;
+        let border = cx.theme().border;
         let staged = status.staged.len();
         let unstaged = status.unstaged.len();
         let message = self.git.message.read(cx).value().to_string();
@@ -638,96 +646,52 @@ impl DartIde {
         let subject_len = message.lines().next().unwrap_or("").chars().count();
         let plural = |n: usize| if n == 1 { "" } else { "s" };
 
-        enum Action {
-            Ready(String, &'static str),
-            NeedsMessage,
-            Nothing,
-        }
-        let action = if amend {
-            Action::Ready(
-                "Amend commit".into(),
-                "Replace the last commit (\u{2318}\u{21b5})",
-            )
-        } else if staged > 0 && has_message {
-            Action::Ready(
-                format!("Commit {staged} file{}", plural(staged)),
-                "Commit the staged files (\u{2318}\u{21b5})",
-            )
-        } else if staged == 0 && unstaged > 0 && has_message {
-            Action::Ready(
-                format!("Commit all {unstaged}"),
-                "Stage everything and commit (\u{2318}\u{21b5})",
-            )
-        } else if staged + unstaged > 0 {
-            Action::NeedsMessage
+        let button_label = if amend {
+            "Amend commit".to_string()
+        } else if staged > 0 {
+            format!("Commit {staged} file{}", plural(staged))
+        } else if unstaged > 0 {
+            format!("Commit {unstaged} file{}", plural(unstaged))
         } else {
-            Action::Nothing
+            "Commit".to_string()
         };
+        let can_commit = !busy && (amend || (has_message && (staged + unstaged > 0)));
 
         let types = self.git.commit_types.clone().unwrap_or_default();
-        let current_type = core_workspace::commit_type_of(message.lines().next().unwrap_or(""))
-            .map(str::to_string);
         let suggestion = (!has_message && !amend)
             .then(|| core_workspace::suggest_message(self.commit_candidates(), &types))
             .flatten();
-
-        let chip =
-            |id: (&'static str, usize), label: String, active: bool, cx: &mut Context<Self>| {
-                let (primary, border) = (cx.theme().primary, cx.theme().border);
-                div()
-                    .id(id)
-                    .px(px(8.))
-                    .h(px(20.))
-                    .flex()
-                    .items_center()
-                    .rounded(px(tokens::RADIUS_PILL))
-                    .border_1()
-                    .border_color(if active { primary.opacity(0.6) } else { border })
-                    .bg(if active {
-                        primary.opacity(0.16)
-                    } else {
-                        gpui_kit::transparent_black()
-                    })
-                    .text_size(px(tokens::UI_XS))
-                    .text_color(if active { primary } else { muted })
-                    .cursor_pointer()
-                    .hover(move |s| s.text_color(theme_fg))
-                    .child(label)
-            };
-        let show_chips = suggestion.is_some() || (!types.is_empty() && !amend);
 
         v_flex()
             .w_full()
             .flex_shrink_0()
             .px(px(tokens::SPACE_4))
-            .pb(px(tokens::SPACE_4))
+            .py(px(tokens::SPACE_3))
+            .gap(px(tokens::SPACE_3))
+            // Cmd/Ctrl+Enter runs the primary action from inside the message box.
+            .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
+                let m = event.keystroke.modifiers;
+                if (m.platform || m.control) && event.keystroke.key == "enter" {
+                    this.git_primary_action(window, cx);
+                    cx.stop_propagation();
+                }
+            }))
             .child(
-                // One surface: message, quick fills, then the footer with the action.
+                // Clean input card with inline footer (☐ Amend on left, ✦ Auto-fill on right)
                 v_flex()
                     .w_full()
-                    .rounded(px(tokens::RADIUS_PANEL))
+                    .rounded(px(tokens::RADIUS_SM))
                     .border_1()
-                    .border_color(cx.theme().border)
+                    .border_color(border)
                     .bg(cx.theme().background)
                     .overflow_hidden()
-                    // Cmd/Ctrl+Enter runs the primary action from inside the message box.
-                    .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
-                        let m = event.keystroke.modifiers;
-                        if (m.platform || m.control) && event.keystroke.key == "enter" {
-                            this.git_primary_action(window, cx);
-                            cx.stop_propagation();
-                        }
-                    }))
                     .child(
                         div()
                             .w_full()
                             .px(px(CARD_INSET))
-                            .pt(px(8.))
-                            .pb(px(4.))
-                            // No field chrome or padding of its own: the card is the field.
+                            .pt(px(6.))
+                            .pb(px(2.))
                             .child(
-                                // The field pads itself by `input_px` (8px at the small size); pull it
-                                // back so the text starts exactly at the card's inset.
                                 div().mx(px(-8.)).child(
                                     Textarea::new(&self.git.message)
                                         .small()
@@ -736,60 +700,14 @@ impl DartIde {
                                 ),
                             ),
                     )
-                    // Quick fills: a suggested subject and this repo's commit types.
-                    .when(show_chips, |el| {
-                        el.child(
-                            h_flex()
-                                .w_full()
-                                .flex_wrap()
-                                .items_center()
-                                .gap(px(6.))
-                                .px(px(CARD_INSET))
-                                .pb(px(8.))
-                                .when_some(suggestion, |row, text| {
-                                    row.child(
-                                        h_flex()
-                                            .id("git-suggestion")
-                                            .max_w_full()
-                                            .items_center()
-                                            .gap(px(tokens::SPACE_2))
-                                            .px(px(8.))
-                                            .h(px(20.))
-                                            .rounded(px(tokens::RADIUS_PILL))
-                                            .bg(cx.theme().primary.opacity(0.14))
-                                            .cursor_pointer()
-                                            .hover(|s| s.bg(cx.theme().primary.opacity(0.24)))
-                                            .text_size(px(tokens::UI_XS))
-                                            .text_color(cx.theme().primary)
-                                            .child(Icon::new(IconName::Sparkles).with_size(px(11.)))
-                                            .child(div().truncate().child(text))
-                                            .on_click(cx.listener(|this, _e, window, cx| {
-                                                this.git_apply_suggestion(window, cx)
-                                            })),
-                                    )
-                                })
-                                .when(!types.is_empty() && !amend, |row| {
-                                    row.children(types.iter().enumerate().map(|(i, ty)| {
-                                        let active = current_type.as_deref() == Some(ty.as_str());
-                                        let ty_owned = ty.clone();
-                                        chip(("git-type", i), ty.clone(), active, cx).on_click(
-                                            cx.listener(move |this, _e, window, cx| {
-                                                this.git_set_commit_type(&ty_owned, window, cx)
-                                            }),
-                                        )
-                                    }))
-                                }),
-                        )
-                    })
                     .child(
                         h_flex()
                             .w_full()
-                            .h(px(36.))
+                            .h(px(24.))
+                            .px(px(CARD_INSET))
+                            .pb(px(4.))
                             .items_center()
                             .justify_between()
-                            .px(px(CARD_INSET))
-                            .border_t_1()
-                            .border_color(cx.theme().border.opacity(0.6))
                             .child(
                                 h_flex()
                                     .items_center()
@@ -799,22 +717,32 @@ impl DartIde {
                                             .id("git-amend")
                                             .items_center()
                                             .gap(px(tokens::SPACE_2))
-                                            .h(px(22.))
-                                            .ml(px(-6.))
-                                            .px(px(6.))
-                                            .rounded(px(tokens::RADIUS_PILL))
                                             .cursor_pointer()
-                                            .when(amend, |el| {
-                                                el.bg(cx.theme().warning.opacity(0.16))
-                                            })
-                                            .hover(|s| s.bg(cx.theme().list_hover))
                                             .text_size(px(tokens::UI_XS))
-                                            .text_color(if amend {
-                                                cx.theme().warning
-                                            } else {
-                                                muted
-                                            })
-                                            .child(Icon::new(IconName::Undo2).with_size(px(11.)))
+                                            .text_color(if amend { primary } else { muted })
+                                            .hover(move |s| s.text_color(fg))
+                                            .child(
+                                                div()
+                                                    .size(px(12.))
+                                                    .rounded(px(3.))
+                                                    .border_1()
+                                                    .border_color(if amend {
+                                                        primary
+                                                    } else {
+                                                        border
+                                                    })
+                                                    .when(amend, |b| b.bg(primary.opacity(0.2)))
+                                                    .flex()
+                                                    .items_center()
+                                                    .justify_center()
+                                                    .when(amend, |b| {
+                                                        b.child(
+                                                            Icon::new(IconName::Check)
+                                                                .with_size(px(9.))
+                                                                .text_color(primary),
+                                                        )
+                                                    }),
+                                            )
                                             .child("Amend")
                                             .on_click(cx.listener(|this, _e, window, cx| {
                                                 this.git_toggle_amend(window, cx)
@@ -823,6 +751,7 @@ impl DartIde {
                                     .when(subject_len > 50, |el| {
                                         el.child(
                                             div()
+                                                .font_family(cx.theme().mono_font_family.clone())
                                                 .text_size(px(tokens::UI_XS))
                                                 .text_color(if subject_len > 72 {
                                                     cx.theme().red
@@ -833,39 +762,72 @@ impl DartIde {
                                         )
                                     }),
                             )
-                            .child(match action {
-                                Action::Ready(label, _tip) => {
-                                    let (accent, hover) =
-                                        (cx.theme().primary, cx.theme().primary_hover);
-                                    div()
-                                        .id("git-commit")
-                                        .h(px(24.))
-                                        .px(px(10.))
-                                        .flex()
+                            .when_some(suggestion, |el, suggested_text| {
+                                el.child(
+                                    h_flex()
+                                        .id("git-suggestion")
                                         .items_center()
+                                        .gap(px(tokens::SPACE_1))
+                                        .px(px(tokens::SPACE_2))
+                                        .h(px(18.))
                                         .rounded(px(tokens::RADIUS_SM))
-                                        .bg(accent)
-                                        .text_color(rgb(0x1a120e))
-                                        .text_size(px(tokens::UI_SM))
-                                        .font_medium()
-                                        .when(busy, |el| el.opacity(0.5))
-                                        .when(!busy, |el| {
-                                            el.cursor_pointer()
-                                                .hover(move |s| s.bg(hover))
-                                                .on_click(cx.listener(|this, _e, window, cx| {
-                                                    this.git_primary_action(window, cx)
-                                                }))
-                                        })
-                                        .child(label)
-                                        .into_any_element()
-                                }
-                                Action::NeedsMessage => div()
-                                    .text_size(px(tokens::UI_XS))
-                                    .text_color(muted)
-                                    .child("Write a message")
-                                    .into_any_element(),
-                                Action::Nothing => div().into_any_element(),
+                                        .cursor_pointer()
+                                        .text_size(px(tokens::UI_XS))
+                                        .text_color(primary)
+                                        .hover(|s| s.bg(cx.theme().list_hover))
+                                        .child(Icon::new(IconName::Sparkles).with_size(px(10.5)))
+                                        .child("Auto-fill")
+                                        .on_click(cx.listener(move |this, _e, window, cx| {
+                                            let _ = &suggested_text;
+                                            this.git_apply_suggestion(window, cx)
+                                        })),
+                                )
                             }),
+                    ),
+            )
+            // Full-width Commit button
+            .child(
+                h_flex()
+                    .id("git-commit")
+                    .w_full()
+                    .h(px(28.))
+                    .px(px(tokens::SPACE_4))
+                    .items_center()
+                    .justify_center()
+                    .gap(px(tokens::SPACE_3))
+                    .rounded(px(tokens::RADIUS_SM))
+                    .border_1()
+                    .border_color(if can_commit {
+                        primary
+                    } else {
+                        border
+                    })
+                    .bg(if can_commit {
+                        primary
+                    } else {
+                        cx.theme().muted
+                    })
+                    .text_color(if can_commit {
+                        cx.theme().primary_foreground
+                    } else {
+                        muted
+                    })
+                    .text_size(px(tokens::UI_SM))
+                    .font_medium()
+                    .when(can_commit, |el| {
+                        el.cursor_pointer()
+                            .hover(move |s| s.bg(primary_hover))
+                            .on_click(cx.listener(|this, _e, window, cx| {
+                                this.git_primary_action(window, cx)
+                            }))
+                    })
+                    .child(button_label)
+                    .child(
+                        div()
+                            .font_family(cx.theme().mono_font_family.clone())
+                            .text_size(px(tokens::UI_XS))
+                            .opacity(0.75)
+                            .child("\u{2318}\u{21b5}"),
                     ),
             )
     }
