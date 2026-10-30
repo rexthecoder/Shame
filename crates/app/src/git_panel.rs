@@ -49,6 +49,9 @@ pub(crate) struct GitState {
     pub(crate) expanded_commit_files: Vec<ChangedFile>,
     /// Whether the diff view shows side-by-side (`false`) or unified inline (`true`) rows.
     pub(crate) unified_diff: bool,
+    /// Left-column width fraction (`0.18..=0.82`) in side-by-side diff mode (default `0.5`).
+    pub(crate) diff_split_ratio: f32,
+    pub(crate) diff_dragging_split: bool,
     /// Discard is destructive: the first click arms it (for a few seconds), the second runs it.
     pub(crate) confirm_discard: Option<String>,
     /// Files (path, staged?) the developer has marked reviewed in the diff view.
@@ -83,6 +86,8 @@ impl GitState {
             expanded_commit: None,
             expanded_commit_files: Vec::new(),
             unified_diff: false,
+            diff_split_ratio: 0.5,
+            diff_dragging_split: false,
             confirm_discard: None,
             reviewed: Default::default(),
             commit_types: None,

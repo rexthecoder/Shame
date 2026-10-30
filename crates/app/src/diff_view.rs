@@ -48,6 +48,7 @@ pub(crate) struct DiffState {
     /// `Some(hash)` when viewing a historical commit rather than staged / working-tree changes.
     pub(crate) commit: Option<String>,
     pub(crate) unified: bool,
+    pub(crate) split_ratio: f32,
     pub(crate) full_path: PathBuf,
     diff: FileDiff,
     /// Syntax spans per line (0-based) of the old / new text.
@@ -262,6 +263,7 @@ impl DartIde {
                             staged,
                             commit,
                             unified: this.git.unified_diff,
+                            split_ratio: this.git.diff_split_ratio,
                             diff,
                             old_spans,
                             new_spans,
@@ -787,6 +789,11 @@ impl DartIde {
     fn render_diff_columns(&self, state: &DiffState, cx: &mut Context<Self>) -> Div {
         let scroll = state.scroll.clone();
         let total = state.display.len().max(1) as f32;
+        let unified = state.unified;
+        let split_ratio = state.split_ratio;
+        let dragging = self.git.diff_dragging_split;
+        let drag_view = cx.entity();
+
         div()
             .relative()
             .flex_1()
@@ -809,6 +816,115 @@ impl DartIde {
                 .track_scroll(&scroll)
                 .size_full(),
             )
+            // Draggable vertical split divider between Old (left) and New (right) diff columns
+            .when(!unified, |el| {
+                el.child(
+                    div()
+                        .id("diff-split-resizer")
+                        .absolute()
+                        .top_0()
+                        .bottom_0()
+                        .left(relative(split_ratio))
+                        .ml(px(-3.))
+                        .w(px(7.))
+                        .cursor_col_resize()
+                        .flex()
+                        .justify_center()
+                        .group("diff-resizer-grp")
+                        .child(
+                            div()
+                                .w(px(if dragging { 2. } else { 1. }))
+                                .h_full()
+                                .bg(if dragging {
+                                    cx.theme().primary
+                                } else {
+                                    cx.theme().border
+                                })
+                                .group_hover("diff-resizer-grp", |s| {
+                                    s.w(px(2.)).bg(cx.theme().primary)
+                                }),
+                        ),
+                )
+                .child(
+                    canvas(
+                        move |bounds, _window, _cx| bounds,
+                        move |bounds, _, window, _cx| {
+                            let view = drag_view.clone();
+                            window.on_mouse_event(
+                                move |event: &MouseDownEvent, phase, _window, cx| {
+                                    if phase != DispatchPhase::Bubble
+                                        || event.button != MouseButton::Left
+                                        || !bounds.contains(&event.position)
+                                    {
+                                        return;
+                                    }
+                                    let w: f32 = bounds.size.width.into();
+                                    if w <= 10.0 {
+                                        return;
+                                    }
+                                    let rx: f32 = (event.position.x - bounds.origin.x).into();
+                                    let handle_x = w * split_ratio;
+                                    if (rx - handle_x).abs() <= 8.0 {
+                                        view.update(cx, |this, cx| {
+                                            if event.click_count >= 2 {
+                                                this.git.diff_split_ratio = 0.5;
+                                                if let Some(d) = this.diff.as_mut() {
+                                                    d.split_ratio = 0.5;
+                                                }
+                                                this.git.diff_dragging_split = false;
+                                            } else {
+                                                this.git.diff_dragging_split = true;
+                                            }
+                                            cx.notify();
+                                        });
+                                    }
+                                },
+                            );
+                            let view = drag_view.clone();
+                            window.on_mouse_event(
+                                move |event: &MouseMoveEvent, phase, _window, cx| {
+                                    if phase != DispatchPhase::Bubble
+                                        || !dragging
+                                        || event.pressed_button != Some(MouseButton::Left)
+                                    {
+                                        return;
+                                    }
+                                    let w: f32 = bounds.size.width.into();
+                                    if w <= 10.0 {
+                                        return;
+                                    }
+                                    let rx: f32 = (event.position.x - bounds.origin.x).into();
+                                    let ratio = (rx / w).clamp(0.18, 0.82);
+                                    view.update(cx, |this, cx| {
+                                        this.git.diff_split_ratio = ratio;
+                                        if let Some(d) = this.diff.as_mut() {
+                                            d.split_ratio = ratio;
+                                        }
+                                        cx.notify();
+                                    });
+                                },
+                            );
+                            let view = drag_view.clone();
+                            window.on_mouse_event(
+                                move |event: &MouseUpEvent, phase, _window, cx| {
+                                    if phase != DispatchPhase::Bubble
+                                        || !dragging
+                                        || event.button != MouseButton::Left
+                                    {
+                                        return;
+                                    }
+                                    view.update(cx, |this, cx| {
+                                        this.git.diff_dragging_split = false;
+                                        cx.notify();
+                                    });
+                                },
+                            );
+                        },
+                    )
+                    .absolute()
+                    .inset_0(),
+                )
+            })
             // The change map: one mark per change block, positioned along the whole file.
             .child(
                 div()
@@ -1000,6 +1116,8 @@ fn render_diff_item(
             let removed_side = matches!(row.kind, RowKind::Removed | RowKind::Changed);
             let added_side = matches!(row.kind, RowKind::Added | RowKind::Changed);
             let (old_marks, new_marks) = state.intra.get(&row_ix).cloned().unwrap_or_default();
+            let left_ratio = state.split_ratio;
+            let right_ratio = 1.0 - left_ratio;
             h_flex()
                 .w_full()
                 .h(px(ROW_H))
@@ -1008,15 +1126,16 @@ fn render_diff_item(
                     spans_of(&state.old_spans, &row.left),
                     old_marks,
                     removed_side.then_some(Side::Removed),
+                    left_ratio,
                     cx,
                 ))
-                .child(div().w(px(1.)).h_full().bg(cx.theme().border))
                 .child(
                     diff_half(
                         &row.right,
                         spans_of(&state.new_spans, &row.right),
                         new_marks,
                         added_side.then_some(Side::Added),
+                        right_ratio,
                         cx,
                     )
                     .when_some(chips, |el, chips| el.child(chips)),
@@ -1151,6 +1270,7 @@ fn diff_half(
     spans: Spans,
     marks: Vec<Range<usize>>,
     tint: Option<Side>,
+    width_ratio: f32,
     cx: &mut Context<DartIde>,
 ) -> Div {
     let theme = cx.theme();
@@ -1163,7 +1283,7 @@ fn diff_half(
     };
     let half = div()
         .relative()
-        .flex_1()
+        .w(relative(width_ratio))
         .min_w(px(0.))
         .h_full()
         .overflow_hidden()
@@ -1364,6 +1484,7 @@ mod tests {
             staged: false,
             commit: None,
             unified: false,
+            split_ratio: 0.5,
             full_path: PathBuf::from("/a.dart"),
             diff: FileDiff {
                 rows,
