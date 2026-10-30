@@ -5,16 +5,16 @@
 //! The diff itself comes from `core_workspace::file_diff`; syntax colors (Dart only, like the
 //! editor) come from `core_syntax`. Both are computed off the UI thread.
 
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::ops::Range;
 use std::path::PathBuf;
 
 use core_syntax::{HighlightKind, SyntaxTree};
-use core_workspace::{ChangeKind, ChangedFile, DiffCell, FileDiff, RowKind};
+use core_workspace::{Block, ChangeKind, ChangedFile, DiffCell, FileDiff, RowKind};
 use gpui_kit::assets::IconName;
 use gpui_kit::base::StyledExt as _;
 use gpui_kit::component::{
-    ActiveTheme as _, Icon, Sizable as _,
+    ActiveTheme as _, Disableable as _, Icon, Sizable as _,
     button::{Button, ButtonVariants as _},
     h_flex, v_flex,
 };
@@ -51,6 +51,16 @@ pub(crate) struct DiffState {
     expanded: HashSet<usize>,
     display: Vec<DisplayItem>,
     scroll: UniformListScrollHandle,
+    /// Runs of changed rows; the unit for hunk staging, navigation and the change map.
+    blocks: Vec<Block>,
+    /// For each block, the index of its first row in `display`.
+    block_display: Vec<usize>,
+    /// Which block a row starts, if any.
+    block_at_row: HashMap<usize, usize>,
+    /// Changed words inside replaced lines: row -> (old-side ranges, new-side ranges).
+    intra: HashMap<usize, (Vec<Range<usize>>, Vec<Range<usize>>)>,
+    /// The block last navigated to (drives the "3 / 12" counter and the change-map marker).
+    current_change: usize,
 }
 
 impl DiffState {
@@ -83,6 +93,16 @@ impl DiffState {
             }
         }
         self.display = display;
+        self.block_display = self
+            .blocks
+            .iter()
+            .map(|b| {
+                self.display
+                    .iter()
+                    .position(|d| matches!(d, DisplayItem::Row(r) if *r == b.start))
+                    .unwrap_or(0)
+            })
+            .collect();
     }
 }
 
@@ -148,7 +168,20 @@ impl DartIde {
                 } else {
                     (Vec::new(), Vec::new())
                 };
-                (diff, old_spans, new_spans)
+                let intra: HashMap<usize, _> = diff
+                    .rows
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, r)| r.kind == RowKind::Changed)
+                    .filter_map(|(i, r)| {
+                        let (old, new) = core_workspace::intraline(
+                            &r.left.as_ref()?.text,
+                            &r.right.as_ref()?.text,
+                        );
+                        (!old.is_empty() || !new.is_empty()).then_some((i, (old, new)))
+                    })
+                    .collect();
+                (diff, old_spans, new_spans, intra)
             });
             let _ = tx.send_blocking(result);
         });
@@ -159,7 +192,21 @@ impl DartIde {
                     return; // a newer request superseded this one
                 }
                 match result {
-                    Ok((diff, old_spans, new_spans)) => {
+                    Ok((diff, old_spans, new_spans, intra)) => {
+                        let same_file =
+                            this.diff.as_ref().is_some_and(|d| d.file.path == file.path);
+                        let blocks = core_workspace::blocks(&diff.rows);
+                        let block_at_row = blocks
+                            .iter()
+                            .enumerate()
+                            .map(|(i, b)| (b.start, i))
+                            .collect();
+                        let current_change = this
+                            .diff
+                            .as_ref()
+                            .filter(|_| same_file)
+                            .map_or(0, |d| d.current_change)
+                            .min(blocks.len().saturating_sub(1));
                         let mut state = DiffState {
                             full_path: root.join(&file.path),
                             file,
@@ -169,11 +216,18 @@ impl DartIde {
                             new_spans,
                             expanded,
                             display: Vec::new(),
+                            // Keep the scroll position across refreshes of the same file only.
                             scroll: this
                                 .diff
                                 .as_ref()
+                                .filter(|_| same_file)
                                 .map(|d| d.scroll.clone())
                                 .unwrap_or_else(UniformListScrollHandle::new),
+                            blocks,
+                            block_display: Vec::new(),
+                            block_at_row,
+                            intra,
+                            current_change,
                         };
                         state.rebuild_display();
                         this.diff = Some(state);
@@ -220,6 +274,125 @@ impl DartIde {
         }
     }
 
+    /// Scroll to the next / previous change block.
+    pub(crate) fn diff_goto_change(&mut self, delta: isize, cx: &mut Context<Self>) {
+        let Some(state) = self.diff.as_mut() else {
+            return;
+        };
+        if state.blocks.is_empty() {
+            return;
+        }
+        let n = state.blocks.len() as isize;
+        let next = (state.current_change as isize + delta).rem_euclid(n) as usize;
+        self.diff_goto_block(next, cx);
+    }
+
+    pub(crate) fn diff_goto_block(&mut self, block: usize, cx: &mut Context<Self>) {
+        let Some(state) = self.diff.as_mut() else {
+            return;
+        };
+        let Some(&display_ix) = state.block_display.get(block) else {
+            return;
+        };
+        state.current_change = block;
+        // Leave a little context above the change.
+        state
+            .scroll
+            .scroll_to_item(display_ix.saturating_sub(2), ScrollStrategy::Top);
+        cx.notify();
+    }
+
+    /// Every file shown in the Staged and Changes lists, in the order the panel shows them.
+    fn diff_file_list(&self) -> Vec<(ChangedFile, bool)> {
+        let Some(status) = &self.git.status else {
+            return Vec::new();
+        };
+        status
+            .staged
+            .iter()
+            .map(|f| (f.clone(), true))
+            .chain(status.unstaged.iter().map(|f| (f.clone(), false)))
+            .collect()
+    }
+
+    /// Step to the next / previous changed file without going back to the panel.
+    pub(crate) fn diff_goto_file(&mut self, delta: isize, cx: &mut Context<Self>) {
+        let list = self.diff_file_list();
+        let Some(open) = &self.diff else { return };
+        let Some(here) = list
+            .iter()
+            .position(|(f, s)| f.path == open.file.path && *s == open.staged)
+        else {
+            return;
+        };
+        let (file, staged) =
+            list[(here as isize + delta).rem_euclid(list.len() as isize) as usize].clone();
+        self.open_git_diff(file, staged, cx);
+    }
+
+    /// Mark the open file reviewed (or not) and, when marking, move on to the next unreviewed one.
+    pub(crate) fn diff_toggle_reviewed(&mut self, cx: &mut Context<Self>) {
+        let Some(open) = &self.diff else { return };
+        let key = (open.file.path.clone(), open.staged);
+        if !self.git.reviewed.remove(&key) {
+            self.git.reviewed.insert(key.clone());
+            let list = self.diff_file_list();
+            let here = list
+                .iter()
+                .position(|(f, s)| (f.path.clone(), *s) == key)
+                .unwrap_or(0);
+            let next = (1..list.len())
+                .map(|step| &list[(here + step) % list.len()])
+                .find(|(f, s)| !self.git.reviewed.contains(&(f.path.clone(), *s)))
+                .cloned();
+            if let Some((file, staged)) = next {
+                self.open_git_diff(file, staged, cx);
+            }
+        }
+        cx.notify();
+    }
+
+    /// Stage / unstage / revert one change block of the open diff.
+    pub(crate) fn diff_hunk_action(
+        &mut self,
+        action: HunkAction,
+        block: usize,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(state) = &self.diff else { return };
+        let (Some(&block_range), false) = (
+            state.blocks.get(block),
+            state.file.kind == ChangeKind::Untracked,
+        ) else {
+            return;
+        };
+        if action == HunkAction::Revert {
+            // Reverting cannot be undone: the first click arms it, the second runs it.
+            let key = format!("hunk:{}:{block}", state.file.path);
+            if self.git.confirm_discard.as_deref() != Some(key.as_str()) {
+                self.arm_confirm(key, cx);
+                return;
+            }
+        }
+        let (file, rows) = (state.file.clone(), state.diff.rows.clone());
+        let (label, done) = match action {
+            HunkAction::Stage => ("Staging hunk\u{2026}", "Staged hunk"),
+            HunkAction::Unstage => ("Unstaging hunk\u{2026}", "Unstaged hunk"),
+            HunkAction::Revert => ("Reverting hunk\u{2026}", "Reverted hunk"),
+        };
+        self.git_run(window, Some(label), false, cx, move |root, _| {
+            match action {
+                HunkAction::Stage => core_workspace::stage_hunk(root, &file, &rows, block_range),
+                HunkAction::Unstage => {
+                    core_workspace::unstage_hunk(root, &file, &rows, block_range)
+                }
+                HunkAction::Revert => core_workspace::revert_hunk(root, &file, &rows, block_range),
+            }
+            .map(|_| done.to_string())
+        });
+    }
+
     pub(crate) fn render_diff_view(&self, cx: &mut Context<Self>) -> AnyElement {
         let Some(state) = &self.diff else {
             return div().into_any_element();
@@ -262,6 +435,64 @@ impl DartIde {
         let stage_file = state.file.clone();
         let open_path = state.full_path.clone();
         let can_open = state.file.kind != ChangeKind::Deleted;
+        let files = self.diff_file_list();
+        let file_pos = files
+            .iter()
+            .position(|(f, s)| f.path == state.file.path && *s == staged);
+        let reviewed = self
+            .git
+            .reviewed
+            .contains(&(state.file.path.clone(), staged));
+        let change_count = state.blocks.len();
+
+        // A little "‹ 3 / 12 ›" stepper.
+        let stepper = |id: &'static str,
+                       text: String,
+                       tip: &'static str,
+                       enabled: bool,
+                       step: fn(&mut DartIde, isize, &mut Context<DartIde>),
+                       cx: &mut Context<Self>| {
+            h_flex()
+                .flex_shrink_0()
+                .items_center()
+                .gap(px(1.))
+                .child(
+                    Button::new((id, 0usize))
+                        .ghost()
+                        .xsmall()
+                        .disabled(!enabled)
+                        .icon(
+                            Icon::new(IconName::ChevronLeft)
+                                .with_size(px(12.))
+                                .text_color(muted),
+                        )
+                        .tooltip(format!("Previous {tip}"))
+                        .on_click(cx.listener(move |this, _e, _w, cx| step(this, -1, cx))),
+                )
+                .child(
+                    div()
+                        .min_w(px(34.))
+                        .text_center()
+                        .font_family(cx.theme().mono_font_family.clone())
+                        .text_size(px(tokens::UI_XS))
+                        .text_color(muted)
+                        .child(text),
+                )
+                .child(
+                    Button::new((id, 1usize))
+                        .ghost()
+                        .xsmall()
+                        .disabled(!enabled)
+                        .icon(
+                            Icon::new(IconName::ChevronRight)
+                                .with_size(px(12.))
+                                .text_color(muted),
+                        )
+                        .tooltip(format!("Next {tip}"))
+                        .on_click(cx.listener(move |this, _e, _w, cx| step(this, 1, cx))),
+                )
+        };
+
         h_flex()
             .w_full()
             .h(px(tokens::TABSTRIP_H))
@@ -327,7 +558,49 @@ impl DartIde {
                 h_flex()
                     .flex_shrink_0()
                     .items_center()
-                    .gap(px(tokens::SPACE_2))
+                    .gap(px(tokens::SPACE_3))
+                    .child(stepper(
+                        "diff-change-nav",
+                        if change_count == 0 {
+                            "\u{2013}".to_string()
+                        } else {
+                            format!("{}/{}", state.current_change + 1, change_count)
+                        },
+                        "change",
+                        change_count > 1,
+                        DartIde::diff_goto_change,
+                        cx,
+                    ))
+                    .child(div().w(px(1.)).h(px(14.)).bg(cx.theme().border))
+                    .child(stepper(
+                        "diff-file-nav",
+                        file_pos.map_or("\u{2013}".to_string(), |i| {
+                            format!("{}/{}", i + 1, files.len())
+                        }),
+                        "file",
+                        files.len() > 1,
+                        DartIde::diff_goto_file,
+                        cx,
+                    ))
+                    .child(
+                        Button::new("diff-reviewed")
+                            .ghost()
+                            .small()
+                            .icon(
+                                Icon::new(IconName::Check)
+                                    .with_size(px(13.))
+                                    .text_color(if reviewed { cx.theme().green } else { muted }),
+                            )
+                            .label(if reviewed {
+                                "Reviewed"
+                            } else {
+                                "Mark reviewed"
+                            })
+                            .tooltip("Mark this file reviewed and move to the next one")
+                            .on_click(
+                                cx.listener(|this, _e, _w, cx| this.diff_toggle_reviewed(cx)),
+                            ),
+                    )
                     .when(can_open, |el| {
                         el.child(
                             Button::new("diff-open-file")
@@ -364,21 +637,72 @@ impl DartIde {
 
     fn render_diff_columns(&self, state: &DiffState, cx: &mut Context<Self>) -> Div {
         let scroll = state.scroll.clone();
-        div().flex_1().w_full().min_h(px(0.)).child(
-            uniform_list(
-                "diff-rows",
-                state.display.len(),
-                cx.processor(|this, range: Range<usize>, _window, cx| {
-                    let Some(state) = &this.diff else {
-                        return Vec::new();
-                    };
-                    range.map(|ix| render_diff_item(state, ix, cx)).collect()
-                }),
+        let total = state.display.len().max(1) as f32;
+        div()
+            .relative()
+            .flex_1()
+            .w_full()
+            .min_h(px(0.))
+            .child(
+                uniform_list(
+                    "diff-rows",
+                    state.display.len(),
+                    cx.processor(|this, range: Range<usize>, window, cx| {
+                        let Some(state) = &this.diff else {
+                            return Vec::new();
+                        };
+                        let armed = this.git.confirm_discard.clone();
+                        range
+                            .map(|ix| render_diff_item(state, ix, armed.as_deref(), window, cx))
+                            .collect()
+                    }),
+                )
+                .track_scroll(&scroll)
+                .size_full(),
             )
-            .track_scroll(&scroll)
-            .size_full(),
-        )
+            // The change map: one mark per change block, positioned along the whole file.
+            .child(
+                div()
+                    .absolute()
+                    .top_0()
+                    .bottom_0()
+                    .right_0()
+                    .w(px(10.))
+                    .bg(cx.theme().background.opacity(0.6))
+                    .border_l_1()
+                    .border_color(cx.theme().border)
+                    .children(state.blocks.iter().enumerate().map(|(i, block)| {
+                        let row = &state.diff.rows[block.start];
+                        let color = match row.kind {
+                            RowKind::Added => cx.theme().green,
+                            RowKind::Removed => cx.theme().red,
+                            _ => cx.theme().warning,
+                        };
+                        let current = i == state.current_change;
+                        let at = state.block_display.get(i).copied().unwrap_or(0) as f32 / total;
+                        div()
+                            .id(("diff-map-mark", i))
+                            .absolute()
+                            .left(px(1.))
+                            .right(px(1.))
+                            .top(relative(at))
+                            .h(px(if current { 7. } else { 5. }))
+                            .rounded(px(1.))
+                            .bg(color.opacity(if current { 1.0 } else { 0.75 }))
+                            .cursor_pointer()
+                            .on_click(
+                                cx.listener(move |this, _e, _w, cx| this.diff_goto_block(i, cx)),
+                            )
+                    })),
+            )
     }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HunkAction {
+    Stage,
+    Unstage,
+    Revert,
 }
 
 fn diff_message(text: &'static str, color: Hsla) -> Div {
@@ -393,7 +717,13 @@ fn diff_message(text: &'static str, color: Hsla) -> Div {
         .child(text)
 }
 
-fn render_diff_item(state: &DiffState, ix: usize, cx: &mut Context<DartIde>) -> AnyElement {
+fn render_diff_item(
+    state: &DiffState,
+    ix: usize,
+    armed: Option<&str>,
+    _window: &mut Window,
+    cx: &mut Context<DartIde>,
+) -> AnyElement {
     match state.display[ix] {
         DisplayItem::Gap { start, end } => {
             let muted = cx.theme().muted_foreground;
@@ -436,25 +766,112 @@ fn render_diff_item(state: &DiffState, ix: usize, cx: &mut Context<DartIde>) -> 
                     .cloned()
                     .unwrap_or_default()
             };
+            let (old_marks, new_marks) = state.intra.get(&row_ix).cloned().unwrap_or_default();
+            let chips = state
+                .block_at_row
+                .get(&row_ix)
+                .copied()
+                .filter(|_| state.file.kind != ChangeKind::Untracked)
+                .map(|block| hunk_chips(state, block, armed, cx));
             h_flex()
                 .w_full()
                 .h(px(ROW_H))
                 .child(diff_half(
                     &row.left,
                     spans_of(&state.old_spans, &row.left),
+                    old_marks,
                     removed_side.then_some(Side::Removed),
                     cx,
                 ))
                 .child(div().w(px(1.)).h_full().bg(cx.theme().border))
-                .child(diff_half(
-                    &row.right,
-                    spans_of(&state.new_spans, &row.right),
-                    added_side.then_some(Side::Added),
-                    cx,
-                ))
+                .child(
+                    diff_half(
+                        &row.right,
+                        spans_of(&state.new_spans, &row.right),
+                        new_marks,
+                        added_side.then_some(Side::Added),
+                        cx,
+                    )
+                    .when_some(chips, |el, chips| el.child(chips)),
+                )
                 .into_any_element()
         }
     }
+}
+
+/// "Stage hunk" / "Revert" (or "Unstage hunk") chips at the right edge of a block's first row.
+/// Revert asks twice: the first click arms it (`armed` names the armed action), the second runs it.
+fn hunk_chips(
+    state: &DiffState,
+    block: usize,
+    armed: Option<&str>,
+    cx: &mut Context<DartIde>,
+) -> Div {
+    let revert_armed = armed == Some(format!("hunk:{}:{block}", state.file.path).as_str());
+    let chip = |id: &'static str,
+                label: &'static str,
+                danger: bool,
+                action: HunkAction,
+                cx: &mut Context<DartIde>| {
+        let theme = cx.theme();
+        let (red, fg, border, bg, muted, font) = (
+            theme.red,
+            theme.foreground,
+            theme.border,
+            theme.background,
+            theme.muted_foreground,
+            theme.font_family.clone(),
+        );
+        div()
+            .id((id, block))
+            .px(px(7.))
+            .h(px(18.))
+            .flex()
+            .items_center()
+            .rounded(px(4.))
+            .border_1()
+            .border_color(if danger { red.opacity(0.5) } else { border })
+            .bg(if danger { red.opacity(0.18) } else { bg })
+            .cursor_pointer()
+            .text_size(px(tokens::UI_XS))
+            .font_family(font)
+            .text_color(if danger { red } else { muted })
+            .hover(move |s| s.text_color(fg))
+            .child(label)
+            .on_click(cx.listener(move |this, _e, window, cx| {
+                this.diff_hunk_action(action, block, window, cx)
+            }))
+    };
+    h_flex()
+        .absolute()
+        .top(px(2.))
+        .right(px(16.))
+        .gap(px(4.))
+        .when(state.staged, |el| {
+            el.child(chip(
+                "hunk-unstage",
+                "Unstage hunk",
+                false,
+                HunkAction::Unstage,
+                cx,
+            ))
+        })
+        .when(!state.staged, |el| {
+            el.child(chip(
+                "hunk-stage",
+                "Stage hunk",
+                false,
+                HunkAction::Stage,
+                cx,
+            ))
+            .child(chip(
+                "hunk-revert",
+                if revert_armed { "Revert?" } else { "Revert" },
+                revert_armed,
+                HunkAction::Revert,
+                cx,
+            ))
+        })
 }
 
 #[derive(Clone, Copy)]
@@ -463,10 +880,49 @@ enum Side {
     Added,
 }
 
+/// Combine syntax colors and "changed word" backgrounds into non-overlapping styled ranges.
+fn merge_styles(
+    len: usize,
+    spans: &[(Range<usize>, HighlightKind)],
+    marks: &[Range<usize>],
+    mark_bg: Hsla,
+) -> Vec<(Range<usize>, HighlightStyle)> {
+    let mut cuts: BTreeSet<usize> = BTreeSet::from([0, len]);
+    for r in spans.iter().map(|(r, _)| r).chain(marks) {
+        cuts.insert(r.start.min(len));
+        cuts.insert(r.end.min(len));
+    }
+    let cuts: Vec<usize> = cuts.into_iter().collect();
+    cuts.windows(2)
+        .filter_map(|w| {
+            let (a, b) = (w[0], w[1]);
+            let color = spans
+                .iter()
+                .find(|(r, _)| r.start <= a && b <= r.end)
+                .map(|(_, k)| editor_view::highlight_color(*k).into());
+            let background_color = marks
+                .iter()
+                .any(|m| m.start <= a && b <= m.end)
+                .then_some(mark_bg);
+            (color.is_some() || background_color.is_some()).then(|| {
+                (
+                    a..b,
+                    HighlightStyle {
+                        color,
+                        background_color,
+                        ..Default::default()
+                    },
+                )
+            })
+        })
+        .collect()
+}
+
 /// One half of a row: line-number gutter plus the (syntax-colored) text.
 fn diff_half(
     cell: &Option<DiffCell>,
     spans: Spans,
+    marks: Vec<Range<usize>>,
     tint: Option<Side>,
     cx: &mut Context<DartIde>,
 ) -> Div {
@@ -504,22 +960,19 @@ fn diff_half(
     } else {
         theme.muted_foreground.opacity(0.7)
     };
-    let text: SharedString = if spans.is_empty() {
+    let plain = spans.is_empty() && marks.is_empty();
+    let text: SharedString = if plain {
         cell.text.replace('\t', "    ")
     } else {
         cell.text.clone()
     }
     .into();
+    let mark_bg = match tint {
+        Some(Side::Removed) => theme.red.opacity(0.35),
+        _ => theme.green.opacity(0.35),
+    };
+    let styles = merge_styles(text.len(), &spans, &marks, mark_bg);
     let default = theme.foreground;
-    let styled = StyledText::new(text).with_highlights(spans.into_iter().map(|(range, kind)| {
-        (
-            range,
-            HighlightStyle {
-                color: Some(editor_view::highlight_color(kind).into()),
-                ..Default::default()
-            },
-        )
-    }));
     half.font_family(theme.mono_font_family.clone())
         .text_size(px(tokens::MONO))
         .child(
@@ -537,7 +990,7 @@ fn diff_half(
                 .min_w(px(0.))
                 .whitespace_nowrap()
                 .text_color(default)
-                .child(styled),
+                .child(StyledText::new(text).with_highlights(styles)),
         )
 }
 
@@ -590,6 +1043,11 @@ mod tests {
             expanded: HashSet::new(),
             display: Vec::new(),
             scroll: UniformListScrollHandle::new(),
+            blocks: Vec::new(),
+            block_display: Vec::new(),
+            block_at_row: HashMap::new(),
+            intra: HashMap::new(),
+            current_change: 0,
         }
     }
 
@@ -671,5 +1129,50 @@ mod tests {
                 last = range.end;
             }
         }
+    }
+
+    #[core::prelude::v1::test]
+    fn word_marks_and_syntax_colors_merge_into_disjoint_ranges() {
+        let spans = vec![
+            (0..3, HighlightKind::Keyword),
+            (4..9, HighlightKind::String),
+        ];
+        let marks = vec![2..6];
+        let merged = merge_styles(12, &spans, &marks, rgba(0xff0000ff).into());
+        let ranges: Vec<_> = merged.iter().map(|(r, _)| r.clone()).collect();
+        assert_eq!(ranges, vec![0..2, 2..3, 3..4, 4..6, 6..9]);
+        let has = |i: usize| {
+            (
+                merged[i].1.color.is_some(),
+                merged[i].1.background_color.is_some(),
+            )
+        };
+        assert_eq!(has(0), (true, false)); // keyword only
+        assert_eq!(has(1), (true, true)); // keyword and changed word
+        assert_eq!(has(2), (false, true)); // changed word only
+        assert_eq!(has(3), (true, true)); // string and changed word
+        assert_eq!(has(4), (true, false)); // string only
+        // Disjoint and in order, as StyledText requires.
+        assert!(ranges.windows(2).all(|w| w[0].end <= w[1].start));
+        assert!(merge_styles(5, &[], &[], rgba(0).into()).is_empty());
+    }
+
+    #[core::prelude::v1::test]
+    fn blocks_drive_navigation_positions_in_the_display_list() {
+        let mut rows: Vec<DiffRow> = (1..=30).map(|n| row(RowKind::Context, n)).collect();
+        rows[5] = row(RowKind::Added, 6);
+        rows[25] = row(RowKind::Removed, 26);
+        let mut s = state(rows);
+        s.blocks = core_workspace::blocks(&s.diff.rows);
+        s.rebuild_display();
+        assert_eq!(s.blocks.len(), 2);
+        // Each block's first row is on screen (never folded away), and in order.
+        assert_eq!(s.block_display.len(), 2);
+        assert!(matches!(s.display[s.block_display[0]], DisplayItem::Row(5)));
+        assert!(matches!(
+            s.display[s.block_display[1]],
+            DisplayItem::Row(25)
+        ));
+        assert!(s.block_display[0] < s.block_display[1]);
     }
 }

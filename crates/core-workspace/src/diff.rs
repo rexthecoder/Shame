@@ -1,6 +1,7 @@
 //! Side-by-side file diffs for the editor's diff view: git's unified diff (with the whole file as
 //! context) turned into aligned left / right rows, the way split diff views show them.
 
+use std::ops::Range;
 use std::path::Path;
 
 use crate::repo::{ChangeKind, ChangedFile, git};
@@ -180,6 +181,192 @@ pub fn parse_unified(diff: &str) -> Result<FileDiff, String> {
     Ok(out)
 }
 
+/// A run of consecutive changed rows (everything between two stretches of unchanged lines).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Block {
+    /// Row range `start..end`, all of them changes.
+    pub start: usize,
+    pub end: usize,
+}
+
+/// The change blocks of a diff, in order.
+pub fn blocks(rows: &[DiffRow]) -> Vec<Block> {
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < rows.len() {
+        if rows[i].is_change() {
+            let start = i;
+            while i < rows.len() && rows[i].is_change() {
+                i += 1;
+            }
+            out.push(Block { start, end: i });
+        } else {
+            i += 1;
+        }
+    }
+    out
+}
+
+const PATCH_CONTEXT: usize = 3;
+
+/// A unified-diff patch containing just `block` (plus up to three unchanged lines either side),
+/// ready for `git apply`.
+pub fn hunk_patch(path: &str, rows: &[DiffRow], block: Block) -> String {
+    let is_context = |r: &DiffRow| r.kind == RowKind::Context;
+    let mut pre = block.start;
+    while pre > 0 && block.start - pre < PATCH_CONTEXT && is_context(&rows[pre - 1]) {
+        pre -= 1;
+    }
+    let mut post = block.end;
+    while post < rows.len() && post - block.end < PATCH_CONTEXT && is_context(&rows[post]) {
+        post += 1;
+    }
+    let context = |range: Range<usize>| rows[range].iter().map(|r| r.left.as_ref().map_or("", |c| c.text.as_str()));
+
+    let mut body = String::new();
+    let (mut old_len, mut new_len) = (0, 0);
+    for text in context(pre..block.start) {
+        body.push_str(&format!(" {text}\n"));
+        old_len += 1;
+        new_len += 1;
+    }
+    for cell in rows[block.start..block.end].iter().filter_map(|r| r.left.as_ref()) {
+        body.push_str(&format!("-{}\n", cell.text));
+        old_len += 1;
+    }
+    for cell in rows[block.start..block.end].iter().filter_map(|r| r.right.as_ref()) {
+        body.push_str(&format!("+{}\n", cell.text));
+        new_len += 1;
+    }
+    for text in context(block.end..post) {
+        body.push_str(&format!(" {text}\n"));
+        old_len += 1;
+        new_len += 1;
+    }
+
+    // Start lines: the first line of that side in the patch; for an empty side, the line before.
+    let window = &rows[pre..post];
+    let before = &rows[..pre];
+    let old_start = window
+        .iter()
+        .find_map(|r| r.left.as_ref().map(|c| c.line))
+        .unwrap_or_else(|| before.iter().rev().find_map(|r| r.left.as_ref().map(|c| c.line)).unwrap_or(0));
+    let new_start = window
+        .iter()
+        .find_map(|r| r.right.as_ref().map(|c| c.line))
+        .unwrap_or_else(|| before.iter().rev().find_map(|r| r.right.as_ref().map(|c| c.line)).unwrap_or(0));
+    format!("diff --git a/{path} b/{path}\n--- a/{path}\n+++ b/{path}\n@@ -{old_start},{old_len} +{new_start},{new_len} @@\n{body}")
+}
+
+fn apply(root: &Path, patch: &str, flags: &[&str]) -> Result<(), String> {
+    let mut args = vec!["apply", "--recount", "--whitespace=nowarn"];
+    args.extend_from_slice(flags);
+    args.push("-");
+    git(root, &args, Some(patch)).map(|_| ())
+}
+
+/// Stage only `block` of an unstaged diff.
+pub fn stage_hunk(root: &Path, file: &ChangedFile, rows: &[DiffRow], block: Block) -> Result<(), String> {
+    apply(root, &hunk_patch(&file.path, rows, block), &["--cached"])
+}
+
+/// Unstage only `block` of a staged diff.
+pub fn unstage_hunk(root: &Path, file: &ChangedFile, rows: &[DiffRow], block: Block) -> Result<(), String> {
+    apply(root, &hunk_patch(&file.path, rows, block), &["--cached", "--reverse"])
+}
+
+/// Throw away `block` of an unstaged diff (restores those lines in the working tree).
+pub fn revert_hunk(root: &Path, file: &ChangedFile, rows: &[DiffRow], block: Block) -> Result<(), String> {
+    apply(root, &hunk_patch(&file.path, rows, block), &["--reverse"])
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TokenClass {
+    Word,
+    Space,
+    Other,
+}
+
+fn tokens(text: &str) -> Vec<Range<usize>> {
+    let class = |c: char| {
+        if c.is_alphanumeric() || c == '_' {
+            TokenClass::Word
+        } else if c.is_whitespace() {
+            TokenClass::Space
+        } else {
+            TokenClass::Other
+        }
+    };
+    let mut out: Vec<Range<usize>> = Vec::new();
+    let mut last: Option<TokenClass> = None;
+    for (i, c) in text.char_indices() {
+        let k = class(c);
+        match (out.last_mut(), last) {
+            (Some(prev), Some(l)) if l == k && k != TokenClass::Other => prev.end = i + c.len_utf8(),
+            _ => out.push(i..i + c.len_utf8()),
+        }
+        last = Some(k);
+    }
+    out
+}
+
+/// The words that differ between two versions of a line, as byte ranges in each. Empty when the
+/// lines have nothing meaningful in common (then the whole line is the change) or are identical.
+pub fn intraline(old: &str, new: &str) -> (Vec<Range<usize>>, Vec<Range<usize>>) {
+    if old == new {
+        return Default::default();
+    }
+    let (a, b) = (tokens(old), tokens(new));
+    if a.is_empty() || b.is_empty() || a.len() > 400 || b.len() > 400 {
+        return Default::default();
+    }
+    // Longest common subsequence of tokens.
+    let mut lcs = vec![vec![0u16; b.len() + 1]; a.len() + 1];
+    for i in (0..a.len()).rev() {
+        for j in (0..b.len()).rev() {
+            lcs[i][j] = if old[a[i].clone()] == new[b[j].clone()] {
+                lcs[i + 1][j + 1] + 1
+            } else {
+                lcs[i + 1][j].max(lcs[i][j + 1])
+            };
+        }
+    }
+    let (mut keep_a, mut keep_b) = (vec![false; a.len()], vec![false; b.len()]);
+    let (mut i, mut j) = (0, 0);
+    while i < a.len() && j < b.len() {
+        if old[a[i].clone()] == new[b[j].clone()] {
+            keep_a[i] = true;
+            keep_b[j] = true;
+            i += 1;
+            j += 1;
+        } else if lcs[i + 1][j] >= lcs[i][j + 1] {
+            i += 1;
+        } else {
+            j += 1;
+        }
+    }
+    let collect = |toks: &[Range<usize>], keep: &[bool]| -> Vec<Range<usize>> {
+        let mut out: Vec<Range<usize>> = Vec::new();
+        for (t, kept) in toks.iter().zip(keep) {
+            if *kept {
+                continue;
+            }
+            match out.last_mut() {
+                Some(prev) if prev.end == t.start => prev.end = t.end,
+                _ => out.push(t.clone()),
+            }
+        }
+        out
+    };
+    let (ra, rb) = (collect(&a, &keep_a), collect(&b, &keep_b));
+    let share = |ranges: &[Range<usize>], text: &str| ranges.iter().map(|r| r.len()).sum::<usize>() as f32 / text.len().max(1) as f32;
+    // If most of the line changed, highlighting "the changed words" is just noise.
+    if share(&ra, old) > 0.6 || share(&rb, new) > 0.6 {
+        return Default::default();
+    }
+    (ra, rb)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -276,5 +463,92 @@ mod tests {
         stage_all(&root).unwrap();
         let staged = file_diff(&root, &by("a.txt"), true).unwrap();
         assert_eq!((staged.added, staged.removed), (2, 1));
+    }
+
+    #[test]
+    fn intraline_marks_only_the_changed_words() {
+        let (old, new) = intraline("let x = foo(1);", "let x = bar(1);");
+        assert_eq!(old, vec![8..11]);
+        assert_eq!(new, vec![8..11]);
+        let (old, new) = intraline("a b c", "a b c d");
+        assert!(old.is_empty());
+        assert_eq!(new, vec![5..7]); // " d"
+        // Nothing in common: no word-level noise.
+        assert_eq!(intraline("alpha beta", "zzz yyy"), Default::default());
+        assert_eq!(intraline("same", "same"), Default::default());
+    }
+
+    #[test]
+    fn blocks_split_at_unchanged_lines() {
+        let d = parse_unified(sample()).unwrap();
+        // Changed + Changed + Added form one block, then a lone Added after two context lines.
+        assert_eq!(blocks(&d.rows), vec![Block { start: 1, end: 4 }, Block { start: 6, end: 7 }]);
+    }
+
+    #[test]
+    fn hunk_patch_covers_one_block_with_context() {
+        let d = parse_unified(sample()).unwrap();
+        let patch = hunk_patch("f.txt", &d.rows, blocks(&d.rows)[1]);
+        assert!(patch.contains("@@ -4,3 +5,4 @@"), "{patch}");
+        assert!(patch.ends_with(" four\n five\n+six\n seven\n"), "{patch}");
+    }
+
+    fn hunk_repo(name: &str) -> (std::path::PathBuf, ChangedFile) {
+        static N: AtomicUsize = AtomicUsize::new(0);
+        let dir = std::env::temp_dir().join(format!("core-workspace-hunk-{name}-{}-{}", std::process::id(), N.fetch_add(1, Ordering::SeqCst)));
+        std::fs::create_dir_all(&dir).unwrap();
+        git(&dir, &["init", "-q", "-b", "main"], None).unwrap();
+        for (k, v) in [("user.email", "t@e.com"), ("user.name", "T"), ("commit.gpgsign", "false")] {
+            git(&dir, &["config", k, v], None).unwrap();
+        }
+        let root = repo_root(&dir).unwrap();
+        let original: String = (1..=12).map(|n| format!("line {n}\n")).collect();
+        std::fs::write(root.join("f.txt"), &original).unwrap();
+        stage_all(&root).unwrap();
+        commit(&root, "init", false).unwrap();
+        // Two separate edits: line 2 changed, line 11 deleted and a line appended after 12.
+        let edited = original.replace("line 2\n", "LINE TWO\n").replace("line 11\n", "") + "line 13\n";
+        std::fs::write(root.join("f.txt"), edited).unwrap();
+        let file = repo_status(&root).unwrap().unstaged[0].clone();
+        (root, file)
+    }
+
+    fn git_out(root: &Path, args: &[&str]) -> String {
+        git(root, args, None).unwrap()
+    }
+
+    #[test]
+    fn staging_one_hunk_leaves_the_other_unstaged() {
+        let (root, file) = hunk_repo("stage");
+        let diff = file_diff(&root, &file, false).unwrap();
+        let bs = blocks(&diff.rows);
+        // Line 2 edited, line 11 deleted, line 13 appended (line 12 separates the last two).
+        assert_eq!(bs.len(), 3);
+
+        stage_hunk(&root, &file, &diff.rows, bs[0]).unwrap();
+        let cached = git_out(&root, &["diff", "--cached", "--no-color"]);
+        assert!(cached.contains("+LINE TWO") && !cached.contains("line 13"), "{cached}");
+        let worktree = git_out(&root, &["diff", "--no-color"]);
+        assert!(!worktree.contains("LINE TWO") && worktree.contains("+line 13"), "{worktree}");
+
+        // The staged view now has exactly the first block; unstaging it puts things back.
+        let staged_file = repo_status(&root).unwrap().staged[0].clone();
+        let staged = file_diff(&root, &staged_file, true).unwrap();
+        let sb = blocks(&staged.rows);
+        assert_eq!(sb.len(), 1);
+        unstage_hunk(&root, &staged_file, &staged.rows, sb[0]).unwrap();
+        assert!(git_out(&root, &["diff", "--cached", "--no-color"]).is_empty());
+    }
+
+    #[test]
+    fn reverting_one_hunk_restores_only_those_lines() {
+        let (root, file) = hunk_repo("revert");
+        let diff = file_diff(&root, &file, false).unwrap();
+        let bs = blocks(&diff.rows);
+        revert_hunk(&root, &file, &diff.rows, bs[1]).unwrap();
+        let text = std::fs::read_to_string(root.join("f.txt")).unwrap();
+        assert!(text.contains("LINE TWO"), "first edit is kept: {text}");
+        assert!(text.contains("line 11\n"), "the deleted line is back: {text}");
+        assert!(text.contains("line 13\n"), "the appended line is untouched: {text}");
     }
 }

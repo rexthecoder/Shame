@@ -43,6 +43,10 @@ pub(crate) struct GitState {
     pub(crate) changes_collapsed: bool,
     /// Discard is destructive: the first click arms it (for a few seconds), the second runs it.
     pub(crate) confirm_discard: Option<String>,
+    /// Files (path, staged?) the developer has marked reviewed in the diff view.
+    pub(crate) reviewed: std::collections::HashSet<(String, bool)>,
+    /// Conventional-commit types this repo uses (`None` until loaded; empty if it has no convention).
+    pub(crate) commit_types: Option<Vec<String>>,
     refreshing: bool,
 }
 
@@ -54,8 +58,8 @@ impl GitState {
             notice: None,
             message: cx.new(|cx| {
                 TextareaState::new(window, cx)
-                    .placeholder("Commit message")
-                    .auto_grow(2, 8)
+                    .placeholder("Describe this change\u{2026}")
+                    .auto_grow(1, 6)
             }),
             branch_input: cx.new(|cx| InputState::new(window, cx).placeholder("New branch name…")),
             branches: Vec::new(),
@@ -64,6 +68,8 @@ impl GitState {
             staged_collapsed: false,
             changes_collapsed: false,
             confirm_discard: None,
+            reviewed: Default::default(),
+            commit_types: None,
             refreshing: false,
         }
     }
@@ -80,22 +86,30 @@ impl DartIde {
         }
         self.git.refreshing = true;
         let root = self.root.clone();
+        let need_types = self.git.commit_types.is_none();
         let (tx, rx) = async_channel::bounded(1);
         std::thread::spawn(move || {
             let _guard = GIT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
             let status = core_workspace::repo_status(&root);
             let branch = core_workspace::current_branch(&root);
             let badges = core_workspace::status_map(&root);
-            let _ = tx.send_blocking((status, branch, badges));
+            let types =
+                (need_types && status.is_some()).then(|| core_workspace::commit_types(&root));
+            let _ = tx.send_blocking((status, branch, badges, types));
         });
         cx.spawn(async move |weak, cx| {
             let result = rx.recv().await;
             let _ = weak.update(cx, |this, cx| {
                 this.git.refreshing = false;
-                let Ok((status, branch, badges)) = result else {
+                let Ok((status, branch, badges, types)) = result else {
                     return;
                 };
-                let changed = this.git.status != status
+                let types_changed = types.is_some();
+                if types.is_some() {
+                    this.git.commit_types = types;
+                }
+                let changed = types_changed
+                    || this.git.status != status
                     || this.git_branch != branch
                     || this.git_status != badges;
                 this.git.status = status;
@@ -150,7 +164,7 @@ impl DartIde {
     /// Run `job` against the repository root off the UI thread, then refresh. `label` marks a
     /// long action ("Pushing…") as busy and reports `Ok` text as the notice; `None` runs quietly
     /// (stage / unstage), showing only errors.
-    fn git_run(
+    pub(crate) fn git_run(
         &mut self,
         window: &Window,
         label: Option<&'static str>,
@@ -190,6 +204,8 @@ impl DartIde {
                                 .message
                                 .update(cx, |state, cx| state.set_value("", window, cx));
                             this.git.amend = false;
+                            this.git.reviewed.clear();
+                            this.git.commit_types = None;
                         }
                         this.git.notice = Some(GitNotice {
                             text,
@@ -205,6 +221,11 @@ impl DartIde {
                     Ok(_) => {}
                 }
                 this.refresh_git(cx);
+                // The open diff shows what just changed (a staged hunk, a reverted one, ...).
+                if let Some((file, staged)) = this.diff.as_ref().map(|d| (d.file.clone(), d.staged))
+                {
+                    this.open_git_diff(file, staged, cx);
+                }
                 cx.notify();
             });
         })
@@ -263,15 +284,19 @@ impl DartIde {
             self.git_discard(file, window, cx);
             return;
         }
-        let path = file.path.clone();
-        self.git.confirm_discard = Some(path.clone());
+        self.arm_confirm(file.path.clone(), cx);
+    }
+
+    /// Arm a destructive action identified by `key` for a few seconds.
+    pub(crate) fn arm_confirm(&mut self, key: String, cx: &mut Context<Self>) {
+        self.git.confirm_discard = Some(key.clone());
         cx.notify();
         cx.spawn(async move |weak, cx| {
             cx.background_executor()
                 .timer(std::time::Duration::from_secs(3))
                 .await;
             let _ = weak.update(cx, |this, cx| {
-                if this.git.confirm_discard.as_deref() == Some(path.as_str()) {
+                if this.git.confirm_discard.as_deref() == Some(key.as_str()) {
                     this.git.confirm_discard = None;
                     cx.notify();
                 }
@@ -322,6 +347,72 @@ impl DartIde {
             }
         }
         cx.notify();
+    }
+
+    /// The files a commit would include: the staged ones, or everything when nothing is staged.
+    pub(crate) fn commit_candidates(&self) -> &[ChangedFile] {
+        match &self.git.status {
+            Some(s) if !s.staged.is_empty() => &s.staged,
+            Some(s) => &s.unstaged,
+            None => &[],
+        }
+    }
+
+    /// Fill the message box with a subject suggested from the files being committed.
+    pub(crate) fn git_apply_suggestion(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let types = self.git.commit_types.clone().unwrap_or_default();
+        if let Some(text) = core_workspace::suggest_message(self.commit_candidates(), &types) {
+            self.git
+                .message
+                .update(cx, |state, cx| state.set_value(text, window, cx));
+            cx.notify();
+        }
+    }
+
+    /// Set (or toggle off) a conventional-commit type on the message.
+    pub(crate) fn git_set_commit_type(
+        &mut self,
+        ty: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let current = self.git.message.read(cx).value().to_string();
+        let text = core_workspace::apply_commit_type(&current, ty);
+        self.git
+            .message
+            .update(cx, |state, cx| state.set_value(text, window, cx));
+        cx.notify();
+    }
+
+    /// The composer's one button: commit what is staged, commit everything when nothing is
+    /// staged, or amend — whichever the current state calls for.
+    pub(crate) fn git_primary_action(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(status) = &self.git.status else {
+            return;
+        };
+        let has_message = !self.git.message.read(cx).value().trim().is_empty();
+        if self.git.amend {
+            self.git_commit(window, cx);
+        } else if has_message && !status.staged.is_empty() {
+            self.git_commit(window, cx);
+        } else if has_message && !status.unstaged.is_empty() {
+            self.git_commit_all(window, cx);
+        }
+    }
+
+    /// Stage everything, then commit it.
+    fn git_commit_all(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let message = self.git.message.read(cx).value().to_string();
+        self.git_run(
+            window,
+            Some("Committing\u{2026}"),
+            true,
+            cx,
+            move |root, _| {
+                core_workspace::stage_all(root)?;
+                core_workspace::commit(root, &message, false)
+            },
+        );
     }
 
     /// Commit the staged changes with the message in the box.
