@@ -8,7 +8,7 @@ use gpui_kit::component::{
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
-use crate::rails::files::{file_icon_color, icon_for_file};
+use crate::rails::files::render_file_icon;
 use crate::{DartIde, MarkdownMode, tokens};
 
 impl DartIde {
@@ -109,11 +109,7 @@ impl DartIde {
                                             });
                                         }
                                     })
-                                    .child(
-                                        icon_for_file(&title)
-                                            .text_color(file_icon_color(&title))
-                                            .small(),
-                                    )
+                                    .child(render_file_icon(&title))
                                     .child(
                                         h_flex()
                                             .items_center()
@@ -498,11 +494,7 @@ impl DartIde {
                                         .gap(px(tokens::SPACE_2))
                                         .min_w(px(0.))
                                         .flex_1()
-                                        .child(
-                                            icon_for_file(&title)
-                                                .text_color(file_icon_color(&title))
-                                                .xsmall(),
-                                        )
+                                        .child(render_file_icon(&title))
                                         .child(
                                             div()
                                                 .truncate()

@@ -618,8 +618,10 @@ impl EditorView {
             }
             ServerMessage::Notification { method, params } if method == "textDocument/publishDiagnostics" => {
                 if let Ok(parsed) = serde_json::from_value::<PublishDiagnosticsParams>(params) {
-                    lsp.diagnostics = parsed.diagnostics;
-                    cx.notify();
+                    if parsed.uri.as_str() == lsp.uri.as_str() {
+                        lsp.diagnostics = parsed.diagnostics;
+                        cx.notify();
+                    }
                 }
             }
             ServerMessage::Response { id, result } if lsp.pending_hover_id == Some(id) => {
@@ -765,10 +767,15 @@ impl EditorView {
         by_line
     }
 
-    /// The primary diagnostic message (from the most severe diagnostic) on each
-    /// 0-indexed line, used for inline Error-Lens style annotations.
-    pub(crate) fn diagnostic_messages_by_line(&self) -> HashMap<u32, (DiagnosticSeverity, String)> {
-        let mut by_line: HashMap<u32, (DiagnosticSeverity, String)> = HashMap::new();
+    /// The primary diagnostic (most severe) on each 0-indexed line:
+    /// `(severity, column_range_on_line, first_line_message)`, used for both
+    /// inline Error-Lens annotations right after the line's text and exact
+    /// column underlines under the offending span.
+    pub(crate) fn diagnostic_messages_by_line(
+        &self,
+    ) -> HashMap<u32, (DiagnosticSeverity, std::ops::Range<usize>, String)> {
+        let mut by_line: HashMap<u32, (DiagnosticSeverity, std::ops::Range<usize>, String)> =
+            HashMap::new();
         let Some(lsp) = &self.lsp else {
             return by_line;
         };
@@ -785,10 +792,16 @@ impl EditorView {
             if first_line.is_empty() {
                 continue;
             }
+            let start_col = diagnostic.range.start.character as usize;
+            let end_col = if diagnostic.range.end.line == line {
+                (diagnostic.range.end.character as usize).max(start_col + 1)
+            } else {
+                usize::MAX
+            };
             match by_line.get(&line) {
-                Some((existing_sev, _)) if *existing_sev <= severity => {}
+                Some((existing_sev, _, _)) if *existing_sev <= severity => {}
                 _ => {
-                    by_line.insert(line, (severity, first_line));
+                    by_line.insert(line, (severity, start_col..end_col, first_line));
                 }
             }
         }

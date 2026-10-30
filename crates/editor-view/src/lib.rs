@@ -685,38 +685,17 @@ impl EditorView {
         let prefix_lower = prefix.to_lowercase();
         let mut seen = std::collections::HashSet::new();
         let mut results: Vec<CompletionEntry> = Vec::new();
-        let is_dart = self
-            .buffer
-            .path()
-            .and_then(|p| p.extension())
-            .and_then(|e| e.to_str())
-            == Some("dart");
 
-        // 1. VS Code Flutter Snippets (`stless`, `stful`, `build`)
-        if is_dart && !after_dot && !prefix.is_empty() {
-            let snippets: &[(&str, &str, &str)] = &[
-                (
-                    "stless",
-                    "Flutter StatelessWidget",
-                    "class MyWidget extends StatelessWidget {\n  const MyWidget({super.key});\n\n  @override\n  Widget build(BuildContext context) {\n    return const Placeholder();\n  }\n}",
-                ),
-                (
-                    "stful",
-                    "Flutter StatefulWidget",
-                    "class MyWidget extends StatefulWidget {\n  const MyWidget({super.key});\n\n  @override\n  State<MyWidget> createState() => _MyWidgetState();\n}\n\nclass _MyWidgetState extends State<MyWidget> {\n  @override\n  Widget build(BuildContext context) {\n    return const Placeholder();\n  }\n}",
-                ),
-                (
-                    "build",
-                    "@override Widget build(BuildContext context)",
-                    "@override\n  Widget build(BuildContext context) {\n    return const SizedBox.shrink();\n  }",
-                ),
-            ];
-            for &(trigger, desc, expansion) in snippets {
-                if trigger.starts_with(&prefix_lower) && seen.insert(trigger.to_string()) {
+        // 1. Language adapter snippets
+        if !after_dot && !prefix.is_empty() {
+            for snippet in self.language.snippets() {
+                if snippet.trigger.starts_with(&prefix_lower)
+                    && seen.insert(snippet.trigger.to_string())
+                {
                     results.push(CompletionEntry {
-                        label: trigger.to_string(),
-                        insert_text: expansion.to_string(),
-                        detail: Some(desc.to_string()),
+                        label: snippet.trigger.to_string(),
+                        insert_text: snippet.body.to_string(),
+                        detail: Some(snippet.detail.to_string()),
                         kind: CompletionKindBadge::Keyword,
                         additional_edits: Vec::new(),
                     });
@@ -724,120 +703,20 @@ impl EditorView {
             }
         }
 
-        // 2. Flutter Widget Constructors & Named Parameters (instant zero-latency suggestions)
-        if is_dart && !after_dot {
-            const FLUTTER_NAMED_ARGS: &[(&str, &str, &str)] = &[
-                ("child:", "child: ", "Widget?"),
-                ("children:", "children: [\n  \n],", "List<Widget>"),
-                ("padding:", "padding: const EdgeInsets.all(8.0),", "EdgeInsetsGeometry"),
-                ("margin:", "margin: const EdgeInsets.all(8.0),", "EdgeInsetsGeometry"),
-                ("mainAxisAlignment:", "mainAxisAlignment: MainAxisAlignment.center,", "MainAxisAlignment"),
-                ("crossAxisAlignment:", "crossAxisAlignment: CrossAxisAlignment.start,", "CrossAxisAlignment"),
-                ("mainAxisSize:", "mainAxisSize: MainAxisSize.min,", "MainAxisSize"),
-                ("onPressed:", "onPressed: () {},", "VoidCallback?"),
-                ("onTap:", "onTap: () {},", "GestureTapCallback?"),
-                ("color:", "color: ", "Color?"),
-                ("backgroundColor:", "backgroundColor: ", "Color?"),
-                ("decoration:", "decoration: const BoxDecoration(),", "Decoration?"),
-                ("style:", "style: const TextStyle(),", "TextStyle?"),
-                ("width:", "width: ", "double?"),
-                ("height:", "height: ", "double?"),
-                ("alignment:", "alignment: Alignment.center,", "AlignmentGeometry"),
-                ("builder:", "builder: (context) => ", "WidgetBuilder"),
-                ("itemCount:", "itemCount: ", "int?"),
-                ("itemBuilder:", "itemBuilder: (context, index) => ", "IndexedWidgetBuilder"),
-                ("appBar:", "appBar: AppBar(),", "PreferredSizeWidget?"),
-                ("body:", "body: ", "Widget?"),
-                ("floatingActionButton:", "floatingActionButton: ", "Widget?"),
-            ];
-            for &(label, insert, ty) in FLUTTER_NAMED_ARGS {
-                if (prefix_lower.is_empty() || label.to_lowercase().starts_with(&prefix_lower))
-                    && seen.insert(label.to_string())
-                {
-                    results.push(CompletionEntry {
-                        label: label.to_string(),
-                        insert_text: insert.to_string(),
-                        detail: Some(ty.to_string()),
-                        kind: CompletionKindBadge::Property,
-                        additional_edits: Vec::new(),
-                    });
-                }
-            }
-
-            const FLUTTER_WIDGETS: &[(&str, &str, &str)] = &[
-                ("Scaffold", "Scaffold(\n  body: \n)", "package:flutter/material.dart"),
-                ("Container", "Container(\n  child: \n)", "package:flutter/widgets.dart"),
-                ("Column", "Column(\n  children: [\n    \n  ],\n)", "package:flutter/widgets.dart"),
-                ("Row", "Row(\n  children: [\n    \n  ],\n)", "package:flutter/widgets.dart"),
-                ("Padding", "Padding(\n  padding: const EdgeInsets.all(8.0),\n  child: \n)", "package:flutter/widgets.dart"),
-                ("Center", "Center(\n  child: \n)", "package:flutter/widgets.dart"),
-                ("SizedBox", "SizedBox(\n  width: ,\n  height: ,\n)", "package:flutter/widgets.dart"),
-                ("SizedBox.shrink", "const SizedBox.shrink()", "package:flutter/widgets.dart"),
-                ("Expanded", "Expanded(\n  child: \n)", "package:flutter/widgets.dart"),
-                ("Flexible", "Flexible(\n  child: \n)", "package:flutter/widgets.dart"),
-                ("Text", "Text('')", "package:flutter/widgets.dart"),
-                ("Icon", "Icon(Icons.)", "package:flutter/widgets.dart"),
-                ("ElevatedButton", "ElevatedButton(\n  onPressed: () {},\n  child: const Text(''),\n)", "package:flutter/material.dart"),
-                ("TextButton", "TextButton(\n  onPressed: () {},\n  child: const Text(''),\n)", "package:flutter/material.dart"),
-                ("IconButton", "IconButton(\n  onPressed: () {},\n  icon: const Icon(Icons.add),\n)", "package:flutter/material.dart"),
-                ("ListView.builder", "ListView.builder(\n  itemCount: 0,\n  itemBuilder: (context, index) {\n    return const SizedBox();\n  },\n)", "package:flutter/widgets.dart"),
-                ("Stack", "Stack(\n  children: [\n    \n  ],\n)", "package:flutter/widgets.dart"),
-                ("Positioned", "Positioned(\n  child: \n)", "package:flutter/widgets.dart"),
-                ("SafeArea", "SafeArea(\n  child: \n)", "package:flutter/widgets.dart"),
-                ("GestureDetector", "GestureDetector(\n  onTap: () {},\n  child: \n)", "package:flutter/widgets.dart"),
-                ("InkWell", "InkWell(\n  onTap: () {},\n  child: \n)", "package:flutter/material.dart"),
-                ("Card", "Card(\n  child: \n)", "package:flutter/material.dart"),
-                ("Divider", "Divider()", "package:flutter/material.dart"),
-                ("CircularProgressIndicator", "const CircularProgressIndicator()", "package:flutter/material.dart"),
-                ("FutureBuilder", "FutureBuilder(\n  future: null,\n  builder: (context, snapshot) {\n    return const SizedBox();\n  },\n)", "package:flutter/widgets.dart"),
-                ("StreamBuilder", "StreamBuilder(\n  stream: null,\n  builder: (context, snapshot) {\n    return const SizedBox();\n  },\n)", "package:flutter/widgets.dart"),
-                ("EdgeInsets.all", "const EdgeInsets.all(8.0)", "package:flutter/painting.dart"),
-                ("EdgeInsets.symmetric", "const EdgeInsets.symmetric(horizontal: 16.0, vertical: 8.0)", "package:flutter/painting.dart"),
-                ("BoxDecoration", "BoxDecoration(\n  color: ,\n  borderRadius: BorderRadius.circular(8.0),\n)", "package:flutter/painting.dart"),
-                ("TextStyle", "TextStyle(\n  fontSize: 14.0,\n  fontWeight: FontWeight.w500,\n)", "package:flutter/painting.dart"),
-                ("MainAxisAlignment", "MainAxisAlignment.center", "package:flutter/rendering.dart"),
-                ("CrossAxisAlignment", "CrossAxisAlignment.start", "package:flutter/rendering.dart"),
-                ("Colors", "Colors.blue", "package:flutter/material.dart"),
-                ("Icons", "Icons.check", "package:flutter/material.dart"),
-                ("Theme.of", "Theme.of(context)", "package:flutter/material.dart"),
-                ("MediaQuery.of", "MediaQuery.of(context)", "package:flutter/widgets.dart"),
-                ("Navigator.of", "Navigator.of(context)", "package:flutter/widgets.dart"),
-            ];
-            if !prefix_lower.is_empty() {
-                for &(label, insert, pkg) in FLUTTER_WIDGETS {
-                    if label != prefix
-                        && label.to_lowercase().contains(&prefix_lower)
-                        && seen.insert(label.to_string())
-                    {
-                        results.push(CompletionEntry {
-                            label: label.to_string(),
-                            insert_text: insert.to_string(),
-                            detail: Some(pkg.to_string()),
-                            kind: CompletionKindBadge::Type,
-                            additional_edits: Vec::new(),
-                        });
-                    }
-                }
+        // 2. Language adapter built-in completions (constructors, named arguments, macros, etc.)
+        for entry in self.language.builtin_completions(prefix, after_dot) {
+            if seen.insert(entry.label.clone()) {
+                results.push(entry);
             }
         }
 
-        const KEYWORDS: &[&str] = &[
-            "abstract", "async", "await", "break", "case", "catch", "class", "const", "continue",
-            "covariant", "default", "deferred", "do", "dynamic", "else", "enum", "export",
-            "extends", "extension", "external", "factory", "false", "final", "finally", "for",
-            "Function", "get", "hide", "if", "implements", "import", "in", "interface", "is",
-            "late", "library", "mixin", "new", "null", "on", "operator", "part", "required",
-            "rethrow", "return", "sealed", "set", "show", "static", "super", "switch", "sync",
-            "this", "throw", "true", "try", "typedef", "var", "void", "when", "while", "with",
-            "yield", "Widget", "BuildContext", "StatelessWidget", "StatefulWidget", "State",
-            "Future", "Stream", "List", "Map", "Set", "String", "int", "double", "bool",
-            "override", "fn", "pub", "struct", "impl", "let", "mut", "match", "Some", "None",
-            "Ok", "Err",
-        ];
-
+        // 3. Language adapter keywords & primitive types
         if !after_dot && !prefix.is_empty() {
-            for &kw in KEYWORDS {
-                if kw != prefix && kw.to_lowercase().starts_with(&prefix_lower) && seen.insert(kw.to_string()) {
+            for &kw in self.language.keywords() {
+                if kw != prefix
+                    && kw.to_lowercase().starts_with(&prefix_lower)
+                    && seen.insert(kw.to_string())
+                {
                     let is_type = kw.bytes().next().is_some_and(|b| b.is_ascii_uppercase());
                     results.push(CompletionEntry {
                         label: kw.to_string(),
@@ -854,7 +733,7 @@ impl EditorView {
             }
         }
 
-        // Scan buffer identifiers (when buffer <= 256 KiB)
+        // 4. Scan buffer identifiers (when buffer <= 256 KiB)
         if should_parse_syntax(&self.buffer) {
             let text = self.buffer.text();
             let bytes = text.as_bytes();
@@ -907,118 +786,6 @@ impl EditorView {
         });
         results.truncate(24);
         results
-    }
-
-    /// Compute VS Code Flutter extension style closing labels (`// WidgetName`)
-    /// for lines that close a multi-line PascalCase constructor call (`Divider(`,
-    /// `Scaffold(`, `Column(`, etc.).
-    fn compute_closing_widget_labels(text: &str) -> std::collections::HashMap<usize, String> {
-        let mut labels_by_line: std::collections::HashMap<usize, Vec<String>> =
-            std::collections::HashMap::new();
-        let bytes = text.as_bytes();
-        // Stack of `(open_line_idx, Option<widget_name>)` for each `(` or `[`
-        let mut stack: Vec<(usize, Option<String>, u8)> = Vec::new();
-        let mut line = 0usize;
-        let mut i = 0usize;
-        let mut in_single = false;
-        let mut in_double = false;
-        let mut in_line_comment = false;
-
-        while i < bytes.len() {
-            let b = bytes[i];
-            if b == b'\n' {
-                line += 1;
-                in_line_comment = false;
-                i += 1;
-                continue;
-            }
-            if in_line_comment {
-                i += 1;
-                continue;
-            }
-            if b == b'/' && i + 1 < bytes.len() && bytes[i + 1] == b'/' {
-                in_line_comment = true;
-                i += 2;
-                continue;
-            }
-            if (in_single || in_double) && b == b'\\' {
-                i += 2;
-                continue;
-            }
-            if !in_double && b == b'\'' {
-                in_single = !in_single;
-                i += 1;
-                continue;
-            }
-            if !in_single && b == b'"' {
-                in_double = !in_double;
-                i += 1;
-                continue;
-            }
-            if in_single || in_double {
-                i += 1;
-                continue;
-            }
-
-            if b == b'(' {
-                // Check if preceded by a PascalCase constructor name (`Divider(`, `ListView.builder(`)
-                let mut end = i;
-                // Skip optional `<TypeArgs>` before `(`
-                if end > 0 && bytes[end - 1] == b'>' {
-                    let mut angle = 1i32;
-                    end -= 1;
-                    while end > 0 && angle > 0 {
-                        end -= 1;
-                        if bytes[end] == b'>' {
-                            angle += 1;
-                        } else if bytes[end] == b'<' {
-                            angle -= 1;
-                        }
-                    }
-                }
-                let ident_end = end;
-                let mut start = ident_end;
-                while start > 0
-                    && (bytes[start - 1].is_ascii_alphanumeric()
-                        || bytes[start - 1] == b'_'
-                        || bytes[start - 1] == b'.')
-                {
-                    start -= 1;
-                }
-                let raw_name = &text[start..ident_end];
-                let first_seg = raw_name.split('.').next().unwrap_or("");
-                let is_widget = first_seg
-                    .bytes()
-                    .next()
-                    .is_some_and(|c| c.is_ascii_uppercase())
-                    && first_seg.bytes().any(|c| c.is_ascii_lowercase());
-                let widget_name = is_widget.then(|| raw_name.to_string());
-                stack.push((line, widget_name, b'('));
-            } else if b == b'[' {
-                // Check if preceded by `children:`
-                let before = text[..i].trim_end();
-                let is_children = before.ends_with("children:");
-                stack.push((line, is_children.then(|| "[]".to_string()), b'['));
-            } else if b == b')' || b == b']' {
-                let expected = if b == b')' { b'(' } else { b'[' };
-                if let Some((open_line, maybe_name, open_ch)) = stack.pop() {
-                    if open_ch == expected && line > open_line + 1 {
-                        if let Some(name) = maybe_name {
-                            labels_by_line.entry(line).or_default().push(name);
-                        }
-                    }
-                }
-            }
-            i += 1;
-        }
-
-        labels_by_line
-            .into_iter()
-            .map(|(ln, mut names)| {
-                names.reverse();
-                (ln, format!("// {}", names.join(", ")))
-            })
-            .collect()
     }
 
     pub(crate) fn accept_completion(&mut self, ix: usize, cx: &mut Context<Self>) {
@@ -1435,7 +1202,7 @@ impl EditorView {
         diagnostics_by_line: &std::collections::HashMap<u32, lsp_types::DiagnosticSeverity>,
         diagnostic_messages: &std::collections::HashMap<
             u32,
-            (lsp_types::DiagnosticSeverity, String),
+            (lsp_types::DiagnosticSeverity, Range<usize>, String),
         >,
         line_changes: &std::collections::HashMap<u32, LineChange>,
         indent_width: usize,
@@ -1444,8 +1211,15 @@ impl EditorView {
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let is_active_line = cursor_line == Some(index);
-        let diagnostic_severity = diagnostics_by_line.get(&(index as u32)).copied();
-        let diagnostic_msg = diagnostic_messages.get(&(index as u32));
+        let display_text_check = line_text.trim_end_matches(['\n', '\r']);
+        let is_comment_or_blank = display_text_check.trim().is_empty()
+            || display_text_check.trim_start().starts_with("//");
+        let diagnostic_severity = (!is_comment_or_blank)
+            .then(|| diagnostics_by_line.get(&(index as u32)).copied())
+            .flatten();
+        let diagnostic_msg = (!is_comment_or_blank)
+            .then(|| diagnostic_messages.get(&(index as u32)))
+            .flatten();
         let gutter_color: Hsla = match diagnostic_severity {
             Some(sev) if sev == lsp_types::DiagnosticSeverity::ERROR => cx.theme().danger,
             Some(sev) if sev == lsp_types::DiagnosticSeverity::WARNING => cx.theme().warning,
@@ -1612,36 +1386,26 @@ impl EditorView {
             })
             .collect();
 
-        let diag_pill = diagnostic_msg.map(|(sev, msg)| {
-            let diag_color = match *sev {
-                s if s == lsp_types::DiagnosticSeverity::ERROR => cx.theme().danger,
-                s if s == lsp_types::DiagnosticSeverity::WARNING => cx.theme().warning,
-                _ => cx.theme().info,
-            };
-            h_flex()
-                .ml_4()
-                .px_2()
-                .h(px(17.))
-                .items_center()
-                .gap_1()
-                .rounded(px(4.))
-                .bg(diag_color.opacity(0.12))
-                .border_1()
-                .border_color(diag_color.opacity(0.28))
-                .text_size(px(11.))
-                .text_color(diag_color)
-                .child("\u{25cf}")
-                .child(msg.clone())
-        });
+        let diag_inline_spec: Option<(Hsla, Range<usize>, SharedString)> =
+            diagnostic_msg.map(|(sev, col_range, msg)| {
+                let diag_color = match *sev {
+                    s if s == lsp_types::DiagnosticSeverity::ERROR => cx.theme().danger,
+                    s if s == lsp_types::DiagnosticSeverity::WARNING => cx.theme().warning,
+                    _ => cx.theme().info,
+                };
+                let label = SharedString::from(format!("\u{25cf} {msg}"));
+                (diag_color, col_range.clone(), label)
+            });
 
         // Single unified line canvas: shapes `display_text` ONCE with `text_runs`
         // and uses that exact `ShapedLine` for:
         // 1. Indent guides (using actual shaped space width)
         // 2. Word-occurrence & matching-bracket background pills
         // 3. Selection highlight
-        // 4. Painting the syntax-highlighted line (`shaped.paint(...)`)
-        // 5. Painting the vertical caret at `shaped.x_for_index(cursor_col)`
-        // 6. Mouse click/drag/hover column hit-testing (`shaped.closest_index_for_x`)
+        // 4. Token-level diagnostic underline + inline diagnostic badge right after the line's text
+        // 5. Painting the syntax-highlighted line (`shaped.paint(...)`)
+        // 6. Painting the vertical caret at `shaped.x_for_index(cursor_col)`
+        // 7. Mouse click/drag/hover column hit-testing (`shaped.closest_index_for_x`)
         let line_shared: SharedString = display_text.to_string().into();
         let line_len = line_shared.len();
         let leading_spaces = display_text.as_bytes().iter().take_while(|&&b| b == b' ').count();
@@ -1655,6 +1419,7 @@ impl EditorView {
             f.style = FontStyle::Italic;
             f
         };
+        let diag_font = font(mono_family.clone());
         let closing_color: Hsla = cx.theme().muted_foreground.opacity(0.42);
         let view = cx.entity();
         let line_canvas = canvas(
@@ -1681,10 +1446,29 @@ impl EditorView {
                         None,
                     )
                 });
-                let text_end_x = shaped.width;
-                (bounds, shaped, shaped_closing, text_end_x)
+                let shaped_diag =
+                    diag_inline_spec
+                        .as_ref()
+                        .map(|(diag_color, col_range, diag_label)| {
+                            let run = TextRun {
+                                len: diag_label.len(),
+                                font: diag_font.clone(),
+                                color: *diag_color,
+                                background_color: None,
+                                underline: None,
+                                strikethrough: None,
+                            };
+                            let shaped_lbl = window.text_system().shape_line(
+                                diag_label.clone(),
+                                px(11.),
+                                &[run],
+                                None,
+                            );
+                            (*diag_color, col_range.clone(), shaped_lbl)
+                        });
+                (bounds, shaped, shaped_closing, shaped_diag)
             },
-            move |bounds, (_, shaped, shaped_closing, _text_end_x), window, cx| {
+            move |bounds, (_, shaped, shaped_closing, shaped_diag), window, cx| {
                 // 1. Faint vertical indent guides at exact shaped column offsets
                 for column in (indent_width..leading_spaces).step_by(indent_width).take(16) {
                     let x = shaped.x_for_index(column.min(line_len));
@@ -1745,7 +1529,30 @@ impl EditorView {
                     }
                 }
 
-                // 4. Paint syntax-highlighted text & optional Flutter closing label (`// WidgetName`)
+                // 3b. Token-level diagnostic underline & subtle background tint
+                if let Some((diag_color, col_range, _)) = &shaped_diag {
+                    let start_idx = col_range.start.clamp(leading_spaces, line_len);
+                    let end_idx = col_range.end.clamp(start_idx, line_len);
+                    let x1 = shaped.x_for_index(start_idx);
+                    let mut x2 = shaped.x_for_index(end_idx);
+                    if x2 <= x1 {
+                        x2 = (x1 + px(14.)).min(shaped.width.max(x1 + px(6.)));
+                    }
+                    let token_bg = Bounds::new(
+                        point(bounds.origin.x + x1, box_y),
+                        size(x2 - x1, box_h),
+                    );
+                    window.paint_quad(fill(token_bg, diag_color.opacity(0.10)).corner_radii(px(2.)));
+                    let underline_rect = Bounds::new(
+                        point(bounds.origin.x + x1, box_y + box_h - px(1.5)),
+                        size(x2 - x1, px(1.5)),
+                    );
+                    window.paint_quad(
+                        fill(underline_rect, diag_color.opacity(0.85)).corner_radii(px(1.)),
+                    );
+                }
+
+                // 4. Paint syntax-highlighted text & optional closing label (`// WidgetName`)
                 let text_y = bounds.origin.y + (bounds.size.height - px(LINE_HEIGHT)) * 0.5;
                 let _ = shaped.paint(
                     point(bounds.origin.x, text_y),
@@ -1755,9 +1562,43 @@ impl EditorView {
                     window,
                     cx,
                 );
+                let mut after_text_x = shaped.width;
                 if let Some(closing) = &shaped_closing {
+                    let closing_x = after_text_x + px(12.);
                     let _ = closing.paint(
-                        point(bounds.origin.x + shaped.width + px(12.), text_y),
+                        point(bounds.origin.x + closing_x, text_y),
+                        px(LINE_HEIGHT),
+                        TextAlign::Left,
+                        None,
+                        window,
+                        cx,
+                    );
+                    after_text_x = closing_x + closing.width;
+                }
+
+                // 4b. Paint inline diagnostic pill directly after the line's text (with a subtle connector)
+                if let Some((diag_color, _, diag_shaped)) = &shaped_diag {
+                    let connector_x = bounds.origin.x + after_text_x + px(8.);
+                    let mid_y = bounds.origin.y + bounds.size.height * 0.5;
+                    let connector_rect =
+                        Bounds::new(point(connector_x, mid_y - px(0.5)), size(px(10.), px(1.)));
+                    window.paint_quad(fill(connector_rect, diag_color.opacity(0.35)));
+
+                    let pill_x = connector_x + px(13.);
+                    let pill_h = px(17.);
+                    let pill_w = diag_shaped.width + px(14.);
+                    let pill_y = bounds.origin.y + (bounds.size.height - pill_h) * 0.5;
+                    let pill_rect = Bounds::new(point(pill_x, pill_y), size(pill_w, pill_h));
+                    window.paint_quad(gpui_kit::quad(
+                        pill_rect,
+                        px(4.),
+                        diag_color.opacity(0.11),
+                        Edges::all(px(1.)),
+                        diag_color.opacity(0.28),
+                        BorderStyle::Solid,
+                    ));
+                    let _ = diag_shaped.paint(
+                        point(pill_x + px(7.), text_y),
                         px(LINE_HEIGHT),
                         TextAlign::Left,
                         None,
@@ -1867,18 +1708,6 @@ impl EditorView {
                     .flex_1()
                     .h_full()
                     .child(line_canvas)
-                    .when_some(diag_pill, |el, pill| {
-                        el.child(
-                            div()
-                                .absolute()
-                                .right_4()
-                                .top_0()
-                                .bottom_0()
-                                .flex()
-                                .items_center()
-                                .child(pill),
-                        )
-                    })
                     .when(
                         is_active_line && !self.completions.is_empty(),
                         |el| {
@@ -2356,7 +2185,7 @@ impl Render for EditorView {
                 } else {
                     self.syntax_tree = Some(SyntaxTree::parse(&text));
                 }
-                self.closing_labels = Self::compute_closing_widget_labels(&text);
+                self.closing_labels = self.language.closing_labels(&text);
                 self.sync_lsp_text(&text);
                 self.synced_text = text;
             } else {

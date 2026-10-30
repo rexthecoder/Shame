@@ -72,22 +72,181 @@ pub(crate) fn icon_for_file(name: &str) -> Icon {
 }
 
 pub(crate) fn file_icon_color(name: &str) -> Rgba {
+    let lower = name.to_ascii_lowercase();
+    if lower.ends_with("_test.dart")
+        || lower.ends_with("_test.rs")
+        || lower.ends_with(".test.ts")
+        || lower.ends_with(".spec.ts")
+    {
+        return rgb(0x3fb950);
+    }
+    if lower.ends_with(".g.dart") || lower.ends_with(".freezed.dart") || lower.ends_with(".gr.dart")
+    {
+        return rgb(0xc678dd);
+    }
     match name {
-        ".gitignore" | ".metadata" | ".gitattributes" | "LICENSE" => return rgb(0x86868f),
-        "CHANGELOG.md" => return rgb(0x8fa3b8),
+        ".gitignore" | ".metadata" | ".gitattributes" | ".gitmodules" => return rgb(0xf05032),
+        "LICENSE" | "LICENSE.md" | "LICENSE.txt" => return rgb(0xe5c07b),
+        "CHANGELOG.md" => return rgb(0x56b6c2),
+        "pubspec.yaml" | "pubspec.lock" => return rgb(0x38bdf8),
+        "Cargo.toml" | "Cargo.lock" => return rgb(0xe07b53),
+        "Podfile" | "Podfile.lock" | "Info.plist" => return rgb(0xf05138),
         _ => {}
     }
     match Path::new(name).extension().and_then(|e| e.to_str()) {
         Some("rs") => rgb(0xdea584),
-        Some("dart") => rgb(0x40c4ff),
-        Some("ts") | Some("tsx") => rgb(0x4f9cf9),
-        Some("js") | Some("jsx") => rgb(0xf0db4f),
-        Some("json") => rgb(0xcbcb41),
+        Some("dart") => rgb(0x29b6f6),
+        Some("ts") => rgb(0x3178c6),
+        Some("tsx" | "jsx") => rgb(0x61dafb),
+        Some("js") => rgb(0xf0db4f),
+        Some("json" | "arb") => rgb(0xcbcb41),
         Some("toml") => rgb(0xe07b53),
-        Some("yaml") | Some("yml") => rgb(0x8fa3b8),
-        Some("md") => rgb(0x8fa3b8),
-        Some("lock") => rgb(0x86868f),
+        Some("yaml" | "yml") => rgb(0xf26d7d),
+        Some("md" | "mdx") => rgb(0x61afef),
+        Some("swift" | "plist") => rgb(0xf05138),
+        Some("kt" | "kts") => rgb(0xa97bff),
+        Some("gradle") => rgb(0x3ddc84),
+        Some("py") => rgb(0x4b8bbe),
+        Some("go") => rgb(0x00add8),
+        Some("html") => rgb(0xe34c26),
+        Some("css" | "scss") => rgb(0x61afef),
+        Some("sh" | "zsh" | "bash") => rgb(0x4eaa25),
+        Some("png" | "jpg" | "jpeg" | "webp" | "svg" | "ico") => rgb(0xc678dd),
+        Some("lock") => rgb(0xd19a66),
         _ => rgb(0x9aa0a6),
+    }
+}
+
+/// Distinct 16×16 rounded-square file badge with a language monogram or
+/// semantic vector glyph so `.dart`, `*_test.dart`, `*.g.dart`, `.rs`,
+/// `pubspec.yaml`, `Cargo.toml`, `.json`, `.md`, etc. are immediately
+/// distinguishable at a glance.
+pub(crate) fn render_file_icon(name: &str) -> Div {
+    let color: Hsla = file_icon_color(name).into();
+    let lower = name.to_ascii_lowercase();
+
+    let badge_base = div()
+        .flex_shrink_0()
+        .size(px(16.))
+        .rounded(px(4.))
+        .bg(color.opacity(0.15))
+        .border_1()
+        .border_color(color.opacity(0.36))
+        .flex()
+        .items_center()
+        .justify_center();
+
+    // Special vector-icon files
+    match name {
+        ".gitignore" | ".metadata" | ".gitattributes" | ".gitmodules" => {
+            return badge_base.child(
+                Icon::new(gpui_kit::assets::IconName::GitBranch)
+                    .with_size(px(10.5))
+                    .text_color(color),
+            );
+        }
+        "CHANGELOG.md" => {
+            return badge_base.child(
+                Icon::new(gpui_kit::assets::IconName::RotateCcwClock)
+                    .with_size(px(10.5))
+                    .text_color(color),
+            );
+        }
+        "LICENSE" | "LICENSE.md" | "LICENSE.txt" => {
+            return badge_base.child(
+                Icon::new(gpui_kit::assets::IconName::Scale)
+                    .with_size(px(10.5))
+                    .text_color(color),
+            );
+        }
+        _ => {}
+    }
+
+    let monogram: Option<&'static str> = if lower.ends_with("_test.dart")
+        || lower.ends_with("_test.rs")
+        || lower.ends_with(".test.ts")
+        || lower.ends_with(".spec.ts")
+    {
+        Some("T")
+    } else if lower.ends_with(".g.dart")
+        || lower.ends_with(".freezed.dart")
+        || lower.ends_with(".gr.dart")
+    {
+        Some("G")
+    } else if lower == "pubspec.yaml" {
+        Some("P")
+    } else if lower == "cargo.toml" {
+        Some("C")
+    } else if lower == "podfile" {
+        Some("Sw")
+    } else {
+        match Path::new(name).extension().and_then(|e| e.to_str()) {
+            Some("dart") => Some("D"),
+            Some("rs") => Some("Rs"),
+            Some("ts") => Some("TS"),
+            Some("tsx") => Some("TX"),
+            Some("js") => Some("JS"),
+            Some("jsx") => Some("JX"),
+            Some("json" | "arb") => Some("{}"),
+            Some("yaml" | "yml") => Some("Y"),
+            Some("toml") => Some("T"),
+            Some("swift") => Some("Sw"),
+            Some("kt" | "kts") => Some("Kt"),
+            Some("gradle") => Some("Gr"),
+            Some("py") => Some("Py"),
+            Some("go") => Some("Go"),
+            Some("c") => Some("C"),
+            Some("cpp" | "cc" | "cxx") => Some("C+"),
+            Some("h" | "hpp") => Some("H"),
+            Some("html") => Some("<>"),
+            Some("css" | "scss") => Some("#"),
+            Some("sh" | "zsh" | "bash") => Some("$"),
+            Some("sql") => Some("DB"),
+            Some("png" | "jpg" | "jpeg" | "webp" | "svg" | "ico") => Some("Im"),
+            _ => None,
+        }
+    };
+
+    if let Some(code) = monogram {
+        let font_sz = if code.len() > 1 { 8.0 } else { 9.5 };
+        return badge_base.child(
+            div()
+                .font_family("SF Mono")
+                .font_semibold()
+                .text_size(px(font_sz))
+                .line_height(px(10.))
+                .text_color(color)
+                .child(code),
+        );
+    }
+
+    let fallback_icon = match Path::new(name).extension().and_then(|e| e.to_str()) {
+        Some("md" | "mdx") => gpui_kit::assets::IconName::BookOpen,
+        Some("lock") => gpui_kit::assets::IconName::Lock,
+        Some("ini" | "env" | "plist") => gpui_kit::assets::IconName::Settings,
+        _ => IconName::File.into(),
+    };
+
+    badge_base.child(
+        Icon::new(fallback_icon)
+            .with_size(px(10.5))
+            .text_color(color),
+    )
+}
+
+pub(crate) fn folder_icon_color(name: &str, cx: &App) -> Hsla {
+    if name.starts_with('.') {
+        return cx.theme().muted_foreground.opacity(0.65);
+    }
+    match name {
+        "lib" | "src" => rgb(0xea7a3c).into(),
+        "ios" | "macos" | "Runner" => rgb(0x4f9cf9).into(),
+        "android" => rgb(0x3ddc84).into(),
+        "test" | "tests" | "integration_test" => rgb(0x3fb950).into(),
+        "assets" | "images" | "fonts" | "icons" => rgb(0xc678dd).into(),
+        "crates" | "packages" | "plugins" => rgb(0xe5c07b).into(),
+        "web" | "build" | "target" | "scripts" => rgb(0x56b6c2).into(),
+        _ => rgb(0xd4a373).into(),
     }
 }
 
@@ -329,17 +488,19 @@ impl DartIde {
                                     let item_path = PathBuf::from(item.id.as_str());
                                     let is_folder = entry.is_folder();
                                     let depth = entry.depth();
-                                    let icon = if !is_folder {
-                                        icon_for_file(&item.label)
-                                    } else if entry.is_expanded() {
-                                        Icon::new(IconName::FolderOpen)
+                                    let icon_el: AnyElement = if !is_folder {
+                                        render_file_icon(&item.label).into_any_element()
                                     } else {
-                                        Icon::new(IconName::Folder)
-                                    };
-                                    let icon_color: Hsla = if is_folder {
-                                        cx.theme().muted_foreground
-                                    } else {
-                                        file_icon_color(&item.label).into()
+                                        let folder_color = folder_icon_color(&item.label, cx);
+                                        let folder_icon = if entry.is_expanded() {
+                                            Icon::new(IconName::FolderOpen)
+                                        } else {
+                                            Icon::new(IconName::Folder)
+                                        };
+                                        folder_icon
+                                            .text_color(folder_color)
+                                            .small()
+                                            .into_any_element()
                                     };
                                     let is_active_file =
                                         active_path.as_deref() == Some(item.id.as_str());
@@ -434,7 +595,7 @@ impl DartIde {
                                                             )
                                                         }),
                                                 )
-                                                .child(icon.text_color(icon_color).small())
+                                                .child(icon_el)
                                                 .child(
                                                     div()
                                                         .flex_1()
