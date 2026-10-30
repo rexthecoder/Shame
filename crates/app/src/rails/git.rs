@@ -41,16 +41,6 @@ fn accent_tint(cx: &App) -> ButtonCustomVariant {
         .shadow(false)
 }
 
-/// Solid accent with dark text: the one primary action of the panel.
-fn accent_solid(cx: &App) -> ButtonCustomVariant {
-    ButtonCustomVariant::new(cx)
-        .color(cx.theme().primary)
-        .foreground(rgb(0x1a120e).into())
-        .hover(cx.theme().primary_hover)
-        .active(cx.theme().primary_active)
-        .shadow(false)
-}
-
 /// A quiet neutral pill (pull).
 fn neutral_pill(cx: &App) -> ButtonCustomVariant {
     ButtonCustomVariant::new(cx)
@@ -517,11 +507,14 @@ impl DartIde {
                             .pb(px(4.))
                             // No field chrome or padding of its own: the card is the field.
                             .child(
-                                Textarea::new(&self.git.message)
-                                    .appearance(false)
-                                    .bordered(false)
-                                    .px(px(0.))
-                                    .py(px(0.)),
+                                // The field pads itself by `input_px` (8px at the small size); pull it
+                                // back so the text starts exactly at the card's inset.
+                                div().mx(px(-8.)).child(
+                                    Textarea::new(&self.git.message)
+                                        .small()
+                                        .appearance(false)
+                                        .bordered(false),
+                                ),
                             ),
                     )
                     // Quick fills: a suggested subject and this repo's commit types.
@@ -622,16 +615,31 @@ impl DartIde {
                                     }),
                             )
                             .child(match action {
-                                Action::Ready(label, tip) => Button::new("git-commit")
-                                    .xsmall()
-                                    .custom(accent_solid(cx))
-                                    .disabled(busy)
-                                    .label(label)
-                                    .tooltip(tip)
-                                    .on_click(cx.listener(|this, _e, window, cx| {
-                                        this.git_primary_action(window, cx)
-                                    }))
-                                    .into_any_element(),
+                                Action::Ready(label, _tip) => {
+                                    let (accent, hover) =
+                                        (cx.theme().primary, cx.theme().primary_hover);
+                                    div()
+                                        .id("git-commit")
+                                        .h(px(24.))
+                                        .px(px(10.))
+                                        .flex()
+                                        .items_center()
+                                        .rounded(px(tokens::RADIUS_SM))
+                                        .bg(accent)
+                                        .text_color(rgb(0x1a120e))
+                                        .text_size(px(tokens::UI_SM))
+                                        .font_medium()
+                                        .when(busy, |el| el.opacity(0.5))
+                                        .when(!busy, |el| {
+                                            el.cursor_pointer()
+                                                .hover(move |s| s.bg(hover))
+                                                .on_click(cx.listener(|this, _e, window, cx| {
+                                                    this.git_primary_action(window, cx)
+                                                }))
+                                        })
+                                        .child(label)
+                                        .into_any_element()
+                                }
                                 Action::NeedsMessage => div()
                                     .text_size(px(tokens::UI_XS))
                                     .text_color(muted)
