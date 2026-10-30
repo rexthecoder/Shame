@@ -65,17 +65,31 @@ impl DartIde {
                         el.child(div().text_color(cx.theme().primary).child("\u{25cf}"))
                     })
                     .when(!segments.is_empty(), |el| el.child(breadcrumb))
-                    .child(
+                    .child({
+                        let view = view.clone();
                         h_flex()
+                            .id("status-problems-toggle")
                             .gap_1()
+                            .px_1p5()
+                            .py_0p5()
+                            .rounded(px(tokens::RADIUS_SM))
                             .items_center()
+                            .cursor_pointer()
+                            .hover(move |s| s.bg(rgba(0xffffff10)).text_color(fg))
                             .child(
                                 Icon::new(gpui_kit::assets::IconName::RotateCw)
                                     .xsmall()
                                     .text_color(muted),
                             )
-                            .child(total_issues.to_string()),
-                    )
+                            .child(total_issues.to_string())
+                            .on_click(move |_e, _w, cx| {
+                                view.update(cx, |this, cx| {
+                                    this.terminal_open = true;
+                                    this.dock_tab = crate::DockTab::Problems;
+                                    cx.notify();
+                                });
+                            })
+                    })
                     .child(
                         h_flex()
                             .gap_1()

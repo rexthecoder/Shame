@@ -35,6 +35,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::str::FromStr;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use core_lsp::{LspClient, ServerMessage, lsp_types};
@@ -76,12 +77,240 @@ pub struct CompletionEntry {
     pub additional_edits: Vec<TextEdit>,
 }
 
-pub(crate) struct LspState {
+struct SharedLspInner {
+    ready: bool,
+    pending_opens: Vec<DidOpenTextDocumentParams>,
+    subscribers: Vec<async_channel::Sender<ServerMessage>>,
+    latest_diagnostics: HashMap<String, Vec<Diagnostic>>,
+}
+
+/// A shared workspace LSP server multiplexed across all open `EditorView` tabs
+/// that share the same `(language_id, project_root)` pair.
+pub(crate) struct SharedLspServer {
     client: LspClient,
+    inner: Mutex<SharedLspInner>,
+}
+
+impl SharedLspServer {
+    fn request(&self, method: &str, params: serde_json::Value) -> std::io::Result<i64> {
+        self.client.request(method, params)
+    }
+
+    fn notify(&self, method: &str, params: serde_json::Value) -> std::io::Result<()> {
+        self.client.notify(method, params)
+    }
+
+    fn register_document(
+        &self,
+        open_params: DidOpenTextDocumentParams,
+    ) -> (async_channel::Receiver<ServerMessage>, bool, Vec<Diagnostic>) {
+        let (tx, rx) = async_channel::unbounded();
+        let uri_str = open_params.text_document.uri.as_str().to_string();
+        let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        guard.subscribers.push(tx);
+        let cached_diags = guard
+            .latest_diagnostics
+            .get(&uri_str)
+            .cloned()
+            .unwrap_or_default();
+        if guard.ready {
+            drop(guard);
+            let _ = self.client.notify(
+                "textDocument/didOpen",
+                serde_json::to_value(open_params).unwrap_or_default(),
+            );
+            (rx, true, cached_diags)
+        } else {
+            guard.pending_opens.push(open_params);
+            (rx, false, cached_diags)
+        }
+    }
+}
+
+type PoolKey = (&'static str, Option<PathBuf>);
+
+fn shared_lsp_server(
+    language_id: &'static str,
+    project_root: Option<PathBuf>,
+    program: &str,
+    args: &[String],
+) -> Option<Arc<SharedLspServer>> {
+    static POOL: OnceLock<Mutex<HashMap<PoolKey, Arc<SharedLspServer>>>> = OnceLock::new();
+    let pool = POOL.get_or_init(|| Mutex::new(HashMap::new()));
+    let key = (language_id, project_root.clone());
+    if let Some(existing) = pool
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&key)
+        .cloned()
+    {
+        return Some(existing);
+    }
+
+    let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    let client = LspClient::spawn(program, &arg_refs).ok()?;
+
+    let root_uri = project_root
+        .as_ref()
+        .and_then(|root| Uri::from_str(&format!("file://{}", root.display())).ok());
+    let workspace_folders = project_root.as_ref().and_then(|root| {
+        let folder_uri = root_uri.clone()?;
+        let name = root
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("workspace")
+            .to_string();
+        Some(vec![WorkspaceFolder {
+            uri: folder_uri,
+            name,
+        }])
+    });
+
+    #[allow(deprecated)]
+    let init_params = InitializeParams {
+        process_id: Some(std::process::id()),
+        root_uri,
+        workspace_folders,
+        capabilities: ClientCapabilities {
+            workspace: Some(WorkspaceClientCapabilities {
+                apply_edit: Some(true),
+                workspace_edit: Some(WorkspaceEditClientCapabilities {
+                    document_changes: Some(true),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            text_document: Some(TextDocumentClientCapabilities {
+                completion: Some(CompletionClientCapabilities {
+                    completion_item: Some(CompletionItemCapability {
+                        snippet_support: Some(true),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+                code_action: Some(CodeActionClientCapabilities {
+                    code_action_literal_support: Some(CodeActionLiteralSupport::default()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+
+    let initialize_id = client
+        .request(
+            "initialize",
+            serde_json::to_value(init_params).unwrap_or_default(),
+        )
+        .ok()?;
+    let events = client.events.clone();
+
+    let server = Arc::new(SharedLspServer {
+        client,
+        inner: Mutex::new(SharedLspInner {
+            ready: false,
+            pending_opens: Vec::new(),
+            subscribers: Vec::new(),
+            latest_diagnostics: HashMap::new(),
+        }),
+    });
+
+    let server_bg = server.clone();
+    std::thread::spawn(move || {
+        while let Ok(message) = events.recv_blocking() {
+            match &message {
+                ServerMessage::Response { id, result } if *id == initialize_id => {
+                    if result.is_ok() {
+                        let _ = server_bg.client.notify("initialized", serde_json::json!({}));
+                        let opens = {
+                            let mut guard = server_bg
+                                .inner
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner());
+                            guard.ready = true;
+                            std::mem::take(&mut guard.pending_opens)
+                        };
+                        for open in opens {
+                            let _ = server_bg.client.notify(
+                                "textDocument/didOpen",
+                                serde_json::to_value(open).unwrap_or_default(),
+                            );
+                        }
+                    }
+                    let mut guard = server_bg.inner.lock().unwrap_or_else(|e| e.into_inner());
+                    guard.subscribers.retain(|sub| {
+                        sub.send_blocking(ServerMessage:: Notification {
+                            method: "$ide/lspReady".to_string(),
+                            params: serde_json::Value::Null,
+                        })
+                        .is_ok()
+                    });
+                }
+                ServerMessage::Notification { method, params }
+                    if method == "textDocument/publishDiagnostics" =>
+                {
+                    if let Ok(parsed) =
+                        serde_json::from_value::<PublishDiagnosticsParams>(params.clone())
+                    {
+                        let mut guard =
+                            server_bg.inner.lock().unwrap_or_else(|e| e.into_inner());
+                        guard.latest_diagnostics.insert(
+                            parsed.uri.as_str().to_string(),
+                            parsed.diagnostics,
+                        );
+                        guard
+                            .subscribers
+                            .retain(|sub| sub.send_blocking(message.clone()).is_ok());
+                    }
+                }
+                ServerMessage::Request { id, method, .. } => {
+                    if method == "workspace/applyEdit" {
+                        let _ = server_bg
+                            .client
+                            .respond(*id, serde_json::json!({"applied": true}));
+                        let mut guard =
+                            server_bg.inner.lock().unwrap_or_else(|e| e.into_inner());
+                        // Deliver workspace/applyEdit to the first active subscriber so it runs once.
+                        let mut delivered = false;
+                        guard.subscribers.retain(|sub| {
+                            if !delivered {
+                                if sub.send_blocking(message.clone()).is_ok() {
+                                    delivered = true;
+                                    true
+                                } else {
+                                    false
+                                }
+                            } else {
+                                !sub.is_closed()
+                            }
+                        });
+                    } else {
+                        let _ = server_bg.client.respond(*id, serde_json::Value::Null);
+                    }
+                }
+                _ => {
+                    let mut guard = server_bg.inner.lock().unwrap_or_else(|e| e.into_inner());
+                    guard
+                        .subscribers
+                        .retain(|sub| sub.send_blocking(message.clone()).is_ok());
+                }
+            }
+        }
+    });
+
+    pool.lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(key, server.clone());
+    Some(server)
+}
+
+pub(crate) struct LspState {
+    client: Arc<SharedLspServer>,
     uri: Uri,
     version: i32,
     last_synced_revision: u64,
-    initialize_id: i64,
     ready: bool,
     diagnostics: Vec<Diagnostic>,
     pending_hover_id: Option<i64>,
@@ -93,8 +322,8 @@ pub(crate) struct LspState {
 }
 
 impl EditorView {
-    /// Start the configured LSP server for this buffer's `LanguageAdapter`
-    /// if the adapter provides one and a server isn't already running.
+    /// Attach this buffer to the shared workspace LSP server for its `LanguageAdapter`
+    /// (spawning the server only once per `(language_id, project_root)` pair).
     pub(crate) fn maybe_start_lsp(&mut self, cx: &mut Context<Self>) {
         if self.lsp.is_some() {
             return;
@@ -102,73 +331,29 @@ impl EditorView {
         let Some(path) = self.buffer.path() else {
             return;
         };
-        let project_root = self.language.find_project_root(&path);
+        let project_root = self.language.find_project_root(path);
         let Some((program, args)) = self.language.lsp_command(project_root.as_deref()) else {
             return;
         };
         let Ok(uri) = Uri::from_str(&format!("file://{}", path.display())) else {
             return;
         };
-        let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
-        let Ok(client) = LspClient::spawn(&program, &arg_refs) else {
-            return;
-        };
-
-        let root_uri = project_root
-            .as_ref()
-            .and_then(|root| Uri::from_str(&format!("file://{}", root.display())).ok());
-        let workspace_folders = project_root.as_ref().and_then(|root| {
-            let folder_uri = root_uri.clone()?;
-            let name = root
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or("workspace")
-                .to_string();
-            Some(vec![WorkspaceFolder {
-                uri: folder_uri,
-                name,
-            }])
-        });
-
-        #[allow(deprecated)]
-        let init_params = InitializeParams {
-            process_id: Some(std::process::id()),
-            root_uri,
-            workspace_folders,
-            capabilities: ClientCapabilities {
-                workspace: Some(WorkspaceClientCapabilities {
-                    apply_edit: Some(true),
-                    workspace_edit: Some(WorkspaceEditClientCapabilities {
-                        document_changes: Some(true),
-                        ..Default::default()
-                    }),
-                    ..Default::default()
-                }),
-                text_document: Some(TextDocumentClientCapabilities {
-                    completion: Some(CompletionClientCapabilities {
-                        completion_item: Some(CompletionItemCapability {
-                            snippet_support: Some(true),
-                            ..Default::default()
-                        }),
-                        ..Default::default()
-                    }),
-                    code_action: Some(CodeActionClientCapabilities {
-                        code_action_literal_support: Some(CodeActionLiteralSupport::default()),
-                        ..Default::default()
-                    }),
-                    ..Default::default()
-                }),
-                ..Default::default()
-            },
-            ..Default::default()
-        };
-        let Ok(initialize_id) =
-            client.request("initialize", serde_json::to_value(init_params).unwrap_or_default())
+        let Some(server) =
+            shared_lsp_server(self.language.language_id(), project_root, &program, &args)
         else {
             return;
         };
 
-        let events = client.events.clone();
+        let open_params = DidOpenTextDocumentParams {
+            text_document: TextDocumentItem {
+                uri: uri.clone(),
+                language_id: self.language.language_id().to_string(),
+                version: 1,
+                text: self.buffer.text(),
+            },
+        };
+        let (events, ready, initial_diagnostics) = server.register_document(open_params);
+
         cx.spawn(async move |weak, cx| {
             loop {
                 let Ok(message) = events.recv().await else {
@@ -182,13 +367,12 @@ impl EditorView {
         .detach();
 
         self.lsp = Some(LspState {
-            client,
+            client: server,
             uri,
             version: 1,
             last_synced_revision: self.buffer.revision(),
-            initialize_id,
-            ready: false,
-            diagnostics: Vec::new(),
+            ready,
+            diagnostics: initial_diagnostics,
             pending_hover_id: None,
             pending_definition_id: None,
             pending_format_id: None,
@@ -607,23 +791,8 @@ impl EditorView {
         };
 
         match message {
-            ServerMessage::Response { id, result } if id == lsp.initialize_id => {
-                if result.is_ok() {
-                    let _ = lsp.client.notify("initialized", serde_json::json!({}));
-                    let params = DidOpenTextDocumentParams {
-                        text_document: TextDocumentItem {
-                            uri: lsp.uri.clone(),
-                            language_id: self.language.language_id().to_string(),
-                            version: lsp.version,
-                            text: self.buffer.text(),
-                        },
-                    };
-                    let _ = lsp.client.notify(
-                        "textDocument/didOpen",
-                        serde_json::to_value(params).unwrap_or_default(),
-                    );
-                    lsp.ready = true;
-                }
+            ServerMessage::Notification { method, .. } if method == "$ide/lspReady" => {
+                lsp.ready = true;
             }
             ServerMessage::Notification { method, params } if method == "textDocument/publishDiagnostics" => {
                 if let Ok(parsed) = serde_json::from_value::<PublishDiagnosticsParams>(params) {
@@ -723,25 +892,21 @@ impl EditorView {
                     self.merge_lsp_completion_entries(entries, cx);
                 }
             }
-            // A request *from* the server, not a reply to one of ours.
-            ServerMessage::Request { id, method, params } if method == "workspace/applyEdit" => {
+            // A request *from* the server (already replied to by `SharedLspServer`).
+            ServerMessage::Request { method, params, .. } if method == "workspace/applyEdit" => {
                 if let Ok(apply_params) = serde_json::from_value::<ApplyWorkspaceEditParams>(params) {
                     self.apply_workspace_edit(apply_params.edit, cx);
-                }
-                if let Some(lsp) = &self.lsp {
-                    let _ = lsp.client.respond(id, serde_json::json!({"applied": true}));
-                }
-            }
-            ServerMessage::Request { id, .. } => {
-                // Always reply to server-initiated requests (`client/registerCapability`,
-                // `window/workDoneProgress/create`, `workspace/configuration`) so
-                // `dart language-server` never stalls awaiting a response.
-                if let Some(lsp) = &self.lsp {
-                    let _ = lsp.client.respond(id, serde_json::Value::Null);
                 }
             }
             _ => {}
         }
+    }
+
+    /// All current LSP diagnostics for this buffer, used by the Problems dock tab.
+    pub fn diagnostics(&self) -> &[Diagnostic] {
+        self.lsp
+            .as_ref()
+            .map_or(&[], |lsp| lsp.diagnostics.as_slice())
     }
 
     /// `(error_count, warning_count)` from the most recent diagnostics

@@ -599,9 +599,9 @@ impl DartIde {
         let modifiers = &keystroke.modifiers;
         let primary_mod = modifiers.platform || modifiers.control;
 
-        // The Debug Console is read-only: don't swallow keystrokes into the hidden shell prompt.
-        if self.dock_tab == DockTab::DebugConsole {
-            if modifiers.platform && key == "k" {
+        // The Debug Console & Problems tabs are read-only: don't swallow keystrokes into the hidden shell prompt.
+        if self.dock_tab != DockTab::Terminal {
+            if modifiers.platform && key == "k" && self.dock_tab == DockTab::DebugConsole {
                 self.debug_lines.clear();
                 cx.stop_propagation();
                 cx.notify();
@@ -948,11 +948,174 @@ impl DartIde {
             .collect();
 
         let debug_active = self.dock_tab == DockTab::DebugConsole;
+        let problems_active = self.dock_tab == DockTab::Problems;
         let debug_count_err = self
             .debug_lines
             .iter()
             .filter(|l| matches!(l, TerminalLine::Output { spans, .. } if spans.iter().any(|s| s.color == AnsiColor::Red)))
             .count();
+
+        let mut all_problems = Vec::new();
+        for tab in &self.tabs {
+            let Some(path) = tab.path.clone() else {
+                continue;
+            };
+            for diag in tab.editor.read(cx).diagnostics() {
+                all_problems.push((path.clone(), diag.clone()));
+            }
+        }
+        let total_problems = all_problems.len();
+
+        let problems_pill = {
+            let view_select = view.clone();
+            h_flex()
+                .id("problems-dock-tab")
+                .items_center()
+                .gap(px(tokens::SPACE_2))
+                .px(px(tokens::SPACE_3))
+                .h(px(28.))
+                .rounded(px(tokens::RADIUS_PANEL))
+                .border_1()
+                .border_color(if problems_active {
+                    cx.theme().border
+                } else {
+                    gpui_kit::transparent_black()
+                })
+                .when(problems_active, |el| el.bg(cx.theme().tab_active).text_color(fg))
+                .when(!problems_active, |el| {
+                    el.text_color(muted)
+                        .hover(move |s| s.bg(rgba(0xffffff08)).text_color(fg))
+                })
+                .text_size(px(tokens::UI_SM))
+                .cursor_pointer()
+                .on_click(move |_event, _window, cx| {
+                    view_select.update(cx, |this, cx| {
+                        this.dock_tab = DockTab::Problems;
+                        cx.notify();
+                    });
+                })
+                .child(
+                    Icon::new(gpui_kit::assets::IconName::TriangleAlert)
+                        .xsmall()
+                        .text_color(if total_problems > 0 { yellow } else { muted }),
+                )
+                .child("Problems")
+                .when(total_problems > 0, |el| {
+                    el.child(
+                        div()
+                            .px(px(5.))
+                            .rounded(px(8.))
+                            .bg(yellow.opacity(0.18))
+                            .text_size(px(9.5))
+                            .text_color(yellow)
+                            .child(total_problems.to_string()),
+                    )
+                })
+        };
+
+        let problems_body = {
+            let rows: Vec<AnyElement> = all_problems
+                .into_iter()
+                .enumerate()
+                .map(|(ix, (path, diag))| {
+                    let is_err = diag.severity
+                        == Some(core_lsp::lsp_types::DiagnosticSeverity::ERROR);
+                    let sev_color = if is_err { red } else { yellow };
+                    let sev_icon = if is_err {
+                        gpui_kit::assets::IconName::CircleX
+                    } else {
+                        gpui_kit::assets::IconName::TriangleAlert
+                    };
+                    let file_name = path
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let line_0 = diag.range.start.line;
+                    let col_0 = diag.range.start.character;
+                    let msg = diag
+                        .message
+                        .lines()
+                        .next()
+                        .unwrap_or(&diag.message)
+                        .trim()
+                        .to_string();
+                    let view = view.clone();
+
+                    h_flex()
+                        .id(("problem-row", ix))
+                        .w_full()
+                        .h(px(26.))
+                        .px(px(tokens::SPACE_4))
+                        .items_center()
+                        .justify_between()
+                        .gap(px(tokens::SPACE_3))
+                        .cursor_pointer()
+                        .hover(|s| s.bg(rgba(0xffffff08)))
+                        .child(
+                            h_flex()
+                                .flex_1()
+                                .min_w(px(0.))
+                                .items_center()
+                                .gap(px(tokens::SPACE_2))
+                                .child(Icon::new(sev_icon).xsmall().text_color(sev_color))
+                                .child(
+                                    div()
+                                        .truncate()
+                                        .text_size(px(tokens::UI_SM))
+                                        .text_color(fg)
+                                        .child(msg),
+                                ),
+                        )
+                        .child(
+                            h_flex()
+                                .flex_shrink_0()
+                                .items_center()
+                                .gap(px(tokens::SPACE_2))
+                                .font_family("SF Mono")
+                                .text_size(px(tokens::UI_XS))
+                                .child(div().text_color(muted).child(file_name))
+                                .child(
+                                    div()
+                                        .text_color(primary)
+                                        .child(format!("{}:{}", line_0 + 1, col_0 + 1)),
+                                ),
+                        )
+                        .on_click(move |_e, window, cx| {
+                            view.update(cx, |this, cx| {
+                                this.open_path(path.clone(), window, cx);
+                                if let Some(ed) = this.active_editor().cloned() {
+                                    ed.update(cx, |editor, cx| {
+                                        editor.set_cursor_to_position(line_0, col_0, cx);
+                                    });
+                                }
+                            });
+                        })
+                        .into_any_element()
+                })
+                .collect();
+
+            v_flex()
+                .id("problems-scrollback")
+                .flex_1()
+                .w_full()
+                .min_h(px(0.))
+                .py(px(tokens::SPACE_2))
+                .bg(cx.theme().background)
+                .overflow_y_scroll()
+                .when(rows.is_empty(), |el| {
+                    el.child(
+                        div()
+                            .px(px(tokens::SPACE_5))
+                            .py(px(tokens::SPACE_3))
+                            .text_size(px(tokens::UI_SM))
+                            .text_color(muted)
+                            .child("No problems detected in open files."),
+                    )
+                })
+                .children(rows)
+                .into_any_element()
+        };
 
         let debug_pill = {
             let view_select = view.clone();
@@ -1308,7 +1471,9 @@ impl DartIde {
                 .into_any_element()
         };
 
-        let body_element = if debug_active {
+        let body_element = if problems_active {
+            problems_body
+        } else if debug_active {
             debug_body
         } else if let Some(session) = self.terminals.get(active_ix) {
             let line_elements: Vec<AnyElement> = session
@@ -1467,6 +1632,7 @@ impl DartIde {
                             .items_center()
                             .gap(px(tokens::SPACE_2))
                             .children(tabs)
+                            .child(problems_pill)
                             .child(debug_pill)
                             .child(
                                 Button::new("new-terminal-tab")

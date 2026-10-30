@@ -10,7 +10,7 @@ use serde_json::Value;
 use crate::transport::{read_message, write_message};
 
 /// Something the server sent us, unprompted or in reply to a request.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum ServerMessage {
     /// A reply to a request we sent, matched by id.
     Response { id: i64, result: Result<Value, Value> },

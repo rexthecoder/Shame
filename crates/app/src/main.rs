@@ -86,8 +86,41 @@ pub(crate) enum MarkdownMode {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DockTab {
     Terminal,
+    Problems,
     DebugConsole,
 }
+
+#[derive(Clone, Copy)]
+pub(crate) struct IdeCommand {
+    pub(crate) id: &'static str,
+    pub(crate) title: &'static str,
+    pub(crate) shortcut: &'static str,
+}
+
+const IDE_COMMANDS: &[IdeCommand] = &[
+    IdeCommand { id: "run-flutter", title: "Flutter: Run App on Selected Device", shortcut: "" },
+    IdeCommand { id: "hot-reload", title: "Flutter: Hot Reload", shortcut: "\u{2318}S" },
+    IdeCommand { id: "hot-restart", title: "Flutter: Hot Restart", shortcut: "" },
+    IdeCommand { id: "pub-get", title: "Flutter: Run Pub Get", shortcut: "" },
+    IdeCommand { id: "add-package", title: "Flutter: Add Package (pub.dev)\u{2026}", shortcut: "" },
+    IdeCommand { id: "debug-dap", title: "Debug: Start Dart DAP Debugger", shortcut: "" },
+    IdeCommand { id: "toggle-sim", title: "Simulator: Attach / Detach iOS Simulator", shortcut: "" },
+    IdeCommand { id: "open-git", title: "Git: Open Git Panel", shortcut: "\u{2318}\u{21e7}G" },
+    IdeCommand { id: "git-stage-all", title: "Git: Stage All Changes", shortcut: "" },
+    IdeCommand { id: "git-unstage-all", title: "Git: Unstage All Changes", shortcut: "" },
+    IdeCommand { id: "git-stash", title: "Git: Stash Uncommitted Changes", shortcut: "" },
+    IdeCommand { id: "git-uncommit", title: "Git: Undo Last Commit (Keep Staged)", shortcut: "" },
+    IdeCommand { id: "diff-unified", title: "Diff: Toggle Split / Unified View", shortcut: "" },
+    IdeCommand { id: "project-search", title: "Search: Find in Project", shortcut: "\u{2318}\u{21e7}F" },
+    IdeCommand { id: "toggle-problems", title: "View: Toggle Problems Panel", shortcut: "\u{2318}\u{21e7}M" },
+    IdeCommand { id: "toggle-terminal", title: "View: Toggle Terminal Dock", shortcut: "\u{2318}J" },
+    IdeCommand { id: "toggle-sidebar", title: "View: Toggle Left Sidebar", shortcut: "\u{2318}B" },
+    IdeCommand { id: "toggle-agent", title: "View: Toggle Agent Rail", shortcut: "" },
+    IdeCommand { id: "format-doc", title: "Editor: Format Document", shortcut: "\u{21e7}\u{2318}F" },
+    IdeCommand { id: "goto-line", title: "Editor: Go to Line\u{2026}", shortcut: "\u{2318}G" },
+    IdeCommand { id: "new-file", title: "File: New Scratch File", shortcut: "\u{2318}N" },
+    IdeCommand { id: "open-folder", title: "File: Open Folder\u{2026}", shortcut: "\u{2318}O" },
+];
 
 pub(crate) struct Tab {
     /// `None` for the initial scratch buffer; every file opened from the
@@ -219,8 +252,10 @@ impl DartIde {
         let all_files = flatten_files(&root);
 
         let tree_state = cx.new(|cx| TreeState::new(cx).items(items));
-        let palette_input =
-            cx.new(|cx| InputState::new(window, cx).placeholder("Go to file..."));
+        let palette_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("Go to file, or type > for commands\u{2026}")
+        });
         let find_input =
             cx.new(|cx| InputState::new(window, cx).placeholder("Find in file..."));
         let go_to_line_input = cx.new(|cx| {
@@ -433,6 +468,29 @@ impl DartIde {
         .detach();
     }
 
+    fn palette_is_command_mode(&self, cx: &Context<Self>) -> bool {
+        self.palette_input
+            .read(cx)
+            .value()
+            .trim_start()
+            .starts_with('>')
+    }
+
+    fn palette_command_matches(&self, cx: &Context<Self>) -> Vec<IdeCommand> {
+        let raw = self.palette_input.read(cx).value().to_string();
+        let query = raw
+            .trim_start()
+            .strip_prefix('>')
+            .unwrap_or(&raw)
+            .trim()
+            .to_lowercase();
+        IDE_COMMANDS
+            .iter()
+            .filter(|cmd| query.is_empty() || cmd.title.to_lowercase().contains(&query))
+            .copied()
+            .collect()
+    }
+
     fn palette_matches(&self, cx: &Context<Self>) -> Vec<PathBuf> {
         let query = self.palette_input.read(cx).value().to_lowercase();
         self.all_files
@@ -446,12 +504,81 @@ impl DartIde {
     }
 
     fn open_palette_selection(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.palette_is_command_mode(cx) {
+            let cmds = self.palette_command_matches(cx);
+            if let Some(cmd) = cmds.get(self.palette_selected).copied() {
+                self.palette_open = false;
+                self.execute_ide_command(cmd.id, window, cx);
+            }
+            return;
+        }
         let matches = self.palette_matches(cx);
         let Some(path) = matches.get(self.palette_selected).cloned() else {
             return;
         };
         self.open_path(path, window, cx);
         self.palette_open = false;
+        cx.notify();
+    }
+
+    pub(crate) fn execute_ide_command(
+        &mut self,
+        id: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match id {
+            "run-flutter" => self.start_flutter_run(window, cx),
+            "hot-reload" => self.trigger_hot_reload(cx),
+            "hot-restart" => self.trigger_hot_restart(cx),
+            "pub-get" => self.run_pub_get(cx),
+            "add-package" => self.open_add_package(window, cx),
+            "debug-dap" => self.start_dap_debug(window, cx),
+            "toggle-sim" => {
+                if self.sim.attached {
+                    self.detach_simulator(cx);
+                } else {
+                    self.attach_simulator(window, cx);
+                }
+            }
+            "open-git" => {
+                self.sidebar_open = true;
+                self.set_sidebar_tab(git_panel::SidebarTab::Git, cx);
+            }
+            "git-stage-all" => self.git_stage_all(window, cx),
+            "git-unstage-all" => self.git_unstage_all(window, cx),
+            "git-stash" => self.git_stash_save(window, cx),
+            "git-uncommit" => self.git_uncommit_last(window, cx),
+            "diff-unified" => self.toggle_diff_unified(cx),
+            "project-search" => {
+                self.sidebar_open = true;
+                self.set_sidebar_tab(git_panel::SidebarTab::Search, cx);
+                self.project_search_input
+                    .update(cx, |s, cx| s.focus(window, cx));
+            }
+            "toggle-problems" => {
+                if self.terminal_open && self.dock_tab == DockTab::Problems {
+                    self.terminal_open = false;
+                } else {
+                    self.terminal_open = true;
+                    self.dock_tab = DockTab::Problems;
+                }
+            }
+            "toggle-terminal" => self.terminal_open = !self.terminal_open,
+            "toggle-sidebar" => self.sidebar_open = !self.sidebar_open,
+            "toggle-agent" => self.agent_open = !self.agent_open,
+            "format-doc" => {
+                if let Some(ed) = self.active_editor().cloned() {
+                    ed.update(cx, |editor, _cx| {
+                        editor.request_format();
+                    });
+                }
+            }
+            "goto-line" => self.open_go_to_line(window, cx),
+            "new-file" => self.new_scratch_tab(window, cx),
+            "open-folder" => self.open_folder(window, cx),
+            _ => {}
+        }
         cx.notify();
     }
 
@@ -768,8 +895,26 @@ impl DartIde {
         if primary_mod && keystroke.key.as_str() == "p" {
             self.palette_open = true;
             self.palette_selected = 0;
-            self.palette_input
-                .update(cx, |state, cx| state.focus(window, cx));
+            let shift = keystroke.modifiers.shift;
+            self.palette_input.update(cx, |state, cx| {
+                if shift {
+                    state.set_value("> ", window, cx);
+                } else if state.value().trim_start().starts_with('>') {
+                    state.set_value("", window, cx);
+                }
+                state.focus(window, cx);
+            });
+            cx.notify();
+            return;
+        }
+
+        if primary_mod && keystroke.modifiers.shift && keystroke.key.as_str() == "m" {
+            if self.terminal_open && self.dock_tab == DockTab::Problems {
+                self.terminal_open = false;
+            } else {
+                self.terminal_open = true;
+                self.dock_tab = DockTab::Problems;
+            }
             cx.notify();
             return;
         }
@@ -854,7 +999,12 @@ impl DartIde {
                     cx.notify();
                 }
                 "down" => {
-                    let last = self.palette_matches(cx).len().saturating_sub(1);
+                    let count = if self.palette_is_command_mode(cx) {
+                        self.palette_command_matches(cx).len()
+                    } else {
+                        self.palette_matches(cx).len()
+                    };
+                    let last = count.saturating_sub(1);
                     self.palette_selected = (self.palette_selected + 1).min(last);
                     cx.notify();
                 }
@@ -874,8 +1024,196 @@ impl DartIde {
             return None;
         }
 
-        let matches = self.palette_matches(cx);
-        let selected = self.palette_selected.min(matches.len().saturating_sub(1));
+        let is_cmd_mode = self.palette_is_command_mode(cx);
+        let cmd_matches = if is_cmd_mode {
+            self.palette_command_matches(cx)
+        } else {
+            Vec::new()
+        };
+        let matches = if is_cmd_mode {
+            Vec::new()
+        } else {
+            self.palette_matches(cx)
+        };
+        let total_items = if is_cmd_mode {
+            cmd_matches.len()
+        } else {
+            matches.len()
+        };
+        let selected = self.palette_selected.min(total_items.saturating_sub(1));
+
+        let rows: Vec<AnyElement> = if is_cmd_mode {
+            cmd_matches
+                .into_iter()
+                .enumerate()
+                .map(|(ix, cmd)| {
+                    let is_selected = ix == selected;
+                    let cmd_id = cmd.id;
+                    let view = view.clone();
+                    h_flex()
+                        .id(("palette-cmd", ix))
+                        .relative()
+                        .w_full()
+                        .h(px(30.))
+                        .items_center()
+                        .justify_between()
+                        .px_3()
+                        .rounded(px(tokens::RADIUS_SM))
+                        .border_1()
+                        .border_color(gpui_kit::transparent_black())
+                        .cursor_pointer()
+                        .when(is_selected, |el| {
+                            el.bg(rgba(0xea7a3c16))
+                                .border_color(rgba(0xea7a3c36))
+                                .child(
+                                    div()
+                                        .absolute()
+                                        .left(px(2.))
+                                        .top(px(6.))
+                                        .bottom(px(6.))
+                                        .w(px(2.5))
+                                        .rounded(px(2.))
+                                        .bg(cx.theme().primary),
+                                )
+                        })
+                        .when(!is_selected, |el| el.hover(|s| s.bg(rgba(0xffffff08))))
+                        .child(
+                            h_flex()
+                                .items_center()
+                                .gap_2()
+                                .min_w(px(0.))
+                                .child(
+                                    gpui_kit::component::Icon::new(
+                                        gpui_kit::assets::IconName::Sparkles,
+                                    )
+                                    .with_size(px(12.))
+                                    .text_color(cx.theme().primary),
+                                )
+                                .child(
+                                    div()
+                                        .text_size(px(tokens::UI))
+                                        .text_color(cx.theme().foreground)
+                                        .child(cmd.title),
+                                ),
+                        )
+                        .when(!cmd.shortcut.is_empty(), |el| {
+                            el.child(
+                                div()
+                                    .px_1p5()
+                                    .py_0p5()
+                                    .rounded(px(4.))
+                                    .bg(cx.theme().background)
+                                    .border_1()
+                                    .border_color(cx.theme().border)
+                                    .font_family("SF Mono")
+                                    .text_size(px(tokens::UI_XS))
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child(cmd.shortcut),
+                            )
+                        })
+                        .on_click(move |_event, window, cx| {
+                            view.update(cx, |this, cx| {
+                                this.palette_open = false;
+                                this.execute_ide_command(cmd_id, window, cx);
+                            });
+                        })
+                        .into_any_element()
+                })
+                .collect()
+        } else {
+            matches
+                .into_iter()
+                .enumerate()
+                .map(|(ix, path)| {
+                    let name = path
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or_default()
+                        .to_string();
+                    let directory = path
+                        .parent()
+                        .and_then(|p| p.strip_prefix(&self.root).ok())
+                        .map(|p| p.to_string_lossy().to_string())
+                        .filter(|p| !p.is_empty())
+                        .unwrap_or_else(|| ".".to_string());
+                    let badge = self.git_status.get(&path).copied();
+                    let row_path = path.clone();
+                    let is_selected = ix == selected;
+
+                    h_flex()
+                        .id(("palette-item", ix))
+                        .relative()
+                        .w_full()
+                        .h(px(30.))
+                        .items_center()
+                        .justify_between()
+                        .px_3()
+                        .rounded(px(tokens::RADIUS_SM))
+                        .border_1()
+                        .border_color(gpui_kit::transparent_black())
+                        .cursor_pointer()
+                        .when(is_selected, |el| {
+                            el.bg(rgba(0xea7a3c16))
+                                .border_color(rgba(0xea7a3c36))
+                                .child(
+                                    div()
+                                        .absolute()
+                                        .left(px(2.))
+                                        .top(px(6.))
+                                        .bottom(px(6.))
+                                        .w(px(2.5))
+                                        .rounded(px(2.))
+                                        .bg(cx.theme().primary),
+                                )
+                        })
+                        .when(!is_selected, |el| el.hover(|s| s.bg(rgba(0xffffff08))))
+                        .child(
+                            h_flex()
+                                .items_center()
+                                .gap_2()
+                                .min_w(px(0.))
+                                .child(render_file_icon(&name))
+                                .child(
+                                    div()
+                                        .text_size(px(tokens::UI))
+                                        .text_color(cx.theme().foreground)
+                                        .child(name),
+                                ),
+                        )
+                        .child(
+                            h_flex()
+                                .items_center()
+                                .gap_2()
+                                .child(
+                                    div()
+                                        .text_size(px(tokens::UI_SM))
+                                        .text_color(cx.theme().muted_foreground)
+                                        .child(directory),
+                                )
+                                .when_some(badge, |el, letter| {
+                                    el.child(
+                                        div()
+                                            .text_size(px(10.))
+                                            .font_medium()
+                                            .text_color(cx.theme().warning)
+                                            .child(letter.to_string()),
+                                    )
+                                }),
+                        )
+                        .on_click({
+                            let view = view.clone();
+                            move |_event, window, cx| {
+                                view.update(cx, |this, cx| {
+                                    this.open_path(row_path.clone(), window, cx);
+                                    this.palette_open = false;
+                                    cx.notify();
+                                });
+                            }
+                        })
+                        .into_any_element()
+                })
+                .collect()
+        };
 
         Some(
             div()
@@ -927,95 +1265,7 @@ impl DartIde {
                                 .p_1p5()
                                 .gap(px(tokens::SPACE_1))
                                 .overflow_y_scroll()
-                                .children(matches.into_iter().enumerate().map(|(ix, path)| {
-                                    let name = path
-                                        .file_name()
-                                        .and_then(|n| n.to_str())
-                                        .unwrap_or_default()
-                                        .to_string();
-                                    let directory = path
-                                        .parent()
-                                        .and_then(|p| p.strip_prefix(&self.root).ok())
-                                        .map(|p| p.to_string_lossy().to_string())
-                                        .filter(|p| !p.is_empty())
-                                        .unwrap_or_else(|| ".".to_string());
-                                    let badge = self.git_status.get(&path).copied();
-                                    let row_path = path.clone();
-                                    let is_selected = ix == selected;
-
-                                    h_flex()
-                                        .id(("palette-item", ix))
-                                        .relative()
-                                        .w_full()
-                                        .h(px(30.))
-                                        .items_center()
-                                        .justify_between()
-                                        .px_3()
-                                        .rounded(px(tokens::RADIUS_SM))
-                                        .border_1()
-                                        .border_color(gpui_kit::transparent_black())
-                                        .cursor_pointer()
-                                        .when(is_selected, |el| {
-                                            el.bg(rgba(0xea7a3c16))
-                                                .border_color(rgba(0xea7a3c36))
-                                                .child(
-                                                    div()
-                                                        .absolute()
-                                                        .left(px(2.))
-                                                        .top(px(6.))
-                                                        .bottom(px(6.))
-                                                        .w(px(2.5))
-                                                        .rounded(px(2.))
-                                                        .bg(cx.theme().primary),
-                                                )
-                                        })
-                                        .when(!is_selected, |el| {
-                                            el.hover(|s| s.bg(rgba(0xffffff08)))
-                                        })
-                                        .child(
-                                            h_flex()
-                                                .items_center()
-                                                .gap_2()
-                                                .min_w(px(0.))
-                                                .child(render_file_icon(&name))
-                                                .child(
-                                                    div()
-                                                        .text_size(px(tokens::UI))
-                                                        .text_color(cx.theme().foreground)
-                                                        .child(name),
-                                                ),
-                                        )
-                                        .child(
-                                            h_flex()
-                                                .items_center()
-                                                .gap_2()
-                                                .child(
-                                                    div()
-                                                        .text_size(px(tokens::UI_SM))
-                                                        .text_color(cx.theme().muted_foreground)
-                                                        .child(directory),
-                                                )
-                                                .when_some(badge, |el, letter| {
-                                                    el.child(
-                                                        div()
-                                                            .text_size(px(10.))
-                                                            .font_medium()
-                                                            .text_color(cx.theme().warning)
-                                                            .child(letter.to_string()),
-                                                    )
-                                                }),
-                                        )
-                                        .on_click({
-                                            let view = view.clone();
-                                            move |_event, window, cx| {
-                                                view.update(cx, |this, cx| {
-                                                    this.open_path(row_path.clone(), window, cx);
-                                                    this.palette_open = false;
-                                                    cx.notify();
-                                                });
-                                            }
-                                        })
-                                })),
+                                .children(rows),
                         )
                         .child(
                             h_flex()
@@ -1027,7 +1277,8 @@ impl DartIde {
                                 .text_size(px(tokens::UI_XS))
                                 .text_color(cx.theme().muted_foreground)
                                 .child("\u{2191}\u{2193} Navigate")
-                                .child("\u{21b5} Open")
+                                .child("\u{21b5} Execute / Open")
+                                .child("> Commands (\u{2318}\u{21e7}P)")
                                 .child("Esc Dismiss"),
                         ),
                 ),
