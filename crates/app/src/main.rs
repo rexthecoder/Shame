@@ -75,6 +75,13 @@ pub(crate) enum RightRailTab {
     Agent,
 }
 
+/// Which view the bottom dock currently shows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DockTab {
+    Terminal,
+    DebugConsole,
+}
+
 pub(crate) struct Tab {
     /// `None` for the initial scratch buffer; every file opened from the
     /// tree gets a path, which also doubles as the tab's dedup key.
@@ -139,6 +146,9 @@ pub struct DartIde {
     pub(crate) sidebar_open: bool,
     pub(crate) terminal_open: bool,
     pub(crate) terminal_maximized: bool,
+    pub(crate) dock_tab: DockTab,
+    pub(crate) debug_lines: Vec<editor::dock::TerminalLine>,
+    pub(crate) debug_scroll: ScrollHandle,
     pub(crate) agent_open: bool,
     pub(crate) right_rail_tab: RightRailTab,
     pub(crate) show_hidden: bool,
@@ -241,6 +251,9 @@ impl DartIde {
             sidebar_open: true,
             terminal_open: true,
             terminal_maximized: false,
+            dock_tab: DockTab::Terminal,
+            debug_lines: Vec::new(),
+            debug_scroll: ScrollHandle::new(),
             agent_open: true,
             right_rail_tab: RightRailTab::Simulator,
             show_hidden,
@@ -593,6 +606,8 @@ impl DartIde {
         self.next_terminal_id += 1;
         self.terminals = vec![editor::dock::TerminalSession::new(id, root.clone(), true)];
         self.active_terminal = 0;
+        self.debug_lines.clear();
+        self.dock_tab = DockTab::Terminal;
 
         let items = build_tree_items(&root, self.show_hidden);
         self.all_files = flatten_files(&root);
@@ -1159,13 +1174,24 @@ impl DartIde {
         cx.notify();
     }
 
-    /// Push a plain or ANSI-styled line into the active terminal session's scrollback.
+    /// Push a plain or ANSI-styled line into the Debug Console (flutter run / pub / test output).
     pub(crate) fn push_flutter_log(&mut self, line: &str) {
-        if let Some(session) = self.terminals.get_mut(self.active_terminal) {
-            session.push_output_line(line);
-            let last = session.lines.len().saturating_sub(1);
-            session.scroll_handle.scroll_to_item(last);
+        self.push_debug_line(line);
+    }
+
+    pub(crate) fn push_debug_line(&mut self, raw: &str) {
+        let spans = editor::dock::parse_ansi_line(raw);
+        let plain: String = spans.iter().map(|s| s.text.as_str()).collect();
+        let file_link = editor::dock::extract_file_link(&plain, &self.root);
+        self.debug_lines
+            .push(editor::dock::TerminalLine::Output { spans, file_link });
+        const MAX_DEBUG_LINES: usize = 5_000;
+        if self.debug_lines.len() > MAX_DEBUG_LINES {
+            let drain = self.debug_lines.len() - MAX_DEBUG_LINES;
+            self.debug_lines.drain(0..drain);
         }
+        self.debug_scroll
+            .scroll_to_item(self.debug_lines.len().saturating_sub(1));
     }
 
     /// Discover connected Flutter devices (`flutter devices --machine`) and
@@ -1321,6 +1347,7 @@ impl DartIde {
 
         let cmd = parts.join(" ");
         self.terminal_open = true;
+        self.dock_tab = DockTab::Terminal;
         self.push_flutter_log(&format!(
             "\x1b[36m\u{25b6} [{label}] Running test{}{}\x1b[0m",
             test_name
@@ -1467,7 +1494,8 @@ impl DartIde {
             .filter(|s| !s.is_empty());
 
         self.terminal_open = true;
-        if let Some(session) = self.terminals.get_mut(self.active_terminal) {
+        self.dock_tab = DockTab::DebugConsole;
+        {
             let args_suffix = if extra_args.is_empty() {
                 String::new()
             } else {
@@ -1478,11 +1506,7 @@ impl DartIde {
                 .map(|d| format!("(cd {d}) "))
                 .unwrap_or_default();
             let cmd_str = format!("{cwd_prefix}flutter run -d {}{args_suffix}", device.id);
-            session.lines.push(editor::dock::TerminalLine::Command {
-                user_host: session.user_host.clone(),
-                dir: session.dir_label(),
-                command: cmd_str,
-            });
+            self.push_debug_line(&format!("\x1b[90m$ {cmd_str}\x1b[0m"));
         }
 
         match core_flutter::FlutterDaemon::spawn_with_options(
@@ -1681,6 +1705,7 @@ impl DartIde {
         let root = self.root.clone();
         self.flutter_status = Some("Running pub get\u{2026}".to_string());
         self.terminal_open = true;
+        self.dock_tab = DockTab::DebugConsole;
         self.push_flutter_log("\x1b[36m\u{21bb} Running `flutter pub get`...\x1b[0m");
         cx.notify();
 
@@ -1933,13 +1958,13 @@ impl DartIde {
     /// Forward a normalized click `(norm_x, norm_y)` inside the embedded iPhone screen
     /// to `Simulator.app` and refresh the frame twice (180ms + 500ms) to capture animations.
     pub(crate) fn tap_simulator(&mut self, norm_x: f32, norm_y: f32, cx: &mut Context<Self>) {
-        let (tx, rx) = async_channel::bounded::<()>(2);
+        let (tx, rx) = async_channel::bounded::<()>(4);
         std::thread::spawn(move || {
             let _ = core_flutter::tap_simulator_window(norm_x, norm_y);
-            std::thread::sleep(std::time::Duration::from_millis(160));
-            let _ = tx.send_blocking(());
-            std::thread::sleep(std::time::Duration::from_millis(360));
-            let _ = tx.send_blocking(());
+            for delay_ms in [90u64, 220, 450] {
+                std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+                let _ = tx.send_blocking(());
+            }
         });
         cx.spawn(async move |weak, cx| {
             while rx.recv().await.is_ok() {
@@ -1977,7 +2002,7 @@ impl DartIde {
         let (tx, rx) = async_channel::bounded::<()>(1);
         std::thread::spawn(move || {
             loop {
-                std::thread::sleep(std::time::Duration::from_millis(650));
+                std::thread::sleep(std::time::Duration::from_millis(280));
                 if tx.send_blocking(()).is_err() {
                     break;
                 }

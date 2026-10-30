@@ -12,7 +12,7 @@ use gpui_kit::component::{
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
-use crate::{DartIde, tokens};
+use crate::{DartIde, DockTab, tokens};
 
 const MAX_SCROLLBACK_LINES: usize = 2_000;
 
@@ -277,7 +277,7 @@ pub(crate) fn parse_ansi_line(raw: &str) -> Vec<AnsiSpan> {
 
 /// Detect `path/to/file.rs:line[:col]` tokens inside a terminal output line so
 /// compiler diagnostics (`--> crates/app/src/main.rs:42:5`) are one-click links.
-fn extract_file_link(plain: &str, cwd: &Path) -> Option<(PathBuf, u32, u32)> {
+pub(crate) fn extract_file_link(plain: &str, cwd: &Path) -> Option<(PathBuf, u32, u32)> {
     for raw_token in plain.split_whitespace() {
         let token = raw_token.trim_matches(|c: char| {
             matches!(c, '(' | ')' | '[' | ']' | ',' | '\'' | '"' | ':')
@@ -600,6 +600,16 @@ impl DartIde {
         let modifiers = &keystroke.modifiers;
         let primary_mod = modifiers.platform || modifiers.control;
 
+        // The Debug Console is read-only: don't swallow keystrokes into the hidden shell prompt.
+        if self.dock_tab == DockTab::DebugConsole {
+            if modifiers.platform && key == "k" {
+                self.debug_lines.clear();
+                cx.stop_propagation();
+                cx.notify();
+            }
+            return;
+        }
+
         // Let global IDE shortcuts (`⌘P`, `⌘B`, `⌘J`, `⌘O`, `⌘N`, `⌘F`) bubble up
         if modifiers.platform && matches!(key, "p" | "b" | "j" | "o" | "n" | "f" | "l" | "g") {
             return;
@@ -876,7 +886,7 @@ impl DartIde {
             .iter()
             .enumerate()
             .map(|(ix, session)| {
-                let is_active = ix == active_ix;
+                let is_active = ix == active_ix && self.dock_tab == DockTab::Terminal;
                 let title = session.tab_title();
                 let is_running = session.running_pid.is_some();
                 let view_select = view.clone();
@@ -907,6 +917,7 @@ impl DartIde {
                     .on_click(move |_event, window, cx| {
                         view_select.update(cx, |this, cx| {
                             this.active_terminal = ix;
+                            this.dock_tab = DockTab::Terminal;
                             window.focus(&this.terminal_focus, cx);
                             cx.notify();
                         });
@@ -937,7 +948,252 @@ impl DartIde {
             })
             .collect();
 
-        let body_element = if let Some(session) = self.terminals.get(active_ix) {
+        let debug_active = self.dock_tab == DockTab::DebugConsole;
+        let debug_count_err = self
+            .debug_lines
+            .iter()
+            .filter(|l| matches!(l, TerminalLine::Output { spans, .. } if spans.iter().any(|s| s.color == AnsiColor::Red)))
+            .count();
+
+        let debug_pill = {
+            let view_select = view.clone();
+            h_flex()
+                .id("debug-console-tab")
+                .items_center()
+                .gap(px(tokens::SPACE_2))
+                .px(px(tokens::SPACE_3))
+                .h(px(28.))
+                .rounded(px(tokens::RADIUS_PANEL))
+                .border_1()
+                .border_color(if debug_active {
+                    tokens::accent_dim()
+                } else {
+                    gpui_kit::transparent_black()
+                })
+                .when(debug_active, |el| el.bg(cx.theme().tab_active).text_color(fg))
+                .when(!debug_active, |el| {
+                    el.text_color(muted)
+                        .hover(move |s| s.bg(rgba(0xffffff08)).text_color(fg))
+                })
+                .text_size(px(tokens::UI_SM))
+                .cursor_pointer()
+                .on_click(move |_event, _window, cx| {
+                    view_select.update(cx, |this, cx| {
+                        this.dock_tab = DockTab::DebugConsole;
+                        cx.notify();
+                    });
+                })
+                .child(
+                    Icon::new(gpui_kit::assets::IconName::Bug)
+                        .xsmall()
+                        .text_color(if self.flutter_daemon.is_some() { green } else { primary }),
+                )
+                .child("Debug Console")
+                .when(debug_count_err > 0, |el| {
+                    el.child(
+                        div()
+                            .px(px(5.))
+                            .rounded(px(8.))
+                            .bg(red.opacity(0.18))
+                            .text_size(px(9.5))
+                            .text_color(red)
+                            .child(debug_count_err.to_string()),
+                    )
+                })
+        };
+
+        let debug_body = {
+            let running = self.flutter_daemon.is_some();
+            let status_text = self
+                .flutter_status
+                .clone()
+                .unwrap_or_else(|| "No debug session".to_string());
+            let dot = if running { green } else { muted };
+
+            let rows: Vec<AnyElement> = self
+                .debug_lines
+                .iter()
+                .enumerate()
+                .filter_map(|(line_ix, line)| {
+                    let TerminalLine::Output { spans, file_link } = line else {
+                        return None;
+                    };
+                    let tint = spans
+                        .iter()
+                        .find(|s| s.color != AnsiColor::Default)
+                        .map(|s| s.color);
+                    let (bar, wash) = match tint {
+                        Some(AnsiColor::Red) => (Some(red), Some(red.opacity(0.07))),
+                        Some(AnsiColor::Yellow) => (Some(yellow), Some(yellow.opacity(0.05))),
+                        _ => (None, None),
+                    };
+                    let children: Vec<AnyElement> = spans
+                        .iter()
+                        .map(|span| {
+                            let color = match span.color {
+                                AnsiColor::Default => fg,
+                                AnsiColor::Muted => muted,
+                                AnsiColor::Red => red,
+                                AnsiColor::Green => green,
+                                AnsiColor::Yellow => yellow,
+                                AnsiColor::Blue => blue,
+                                AnsiColor::Magenta => magenta,
+                                AnsiColor::Cyan => cyan,
+                            };
+                            div()
+                                .text_color(color)
+                                .when(span.bold, |el| el.font_semibold())
+                                .child(span.text.clone())
+                                .into_any_element()
+                        })
+                        .collect();
+                    let row = h_flex()
+                        .id(("debug-line", line_ix))
+                        .w_full()
+                        .min_h(px(20.))
+                        .items_start()
+                        .gap(px(8.))
+                        .px(px(tokens::SPACE_4))
+                        .border_l_2()
+                        .border_color(bar.unwrap_or_else(gpui_kit::transparent_black))
+                        .when_some(wash, |el, w| el.bg(w))
+                        .font_family("SF Mono")
+                        .text_size(px(tokens::MONO))
+                        .child(
+                            div()
+                                .w(px(28.))
+                                .flex_shrink_0()
+                                .text_color(muted.opacity(0.5))
+                                .text_size(px(9.5))
+                                .pt(px(3.))
+                                .child(format!("{:>3}", line_ix + 1)),
+                        )
+                        .child(h_flex().flex_wrap().flex_1().min_w(px(0.)).children(children));
+                    if let Some((path, l0, c0)) = file_link.clone() {
+                        let view = view.clone();
+                        Some(
+                            row.cursor_pointer()
+                                .hover(|s| s.bg(rgba(0xffffff08)))
+                                .on_click(move |_e, window, cx| {
+                                    view.update(cx, |this, cx| {
+                                        this.open_path(path.clone(), window, cx);
+                                        if let Some(ed) = this.active_editor().cloned() {
+                                            ed.update(cx, |editor, cx| {
+                                                editor.set_cursor_to_position(l0, c0, cx);
+                                            });
+                                        }
+                                    });
+                                })
+                                .into_any_element(),
+                        )
+                    } else {
+                        Some(row.into_any_element())
+                    }
+                })
+                .collect();
+
+            v_flex()
+                .flex_1()
+                .w_full()
+                .min_h(px(0.))
+                .bg(cx.theme().background)
+                .child(
+                    h_flex()
+                        .w_full()
+                        .h(px(30.))
+                        .flex_shrink_0()
+                        .px(px(tokens::SPACE_4))
+                        .items_center()
+                        .justify_between()
+                        .border_b_1()
+                        .border_color(cx.theme().border)
+                        .child(
+                            h_flex()
+                                .items_center()
+                                .gap(px(tokens::SPACE_2))
+                                .child(div().size(px(7.)).rounded(px(4.)).bg(dot))
+                                .child(
+                                    div()
+                                        .text_size(px(tokens::UI_SM))
+                                        .text_color(fg)
+                                        .child(status_text),
+                                ),
+                        )
+                        .child(
+                            h_flex()
+                                .items_center()
+                                .gap(px(2.))
+                                .child(
+                                    Button::new("dbg-reload")
+                                        .ghost()
+                                        .xsmall()
+                                        .icon(
+                                            Icon::new(gpui_kit::assets::IconName::Zap)
+                                                .xsmall()
+                                                .text_color(yellow),
+                                        )
+                                        .tooltip("Hot Reload")
+                                        .on_click(cx.listener(|this, _e, _w, cx| {
+                                            this.trigger_hot_reload(cx);
+                                        })),
+                                )
+                                .child(
+                                    Button::new("dbg-restart")
+                                        .ghost()
+                                        .xsmall()
+                                        .icon(
+                                            Icon::new(gpui_kit::assets::IconName::RotateCw)
+                                                .xsmall()
+                                                .text_color(blue),
+                                        )
+                                        .tooltip("Hot Restart")
+                                        .on_click(cx.listener(|this, _e, _w, cx| {
+                                            this.trigger_hot_restart(cx);
+                                        })),
+                                )
+                                .child(
+                                    Button::new("dbg-stop")
+                                        .ghost()
+                                        .xsmall()
+                                        .icon(
+                                            Icon::new(gpui_kit::assets::IconName::X)
+                                                .xsmall()
+                                                .text_color(if running { red } else { muted }),
+                                        )
+                                        .tooltip("Stop")
+                                        .on_click(cx.listener(|this, _e, _w, cx| {
+                                            this.stop_flutter_run(cx);
+                                        })),
+                                ),
+                        ),
+                )
+                .child(
+                    v_flex()
+                        .id("debug-scrollback")
+                        .flex_1()
+                        .w_full()
+                        .min_h(px(0.))
+                        .py(px(tokens::SPACE_2))
+                        .overflow_y_scroll()
+                        .track_scroll(&self.debug_scroll)
+                        .when(rows.is_empty(), |el| {
+                            el.child(
+                                div()
+                                    .px(px(tokens::SPACE_5))
+                                    .py(px(tokens::SPACE_3))
+                                    .text_size(px(tokens::UI_SM))
+                                    .text_color(muted)
+                                    .child("Run a launch configuration to see debug output here."),
+                            )
+                        })
+                        .children(rows),
+                )
+                .into_any_element()
+        };
+
+        let body_element = if debug_active {
+            debug_body
+        } else if let Some(session) = self.terminals.get(active_ix) {
             let line_elements: Vec<AnyElement> = session
                 .lines
                 .iter()
@@ -1094,6 +1350,7 @@ impl DartIde {
                             .items_center()
                             .gap(px(tokens::SPACE_2))
                             .children(tabs)
+                            .child(debug_pill)
                             .child(
                                 Button::new("new-terminal-tab")
                                     .ghost()
@@ -1136,12 +1393,14 @@ impl DartIde {
                                             .xsmall()
                                             .text_color(muted),
                                     )
-                                    .tooltip("Clear terminal (cmd+K)")
+                                    .tooltip("Clear (cmd+K)")
                                     .on_click(cx.listener(|this, _event, _window, cx| {
-                                        if let Some(session) = this.active_terminal_mut() {
+                                        if this.dock_tab == DockTab::DebugConsole {
+                                            this.debug_lines.clear();
+                                        } else if let Some(session) = this.active_terminal_mut() {
                                             session.lines.clear();
-                                            cx.notify();
                                         }
+                                        cx.notify();
                                     })),
                             )
                             .child(

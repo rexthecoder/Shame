@@ -117,7 +117,7 @@ pub fn list_ios_simulators() -> io::Result<Vec<IosSimulator>> {
 pub fn boot_ios_simulator(udid: &str) -> io::Result<()> {
     let _ = Command::new("xcrun").args(["simctl", "boot", udid]).status();
     let _ = Command::new("open")
-        .args(["-a", "Simulator", "--args", "-CurrentDeviceUDID", udid])
+        .args(["-g", "-a", "Simulator", "--args", "-CurrentDeviceUDID", udid])
         .status();
     Ok(())
 }
@@ -126,8 +126,8 @@ pub fn boot_ios_simulator(udid: &str) -> io::Result<()> {
 /// against the right edge of our IDE window (or inside its right rail bounds)
 /// and raise it cleanly alongside the editor.
 pub fn attach_simulator_window(ide_x: i32, ide_y: i32, ide_w: i32, ide_h: i32) -> io::Result<()> {
-    // Ensure Simulator.app is open
-    let _ = Command::new("open").args(["-a", "Simulator"]).status();
+    // Ensure Simulator.app is open (`-g`: don't steal focus from the IDE)
+    let _ = Command::new("open").args(["-g", "-a", "Simulator"]).status();
     let target_x = (ide_x + ide_w - 400).max(40);
     let target_y = ide_y.max(28);
     let target_h = ide_h.max(680);
@@ -135,7 +135,6 @@ pub fn attach_simulator_window(ide_x: i32, ide_y: i32, ide_w: i32, ide_h: i32) -
         r#"tell application "System Events"
             if exists process "Simulator" then
                 tell process "Simulator"
-                    set frontmost to true
                     if (count of windows) > 0 then
                         set position of window 1 to {{{target_x}, {target_y}}}
                         try
@@ -174,43 +173,67 @@ pub fn capture_simulator_screenshot(udid: Option<&str>, out_path: &Path) -> io::
     Ok(())
 }
 
+/// Run a JXA (JavaScript for Automation) snippet via `osascript -l JavaScript`.
+fn run_jxa(script: &str) -> io::Result<()> {
+    Command::new("osascript")
+        .args(["-l", "JavaScript", "-e", script])
+        .status()
+        .map(|_| ())
+}
+
+/// JXA prelude: finds the on-screen `Simulator` window (`win`, with `win.kCGWindowBounds`)
+/// and its owner pid (`pid`) via CoreGraphics, without needing Accessibility APIs and
+/// without activating the app.
+const JXA_FIND_SIMULATOR: &str = r#"
+ObjC.import('CoreGraphics');
+const infos = ObjC.deepUnwrap(ObjC.castRefToObject($.CGWindowListCopyWindowInfo(17, 0)));
+const win = infos.find(w => w.kCGWindowOwnerName === 'Simulator'
+    && w.kCGWindowLayer === 0 && w.kCGWindowBounds.Height > 200);
+if (!win) { throw new Error('no simulator window'); }
+const pid = win.kCGWindowOwnerPID;
+const b = win.kCGWindowBounds;
+"#;
+
 /// Forward a normalized `(norm_x, norm_y)` tap (`0.0..=1.0`) from the embedded
-/// iPhone screen in the IDE rail to the native macOS `Simulator.app` window.
+/// iPhone screen in the IDE rail to the native `Simulator.app` window.
+///
+/// Events are posted directly to the Simulator's pid (`CGEventPostToPid`), so the
+/// Simulator is **never raised or activated** and the IDE keeps focus.
 pub fn tap_simulator_window(norm_x: f32, norm_y: f32) -> io::Result<()> {
     let nx = norm_x.clamp(0.02, 0.98);
     let ny = norm_y.clamp(0.02, 0.98);
     let script = format!(
-        r#"tell application "System Events"
-            if exists process "Simulator" then
-                tell process "Simulator"
-                    set frontmost to true
-                    if (count of windows) > 0 then
-                        set {{wx, wy}} to position of window 1
-                        set {{ww, wh}} to size of window 1
-                        set tx to wx + 18 + ((ww - 36) * {nx:.4})
-                        set ty to wy + 44 + ((wh - 62) * {ny:.4})
-                        click at {{tx as integer, ty as integer}}
-                    end if
-                end tell
-            end if
-        end tell"#
+        r#"{JXA_FIND_SIMULATOR}
+const p = {{ x: b.X + 18 + (b.Width - 36) * {nx:.4}, y: b.Y + 44 + (b.Height - 62) * {ny:.4} }};
+function post(type) {{
+    const e = $.CGEventCreateMouseEvent(null, type, p, 0);
+    $.CGEventSetIntegerValueField(e, 1, 1);
+    $.CGEventPostToPid(pid, e);
+}}
+post(5);
+delay(0.02);
+post(1);
+delay(0.05);
+post(2);
+"#
     );
-    let _ = Command::new("osascript").args(["-e", &script]).status();
-    Ok(())
+    run_jxa(&script)
 }
 
-/// Trigger the iOS Home gesture (`Cmd+Shift+H`) on the active `Simulator.app`.
+/// Trigger the iOS Home gesture (`Cmd+Shift+H`) on `Simulator.app` without raising it.
 pub fn simulator_press_home() -> io::Result<()> {
-    let script = r#"tell application "System Events"
-        if exists process "Simulator" then
-            tell process "Simulator"
-                set frontmost to true
-                keystroke "h" using {command down, shift down}
-            end tell
-        end if
-    end tell"#;
-    let _ = Command::new("osascript").args(["-e", script]).status();
-    Ok(())
+    let script = format!(
+        r#"{JXA_FIND_SIMULATOR}
+function key(down) {{
+    const e = $.CGEventCreateKeyboardEvent(null, 4, down);
+    $.CGEventSetFlags(e, 0x100000 | 0x20000);
+    $.CGEventPostToPid(pid, e);
+}}
+key(true);
+key(false);
+"#
+    );
+    run_jxa(&script)
 }
 
 #[cfg(test)]
