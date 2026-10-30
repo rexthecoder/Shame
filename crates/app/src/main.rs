@@ -65,6 +65,16 @@ fn flatten_files(dir: &Path) -> Vec<PathBuf> {
     files
 }
 
+fn hash_paths(paths: &[PathBuf]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    paths.len().hash(&mut h);
+    for p in paths {
+        p.hash(&mut h);
+    }
+    h.finish()
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum MarkdownMode {
     Code,
@@ -167,6 +177,8 @@ pub struct DartIde {
     pub(crate) tab_scroll: ScrollHandle,
     pub(crate) tab_overflow_open: bool,
     pub(crate) all_files: Vec<PathBuf>,
+    pub(crate) all_files_hash: u64,
+    pub(crate) syncing_files: bool,
     pub(crate) palette_open: bool,
     pub(crate) palette_input: Entity<InputState>,
     pub(crate) palette_selected: usize,
@@ -281,7 +293,9 @@ impl DartIde {
             active_tab: 0,
             tab_scroll: ScrollHandle::new(),
             tab_overflow_open: false,
+            all_files_hash: hash_paths(&all_files),
             all_files,
+            syncing_files: false,
             palette_open: false,
             palette_input,
             palette_selected: 0,
@@ -383,31 +397,37 @@ impl DartIde {
     }
 
     /// Background check: if files were added, renamed, or deleted on disk outside the editor,
-    /// refresh `all_files` and `tree_state` automatically.
+    /// refresh `all_files` and `tree_state` automatically without cloning `all_files` on the UI thread.
     pub(crate) fn sync_workspace_files_if_changed(&mut self, cx: &mut Context<Self>) {
+        if self.syncing_files {
+            return;
+        }
+        self.syncing_files = true;
         let root = self.root.clone();
-        let prev_len = self.all_files.len();
-        let prev_files = self.all_files.clone();
+        let prev_hash = self.all_files_hash;
         let (tx, rx) = async_channel::bounded(1);
         std::thread::spawn(move || {
             let files = flatten_files(&root);
-            if files.len() != prev_len || files != prev_files {
-                let _ = tx.send_blocking(Some(files));
+            let h = hash_paths(&files);
+            if h != prev_hash {
+                let _ = tx.send_blocking(Some((files, h)));
             } else {
                 let _ = tx.send_blocking(None);
             }
         });
         cx.spawn(async move |weak, cx| {
-            let Ok(Some(files)) = rx.recv().await else {
-                return;
-            };
+            let res = rx.recv().await;
             let _ = weak.update(cx, |this, cx| {
-                let items = build_tree_items(&this.root, this.show_hidden);
-                this.all_files = files;
-                this.tree_state.update(cx, |state, cx| {
-                    state.set_items(items, cx);
-                });
-                cx.notify();
+                this.syncing_files = false;
+                if let Ok(Some((files, h))) = res {
+                    let items = build_tree_items(&this.root, this.show_hidden);
+                    this.all_files = files;
+                    this.all_files_hash = h;
+                    this.tree_state.update(cx, |state, cx| {
+                        state.set_items(items, cx);
+                    });
+                    cx.notify();
+                }
             });
         })
         .detach();

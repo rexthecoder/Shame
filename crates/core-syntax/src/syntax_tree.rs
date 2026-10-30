@@ -1,4 +1,5 @@
 use std::ops::Range;
+use std::sync::OnceLock;
 
 use tree_sitter::{
     InputEdit, Language, Node, Parser, Point, Query, QueryCursor, StreamingIterator, Tree,
@@ -8,6 +9,14 @@ use crate::highlight::{Highlight, HighlightKind};
 
 fn dart_language() -> Language {
     tree_sitter_dart::LANGUAGE.into()
+}
+
+fn dart_query() -> &'static Query {
+    static QUERY: OnceLock<Query> = OnceLock::new();
+    QUERY.get_or_init(|| {
+        Query::new(&dart_language(), tree_sitter_dart::HIGHLIGHTS_QUERY)
+            .expect("tree-sitter-dart ships a highlights query valid for its own grammar")
+    })
 }
 
 fn dart_parser() -> Parser {
@@ -29,27 +38,26 @@ pub struct FoldRange {
 
 /// A parsed Dart syntax tree, re-parsed incrementally as the source edits.
 pub struct SyntaxTree {
+    parser: Parser,
     tree: Tree,
-    query: Query,
 }
 
 impl SyntaxTree {
     pub fn parse(source: &str) -> Self {
-        let language = dart_language();
-        let tree = dart_parser()
+        let mut parser = dart_parser();
+        let tree = parser
             .parse(source, None)
             .expect("tree-sitter only returns None if parsing was cancelled or timed out");
-        let query = Query::new(&language, tree_sitter_dart::HIGHLIGHTS_QUERY)
-            .expect("tree-sitter-dart ships a highlights query valid for its own grammar");
-        Self { tree, query }
+        let _ = dart_query();
+        Self { parser, tree }
     }
 
-    /// Apply a text edit and re-parse, reusing the previous tree so
+    /// Apply a text edit and re-parse, reusing the previous tree and parser so
     /// tree-sitter only re-derives the parts of the syntax tree that
     /// actually changed.
     pub fn reparse(&mut self, new_source: &str, edit: InputEdit) {
         self.tree.edit(&edit);
-        if let Some(tree) = dart_parser().parse(new_source, Some(&self.tree)) {
+        if let Some(tree) = self.parser.parse(new_source, Some(&self.tree)) {
             self.tree = tree;
         }
     }
@@ -67,10 +75,11 @@ impl SyntaxTree {
     /// Run the grammar's highlights query restricted to `byte_range` so
     /// virtualized editor rendering only queries the visible viewport lines.
     pub fn highlights_in_range(&self, source: &str, byte_range: Range<usize>) -> Vec<Highlight> {
-        let capture_names = self.query.capture_names();
+        let query = dart_query();
+        let capture_names = query.capture_names();
         let mut cursor = QueryCursor::new();
         cursor.set_byte_range(byte_range);
-        let mut matches = cursor.matches(&self.query, self.tree.root_node(), source.as_bytes());
+        let mut matches = cursor.matches(query, self.tree.root_node(), source.as_bytes());
 
         let mut highlights = Vec::new();
         while let Some(m) = matches.next() {
@@ -129,24 +138,37 @@ impl SyntaxTree {
     /// throw off matching in the real code around it.
     pub fn matching_bracket(&self, source: &str, offset: usize) -> Option<usize> {
         const PAIRS: &[(u8, u8)] = &[(b'(', b')'), (b'[', b']'), (b'{', b'}')];
+        const WINDOW: usize = 24 * 1024;
 
         let bytes = source.as_bytes();
         let at = *bytes.get(offset)?;
-        if !PAIRS.iter().any(|&(open, close)| at == open || at == close) {
+        let is_open = PAIRS.iter().find(|&&(open, _)| open == at).copied();
+        let is_close = PAIRS.iter().find(|&&(_, close)| close == at).copied();
+        if is_open.is_none() && is_close.is_none() {
             return None;
         }
 
-        let skip: Vec<Range<usize>> = self
-            .highlights(source)
+        let scan_range = if is_open.is_some() {
+            offset..(offset + WINDOW).min(bytes.len())
+        } else {
+            offset.saturating_sub(WINDOW)..(offset + 1).min(bytes.len())
+        };
+
+        let mut skip: Vec<Range<usize>> = self
+            .highlights_in_range(source, scan_range.clone())
             .into_iter()
             .filter(|h| matches!(h.kind, HighlightKind::Comment | HighlightKind::String))
             .map(|h| h.range)
             .collect();
-        let in_skip = |pos: usize| skip.iter().any(|r| r.contains(&pos));
+        skip.sort_by_key(|r| r.start);
+        let in_skip = |pos: usize| {
+            let idx = skip.partition_point(|r| r.end <= pos);
+            skip.get(idx).is_some_and(|r| r.start <= pos && pos < r.end)
+        };
 
-        if let Some(&(open, close)) = PAIRS.iter().find(|(open, _)| *open == at) {
+        if let Some((open, close)) = is_open {
             let mut depth = 1usize;
-            for pos in (offset + 1)..bytes.len() {
+            for pos in (offset + 1)..scan_range.end {
                 if in_skip(pos) {
                     continue;
                 }
@@ -162,9 +184,9 @@ impl SyntaxTree {
             return None;
         }
 
-        if let Some(&(open, close)) = PAIRS.iter().find(|(_, close)| *close == at) {
+        if let Some((open, close)) = is_close {
             let mut depth = 1usize;
-            for pos in (0..offset).rev() {
+            for pos in (scan_range.start..offset).rev() {
                 if in_skip(pos) {
                     continue;
                 }

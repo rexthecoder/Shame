@@ -175,10 +175,6 @@ impl EditorView {
         };
         let synced_revision = buffer.revision();
         let indent_width = buffer.detect_indent_width();
-        let line_changes = buffer
-            .path()
-            .map(core_workspace::line_changes)
-            .unwrap_or_default();
         let mut this = Self {
             buffer,
             focus_handle: cx.focus_handle(),
@@ -188,7 +184,7 @@ impl EditorView {
             synced_text,
             synced_revision,
             indent_width,
-            line_changes,
+            line_changes: std::collections::HashMap::new(),
             lsp: None,
             hover_point: None,
             hover_sequence: 0,
@@ -205,7 +201,60 @@ impl EditorView {
             save_after_format: false,
         };
         this.maybe_start_lsp(cx);
+        this.refresh_line_changes(cx);
         this
+    }
+
+    fn refresh_line_changes(&mut self, cx: &mut Context<Self>) {
+        let Some(path) = self.buffer.path().map(Path::to_path_buf) else {
+            self.line_changes.clear();
+            return;
+        };
+        let (tx, rx) = async_channel::bounded(1);
+        std::thread::spawn(move || {
+            let _ = tx.send_blocking(core_workspace::line_changes(&path));
+        });
+        cx.spawn(async move |weak, cx| {
+            let Ok(changes) = rx.recv().await else { return };
+            let _ = weak.update(cx, |this, cx| {
+                if this.line_changes != changes {
+                    this.line_changes = changes;
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// Synchronize `synced_text`, `syntax_tree`, `closing_labels`, and LSP
+    /// `didChange` at most once per `buffer.revision()`, avoiding duplicate
+    /// full-buffer allocations across keystroke handlers and `render()`.
+    pub(crate) fn sync_buffer_state(&mut self) {
+        if self.buffer.revision() == self.synced_revision {
+            return;
+        }
+        self.synced_revision = self.buffer.revision();
+        self.indent_width = self.buffer.detect_indent_width();
+        if !self.search_query.is_empty() {
+            self.recompute_search_matches();
+        }
+        if should_parse_syntax(&self.buffer) {
+            let text = self.buffer.text();
+            if let Some(tree) = &mut self.syntax_tree {
+                if let Some(edit) = diff_as_edit(&self.synced_text, &text) {
+                    tree.reparse(&text, edit);
+                }
+            } else {
+                self.syntax_tree = Some(SyntaxTree::parse(&text));
+            }
+            self.closing_labels = self.language.closing_labels(&text);
+            self.sync_lsp_text(&text);
+            self.synced_text = text;
+        } else {
+            self.syntax_tree = None;
+            self.closing_labels.clear();
+            self.synced_text.clear();
+        }
     }
 
     pub fn set_test_code_lenses(
@@ -285,24 +334,18 @@ impl EditorView {
         }
         self.synced_revision = self.buffer.revision();
         self.indent_width = self.buffer.detect_indent_width();
-        self.line_changes = self
-            .buffer
-            .path()
-            .map(core_workspace::line_changes)
-            .unwrap_or_default();
+        self.line_changes.clear();
         self.lsp = None;
         self.maybe_start_lsp(cx);
+        self.refresh_line_changes(cx);
         cx.notify();
         Ok(())
     }
 
     pub fn save(&mut self, cx: &mut Context<Self>) {
-        if should_parse_syntax(&self.buffer) {
-            let text = self.buffer.text();
-            self.sync_lsp_text(&text);
-            if self.request_format() {
-                self.save_after_format = true;
-            }
+        self.sync_buffer_state();
+        if should_parse_syntax(&self.buffer) && self.request_format() {
+            self.save_after_format = true;
         }
         self.flush_save(cx);
     }
@@ -313,11 +356,7 @@ impl EditorView {
                 cx.emit(EditorEvent::Saved { path });
             }
         }
-        self.line_changes = self
-            .buffer
-            .path()
-            .map(core_workspace::line_changes)
-            .unwrap_or_default();
+        self.refresh_line_changes(cx);
     }
 
     fn set_cursor(&mut self, offset: usize, cx: &mut Context<Self>) {
@@ -701,11 +740,10 @@ impl EditorView {
             return;
         }
 
-        // Sync buffer text to LSP immediately so `textDocument/completion`
-        // sees the newly typed character before the next frame's `render()`.
+        // Sync buffer text once so both LSP completion and local identifier scan
+        // reuse `self.synced_text` without extra full-buffer allocations.
+        self.sync_buffer_state();
         if should_parse_syntax(&self.buffer) {
-            let text = self.buffer.text();
-            self.sync_lsp_text(&text);
             let head = self.buffer.selections().primary().head;
             let line = self.buffer.byte_to_line(head);
             let col = head - self.buffer.line_to_byte(line);
@@ -723,20 +761,19 @@ impl EditorView {
         cx: &mut Context<Self>,
     ) {
         let (_range, prefix, after_dot) = self.current_completion_prefix();
-        let prefix_lower = prefix.to_lowercase();
+        let prefix_lower = prefix.to_ascii_lowercase();
         let mut entries: Vec<CompletionEntry> = lsp_entries
             .into_iter()
             .filter(|e| {
                 e.label != prefix
                     && (prefix_lower.is_empty()
-                        || e.label.to_lowercase().contains(&prefix_lower))
+                        || contains_ascii_ci(&e.label, &prefix_lower))
             })
             .collect();
 
         entries.sort_by_key(|e| {
-            let lower = e.label.to_lowercase();
             let exact = e.label.starts_with(&prefix);
-            let starts = lower.starts_with(&prefix_lower);
+            let starts = starts_with_ascii_ci(&e.label, &prefix_lower);
             (!exact, !starts, e.label.len(), e.label.clone())
         });
 
@@ -799,7 +836,7 @@ impl EditorView {
         if !after_dot && !prefix.is_empty() {
             for &kw in self.language.keywords() {
                 if kw != prefix
-                    && kw.to_lowercase().starts_with(&prefix_lower)
+                    && starts_with_ascii_ci(kw, &prefix_lower)
                     && seen.insert(kw.to_string())
                 {
                     let is_type = kw.bytes().next().is_some_and(|b| b.is_ascii_uppercase());
@@ -818,9 +855,9 @@ impl EditorView {
             }
         }
 
-        // 4. Scan buffer identifiers (when buffer <= 256 KiB)
-        if should_parse_syntax(&self.buffer) {
-            let text = self.buffer.text();
+        // 4. Scan buffer identifiers from `self.synced_text` (zero extra allocation)
+        if should_parse_syntax(&self.buffer) && !self.synced_text.is_empty() {
+            let text = &self.synced_text;
             let bytes = text.as_bytes();
             let mut i = 0;
             while i < bytes.len() {
@@ -833,8 +870,7 @@ impl EditorView {
                     let word = &text[start..i];
                     if word.len() >= 2
                         && word != prefix
-                        && (prefix_lower.is_empty()
-                            || word.to_lowercase().contains(&prefix_lower))
+                        && (prefix_lower.is_empty() || contains_ascii_ci(word, &prefix_lower))
                         && (!after_dot || preceded_by_dot || !prefix.is_empty())
                         && seen.insert(word.to_string())
                     {
@@ -864,9 +900,8 @@ impl EditorView {
         }
 
         results.sort_by_key(|e| {
-            let lower = e.label.to_lowercase();
             let exact_prefix = !prefix.is_empty() && e.label.starts_with(prefix);
-            let ci_prefix = !prefix_lower.is_empty() && lower.starts_with(&prefix_lower);
+            let ci_prefix = !prefix_lower.is_empty() && starts_with_ascii_ci(&e.label, &prefix_lower);
             (!exact_prefix, !ci_prefix, e.label.len(), e.label.clone())
         });
         results.truncate(24);
@@ -2281,6 +2316,29 @@ fn is_word_byte(b: u8) -> bool {
     b.is_ascii_alphanumeric() || b == b'_' || b >= 0x80
 }
 
+/// Zero-allocation ASCII case-insensitive prefix check (`needle_lower` must be lowercase).
+fn starts_with_ascii_ci(haystack: &str, needle_lower: &str) -> bool {
+    haystack.len() >= needle_lower.len()
+        && haystack.as_bytes()[..needle_lower.len()]
+            .iter()
+            .zip(needle_lower.as_bytes())
+            .all(|(h, n)| h.to_ascii_lowercase() == *n)
+}
+
+/// Zero-allocation ASCII case-insensitive substring check (`needle_lower` must be lowercase).
+fn contains_ascii_ci(haystack: &str, needle_lower: &str) -> bool {
+    if needle_lower.is_empty() {
+        return true;
+    }
+    let h = haystack.as_bytes();
+    let n = needle_lower.as_bytes();
+    if h.len() < n.len() {
+        return false;
+    }
+    h.windows(n.len())
+        .any(|w| w.iter().zip(n).all(|(a, b)| a.to_ascii_lowercase() == *b))
+}
+
 /// A quiet, One Dark-derived palette: each kind gets its own hue family
 /// (purple/gold/blue/cyan/red/green/orange) so two unrelated kinds never
 /// compete for the same colour the way the previous pass's keyword and
@@ -2365,31 +2423,7 @@ impl Render for EditorView {
         // Only touch the full buffer string or re-run tree-sitter when an edit
         // actually incremented `buffer.revision()`. Hovering, scrolling, or
         // moving the cursor does zero full-buffer work.
-        if self.buffer.revision() != self.synced_revision {
-            self.synced_revision = self.buffer.revision();
-            self.indent_width = self.buffer.detect_indent_width();
-            if !self.search_query.is_empty() {
-                self.recompute_search_matches();
-            }
-
-            if should_parse_syntax(&self.buffer) {
-                let text = self.buffer.text();
-                if let Some(tree) = &mut self.syntax_tree {
-                    if let Some(edit) = diff_as_edit(&self.synced_text, &text) {
-                        tree.reparse(&text, edit);
-                    }
-                } else {
-                    self.syntax_tree = Some(SyntaxTree::parse(&text));
-                }
-                self.closing_labels = self.language.closing_labels(&text);
-                self.sync_lsp_text(&text);
-                self.synced_text = text;
-            } else {
-                self.syntax_tree = None;
-                self.closing_labels.clear();
-                self.synced_text.clear();
-            }
-        }
+        self.sync_buffer_state();
 
         let primary = self.buffer.selections().primary();
         let head = primary.head;

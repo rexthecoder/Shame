@@ -427,7 +427,19 @@ impl DartIde {
                                     .active_editor()
                                     .and_then(|ed| ed.read(cx).buffer().path())
                                     .map(|path| path.to_string_lossy().to_string());
-                                let git_status = self.git_status.clone();
+                                let mut dirty_folders = std::collections::HashSet::new();
+                                for changed in self.git_status.keys() {
+                                    for anc in changed.ancestors().skip(1) {
+                                        if !anc.starts_with(&self.root) {
+                                            break;
+                                        }
+                                        if !dirty_folders.insert(anc.to_path_buf()) {
+                                            break;
+                                        }
+                                    }
+                                }
+                                let dirty_folders = std::rc::Rc::new(dirty_folders);
+                                let git_status = std::rc::Rc::new(self.git_status.clone());
                                 move |ix, entry, _entry_state, _window, cx| {
                                     let item = entry.item();
                                     let item_path = PathBuf::from(item.id.as_str());
@@ -451,10 +463,7 @@ impl DartIde {
                                         active_path.as_deref() == Some(item.id.as_str());
 
                                     let badge = if is_folder {
-                                        git_status
-                                            .keys()
-                                            .any(|changed| changed.starts_with(&item_path))
-                                            .then_some('M')
+                                        dirty_folders.contains(&item_path).then_some('M')
                                     } else {
                                         git_status.get(&item_path).copied()
                                     };
