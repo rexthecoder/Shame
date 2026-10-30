@@ -1544,11 +1544,11 @@ impl DartIde {
                 ));
                 cx.notify();
 
-                cx.spawn(async move |weak, cx| {
+                cx.spawn_in(window, async move |weak, cx| {
                     while let Ok(output) = events.recv().await {
                         let keep_going = weak
-                            .update(cx, |this, cx| {
-                                this.handle_flutter_daemon_output(output, cx);
+                            .update_in(cx, |this, window, cx| {
+                                this.handle_flutter_daemon_output(output, window, cx);
                             })
                             .is_ok();
                         if !keep_going {
@@ -1577,8 +1577,17 @@ impl DartIde {
     fn handle_flutter_daemon_output(
         &mut self,
         output: core_flutter::DaemonOutput,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // The reply to "which widget is selected?" is not a hot-reload response.
+        if let core_flutter::DaemonOutput::Response { id, result } = &output {
+            if self.sim.inspect_request == Some(*id) {
+                self.sim.inspect_request = None;
+                self.finish_inspect(result.clone(), window, cx);
+                return;
+            }
+        }
         match output {
             core_flutter::DaemonOutput::Event { event, params } => match event.as_str() {
                 "app.start" => {
@@ -1623,6 +1632,8 @@ impl DartIde {
                     }
                 }
                 "app.stop" => {
+                    self.sim.inspect = false;
+                    self.sim.inspected = None;
                     self.flutter_app_id = None;
                     self.flutter_daemon = None;
                     self.flutter_status = None;

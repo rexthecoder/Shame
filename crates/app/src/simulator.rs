@@ -26,6 +26,13 @@ pub(crate) struct SimulatorState {
     pub(crate) capturing: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// The keep-alive loop is running (it starts on attach and ends on detach).
     pub(crate) live_loop_running: bool,
+    /// Inspect mode: the running app is in "select widget" mode and a tap on the phone selects
+    /// the widget under it (and jumps to its source) instead of using it.
+    pub(crate) inspect: bool,
+    /// The daemon request asking which widget is selected, while its reply is awaited.
+    pub(crate) inspect_request: Option<i64>,
+    /// The widget most recently selected.
+    pub(crate) inspected: Option<core_flutter::WidgetLocation>,
 }
 
 impl Default for SimulatorState {
@@ -41,6 +48,9 @@ impl Default for SimulatorState {
             last_hash: 0,
             capturing: Default::default(),
             live_loop_running: false,
+            inspect: false,
+            inspect_request: None,
+            inspected: None,
         }
     }
 }
@@ -108,6 +118,104 @@ impl DartIde {
         self.start_simulator_stream(cx);
         self.refresh_simulator_screenshot(cx);
         cx.notify();
+    }
+
+    /// Whether a Flutter app started from this editor is running (so its inspector is reachable).
+    pub(crate) fn can_inspect(&self) -> bool {
+        self.flutter_daemon.is_some() && self.flutter_app_id.is_some()
+    }
+
+    /// Turn inspect mode on or off: the app's own "select widget" mode, driven through the daemon.
+    pub(crate) fn toggle_inspect(&mut self, cx: &mut Context<Self>) {
+        let (Some(daemon), Some(app_id)) =
+            (self.flutter_daemon.clone(), self.flutter_app_id.clone())
+        else {
+            self.push_flutter_log("\x1b[33mRun the app first \u{2014} widget inspect needs a running Flutter session.\x1b[0m");
+            cx.notify();
+            return;
+        };
+        let turning_on = !self.sim.inspect;
+        let sent = daemon.lock().map(|d| {
+            if turning_on {
+                d.inspector_enable(&app_id, &self.root)
+            } else {
+                d.inspector_disable(&app_id)
+            }
+        });
+        if !matches!(sent, Ok(Ok(()))) {
+            self.push_flutter_log("\x1b[31mCould not reach the Flutter inspector.\x1b[0m");
+        } else {
+            self.sim.inspect = turning_on;
+            self.sim.inspected = None;
+        }
+        cx.notify();
+    }
+
+    /// Ask the app which widget the last tap selected (its reply lands in `finish_inspect`).
+    fn request_inspected_widget(&mut self, cx: &mut Context<Self>) {
+        if !self.sim.inspect {
+            return;
+        }
+        let (Some(daemon), Some(app_id)) =
+            (self.flutter_daemon.clone(), self.flutter_app_id.clone())
+        else {
+            return;
+        };
+        if let Ok(Ok(id)) = daemon.lock().map(|d| d.inspector_request_selected(&app_id)) {
+            self.sim.inspect_request = Some(id);
+        }
+        cx.notify();
+    }
+
+    /// The app answered: show the selected widget and jump to where it is written.
+    pub(crate) fn finish_inspect(
+        &mut self,
+        reply: Result<serde_json::Value, serde_json::Value>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(widget) = reply
+            .ok()
+            .and_then(|v| core_flutter::parse_selected_widget(&v))
+        else {
+            self.sim.inspected = None;
+            cx.notify();
+            return;
+        };
+        let (path, line, column, local) = (
+            widget.path.clone(),
+            widget.line,
+            widget.column,
+            widget.local,
+        );
+        self.sim.inspected = Some(widget);
+        // Only the project's own widgets are worth a jump; a framework widget just shows its name.
+        if local {
+            self.open_source_location(path, line, column, window, cx);
+        }
+        cx.notify();
+    }
+
+    /// Open `path` with the cursor at a 1-based line and column.
+    pub(crate) fn open_source_location(
+        &mut self,
+        path: std::path::PathBuf,
+        line: u32,
+        column: u32,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.open_path(path, window, cx);
+        if let Some(editor) = self.active_editor().cloned() {
+            editor.update(cx, |ed, cx| {
+                let last = ed.buffer().line_count().saturating_sub(1) as u32;
+                ed.set_cursor_to_position(
+                    line.saturating_sub(1).min(last),
+                    column.saturating_sub(1),
+                    cx,
+                );
+            });
+        }
     }
 
     /// Detach the embedded simulator: stop the helper and its stream, clear the frame and close
@@ -277,6 +385,16 @@ impl DartIde {
             return;
         }
         self.refresh_simulator_screenshot(cx);
+        if phase == TouchPhase::Up && self.sim.inspect {
+            // Give the app a moment to register the tap, then ask what it selected.
+            cx.spawn(async move |weak, cx| {
+                cx.background_executor()
+                    .timer(std::time::Duration::from_millis(250))
+                    .await;
+                let _ = weak.update(cx, |this, cx| this.request_inspected_widget(cx));
+            })
+            .detach();
+        }
         if phase == TouchPhase::Up {
             let (tx, rx) = async_channel::bounded::<()>(6);
             std::thread::spawn(move || {

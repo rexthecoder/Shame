@@ -12,6 +12,7 @@ path = "src/main.rs"
 [dependencies]
 gpui-kit.workspace = true
 anyhow.workspace = true
+serde_json.workspace = true
 image = { version = "0.25", default-features = false, features = ["jpeg"] }
 async-channel.workspace = true
 core-buffer = { path = "../core-buffer" }

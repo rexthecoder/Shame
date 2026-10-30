@@ -175,6 +175,42 @@ impl FlutterDaemon {
         )
     }
 
+    /// Call a VM service extension of the running app (`ext.flutter.…`); the reply arrives as a
+    /// `Response` with the returned id.
+    pub fn call_service_extension(&self, app_id: &str, method: &str, params: Value) -> io::Result<i64> {
+        self.request(
+            "app.callServiceExtension",
+            serde_json::json!({"appId": app_id, "methodName": method, "params": params}),
+        )
+    }
+
+    /// Put the app in "select widget" mode: taps select widgets instead of using them. The open
+    /// project is registered so its own widgets count as local.
+    pub fn inspector_enable(&self, app_id: &str, project_dir: &Path) -> io::Result<()> {
+        self.call_service_extension(
+            app_id,
+            "ext.flutter.inspector.addPubRootDirectories",
+            serde_json::json!({"arg0": crate::inspector::path_to_file_uri(project_dir)}),
+        )?;
+        self.call_service_extension(app_id, "ext.flutter.inspector.show", serde_json::json!({"enabled": "true"}))
+            .map(|_| ())
+    }
+
+    pub fn inspector_disable(&self, app_id: &str) -> io::Result<()> {
+        self.call_service_extension(app_id, "ext.flutter.inspector.show", serde_json::json!({"enabled": "false"}))
+            .map(|_| ())
+    }
+
+    /// Ask for the selected widget (nearest one created by the project); parse the reply with
+    /// [`crate::parse_selected_widget`].
+    pub fn inspector_request_selected(&self, app_id: &str) -> io::Result<i64> {
+        self.call_service_extension(
+            app_id,
+            "ext.flutter.inspector.getSelectedSummaryWidget",
+            serde_json::json!({"objectGroup": "shame"}),
+        )
+    }
+
     pub fn stop(&self, app_id: &str) -> io::Result<i64> {
         self.request("app.stop", serde_json::json!({"appId": app_id}))
     }

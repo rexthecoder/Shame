@@ -24,11 +24,13 @@
 
 mod daemon;
 mod devices;
+mod inspector;
 mod launch;
 mod pubspec;
 mod sdk;
 
 pub use daemon::{DaemonOutput, FlutterDaemon};
+pub use inspector::{WidgetLocation, file_uri_to_path, parse_selected_widget, path_to_file_uri};
 pub use devices::{
     Device, IosSimulator, boot_ios_simulator,
     capture_simulator_screenshot, find_sim_helper, list_devices, list_ios_simulators,

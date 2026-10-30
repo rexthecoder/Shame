@@ -5,7 +5,7 @@
 use gpui_kit::assets::IconName;
 use gpui_kit::base::StyledExt as _;
 use gpui_kit::component::{
-    ActiveTheme as _, Icon, Sizable as _,
+    ActiveTheme as _, Disableable as _, Icon, Selectable as _, Sizable as _,
     button::{Button, ButtonVariants as _},
     h_flex, v_flex,
 };
@@ -21,6 +21,9 @@ impl DartIde {
             .w_full()
             .min_h(px(0.))
             .child(self.render_sim_control_strip(cx))
+            .when(self.sim.inspect, |el| {
+                el.child(self.render_sim_inspect_bar(cx))
+            })
             .child(
                 // Centered iPhone 16 Pro Hardware Frame (exact 19.5:9 aspect ratio,
                 // Natural Titanium outer ring, physical Action/Volume/Side buttons,
@@ -146,6 +149,8 @@ impl DartIde {
         let info = cx.theme().info;
         let warning = cx.theme().warning;
         let list_hover = cx.theme().list_hover;
+        let can_inspect = self.can_inspect();
+        let inspecting = self.sim.inspect;
         let active_sim_label = self
             .selected_device
             .as_ref()
@@ -245,6 +250,30 @@ impl DartIde {
                             })),
                     )
                     .child(
+                        Button::new("sim-inspect")
+                            .ghost()
+                            .xsmall()
+                            .disabled(!can_inspect)
+                            .selected(inspecting)
+                            .icon(
+                                Icon::new(IconName::MousePointerClick)
+                                    .with_size(px(13.))
+                                    .text_color(if inspecting {
+                                        cx.theme().primary
+                                    } else {
+                                        muted
+                                    }),
+                            )
+                            .tooltip(if can_inspect {
+                                "Inspect: tap a widget on the phone to jump to its code"
+                            } else {
+                                "Inspect needs a running app \u{2014} click Run first"
+                            })
+                            .on_click(cx.listener(|this, _event, _window, cx| {
+                                this.toggle_inspect(cx);
+                            })),
+                    )
+                    .child(
                         Button::new("sim-hot-reload")
                             .ghost()
                             .xsmall()
@@ -272,6 +301,77 @@ impl DartIde {
                                 this.refresh_simulator_screenshot(cx);
                             })),
                     ),
+            )
+    }
+
+    /// Shown while inspecting: the hint, then the widget last selected and where it is written.
+    fn render_sim_inspect_bar(&self, cx: &mut Context<Self>) -> Div {
+        let muted = cx.theme().muted_foreground;
+        let accent = cx.theme().primary;
+        let selected = self.sim.inspected.clone();
+        h_flex()
+            .w_full()
+            .min_h(px(30.))
+            .flex_shrink_0()
+            .items_center()
+            .justify_between()
+            .gap(px(tokens::SPACE_3))
+            .px(px(tokens::SPACE_4))
+            .py(px(tokens::SPACE_2))
+            .bg(accent.opacity(0.1))
+            .border_b_1()
+            .border_color(accent.opacity(0.3))
+            .text_size(px(tokens::UI_SM))
+            .child(match selected {
+                Some(widget) => {
+                    let (path, line, column) = (widget.path.clone(), widget.line, widget.column);
+                    let file = widget
+                        .path
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or("")
+                        .to_string();
+                    h_flex()
+                        .id("sim-inspect-selected")
+                        .min_w(px(0.))
+                        .items_center()
+                        .gap(px(tokens::SPACE_3))
+                        .cursor_pointer()
+                        .child(
+                            div()
+                                .flex_shrink_0()
+                                .font_medium()
+                                .text_color(if widget.local { accent } else { muted })
+                                .child(widget.name.clone()),
+                        )
+                        .child(
+                            div()
+                                .truncate()
+                                .text_size(px(tokens::UI_XS))
+                                .text_color(muted)
+                                .child(if widget.local {
+                                    format!("{file}:{}", widget.line)
+                                } else {
+                                    "not in your project".to_string()
+                                }),
+                        )
+                        .on_click(cx.listener(move |this, _e, window, cx| {
+                            this.open_source_location(path.clone(), line, column, window, cx)
+                        }))
+                        .into_any_element()
+                }
+                None => div()
+                    .text_size(px(tokens::UI_XS))
+                    .text_color(muted)
+                    .child("Tap a widget on the phone to jump to its code")
+                    .into_any_element(),
+            })
+            .child(
+                Button::new("sim-inspect-done")
+                    .ghost()
+                    .xsmall()
+                    .label("Done")
+                    .on_click(cx.listener(|this, _e, _w, cx| this.toggle_inspect(cx))),
             )
     }
 
