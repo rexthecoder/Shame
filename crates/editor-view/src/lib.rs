@@ -21,11 +21,13 @@
 //! - Every line is rendered on every frame; no virtualization for huge
 //!   files.
 
+pub mod language;
 mod lsp_integration;
 
 use std::io;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use core_buffer::{Buffer, Selection};
 use core_lsp::lsp_types;
@@ -34,9 +36,9 @@ use core_workspace::LineChange;
 use gpui_kit::component::{ActiveTheme as _, Sizable as _, h_flex, v_flex};
 use gpui_kit::*;
 use gpui_kit::prelude::FluentBuilder as _;
-use lsp_integration::{
-    CompletionEntry, CompletionKindBadge, LspState,
-};
+use language::{LanguageAdapter, language_for_path};
+pub use lsp_integration::{CompletionEntry, CompletionKindBadge};
+use lsp_integration::LspState;
 
 /// Second pass on this editor's look. The first pass piled on chrome —
 /// a bordered gutter column with its own background tint, a left-edge
@@ -99,6 +101,7 @@ pub struct EditorView {
     buffer: Buffer,
     focus_handle: FocusHandle,
     scroll_handle: UniformListScrollHandle,
+    language: Arc<dyn LanguageAdapter>,
     syntax_tree: Option<SyntaxTree>,
     /// The text `syntax_tree` was last parsed/reparsed from, so `render`
     /// can diff against the buffer's current text to build a single
@@ -107,8 +110,7 @@ pub struct EditorView {
     synced_revision: u64,
     indent_width: usize,
     line_changes: std::collections::HashMap<u32, LineChange>,
-    /// `dart language-server` state for this buffer, if it's a `.dart`
-    /// file. See `lsp_integration.rs`.
+    /// Language server state for this buffer, spawned via `language.lsp_command(...)`.
     lsp: Option<LspState>,
     /// `(line, column)` the mouse is currently hovering, for debouncing
     /// `textDocument/hover` requests. See `lsp_integration.rs`.
@@ -123,7 +125,7 @@ pub struct EditorView {
     /// Active autocomplete candidates and selected row index.
     completions: Vec<CompletionEntry>,
     completion_selected: usize,
-    /// VS Code Flutter-style closing labels (`// WidgetName` on multi-line closing `),` / `);`).
+    /// Optional end-of-line closing annotations provided by `language.closing_labels(...)`.
     closing_labels: std::collections::HashMap<usize, String>,
 }
 
@@ -133,6 +135,7 @@ impl EditorView {
     }
 
     pub fn from_buffer(buffer: Buffer, cx: &mut Context<Self>) -> Self {
+        let language = language_for_path(buffer.path());
         let parse_syntax = should_parse_syntax(&buffer);
         let synced_text = if parse_syntax {
             buffer.text()
@@ -141,7 +144,7 @@ impl EditorView {
         };
         let syntax_tree = parse_syntax.then(|| SyntaxTree::parse(&synced_text));
         let closing_labels = if parse_syntax {
-            Self::compute_closing_widget_labels(&synced_text)
+            language.closing_labels(&synced_text)
         } else {
             std::collections::HashMap::new()
         };
@@ -155,6 +158,7 @@ impl EditorView {
             buffer,
             focus_handle: cx.focus_handle(),
             scroll_handle: UniformListScrollHandle::new(),
+            language,
             syntax_tree,
             synced_text,
             synced_revision,
@@ -193,13 +197,16 @@ impl EditorView {
     /// history and resetting the cursor to the start of the file.
     pub fn open_file(&mut self, path: impl AsRef<Path>, cx: &mut Context<Self>) -> io::Result<()> {
         self.buffer = Buffer::open(path)?;
+        self.language = language_for_path(self.buffer.path());
         let parse_syntax = should_parse_syntax(&self.buffer);
         if parse_syntax {
             let text = self.buffer.text();
             self.syntax_tree = Some(SyntaxTree::parse(&text));
+            self.closing_labels = self.language.closing_labels(&text);
             self.synced_text = text;
         } else {
             self.syntax_tree = None;
+            self.closing_labels.clear();
             self.synced_text.clear();
         }
         self.synced_revision = self.buffer.revision();

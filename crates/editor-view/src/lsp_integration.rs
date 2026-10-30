@@ -675,7 +675,7 @@ impl EditorView {
                     .and_then(|v| serde_json::from_value::<Option<Vec<CodeActionOrCommand>>>(v).ok())
                     .flatten()
                     .unwrap_or_default();
-                let builtin = self.builtin_flutter_widget_assists(line);
+                let builtin = self.builtin_language_code_actions(line);
                 for b in builtin {
                     let b_title = match &b {
                         CodeActionOrCommand::Command(c) => &c.title,
@@ -968,126 +968,6 @@ pub(crate) fn parse_completion_entries_from_value(value: serde_json::Value) -> V
         });
     }
     entries
-}
-
-/// Locate the widget call expression starting on `line_idx` (e.g. `return Padding(...);`,
-/// `child: Column(...),`, or `Divider(...)`) so built-in Flutter widget assists can wrap
-/// the entire balanced `(...)` expression cleanly.
-fn find_widget_call_range(
-    text: &str,
-    buffer: &core_buffer::Buffer,
-    line_idx: usize,
-    line_start_byte: usize,
-    display_line: &str,
-) -> (Range, String, String) {
-    let indent_len = display_line.len() - display_line.trim_start().len();
-    let indent_str = display_line[..indent_len].to_string();
-    let trimmed = &display_line[indent_len..];
-
-    // Look for an uppercase widget constructor call on this line (e.g. `child: Text(`, `return Column(`, `=> Divider(`)
-    let mut widget_rel_start: Option<usize> = None;
-    let mut open_paren_rel: Option<usize> = None;
-    let bytes = trimmed.as_bytes();
-    let mut idx = 0;
-    while idx < bytes.len() {
-        if bytes[idx].is_ascii_uppercase()
-            && (idx == 0 || !(bytes[idx - 1].is_ascii_alphanumeric() || bytes[idx - 1] == b'_'))
-        {
-            let start = idx;
-            while idx < bytes.len()
-                && (bytes[idx].is_ascii_alphanumeric()
-                    || bytes[idx] == b'_'
-                    || bytes[idx] == b'.'
-                    || bytes[idx] == b'<'
-                    || bytes[idx] == b'>')
-            {
-                idx += 1;
-            }
-            if idx < bytes.len() && bytes[idx] == b'(' {
-                // Skip optional `const ` immediately preceding the widget constructor
-                let before = &trimmed[..start];
-                let adj_start = if let Some(stripped) = before.strip_suffix("const ") {
-                    stripped.len()
-                } else {
-                    start
-                };
-                widget_rel_start = Some(indent_len + adj_start);
-                open_paren_rel = Some(indent_len + idx);
-                break;
-            }
-        } else {
-            idx += 1;
-        }
-    }
-
-    if let (Some(w_rel), Some(p_rel)) = (widget_rel_start, open_paren_rel) {
-        let abs_start = line_start_byte + w_rel;
-        let abs_paren = line_start_byte + p_rel;
-        let all_bytes = text.as_bytes();
-        let mut depth = 0i32;
-        let mut in_single = false;
-        let mut in_double = false;
-        let mut k = abs_paren;
-        while k < all_bytes.len() {
-            let b = all_bytes[k];
-            if b == b'\\' {
-                k += 2;
-                continue;
-            }
-            if !in_double && b == b'\'' {
-                in_single = !in_single;
-            } else if !in_single && b == b'"' {
-                in_double = !in_double;
-            } else if !in_single && !in_double {
-                if b == b'(' {
-                    depth += 1;
-                } else if b == b')' {
-                    depth -= 1;
-                    if depth == 0 {
-                        let abs_end = k + 1;
-                        let end_line = buffer.byte_to_line(abs_end) as u32;
-                        let end_col =
-                            (abs_end - buffer.line_to_byte(end_line as usize)) as u32;
-                        let expr = text[abs_start..abs_end].to_string();
-                        return (
-                            Range {
-                                start: Position {
-                                    line: line_idx as u32,
-                                    character: w_rel as u32,
-                                },
-                                end: Position {
-                                    line: end_line,
-                                    character: end_col,
-                                },
-                            },
-                            expr,
-                            indent_str,
-                        );
-                    }
-                }
-            }
-            k += 1;
-        }
-    }
-
-    // Fallback: single-line expression without trailing comma/semicolon
-    let stripped_end = trimmed.trim_end_matches([',', ';']).trim_end();
-    let start_col = indent_len as u32;
-    let end_col = (indent_len + stripped_end.len()) as u32;
-    (
-        Range {
-            start: Position {
-                line: line_idx as u32,
-                character: start_col,
-            },
-            end: Position {
-                line: line_idx as u32,
-                character: end_col,
-            },
-        },
-        stripped_end.to_string(),
-        indent_str,
-    )
 }
 
 /// Strip LSP snippet placeholders (`$0`, `$1`, `${1:default}`) so inserting a
