@@ -204,7 +204,7 @@ impl DartIde {
                     .justify_end()
                     .items_center()
                     .gap(px(tokens::SPACE_2))
-                    // Unified Run Capsule: [ Device ▾ | Launch Config ▾ | Contextual Actions ]
+                    // Option A: Single Target Button (`🖥 macOS ▾`) + Dedicated Green `▶ Run` Button
                     .child({
                         let is_running = self.flutter_daemon.is_some();
                         let dev_name = self
@@ -229,216 +229,183 @@ impl DartIde {
                                 }
                             })
                             .unwrap_or(gpui_kit::assets::IconName::Monitor);
-                        let dev_open = self.device_picker_open;
+                        let is_open = self.device_picker_open;
 
                         let active_cfg = self
                             .selected_launch_config
                             .and_then(|ix| self.launch_configs.get(ix));
-                        let cfg_name = active_cfg
-                            .map(|c| c.name.clone())
-                            .unwrap_or_else(|| "launch.json".to_string());
-                        let flavor = active_cfg.and_then(|c| c.flavor());
-                        let cfg_open = self.launch_picker_open;
-                        let has_configs = !self.launch_configs.is_empty()
-                            || !self.test_launch_templates.is_empty();
+                        let cfg_badge = active_cfg.and_then(|c| c.flavor().or_else(|| Some(c.name.clone())));
 
+                        h_flex()
+                            .id("titlebar-device-picker")
+                            .h(px(26.))
+                            .px(px(tokens::SPACE_3))
+                            .items_center()
+                            .gap(px(tokens::SPACE_2))
+                            .rounded(px(tokens::RADIUS_SM))
+                            .bg(if is_open {
+                                tokens::accent_dim()
+                            } else {
+                                cx.theme().sidebar
+                            })
+                            .border_1()
+                            .border_color(if is_open {
+                                cx.theme().primary
+                            } else if is_running {
+                                green.opacity(0.45)
+                            } else {
+                                cx.theme().border
+                            })
+                            .cursor_pointer()
+                            .hover(|s| s.bg(cx.theme().list_hover))
+                            .text_size(px(tokens::UI_SM))
+                            .text_color(fg)
+                            .child(if is_running {
+                                div()
+                                    .size(px(6.))
+                                    .rounded(px(3.))
+                                    .bg(green)
+                                    .into_any_element()
+                            } else {
+                                Icon::new(dev_icon)
+                                    .with_size(px(12.))
+                                    .text_color(green)
+                                    .into_any_element()
+                            })
+                            .child(
+                                div()
+                                    .max_w(px(140.))
+                                    .truncate()
+                                    .font_medium()
+                                    .child(dev_name),
+                            )
+                            .when_some(cfg_badge, |el, badge| {
+                                el.child(
+                                    div()
+                                        .px_1()
+                                        .rounded(px(3.))
+                                        .bg(info.opacity(0.16))
+                                        .font_family("SF Mono")
+                                        .text_size(px(9.5))
+                                        .text_color(info)
+                                        .child(badge),
+                                )
+                            })
+                            .child(
+                                Icon::new(gpui_kit::assets::IconName::ChevronDown)
+                                    .with_size(px(9.5))
+                                    .text_color(muted),
+                            )
+                            .on_click(cx.listener(|this, _event, _window, cx| {
+                                this.device_picker_open = !this.device_picker_open;
+                                this.launch_picker_open = false;
+                                if this.device_picker_open {
+                                    this.refresh_devices(cx);
+                                    this.reload_launch_configs(cx);
+                                }
+                                cx.notify();
+                            }))
+                    })
+                    // Dedicated Run Pill (when idle) or Contextual Reload / Restart / Stop (when running)
+                    .child(if self.flutter_daemon.is_some() {
                         h_flex()
                             .h(px(26.))
                             .px(px(tokens::SPACE_1))
                             .items_center()
-                            .gap(px(tokens::SPACE_1))
-                            .rounded(px(tokens::RADIUS_PILL))
+                            .gap(px(2.))
+                            .rounded(px(tokens::RADIUS_SM))
                             .bg(cx.theme().sidebar)
                             .border_1()
-                            .border_color(if is_running {
-                                green.opacity(0.38)
-                            } else if dev_open || cfg_open {
-                                cx.theme().list_active_border
-                            } else {
-                                cx.theme().border
-                            })
-                            // 1. Device segment
+                            .border_color(cx.theme().border)
+                            .child(
+                                Button::new("fast")
+                                    .ghost()
+                                    .xsmall()
+                                    .icon(
+                                        Icon::new(gpui_kit::assets::IconName::Zap)
+                                            .with_size(px(12.))
+                                            .text_color(cx.theme().warning),
+                                    )
+                                    .tooltip("Hot reload (\u{2318}S)")
+                                    .on_click(cx.listener(|this, _event, _window, cx| {
+                                        this.trigger_hot_reload(cx);
+                                    })),
+                            )
+                            .child(
+                                Button::new("hot-restart")
+                                    .ghost()
+                                    .xsmall()
+                                    .icon(
+                                        Icon::new(gpui_kit::assets::IconName::RotateCw)
+                                            .with_size(px(12.))
+                                            .text_color(info),
+                                    )
+                                    .tooltip("Hot restart Flutter app")
+                                    .on_click(cx.listener(|this, _event, _window, cx| {
+                                        this.trigger_hot_restart(cx);
+                                    })),
+                            )
+                            .child(
+                                Button::new("stop-flutter")
+                                    .ghost()
+                                    .xsmall()
+                                    .icon(
+                                        Icon::new(gpui_kit::assets::IconName::X)
+                                            .with_size(px(12.))
+                                            .text_color(cx.theme().danger),
+                                    )
+                                    .tooltip("Stop running Flutter app")
+                                    .on_click(cx.listener(|this, _event, _window, cx| {
+                                        this.stop_flutter_run(cx);
+                                    })),
+                            )
+                            .into_any_element()
+                    } else {
+                        h_flex()
+                            .items_center()
+                            .gap(px(tokens::SPACE_1))
                             .child(
                                 h_flex()
-                                    .id("titlebar-device-picker")
-                                    .h(px(20.))
+                                    .id("run")
+                                    .h(px(26.))
                                     .px(px(tokens::SPACE_3))
                                     .items_center()
                                     .gap(px(tokens::SPACE_2))
-                                    .rounded(px(tokens::RADIUS_PILL))
+                                    .rounded(px(tokens::RADIUS_SM))
+                                    .bg(green.opacity(0.15))
+                                    .border_1()
+                                    .border_color(green.opacity(0.38))
                                     .cursor_pointer()
-                                    .when(dev_open, |s| s.bg(tokens::accent_dim()))
-                                    .hover(|s| s.bg(cx.theme().list_hover))
+                                    .hover(move |s| s.bg(green.opacity(0.24)))
                                     .text_size(px(tokens::UI_SM))
-                                    .text_color(fg)
-                                    .child(if is_running {
-                                        div()
-                                            .size(px(6.))
-                                            .rounded(px(3.))
-                                            .bg(green)
-                                            .into_any_element()
-                                    } else {
-                                        Icon::new(dev_icon)
-                                            .with_size(px(12.))
-                                            .text_color(green)
-                                            .into_any_element()
-                                    })
+                                    .font_medium()
+                                    .text_color(green)
                                     .child(
-                                        div()
-                                            .max_w(px(130.))
-                                            .truncate()
-                                            .child(dev_name),
+                                        Icon::new(gpui_kit::assets::IconName::Play)
+                                            .with_size(px(11.))
+                                            .text_color(green),
                                     )
-                                    .child(
-                                        Icon::new(gpui_kit::assets::IconName::ChevronDown)
-                                            .with_size(px(9.5))
-                                            .text_color(muted),
-                                    )
-                                    .on_click(cx.listener(|this, _event, _window, cx| {
-                                        this.device_picker_open = !this.device_picker_open;
-                                        this.launch_picker_open = false;
-                                        if this.device_picker_open {
-                                            this.refresh_devices(cx);
-                                        }
-                                        cx.notify();
+                                    .child("Run")
+                                    .on_click(cx.listener(|this, _event, window, cx| {
+                                        this.start_flutter_run(window, cx);
                                     })),
                             )
-                            .child(div().w(px(1.)).h(px(12.)).bg(cx.theme().border))
-                            // 2. Launch config segment (hidden while running to keep the running bar extra clean)
-                            .when(!is_running, |el| {
-                                el.child(
-                                    h_flex()
-                                        .id("titlebar-launch-picker")
-                                        .h(px(20.))
-                                        .px(px(tokens::SPACE_3))
-                                        .items_center()
-                                        .gap(px(tokens::SPACE_1))
-                                        .rounded(px(tokens::RADIUS_PILL))
-                                        .cursor_pointer()
-                                        .when(cfg_open, |s| s.bg(tokens::accent_dim()))
-                                        .hover(|s| s.bg(cx.theme().list_hover))
-                                        .text_size(px(tokens::UI_SM))
-                                        .text_color(if has_configs { fg } else { muted })
-                                        .child(
-                                            div()
-                                                .max_w(px(110.))
-                                                .truncate()
-                                                .child(cfg_name),
-                                        )
-                                        .when_some(flavor, |el, flv| {
-                                            el.child(
-                                                div()
-                                                    .px_1()
-                                                    .rounded(px(3.))
-                                                    .bg(info.opacity(0.16))
-                                                    .font_family("SF Mono")
-                                                    .text_size(px(9.5))
-                                                    .text_color(info)
-                                                    .child(flv),
-                                            )
-                                        })
-                                        .child(
-                                            Icon::new(gpui_kit::assets::IconName::ChevronDown)
-                                                .with_size(px(9.5))
-                                                .text_color(muted),
-                                        )
-                                        .on_click(cx.listener(|this, _event, _window, cx| {
-                                            this.launch_picker_open = !this.launch_picker_open;
-                                            this.device_picker_open = false;
-                                            if this.launch_picker_open {
-                                                this.reload_launch_configs(cx);
-                                            }
-                                            cx.notify();
-                                        })),
+                            .child(
+                                icon_button(
+                                    "debug-dap",
+                                    gpui_kit::assets::IconName::Bug,
+                                    Some(if self.dap_client.is_some() {
+                                        cx.theme().primary
+                                    } else {
+                                        muted
+                                    }),
+                                    "Debug Dart file with breakpoints (DAP)",
                                 )
-                                .child(div().w(px(1.)).h(px(12.)).bg(cx.theme().border))
-                            })
-                            // 3. Contextual Action Segment: (Run + Debug when idle) vs (Hot Reload + Restart + Stop when running)
-                            .child(if is_running {
-                                h_flex()
-                                    .items_center()
-                                    .px(px(tokens::SPACE_1))
-                                    .gap(px(2.))
-                                    .child(
-                                        Button::new("fast")
-                                            .ghost()
-                                            .xsmall()
-                                            .icon(
-                                                Icon::new(gpui_kit::assets::IconName::Zap)
-                                                    .with_size(px(12.))
-                                                    .text_color(cx.theme().warning),
-                                            )
-                                            .tooltip("Hot reload (\u{2318}S)")
-                                            .on_click(cx.listener(|this, _event, _window, cx| {
-                                                this.trigger_hot_reload(cx);
-                                            })),
-                                    )
-                                    .child(
-                                        Button::new("hot-restart")
-                                            .ghost()
-                                            .xsmall()
-                                            .icon(
-                                                Icon::new(gpui_kit::assets::IconName::RotateCw)
-                                                    .with_size(px(12.))
-                                                    .text_color(info),
-                                            )
-                                            .tooltip("Hot restart Flutter app")
-                                            .on_click(cx.listener(|this, _event, _window, cx| {
-                                                this.trigger_hot_restart(cx);
-                                            })),
-                                    )
-                                    .child(
-                                        Button::new("stop-flutter")
-                                            .ghost()
-                                            .xsmall()
-                                            .icon(
-                                                Icon::new(gpui_kit::assets::IconName::X)
-                                                    .with_size(px(12.))
-                                                    .text_color(cx.theme().danger),
-                                            )
-                                            .tooltip("Stop running Flutter app")
-                                            .on_click(cx.listener(|this, _event, _window, cx| {
-                                                this.stop_flutter_run(cx);
-                                            })),
-                                    )
-                            } else {
-                                h_flex()
-                                    .items_center()
-                                    .px(px(tokens::SPACE_1))
-                                    .gap(px(2.))
-                                    .child(
-                                        Button::new("run")
-                                            .ghost()
-                                            .xsmall()
-                                            .icon(
-                                                Icon::new(gpui_kit::assets::IconName::Play)
-                                                    .with_size(px(12.))
-                                                    .text_color(green),
-                                            )
-                                            .tooltip("Run project on selected device")
-                                            .on_click(cx.listener(|this, _event, window, cx| {
-                                                this.start_flutter_run(window, cx);
-                                            })),
-                                    )
-                                    .child(
-                                        Button::new("debug-dap")
-                                            .ghost()
-                                            .xsmall()
-                                            .icon(
-                                                Icon::new(gpui_kit::assets::IconName::Bug)
-                                                    .with_size(px(12.))
-                                                    .text_color(if self.dap_client.is_some() {
-                                                        cx.theme().primary
-                                                    } else {
-                                                        muted
-                                                    }),
-                                            )
-                                            .tooltip("Debug Dart file with breakpoints (DAP)")
-                                            .on_click(cx.listener(|this, _event, window, cx| {
-                                                this.start_dap_debug(window, cx);
-                                            })),
-                                    )
-                            })
+                                .on_click(cx.listener(|this, _event, window, cx| {
+                                    this.start_dap_debug(window, cx);
+                                })),
+                            )
+                            .into_any_element()
                     })
                     // Right-hand tool icons: Simulator, Agent, Quick Open, Settings
                     .child(

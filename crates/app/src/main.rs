@@ -3051,6 +3051,8 @@ impl DartIde {
         let primary = cx.theme().primary;
         let list_hover = cx.theme().list_hover;
         let selected_id = self.selected_device.as_ref().map(|d| d.id.clone());
+        let selected_cfg_ix = self.selected_launch_config;
+        let sim_attached = self.sim.attached;
 
         // Simulators that aren't already listed in `self.devices`
         let extra_sims: Vec<_> = self
@@ -3080,8 +3082,10 @@ impl DartIde {
                         .id("device-picker-card")
                         .absolute()
                         .top(px(tokens::TITLEBAR_H + 4.))
-                        .right(px(140.))
-                        .w(px(310.))
+                        .right(px(110.))
+                        .w(px(330.))
+                        .max_h(px(460.))
+                        .overflow_y_scroll()
                         .p(px(tokens::SPACE_2))
                         .gap(px(tokens::SPACE_1))
                         .bg(cx.theme().popover)
@@ -3092,6 +3096,77 @@ impl DartIde {
                         .on_mouse_down(MouseButton::Left, |_event, _window, cx| {
                             cx.stop_propagation();
                         })
+                        // Featured Top Row: Attach / Detach Simulator in Editor
+                        .child({
+                            let view = view.clone();
+                            h_flex()
+                                .id("device-picker-attach-sim")
+                                .w_full()
+                                .h(px(30.))
+                                .px(px(tokens::SPACE_3))
+                                .items_center()
+                                .justify_between()
+                                .rounded(px(tokens::RADIUS_SM))
+                                .border_1()
+                                .border_color(if sim_attached {
+                                    green.opacity(0.4)
+                                } else {
+                                    primary.opacity(0.35)
+                                })
+                                .bg(if sim_attached {
+                                    green.opacity(0.12)
+                                } else {
+                                    tokens::accent_dim()
+                                })
+                                .cursor_pointer()
+                                .hover(move |s| s.bg(list_hover))
+                                .child(
+                                    h_flex()
+                                        .items_center()
+                                        .gap_2()
+                                        .child(
+                                            gpui_kit::component::Icon::new(
+                                                gpui_kit::assets::IconName::Smartphone,
+                                            )
+                                            .with_size(px(13.))
+                                            .text_color(if sim_attached { green } else { primary }),
+                                        )
+                                        .child(
+                                            div()
+                                                .text_size(px(tokens::UI_SM))
+                                                .font_medium()
+                                                .text_color(fg)
+                                                .child(if sim_attached {
+                                                    "iOS Simulator Docked in Editor"
+                                                } else {
+                                                    "Attach iOS Simulator to Editor"
+                                                }),
+                                        ),
+                                )
+                                .child(
+                                    div()
+                                        .px_1p5()
+                                        .py_0p5()
+                                        .rounded(px(4.))
+                                        .bg(cx.theme().background)
+                                        .font_family("SF Mono")
+                                        .text_size(px(9.5))
+                                        .text_color(if sim_attached { green } else { primary })
+                                        .child(if sim_attached { "Detach" } else { "Dock \u{2192}" }),
+                                )
+                                .on_click(move |_event, window, cx| {
+                                    view.update(cx, |this, cx| {
+                                        this.device_picker_open = false;
+                                        if this.sim.attached {
+                                            this.detach_simulator(cx);
+                                        } else {
+                                            this.attach_simulator(window, cx);
+                                        }
+                                    });
+                                })
+                        })
+                        .child(div().h(px(1.)).w_full().my_1().bg(cx.theme().border))
+                        // Section 1: Active Device Targets
                         .child(
                             h_flex()
                                 .px(px(tokens::SPACE_2))
@@ -3103,7 +3178,7 @@ impl DartIde {
                                         .text_size(px(tokens::UI_XS))
                                         .font_medium()
                                         .text_color(muted)
-                                        .child("ACTIVE TARGETS"),
+                                        .child("DEVICE TARGET"),
                                 )
                                 .child({
                                     let view = view.clone();
@@ -3134,6 +3209,7 @@ impl DartIde {
                         )
                         .children(self.devices.iter().enumerate().map(|(ix, dev)| {
                             let is_sel = selected_id.as_deref() == Some(dev.id.as_str());
+                            let is_ios = dev.is_ios();
                             let icon = if dev.target_platform.contains("ios")
                                 || dev.target_platform.contains("android")
                             {
@@ -3144,7 +3220,9 @@ impl DartIde {
                                 gpui_kit::assets::IconName::Monitor
                             };
                             let dev_clone = dev.clone();
-                            let view = view.clone();
+                            let dev_dock = dev.clone();
+                            let view_sel = view.clone();
+                            let view_dock = view.clone();
 
                             h_flex()
                                 .id(("device-item", ix))
@@ -3164,7 +3242,7 @@ impl DartIde {
                                 .when(!is_sel, |el| el.hover(move |s| s.bg(list_hover)))
                                 .cursor_pointer()
                                 .on_click(move |_event, _window, cx| {
-                                    view.update(cx, |this, cx| {
+                                    view_sel.update(cx, |this, cx| {
                                         this.selected_device = Some(dev_clone.clone());
                                         this.device_picker_open = false;
                                         this.refresh_simulator_screenshot(cx);
@@ -3188,17 +3266,52 @@ impl DartIde {
                                         ),
                                 )
                                 .child(
-                                    div()
-                                        .font_family("SF Mono")
-                                        .text_size(px(10.))
-                                        .text_color(muted)
-                                        .child(if dev.emulator {
-                                            "sim".to_string()
-                                        } else {
-                                            dev.id.clone()
-                                        }),
+                                    h_flex()
+                                        .items_center()
+                                        .gap(px(tokens::SPACE_2))
+                                        .when(is_ios, |row| {
+                                            row.child(
+                                                div()
+                                                    .id(("active-sim-dock", ix))
+                                                    .px_1p5()
+                                                    .py_0p5()
+                                                    .rounded(px(4.))
+                                                    .bg(primary.opacity(0.16))
+                                                    .font_family("SF Mono")
+                                                    .text_size(px(9.5))
+                                                    .text_color(primary)
+                                                    .child("Dock")
+                                                    .on_mouse_down(
+                                                        MouseButton::Left,
+                                                        |_, _, cx| cx.stop_propagation(),
+                                                    )
+                                                    .on_click(move |_e, window, cx| {
+                                                        cx.stop_propagation();
+                                                        let d = dev_dock.clone();
+                                                        view_dock.update(cx, |this, cx| {
+                                                            this.selected_device = Some(d);
+                                                            this.device_picker_open = false;
+                                                            this.attach_simulator(window, cx);
+                                                        });
+                                                    }),
+                                            )
+                                        })
+                                        .child(
+                                            div()
+                                                .font_family("SF Mono")
+                                                .text_size(px(10.))
+                                                .text_color(if is_sel { primary } else { muted })
+                                                .child(if is_sel {
+                                                    "\u{2713}".to_string()
+                                                } else if dev.emulator {
+                                                    "sim".to_string()
+                                                } else {
+                                                    dev.id.clone()
+                                                }),
+                                        ),
                                 )
                         }))
+                        // Section 2: Installed iOS Simulators (with one-click Boot & Dock in Editor)
                         .when(!extra_sims.is_empty(), |el| {
                             el.child(div().h(px(1.)).w_full().my_1().bg(cx.theme().border))
                                 .child(
@@ -3208,14 +3321,16 @@ impl DartIde {
                                         .text_size(px(tokens::UI_XS))
                                         .font_medium()
                                         .text_color(muted)
-                                        .child("IOS SIMULATORS (CLICK TO BOOT & ATTACH)"),
+                                        .child("IOS SIMULATORS"),
                                 )
                                 .children(extra_sims.into_iter().enumerate().map(|(ix, sim)| {
-                                    let view = view.clone();
+                                    let view_sel = view.clone();
+                                    let view_dock = view.clone();
                                     let booted = sim.is_booted();
                                     let sim_name = sim.name.clone();
                                     let sim_runtime = sim.runtime.clone();
                                     let sim_for_click = sim.clone();
+                                    let sim_for_dock = sim.clone();
                                     h_flex()
                                         .id(("ios-sim-item", ix))
                                         .w_full()
@@ -3226,11 +3341,9 @@ impl DartIde {
                                         .rounded(px(tokens::RADIUS_SM))
                                         .cursor_pointer()
                                         .hover(move |s| s.bg(list_hover))
-                                        .on_click(move |_event, _window, cx| {
+                                        .on_click(move |_event, window, cx| {
                                             let sim_clone = sim_for_click.clone();
-                                            view.update(cx, |this, cx| {
-                                                let _ =
-                                                    core_flutter::boot_ios_simulator(&sim_clone.udid);
+                                            view_sel.update(cx, |this, cx| {
                                                 this.selected_device = Some(core_flutter::Device {
                                                     id: sim_clone.udid.clone(),
                                                     name: sim_clone.name.clone(),
@@ -3239,11 +3352,13 @@ impl DartIde {
                                                     is_supported: true,
                                                 });
                                                 this.device_picker_open = false;
+                                                this.attach_simulator(window, cx);
                                                 this.refresh_devices(cx);
                                             });
                                         })
                                         .child(
                                             h_flex()
+                                                .min_w(px(0.))
                                                 .items_center()
                                                 .gap_2()
                                                 .child(
@@ -3255,31 +3370,148 @@ impl DartIde {
                                                 )
                                                 .child(
                                                     div()
+                                                        .truncate()
                                                         .text_size(px(tokens::UI_SM))
                                                         .text_color(fg)
                                                         .child(sim_name),
                                                 ),
                                         )
                                         .child(
-                                            div()
-                                                .font_family("SF Mono")
-                                                .text_size(px(10.))
-                                                .text_color(if booted { green } else { muted })
-                                                .child(if booted {
-                                                    "Booted".to_string()
-                                                } else {
-                                                    sim_runtime
-                                                }),
+                                            h_flex()
+                                                .flex_shrink_0()
+                                                .items_center()
+                                                .gap(px(tokens::SPACE_2))
+                                                .child(
+                                                    div()
+                                                        .font_family("SF Mono")
+                                                        .text_size(px(9.5))
+                                                        .text_color(if booted {
+                                                            green
+                                                        } else {
+                                                            muted
+                                                        })
+                                                        .child(if booted {
+                                                            "Booted".to_string()
+                                                        } else {
+                                                            sim_runtime
+                                                        }),
+                                                )
+                                                .child(
+                                                    div()
+                                                        .id(("ios-sim-dock", ix))
+                                                        .px_1p5()
+                                                        .py_0p5()
+                                                        .rounded(px(4.))
+                                                        .bg(primary.opacity(0.16))
+                                                        .font_family("SF Mono")
+                                                        .text_size(px(9.5))
+                                                        .text_color(primary)
+                                                        .child("Boot & Dock")
+                                                        .on_mouse_down(
+                                                            MouseButton::Left,
+                                                            |_, _, cx| cx.stop_propagation(),
+                                                        )
+                                                        .on_click(move |_e, window, cx| {
+                                                            cx.stop_propagation();
+                                                            let s = sim_for_dock.clone();
+                                                            view_dock.update(cx, |this, cx| {
+                                                                this.selected_device =
+                                                                    Some(core_flutter::Device {
+                                                                        id: s.udid.clone(),
+                                                                        name: s.name.clone(),
+                                                                        target_platform: "ios"
+                                                                            .to_string(),
+                                                                        emulator: true,
+                                                                        is_supported: true,
+                                                                    });
+                                                                this.device_picker_open = false;
+                                                                this.attach_simulator(window, cx);
+                                                                this.refresh_devices(cx);
+                                                            });
+                                                        }),
+                                                ),
                                         )
                                 }))
                         })
+                        // Section 3: Launch Profiles (merged into the same unified popover)
                         .child(div().h(px(1.)).w_full().my_1().bg(cx.theme().border))
+                        .child(
+                            div()
+                                .px(px(tokens::SPACE_2))
+                                .py(px(2.))
+                                .text_size(px(tokens::UI_XS))
+                                .font_medium()
+                                .text_color(muted)
+                                .child("LAUNCH PROFILE"),
+                        )
+                        .when(self.launch_configs.is_empty(), |el| {
+                            el.child(
+                                h_flex()
+                                    .w_full()
+                                    .h(px(26.))
+                                    .px(px(tokens::SPACE_3))
+                                    .items_center()
+                                    .justify_between()
+                                    .rounded(px(tokens::RADIUS_SM))
+                                    .bg(rgba(0xea7a3c14))
+                                    .child(
+                                        div()
+                                            .text_size(px(tokens::UI_SM))
+                                            .text_color(fg)
+                                            .child("Default (lib/main.dart)"),
+                                    )
+                                    .child(
+                                        div()
+                                            .font_family("SF Mono")
+                                            .text_size(px(10.))
+                                            .text_color(primary)
+                                            .child("\u{2713}"),
+                                    ),
+                            )
+                        })
+                        .children(self.launch_configs.iter().enumerate().map(|(ix, cfg)| {
+                            let is_sel = selected_cfg_ix == Some(ix);
+                            let name = cfg.name.clone();
+                            let view = view.clone();
+                            h_flex()
+                                .id(("unified-launch-cfg", ix))
+                                .w_full()
+                                .h(px(26.))
+                                .px(px(tokens::SPACE_3))
+                                .items_center()
+                                .justify_between()
+                                .rounded(px(tokens::RADIUS_SM))
+                                .cursor_pointer()
+                                .when(is_sel, |s| s.bg(rgba(0xea7a3c18)))
+                                .when(!is_sel, |s| s.hover(move |h| h.bg(list_hover)))
+                                .child(
+                                    div()
+                                        .truncate()
+                                        .text_size(px(tokens::UI_SM))
+                                        .text_color(fg)
+                                        .child(name),
+                                )
+                                .child(
+                                    div()
+                                        .font_family("SF Mono")
+                                        .text_size(px(10.))
+                                        .text_color(if is_sel { primary } else { muted })
+                                        .child(if is_sel { "\u{2713}" } else { "" }),
+                                )
+                                .on_click(move |_e, _w, cx| {
+                                    view.update(cx, |this, cx| {
+                                        this.selected_launch_config = Some(ix);
+                                        this.device_picker_open = false;
+                                        cx.notify();
+                                    });
+                                })
+                        }))
                         .child({
                             let view = view.clone();
                             h_flex()
-                                .id("device-picker-attach-sim")
+                                .id("unified-edit-launch-json")
                                 .w_full()
-                                .h(px(28.))
+                                .h(px(26.))
                                 .px(px(tokens::SPACE_3))
                                 .items_center()
                                 .justify_between()
@@ -3292,29 +3524,22 @@ impl DartIde {
                                         .gap_2()
                                         .child(
                                             gpui_kit::component::Icon::new(
-                                                gpui_kit::assets::IconName::Columns2,
+                                                gpui_kit::assets::IconName::Settings,
                                             )
-                                            .with_size(px(13.))
-                                            .text_color(primary),
+                                            .with_size(px(11.5))
+                                            .text_color(info),
                                         )
                                         .child(
                                             div()
                                                 .text_size(px(tokens::UI_SM))
-                                                .text_color(fg)
-                                                .child("Attach Simulator to Editor"),
+                                                .text_color(info)
+                                                .child("Configure launch.json\u{2026}"),
                                         ),
-                                )
-                                .child(
-                                    div()
-                                        .font_family("SF Mono")
-                                        .text_size(px(10.))
-                                        .text_color(info)
-                                        .child("Dock"),
                                 )
                                 .on_click(move |_event, window, cx| {
                                     view.update(cx, |this, cx| {
                                         this.device_picker_open = false;
-                                        this.attach_simulator(window, cx);
+                                        this.open_or_create_launch_json(window, cx);
                                     });
                                 })
                         }),
