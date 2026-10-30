@@ -403,6 +403,228 @@ impl DartIde {
             })
     }
 
+    fn render_image_viewer(
+        &self,
+        tab_ix: usize,
+        preview: &crate::ImagePreview,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let fg = cx.theme().foreground;
+        let muted = cx.theme().muted_foreground;
+        let border = cx.theme().border;
+        let magenta = cx.theme().magenta;
+        let primary = cx.theme().primary;
+        let list_hover = cx.theme().list_hover;
+        let zoom_pct = preview.zoom_percent;
+        let light_bg = preview.light_backdrop;
+        let dims = format!("{} \u{00d7} {} px", preview.width, preview.height);
+        let size_str = crate::format_byte_size(preview.byte_size);
+        let fmt_label = preview.format_label.clone();
+        let zoom_label = match zoom_pct {
+            Some(pct) => format!("{pct}%"),
+            None => "Fit".to_string(),
+        };
+        let canvas_bg: Hsla = if light_bg {
+            rgb(0xe8e8ec).into()
+        } else {
+            tokens::bg_editor()
+        };
+
+        v_flex()
+            .size_full()
+            .min_h(px(0.))
+            .bg(cx.theme().background)
+            // Toolbar strip: dimensions, format, file size, backdrop toggle, and zoom controls
+            .child(
+                h_flex()
+                    .w_full()
+                    .h(px(32.))
+                    .flex_shrink_0()
+                    .px(px(tokens::SPACE_5))
+                    .items_center()
+                    .justify_between()
+                    .bg(cx.theme().tab_bar)
+                    .border_b_1()
+                    .border_color(border)
+                    .child(
+                        h_flex()
+                            .items_center()
+                            .gap(px(tokens::SPACE_3))
+                            .child(
+                                div()
+                                    .px(px(6.))
+                                    .py(px(1.))
+                                    .rounded(px(4.))
+                                    .bg(magenta.opacity(0.16))
+                                    .font_family("SF Mono")
+                                    .text_size(px(tokens::UI_XS))
+                                    .text_color(magenta)
+                                    .child(fmt_label),
+                            )
+                            .child(
+                                div()
+                                    .font_family("SF Mono")
+                                    .text_size(px(tokens::UI_XS))
+                                    .text_color(fg)
+                                    .child(dims),
+                            )
+                            .child(div().w(px(1.)).h(px(12.)).bg(border))
+                            .child(
+                                div()
+                                    .font_family("SF Mono")
+                                    .text_size(px(tokens::UI_XS))
+                                    .text_color(muted)
+                                    .child(size_str),
+                            ),
+                    )
+                    .child(
+                        h_flex()
+                            .items_center()
+                            .gap(px(tokens::SPACE_2))
+                            .child(
+                                h_flex()
+                                    .id("img-backdrop-toggle")
+                                    .h(px(22.))
+                                    .px(px(tokens::SPACE_3))
+                                    .items_center()
+                                    .rounded(px(tokens::RADIUS_SM))
+                                    .border_1()
+                                    .border_color(if light_bg { primary } else { border })
+                                    .bg(cx.theme().background)
+                                    .cursor_pointer()
+                                    .hover(move |s| s.bg(list_hover))
+                                    .text_size(px(tokens::UI_XS))
+                                    .text_color(if light_bg { primary } else { muted })
+                                    .child(if light_bg { "Light bg" } else { "Dark bg" })
+                                    .on_click(cx.listener(move |this, _e, _w, cx| {
+                                        if let Some(img) =
+                                            this.tabs.get_mut(tab_ix).and_then(|t| t.image.as_mut())
+                                        {
+                                            img.light_backdrop = !img.light_backdrop;
+                                            cx.notify();
+                                        }
+                                    })),
+                            )
+                            .child(div().w(px(1.)).h(px(12.)).bg(border))
+                            .child(
+                                h_flex()
+                                    .id("img-zoom-out")
+                                    .w(px(22.))
+                                    .h(px(22.))
+                                    .items_center()
+                                    .justify_center()
+                                    .rounded(px(tokens::RADIUS_SM))
+                                    .cursor_pointer()
+                                    .hover(move |s| s.bg(list_hover).text_color(fg))
+                                    .text_size(px(tokens::UI))
+                                    .text_color(muted)
+                                    .child("\u{2212}")
+                                    .on_click(cx.listener(move |this, _e, _w, cx| {
+                                        if let Some(img) =
+                                            this.tabs.get_mut(tab_ix).and_then(|t| t.image.as_mut())
+                                        {
+                                            let cur = img.zoom_percent.unwrap_or(100);
+                                            img.zoom_percent = Some(cur.saturating_sub(25).max(25));
+                                            cx.notify();
+                                        }
+                                    })),
+                            )
+                            .child(
+                                div()
+                                    .id("img-zoom-reset")
+                                    .min_w(px(44.))
+                                    .h(px(22.))
+                                    .px(px(tokens::SPACE_2))
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .rounded(px(tokens::RADIUS_SM))
+                                    .cursor_pointer()
+                                    .hover(move |s| s.bg(list_hover).text_color(fg))
+                                    .font_family("SF Mono")
+                                    .text_size(px(tokens::UI_XS))
+                                    .text_color(fg)
+                                    .child(zoom_label)
+                                    .on_click(cx.listener(move |this, _e, _w, cx| {
+                                        if let Some(img) =
+                                            this.tabs.get_mut(tab_ix).and_then(|t| t.image.as_mut())
+                                        {
+                                            img.zoom_percent = match img.zoom_percent {
+                                                None => Some(100),
+                                                Some(_) => None,
+                                            };
+                                            cx.notify();
+                                        }
+                                    })),
+                            )
+                            .child(
+                                h_flex()
+                                    .id("img-zoom-in")
+                                    .w(px(22.))
+                                    .h(px(22.))
+                                    .items_center()
+                                    .justify_center()
+                                    .rounded(px(tokens::RADIUS_SM))
+                                    .cursor_pointer()
+                                    .hover(move |s| s.bg(list_hover).text_color(fg))
+                                    .text_size(px(tokens::UI))
+                                    .text_color(muted)
+                                    .child("+")
+                                    .on_click(cx.listener(move |this, _e, _w, cx| {
+                                        if let Some(img) =
+                                            this.tabs.get_mut(tab_ix).and_then(|t| t.image.as_mut())
+                                        {
+                                            let cur = img.zoom_percent.unwrap_or(100);
+                                            img.zoom_percent = Some((cur + 25).min(400));
+                                            cx.notify();
+                                        }
+                                    })),
+                            ),
+                    ),
+            )
+            // Image canvas
+            .child(match zoom_pct {
+                None => div()
+                    .flex_1()
+                    .w_full()
+                    .min_h(px(0.))
+                    .p(px(tokens::SPACE_6))
+                    .bg(canvas_bg)
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(
+                        img(preview.render_image.clone())
+                            .size_full()
+                            .object_fit(ObjectFit::Contain),
+                    )
+                    .into_any_element(),
+                Some(pct) => {
+                    let scaled_w = (preview.width as f32 * pct as f32 / 100.0).max(16.0);
+                    let scaled_h = (preview.height as f32 * pct as f32 / 100.0).max(16.0);
+                    div()
+                        .id("img-scroll-canvas")
+                        .flex_1()
+                        .w_full()
+                        .min_h(px(0.))
+                        .p(px(tokens::SPACE_6))
+                        .bg(canvas_bg)
+                        .overflow_scroll()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .child(
+                            img(preview.render_image.clone())
+                                .w(px(scaled_w))
+                                .h(px(scaled_h))
+                                .object_fit(ObjectFit::Fill),
+                        )
+                        .into_any_element()
+                }
+            })
+            .into_any_element()
+    }
+
     pub(crate) fn render_shell(
         &self,
         view: &Entity<Self>,
@@ -411,6 +633,7 @@ impl DartIde {
     ) -> impl IntoElement {
         let active_tab = self.tabs.get(self.active_tab);
         let active_editor = active_tab.map(|t| t.editor.clone());
+        let active_image = active_tab.and_then(|t| t.image.clone());
         let active_md_mode = active_tab
             .filter(|t| t.is_markdown())
             .map(|t| t.md_mode)
@@ -431,6 +654,9 @@ impl DartIde {
 
         let editor_body = match (active_editor, active_md_mode) {
             _ if self.diff.is_some() => self.render_diff_view(cx),
+            _ if active_image.is_some() => {
+                self.render_image_viewer(self.active_tab, active_image.as_ref().unwrap(), cx)
+            }
             (Some(editor), MarkdownMode::Code) => editor.into_any_element(),
             (Some(editor), MarkdownMode::Preview) => render_md_pane(&editor, cx).into_any_element(),
             (Some(editor), MarkdownMode::Split) => {

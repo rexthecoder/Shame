@@ -122,12 +122,74 @@ const IDE_COMMANDS: &[IdeCommand] = &[
     IdeCommand { id: "open-folder", title: "File: Open Folder\u{2026}", shortcut: "\u{2318}O" },
 ];
 
+#[derive(Clone)]
+pub(crate) struct ImagePreview {
+    pub(crate) render_image: std::sync::Arc<RenderImage>,
+    pub(crate) width: u32,
+    pub(crate) height: u32,
+    pub(crate) byte_size: u64,
+    pub(crate) format_label: String,
+    /// `None` fits the image to the viewport; `Some(pct)` renders at `pct`% (`25..=400`).
+    pub(crate) zoom_percent: Option<u32>,
+    /// Toggle between dark and light backdrop for inspecting dark/white transparent assets.
+    pub(crate) light_backdrop: bool,
+}
+
+pub(crate) fn is_image_path(path: &Path) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|ext| {
+            matches!(
+                ext.to_ascii_lowercase().as_str(),
+                "png" | "jpg" | "jpeg" | "webp" | "gif" | "bmp" | "ico" | "tiff" | "tif"
+            )
+        })
+}
+
+pub(crate) fn load_image_preview(path: &Path) -> Option<ImagePreview> {
+    let bytes = std::fs::read(path).ok()?;
+    let byte_size = bytes.len() as u64;
+    let format_label = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("IMG")
+        .to_ascii_uppercase();
+    let decoded = image::load_from_memory(&bytes).ok()?;
+    let (width, height) = (decoded.width(), decoded.height());
+    let mut rgba = decoded.into_rgba8();
+    // GPUI renders BGRA channel order in `RenderImage`.
+    for px in rgba.pixels_mut() {
+        px.0.swap(0, 2);
+    }
+    let render_image = std::sync::Arc::new(RenderImage::new(vec![image::Frame::new(rgba)]));
+    Some(ImagePreview {
+        render_image,
+        width,
+        height,
+        byte_size,
+        format_label,
+        zoom_percent: None,
+        light_backdrop: false,
+    })
+}
+
+pub(crate) fn format_byte_size(bytes: u64) -> String {
+    if bytes < 1024 {
+        format!("{bytes} B")
+    } else if bytes < 1024 * 1024 {
+        format!("{:.1} KB", bytes as f64 / 1024.0)
+    } else {
+        format!("{:.2} MB", bytes as f64 / (1024.0 * 1024.0))
+    }
+}
+
 pub(crate) struct Tab {
     /// `None` for the initial scratch buffer; every file opened from the
     /// tree gets a path, which also doubles as the tab's dedup key.
     pub(crate) path: Option<PathBuf>,
     pub(crate) editor: Entity<EditorView>,
     pub(crate) md_mode: MarkdownMode,
+    pub(crate) image: Option<ImagePreview>,
     /// Zed/VS Code-style preview tab (`true` when opened via single-click in
     /// the file tree, promoted to `false` on double-click or buffer edit).
     pub(crate) is_preview: bool,
@@ -1448,6 +1510,32 @@ impl DartIde {
                 self.tabs[ix].is_preview = false;
             }
             self.active_tab = ix;
+        } else if is_image_path(&canonical) {
+            let Some(preview) = load_image_preview(&canonical) else {
+                eprintln!("failed to decode image {}", canonical.display());
+                return;
+            };
+            let editor = cx.new(|cx| EditorView::new(cx));
+            let new_tab = Tab {
+                path: Some(canonical),
+                editor,
+                md_mode: MarkdownMode::Code,
+                image: Some(preview),
+                is_preview: as_preview,
+                opened_revision: 0,
+            };
+            if as_preview {
+                if let Some(preview_ix) = self.tabs.iter().position(|t| t.is_preview) {
+                    self.tabs[preview_ix] = new_tab;
+                    self.active_tab = preview_ix;
+                } else {
+                    self.tabs.push(new_tab);
+                    self.active_tab = self.tabs.len() - 1;
+                }
+            } else {
+                self.tabs.push(new_tab);
+                self.active_tab = self.tabs.len() - 1;
+            }
         } else {
             let buffer = match Buffer::open(&canonical) {
                 Ok(buffer) => buffer,
@@ -1472,6 +1560,7 @@ impl DartIde {
                 path: Some(canonical),
                 editor,
                 md_mode: MarkdownMode::Code,
+                image: None,
                 is_preview: as_preview,
                 opened_revision,
             };
@@ -1511,6 +1600,7 @@ impl DartIde {
             path: None,
             editor,
             md_mode: MarkdownMode::Code,
+            image: None,
             is_preview: false,
             opened_revision,
         });
@@ -1531,6 +1621,7 @@ impl DartIde {
                 path: keep.path.clone(),
                 editor: keep.editor.clone(),
                 md_mode: keep.md_mode,
+                image: keep.image.clone(),
                 is_preview: false,
                 opened_revision: keep.opened_revision,
             };

@@ -480,7 +480,39 @@ impl DartIde {
             .bg(cx.theme().background)
             .child(self.render_diff_header(state, cx))
             .child(if state.diff.binary {
-                diff_message("Binary file not shown", muted)
+                if crate::is_image_path(&state.full_path) {
+                    if let Some(preview) = crate::load_image_preview(&state.full_path) {
+                        v_flex()
+                            .flex_1()
+                            .w_full()
+                            .min_h(px(0.))
+                            .p(px(tokens::SPACE_6))
+                            .gap(px(tokens::SPACE_3))
+                            .items_center()
+                            .justify_center()
+                            .child(
+                                img(preview.render_image)
+                                    .size_full()
+                                    .object_fit(ObjectFit::Contain),
+                            )
+                            .child(
+                                div()
+                                    .font_family("SF Mono")
+                                    .text_size(px(tokens::UI_XS))
+                                    .text_color(muted)
+                                    .child(format!(
+                                        "{} \u{00d7} {} px \u{00b7} {}",
+                                        preview.width,
+                                        preview.height,
+                                        crate::format_byte_size(preview.byte_size)
+                                    )),
+                            )
+                    } else {
+                        diff_message("Binary file not shown", muted)
+                    }
+                } else {
+                    diff_message("Binary file not shown", muted)
+                }
             } else if state.diff.rows.is_empty() {
                 diff_message("No differences", muted)
             } else {
@@ -1500,5 +1532,23 @@ mod tests {
         s.rebuild_display();
         assert_eq!(shape(&s), ["r0", "u-1", "u+1", "r2"]);
         assert_eq!(s.block_display, [1]);
+    }
+
+    #[core::prelude::v1::test]
+    fn loads_and_decodes_png_and_webp_images() {
+        let manifest_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let root = manifest_dir.parent().unwrap().parent().unwrap();
+        let webp_path = root.join("docs/reference/panes.webp");
+        let png_path = root.join("docs/reference/phase1-shell.png");
+        assert!(crate::is_image_path(&webp_path));
+        assert!(crate::is_image_path(&png_path));
+
+        let webp = crate::load_image_preview(&webp_path).expect("should decode panes.webp");
+        assert!(webp.width > 0 && webp.height > 0);
+        assert_eq!(webp.format_label, "WEBP");
+
+        let png = crate::load_image_preview(&png_path).expect("should decode phase1-shell.png");
+        assert!(png.width > 0 && png.height > 0);
+        assert_eq!(png.format_label, "PNG");
     }
 }
