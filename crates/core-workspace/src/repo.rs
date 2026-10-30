@@ -61,6 +61,8 @@ pub struct ChangedFile {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct RepoStatus {
     pub root: PathBuf,
+    /// Where the directory the status was asked for sits below `root` (`"crates/app/"`, or empty).
+    pub prefix: String,
     /// `None` while HEAD is detached.
     pub branch: Option<String>,
     /// Abbreviated commit id of HEAD; `None` before the first commit.
@@ -135,21 +137,45 @@ pub fn repo_root(dir: &Path) -> Option<PathBuf> {
 }
 
 /// The structured status of the repository containing `dir`, or `None` outside one.
+/// Two git processes in total (locate the repo, read the status), however much the UI wants
+/// from it.
 pub fn repo_status(dir: &Path) -> Option<RepoStatus> {
-    let root = repo_root(dir)?;
+    let located = git(dir, &["rev-parse", "--show-toplevel", "--show-prefix"], None).ok()?;
+    let mut lines = located.lines();
+    let root = PathBuf::from(lines.next()?.trim());
+    let prefix = lines.next().unwrap_or("").trim().to_string();
     let out = git(
         &root,
-        &[
-            "status",
-            "--porcelain=v2",
-            "--branch",
-            "-z",
-            "--untracked-files=all",
-        ],
+        &["status", "--porcelain=v2", "--branch", "-z", "--untracked-files=all"],
         None,
     )
     .ok()?;
-    Some(parse_status(&out, root))
+    let mut status = parse_status(&out, root);
+    status.prefix = prefix;
+    Some(status)
+}
+
+impl RepoStatus {
+    /// Per-file badge letters keyed by absolute path under `dir` (the folder the editor has
+    /// open), for the file tree: `U` untracked / conflicted, `M`, `A`, `D`, `R`. A working-tree
+    /// change wins over a staged one. Built from this status, so it costs no extra git process.
+    pub fn badge_map(&self, dir: &Path) -> std::collections::HashMap<PathBuf, char> {
+        let mut map = std::collections::HashMap::new();
+        let mut put = |file: &ChangedFile, letter: char| {
+            let relative = file.path.strip_prefix(self.prefix.as_str()).unwrap_or(&file.path);
+            map.entry(dir.join(relative)).or_insert(letter);
+        };
+        for f in &self.conflicts {
+            put(f, 'U');
+        }
+        for f in &self.unstaged {
+            put(f, f.kind.letter());
+        }
+        for f in &self.staged {
+            put(f, f.kind.letter());
+        }
+        map
+    }
 }
 
 /// Parse `git status --porcelain=v2 --branch -z` output.
@@ -636,5 +662,32 @@ mod tests {
     fn outside_a_repo_there_is_no_status() {
         let dir = scratch("plain");
         assert!(repo_status(&dir).is_none());
+    }
+
+    #[test]
+    fn badges_follow_the_status_and_the_prefix_of_the_open_folder() {
+        let root = init_repo("badges");
+        std::fs::create_dir_all(root.join("sub")).unwrap();
+        write(&root, "sub/a.txt", "1");
+        write(&root, "top.txt", "1");
+        stage_all(&root).unwrap();
+        commit(&root, "init", false).unwrap();
+        write(&root, "sub/a.txt", "2"); // modified, unstaged
+        write(&root, "sub/new.txt", "n"); // untracked
+        write(&root, "top.txt", "2");
+        stage(&root, &["top.txt".to_string()]).unwrap(); // modified, staged
+        write(&root, "top.txt", "3"); // ... and edited again: the working tree wins
+
+        // Asked from inside `sub`, the keys live under that folder.
+        let sub = root.join("sub");
+        let status = repo_status(&sub).unwrap();
+        assert_eq!(status.prefix, "sub/");
+        let badges = status.badge_map(&sub);
+        assert_eq!(badges.get(&sub.join("a.txt")), Some(&'M'));
+        assert_eq!(badges.get(&sub.join("new.txt")), Some(&'U'));
+        // Asked from the root, everything is keyed under the root.
+        let whole = repo_status(&root).unwrap().badge_map(&root);
+        assert_eq!(whole.get(&root.join("top.txt")), Some(&'M'));
+        assert_eq!(whole.len(), 3);
     }
 }

@@ -219,8 +219,9 @@ impl DartIde {
                 .placeholder("Package name (e.g. provider, http, dev:build_runner)...")
         });
 
-        let git_branch = core_workspace::current_branch(&root);
-        let git_status = core_workspace::status_map(&root);
+        // Filled in by the first `refresh_git` (off the UI thread) right after construction.
+        let git_branch = None;
+        let git_status = HashMap::new();
         let (terminal_tx, terminal_rx) = async_channel::unbounded();
         let initial_terminal = editor::dock::TerminalSession::new(0, root.clone(), true);
         let terminal_focus = cx.focus_handle();
@@ -302,7 +303,6 @@ impl DartIde {
 
         this.reload_launch_configs(cx);
         this.refresh_devices(cx);
-        this.start_simulator_live_loop(cx);
         this.start_git_refresh_loop(cx);
         this.refresh_git(cx);
         // The Commit button depends on whether the message box is empty.
@@ -386,7 +386,7 @@ impl DartIde {
                     cx.notify();
                 }
                 EditorEvent::Saved { path } => {
-                    this.git_status = core_workspace::status_map(&this.root);
+                    this.refresh_git(cx);
                     let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
                     let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
                     if name.eq_ignore_ascii_case("launch.json") {
@@ -617,9 +617,14 @@ impl DartIde {
         self.tree_state.update(cx, |state, cx| {
             state.set_items(items, cx);
         });
-        self.git_branch = core_workspace::current_branch(&root);
-        self.git_status = core_workspace::status_map(&root);
         self.root = root;
+        // A different folder is a different repository.
+        self.git.status = None;
+        self.git.commit_types = None;
+        self.git_branch = None;
+        self.git_status.clear();
+        self.diff = None;
+        self.refresh_git(cx);
         self.reload_launch_configs(cx);
         cx.notify();
     }
@@ -1741,7 +1746,7 @@ impl DartIde {
                     }
                 }
                 this.flutter_status = this.flutter_app_id.as_ref().map(|_| "Running".to_string());
-                this.git_status = core_workspace::status_map(&this.root);
+                this.refresh_git(cx);
                 cx.notify();
             });
         })
@@ -1795,7 +1800,7 @@ impl DartIde {
                     }
                 }
                 this.flutter_status = this.flutter_app_id.as_ref().map(|_| "Running".to_string());
-                this.git_status = core_workspace::status_map(&this.root);
+                this.refresh_git(cx);
                 cx.notify();
             });
         })

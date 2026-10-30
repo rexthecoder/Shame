@@ -401,8 +401,7 @@ impl DartIde {
                     session.running_cmd = None;
                     session.scroll_handle.scroll_to_item(session.lines.len());
                 }
-                self.git_branch = core_workspace::current_branch(&self.root);
-                self.git_status = core_workspace::status_map(&self.root);
+                self.refresh_git(cx);
                 cx.notify();
             }
         }

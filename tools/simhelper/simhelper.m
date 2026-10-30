@@ -215,7 +215,8 @@ static void startStream(void) {
   if (!display) { fprintf(stderr, "shame-sim: no display surface (is the device booted?)\n"); return; }
   dispatch_queue_t q = dispatch_queue_create("shame.sim.stream", DISPATCH_QUEUE_SERIAL);
   gStreamTimer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, q);
-  dispatch_source_set_timer(gStreamTimer, DISPATCH_TIME_NOW, 16 * NSEC_PER_MSEC, 2 * NSEC_PER_MSEC);
+  // ~30 fps: every frame makes the editor repaint, and 60 is more than a phone mirror needs.
+  dispatch_source_set_timer(gStreamTimer, DISPATCH_TIME_NOW, 33 * NSEC_PER_MSEC, 3 * NSEC_PER_MSEC);
   __block IOSurfaceRef lastSurface = NULL;
   __block uint32_t lastSeed = 0;
   __block uint8_t *out = NULL;

@@ -48,6 +48,8 @@ pub(crate) struct GitState {
     /// Conventional-commit types this repo uses (`None` until loaded; empty if it has no convention).
     pub(crate) commit_types: Option<Vec<String>>,
     refreshing: bool,
+    /// Something asked for a refresh while one was running; run another when it finishes.
+    refresh_queued: bool,
 }
 
 impl GitState {
@@ -71,6 +73,7 @@ impl GitState {
             reviewed: Default::default(),
             commit_types: None,
             refreshing: false,
+            refresh_queued: false,
         }
     }
 }
@@ -82,6 +85,7 @@ impl DartIde {
     /// Re-read the repository status (and the branch / file badges the rest of the UI shows).
     pub(crate) fn refresh_git(&mut self, cx: &mut Context<Self>) {
         if self.git.refreshing {
+            self.git.refresh_queued = true;
             return;
         }
         self.git.refreshing = true;
@@ -90,9 +94,13 @@ impl DartIde {
         let (tx, rx) = async_channel::bounded(1);
         std::thread::spawn(move || {
             let _guard = GIT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            // One status read feeds the panel, the titlebar branch and the file-tree badges.
             let status = core_workspace::repo_status(&root);
-            let branch = core_workspace::current_branch(&root);
-            let badges = core_workspace::status_map(&root);
+            let branch = status.as_ref().and_then(|s| s.branch.clone());
+            let badges = status
+                .as_ref()
+                .map(|s| s.badge_map(&root))
+                .unwrap_or_default();
             let types =
                 (need_types && status.is_some()).then(|| core_workspace::commit_types(&root));
             let _ = tx.send_blocking((status, branch, badges, types));
@@ -101,6 +109,9 @@ impl DartIde {
             let result = rx.recv().await;
             let _ = weak.update(cx, |this, cx| {
                 this.git.refreshing = false;
+                if std::mem::take(&mut this.git.refresh_queued) {
+                    this.refresh_git(cx);
+                }
                 let Ok((status, branch, badges, types)) = result else {
                     return;
                 };

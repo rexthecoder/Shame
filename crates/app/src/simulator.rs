@@ -24,6 +24,8 @@ pub(crate) struct SimulatorState {
     pub(crate) stream_retry_at: Option<std::time::Instant>,
     pub(crate) last_hash: u64,
     pub(crate) capturing: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// The keep-alive loop is running (it starts on attach and ends on detach).
+    pub(crate) live_loop_running: bool,
 }
 
 impl Default for SimulatorState {
@@ -38,6 +40,7 @@ impl Default for SimulatorState {
             stream_retry_at: None,
             last_hash: 0,
             capturing: Default::default(),
+            live_loop_running: false,
         }
     }
 }
@@ -49,6 +52,7 @@ impl DartIde {
         self.agent_open = true;
         self.right_rail_tab = RightRailTab::Simulator;
         self.sim.attached = true;
+        self.start_simulator_live_loop(cx);
 
         // Pick a booted simulator or the first available iPhone simulator
         let sim_udid = self
@@ -327,34 +331,40 @@ impl DartIde {
         .detach();
     }
 
-    /// Periodically refresh the Attached Simulator frame when the Simulator rail
-    /// is open and `simulator_live_sync` is enabled.
+    /// While a simulator is attached: keep the picture current — start the frame stream (retrying
+    /// if the simulator was still booting) or fall back to screenshots. Runs only while attached;
+    /// once the stream is up it just keeps a slow watch, so an idle editor does not wake every
+    /// few milliseconds.
     pub(crate) fn start_simulator_live_loop(&mut self, cx: &mut Context<Self>) {
-        let (tx, rx) = async_channel::bounded::<()>(1);
-        std::thread::spawn(move || {
-            loop {
-                std::thread::sleep(std::time::Duration::from_millis(80));
-                if tx.send_blocking(()).is_err() {
-                    break;
-                }
-            }
-        });
+        if self.sim.live_loop_running {
+            return;
+        }
+        self.sim.live_loop_running = true;
         cx.spawn(async move |weak, cx| {
-            while rx.recv().await.is_ok() {
-                let keep_going = weak
-                    .update(cx, |this, cx| {
-                        if this.agent_open
-                            && this.right_rail_tab == RightRailTab::Simulator
-                            && this.sim.live_sync
-                            && this.sim.attached
-                        {
-                            this.start_simulator_stream(cx);
-                            this.refresh_simulator_screenshot(cx);
-                        }
+            let mut delay = std::time::Duration::from_millis(80);
+            loop {
+                cx.background_executor().timer(delay).await;
+                let next = weak.update(cx, |this, cx| {
+                    if !this.sim.attached {
+                        this.sim.live_loop_running = false;
+                        return None;
+                    }
+                    if this.agent_open
+                        && this.right_rail_tab == RightRailTab::Simulator
+                        && this.sim.live_sync
+                    {
+                        this.start_simulator_stream(cx);
+                        this.refresh_simulator_screenshot(cx);
+                    }
+                    Some(if this.sim.streaming {
+                        std::time::Duration::from_secs(1)
+                    } else {
+                        std::time::Duration::from_millis(80)
                     })
-                    .is_ok();
-                if !keep_going {
-                    break;
+                });
+                match next {
+                    Ok(Some(d)) => delay = d,
+                    _ => break,
                 }
             }
         })

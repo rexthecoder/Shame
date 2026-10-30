@@ -406,7 +406,6 @@ impl DartIde {
                                     .on_click(cx.listener(|this, _event, _window, cx| {
                                         this.show_hidden = !this.show_hidden;
                                         let items = build_tree_items(&this.root, this.show_hidden);
-                                        this.git_status = core_workspace::status_map(&this.root);
                                         this.tree_state.update(cx, |state, cx| {
                                             state.set_items(items, cx);
                                         });

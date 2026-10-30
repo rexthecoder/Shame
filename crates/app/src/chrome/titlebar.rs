@@ -146,9 +146,8 @@ impl DartIde {
                             .child(root_name),
                     )
                     .when_some(self.git_branch.clone(), |el, branch| {
-                        let ahead = core_workspace::ahead_behind(&self.root)
-                            .map(|(ahead, _)| ahead)
-                            .unwrap_or(0);
+                        // From the cached status: never run `git` while rendering.
+                        let ahead = self.git.status.as_ref().map_or(0, |s| s.ahead);
                         el.child(
                             h_flex()
                                 .items_center()
