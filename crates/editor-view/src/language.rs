@@ -96,6 +96,18 @@ pub trait LanguageAdapter: Send + Sync {
     fn closing_labels(&self, _text: &str) -> HashMap<usize, String> {
         HashMap::new()
     }
+
+    /// Detect if `line_text` in `file_path` is a test entry point (`void main(`,
+    /// `test(`, `testWidgets(`, `group(`).
+    /// Returns `Some((is_whole_file, Option<test_name>))` when the line should
+    /// display inline test CodeLens buttons (`Run` + `launch.json` test templates).
+    fn detect_test_target(
+        &self,
+        _file_path: Option<&Path>,
+        _line_text: &str,
+    ) -> Option<(bool, Option<String>)> {
+        None
+    }
 }
 
 /// Resolve the appropriate `LanguageAdapter` for a file path (or a generic
@@ -644,6 +656,37 @@ impl LanguageAdapter for DartLanguageAdapter {
                 (ln, format!("// {}", names.join(", ")))
             })
             .collect()
+    }
+
+    fn detect_test_target(
+        &self,
+        file_path: Option<&Path>,
+        line_text: &str,
+    ) -> Option<(bool, Option<String>)> {
+        let is_test_file = file_path
+            .and_then(|p| p.file_name())
+            .and_then(|n| n.to_str())
+            .is_some_and(|name| name.ends_with("_test.dart"));
+        let trimmed = line_text.trim_start();
+        if is_test_file
+            && (trimmed.starts_with("void main(") || trimmed.starts_with("Future<void> main("))
+        {
+            return Some((true, None));
+        }
+        for prefix in ["testWidgets(", "test(", "group("] {
+            if let Some(rest) = trimmed.strip_prefix(prefix) {
+                let rest = rest.trim_start();
+                let name = if let Some(after_q) = rest.strip_prefix('\'') {
+                    after_q.split('\'').next().map(str::to_string)
+                } else if let Some(after_q) = rest.strip_prefix('"') {
+                    after_q.split('"').next().map(str::to_string)
+                } else {
+                    None
+                };
+                return Some((false, name));
+            }
+        }
+        None
     }
 }
 

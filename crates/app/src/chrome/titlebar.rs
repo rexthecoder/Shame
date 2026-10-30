@@ -227,6 +227,81 @@ impl DartIde {
                         )
                     })
                     .child({
+                        let active_cfg = self
+                            .selected_launch_config
+                            .and_then(|ix| self.launch_configs.get(ix));
+                        let cfg_name = active_cfg
+                            .map(|c| c.name.clone())
+                            .unwrap_or_else(|| "launch.json".to_string());
+                        let flavor = active_cfg.and_then(|c| c.flavor());
+                        let is_open = self.launch_picker_open;
+                        let has_configs = !self.launch_configs.is_empty()
+                            || !self.test_launch_templates.is_empty();
+
+                        h_flex()
+                            .id("titlebar-launch-picker")
+                            .h(px(24.))
+                            .px(px(tokens::SPACE_3))
+                            .items_center()
+                            .gap(px(tokens::SPACE_1))
+                            .rounded(px(tokens::RADIUS_PILL))
+                            .border_1()
+                            .border_color(if is_open {
+                                rgba(0xea7a3c55).into()
+                            } else {
+                                cx.theme().border
+                            })
+                            .bg(if is_open {
+                                rgba(0xea7a3c1a)
+                            } else {
+                                rgba(0xffffff05)
+                            })
+                            .cursor_pointer()
+                            .hover(|s| s.bg(rgba(0xffffff0f)))
+                            .text_size(px(tokens::UI_SM))
+                            .text_color(if has_configs { fg } else { muted })
+                            .child(
+                                Icon::new(gpui_kit::assets::IconName::Play)
+                                    .with_size(px(10.))
+                                    .text_color(if has_configs {
+                                        cx.theme().primary
+                                    } else {
+                                        muted
+                                    }),
+                            )
+                            .child(
+                                div()
+                                    .max_w(px(140.))
+                                    .truncate()
+                                    .child(cfg_name),
+                            )
+                            .when_some(flavor, |el, flv| {
+                                el.child(
+                                    div()
+                                        .px_1()
+                                        .rounded(px(3.))
+                                        .bg(info.opacity(0.16))
+                                        .font_family("SF Mono")
+                                        .text_size(px(9.5))
+                                        .text_color(info)
+                                        .child(flv),
+                                )
+                            })
+                            .child(
+                                Icon::new(gpui_kit::assets::IconName::ChevronDown)
+                                    .with_size(px(10.))
+                                    .text_color(muted),
+                            )
+                            .on_click(cx.listener(|this, _event, _window, cx| {
+                                this.launch_picker_open = !this.launch_picker_open;
+                                this.device_picker_open = false;
+                                if this.launch_picker_open {
+                                    this.reload_launch_configs(cx);
+                                }
+                                cx.notify();
+                            }))
+                    })
+                    .child({
                         let dev_name = self
                             .selected_device
                             .as_ref()

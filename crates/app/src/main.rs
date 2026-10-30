@@ -31,7 +31,7 @@ use gpui_kit::component::{
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
-use rails::files::{build_tree_items, file_icon_color, icon_for_file};
+use rails::files::{build_tree_items, render_file_icon};
 
 /// Directory/file names we never want to show in the file tree.
 pub(crate) const IGNORED_NAMES: &[&str] = &["target", "node_modules", ".DS_Store"];
@@ -163,11 +163,15 @@ pub struct DartIde {
     pub(crate) next_terminal_id: usize,
     pub(crate) terminal_focus: FocusHandle,
     pub(crate) terminal_tx: async_channel::Sender<editor::dock::TerminalEvent>,
-    /// Flutter devices, running daemon, and Attached Simulator state.
+    /// Flutter devices, `.vscode/launch.json` configurations, running daemon, and Attached Simulator state.
     pub(crate) devices: Vec<core_flutter::Device>,
     pub(crate) ios_simulators: Vec<core_flutter::IosSimulator>,
     pub(crate) selected_device: Option<core_flutter::Device>,
     pub(crate) device_picker_open: bool,
+    pub(crate) launch_configs: Vec<core_flutter::LaunchConfig>,
+    pub(crate) test_launch_templates: Vec<core_flutter::LaunchConfig>,
+    pub(crate) selected_launch_config: Option<usize>,
+    pub(crate) launch_picker_open: bool,
     pub(crate) flutter_daemon: Option<std::sync::Arc<std::sync::Mutex<core_flutter::FlutterDaemon>>>,
     pub(crate) flutter_app_id: Option<String>,
     pub(crate) flutter_status: Option<String>,
@@ -265,6 +269,10 @@ impl DartIde {
             ios_simulators: Vec::new(),
             selected_device: Some(default_device),
             device_picker_open: false,
+            launch_configs: Vec::new(),
+            test_launch_templates: Vec::new(),
+            selected_launch_config: None,
+            launch_picker_open: false,
             flutter_daemon: None,
             flutter_app_id: None,
             flutter_status: None,
@@ -280,6 +288,7 @@ impl DartIde {
             _subscriptions: Vec::new(),
         };
 
+        this.reload_launch_configs(cx);
         this.refresh_devices(cx);
         this.start_simulator_live_loop(cx);
 
@@ -364,12 +373,28 @@ impl DartIde {
                     this.git_status = core_workspace::status_map(&this.root);
                     let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
                     let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-                    if ext == "dart" && this.flutter_app_id.is_some() {
+                    if name.eq_ignore_ascii_case("launch.json") {
+                        this.reload_launch_configs(cx);
+                    } else if ext == "dart" && this.flutter_app_id.is_some() {
                         this.trigger_hot_reload(cx);
                     } else if name.eq_ignore_ascii_case("pubspec.yaml") {
                         this.run_pub_get(cx);
                     }
                     cx.notify();
+                }
+                EditorEvent::RunTest {
+                    path,
+                    test_name,
+                    extra_args,
+                    label,
+                } => {
+                    this.run_flutter_test(
+                        path.clone(),
+                        test_name.clone(),
+                        extra_args.clone(),
+                        label.clone(),
+                        cx,
+                    );
                 }
             });
         self._subscriptions.push(subscription);
@@ -547,6 +572,7 @@ impl DartIde {
         self.active_tab = 0;
         self.tab_overflow_open = false;
         self.device_picker_open = false;
+        self.launch_picker_open = false;
         self.add_package_open = false;
         self.palette_open = false;
         self.find_open = false;
@@ -576,6 +602,7 @@ impl DartIde {
         self.git_branch = core_workspace::current_branch(&root);
         self.git_status = core_workspace::status_map(&root);
         self.root = root;
+        self.reload_launch_configs(cx);
         cx.notify();
     }
 
@@ -787,11 +814,7 @@ impl DartIde {
                                                 .items_center()
                                                 .gap_2()
                                                 .min_w(px(0.))
-                                                .child(
-                                                    icon_for_file(&name)
-                                                        .text_color(file_icon_color(&name))
-                                                        .small(),
-                                                )
+                                                .child(render_file_icon(&name))
                                                 .child(
                                                     div()
                                                         .text_size(px(tokens::UI))
@@ -1019,7 +1042,12 @@ impl DartIde {
                 }
             };
             let opened_revision = buffer.revision();
-            let editor = cx.new(|cx| EditorView::from_buffer(buffer, cx));
+            let lenses = self.current_test_code_lenses();
+            let editor = cx.new(|cx| {
+                let mut ed = EditorView::from_buffer(buffer, cx);
+                ed.set_test_code_lenses(lenses, cx);
+                ed
+            });
             self.watch_editor(&editor, window, cx);
             let new_tab = Tab {
                 path: Some(canonical),
@@ -1181,9 +1209,213 @@ impl DartIde {
         .detach();
     }
 
-    /// Start or restart `flutter run --machine -d <device_id>` on the selected device.
+    /// Reload `.vscode/launch.json` from `self.root`, splitting configurations into
+    /// runnable app targets (`self.launch_configs`) and test CodeLens templates
+    /// (`self.test_launch_templates`), and updating all open editor buffers.
+    pub(crate) fn reload_launch_configs(&mut self, cx: &mut Context<Self>) {
+        let prev_name = self
+            .selected_launch_config
+            .and_then(|ix| self.launch_configs.get(ix))
+            .map(|c| c.name.clone());
+
+        if let Some(file) = core_flutter::load_launch_file(&self.root) {
+            let mut runnable = Vec::new();
+            let mut templates = Vec::new();
+            for cfg in file.configurations {
+                if cfg.is_test_template() {
+                    templates.push(cfg);
+                } else {
+                    runnable.push(cfg);
+                }
+            }
+            self.launch_configs = runnable;
+            self.test_launch_templates = templates;
+        } else {
+            self.launch_configs.clear();
+            self.test_launch_templates.clear();
+        }
+
+        self.selected_launch_config = prev_name
+            .and_then(|name| self.launch_configs.iter().position(|c| c.name == name))
+            .or_else(|| (!self.launch_configs.is_empty()).then_some(0));
+
+        let lenses = self.current_test_code_lenses();
+        let editors: Vec<_> = self.tabs.iter().map(|t| t.editor.clone()).collect();
+        for ed in editors {
+            let lenses = lenses.clone();
+            ed.update(cx, |editor, cx| {
+                editor.set_test_code_lenses(lenses, cx);
+            });
+        }
+    }
+
+    pub(crate) fn current_test_code_lenses(&self) -> Vec<editor_view::TestCodeLensTemplate> {
+        self.test_launch_templates
+            .iter()
+            .map(|tpl| editor_view::TestCodeLensTemplate {
+                title: tpl.code_lens_title().to_string(),
+                args: tpl.resolved_cli_args(&self.root),
+                for_test: tpl.applies_to_single_test(),
+                for_file: tpl.applies_to_test_file(),
+            })
+            .collect()
+    }
+
+    /// Execute `flutter test` for a specific test file (and optional test name +
+    /// extra arguments from a `.vscode/launch.json` test template like `--update-goldens`
+    /// or `--coverage`) in the nearest package directory containing `pubspec.yaml`.
+    pub(crate) fn run_flutter_test(
+        &mut self,
+        path: PathBuf,
+        test_name: Option<String>,
+        extra_args: Vec<String>,
+        label: String,
+        cx: &mut Context<Self>,
+    ) {
+        // Walk up from `path` to find the nearest package directory containing `pubspec.yaml`
+        let mut pkg_dir = path.parent().map(Path::to_path_buf).unwrap_or_else(|| self.root.clone());
+        let mut cur = Some(pkg_dir.as_path());
+        while let Some(dir) = cur {
+            if dir.join("pubspec.yaml").is_file() {
+                pkg_dir = dir.to_path_buf();
+                break;
+            }
+            cur = dir.parent();
+        }
+
+        let rel_test_path = path
+            .strip_prefix(&pkg_dir)
+            .unwrap_or(&path)
+            .to_string_lossy()
+            .into_owned();
+
+        let local_fvm = pkg_dir.join(".fvm/flutter_sdk/bin/flutter");
+        let root_fvm = self.root.join(".fvm/flutter_sdk/bin/flutter");
+        let flutter_bin = if local_fvm.is_file() {
+            local_fvm.to_string_lossy().into_owned()
+        } else if root_fvm.is_file() {
+            root_fvm.to_string_lossy().into_owned()
+        } else {
+            "flutter".to_string()
+        };
+
+        let mut parts: Vec<String> = Vec::new();
+        if pkg_dir != self.root {
+            parts.push(format!("cd '{}' &&", pkg_dir.display()));
+        }
+        parts.push(flutter_bin);
+        parts.push("test".to_string());
+        for arg in &extra_args {
+            if arg.contains(' ') {
+                parts.push(format!("'{arg}'"));
+            } else {
+                parts.push(arg.clone());
+            }
+        }
+        if let Some(name) = &test_name {
+            let escaped = name.replace('\'', "'\\''");
+            parts.push("--plain-name".to_string());
+            parts.push(format!("'{escaped}'"));
+        }
+        parts.push(format!("'{rel_test_path}'"));
+
+        let cmd = parts.join(" ");
+        self.terminal_open = true;
+        self.push_flutter_log(&format!(
+            "\x1b[36m\u{25b6} [{label}] Running test{}{}\x1b[0m",
+            test_name
+                .as_ref()
+                .map(|n| format!(" \"{n}\""))
+                .unwrap_or_default(),
+            if extra_args.is_empty() {
+                String::new()
+            } else {
+                format!(" ({})", extra_args.join(" "))
+            }
+        ));
+        self.execute_terminal_command(cmd, cx);
+    }
+
+    pub(crate) fn open_or_create_launch_json(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let vscode_dir = self.root.join(".vscode");
+        let launch_path = vscode_dir.join("launch.json");
+        if !launch_path.is_file() {
+            let _ = std::fs::create_dir_all(&vscode_dir);
+            let starter = r#"{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Update goldens",
+            "type": "dart",
+            "request": "launch",
+            "args": [
+                "--update-goldens"
+            ],
+            "templateFor": "test",
+            "codeLens": {
+                "for": [
+                    "run-test",
+                    "run-test-file"
+                ],
+                "title": "Update goldens"
+            }
+        },
+        {
+            "name": "Coverage",
+            "type": "dart",
+            "request": "launch",
+            "args": [
+                "--coverage"
+            ],
+            "templateFor": "test",
+            "codeLens": {
+                "for": [
+                    "run-test",
+                    "run-test-file"
+                ],
+                "title": "Coverage"
+            }
+        },
+        {
+            "name": "Flutter (Debug)",
+            "type": "dart",
+            "request": "launch"
+        }
+    ]
+}
+"#;
+            let _ = std::fs::write(&launch_path, starter);
+            self.reload_launch_configs(cx);
+        }
+        self.open_path(launch_path, window, cx);
+    }
+
+    /// Start or restart `flutter run --machine -d <device_id>` using the active
+    /// `.vscode/launch.json` configuration (if any) and selected device.
     pub(crate) fn start_flutter_run(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.root.join("pubspec.yaml").is_file() {
+        let active_launch = self
+            .selected_launch_config
+            .and_then(|ix| self.launch_configs.get(ix))
+            .cloned();
+
+        let project_dir = active_launch
+            .as_ref()
+            .map(|c| c.resolved_cwd(&self.root))
+            .unwrap_or_else(|| self.root.clone());
+        let extra_args = active_launch
+            .as_ref()
+            .map(|c| c.resolved_cli_args(&self.root))
+            .unwrap_or_default();
+        let extra_env = active_launch
+            .as_ref()
+            .map(|c| c.resolved_env(&self.root))
+            .unwrap_or_default();
+
+        if !project_dir.join("pubspec.yaml").is_file() && active_launch.is_none() {
             self.terminal_open = true;
             window.focus(&self.terminal_focus, cx);
             let cmd = if self.root.join("Cargo.toml").is_file() {
@@ -1198,13 +1430,25 @@ impl DartIde {
         // Stop any existing Flutter daemon first
         self.stop_flutter_run(cx);
 
-        let device = self.selected_device.clone().unwrap_or(core_flutter::Device {
+        let mut device = self.selected_device.clone().unwrap_or(core_flutter::Device {
             id: "macos".to_string(),
             name: "macOS".to_string(),
             target_platform: "darwin".to_string(),
             emulator: false,
             is_supported: true,
         });
+        if let Some(cfg_dev_id) = active_launch
+            .as_ref()
+            .and_then(|c| c.device_id.as_ref())
+            .filter(|s| !s.is_empty())
+        {
+            if let Some(found) = self.devices.iter().find(|d| &d.id == cfg_dev_id) {
+                device = found.clone();
+            } else {
+                device.id = cfg_dev_id.clone();
+                device.name = cfg_dev_id.clone();
+            }
+        }
 
         // If targeting an iOS simulator, ensure it is booted and open in Simulator.app
         if device.target_platform.contains("ios") || device.id.contains('-') {
@@ -1216,9 +1460,24 @@ impl DartIde {
             }
         }
 
+        let rel_cwd = project_dir
+            .strip_prefix(&self.root)
+            .ok()
+            .map(|p| p.to_string_lossy().into_owned())
+            .filter(|s| !s.is_empty());
+
         self.terminal_open = true;
         if let Some(session) = self.terminals.get_mut(self.active_terminal) {
-            let cmd_str = format!("flutter run -d {}", device.id);
+            let args_suffix = if extra_args.is_empty() {
+                String::new()
+            } else {
+                format!(" {}", extra_args.join(" "))
+            };
+            let cwd_prefix = rel_cwd
+                .as_ref()
+                .map(|d| format!("(cd {d}) "))
+                .unwrap_or_default();
+            let cmd_str = format!("{cwd_prefix}flutter run -d {}{args_suffix}", device.id);
             session.lines.push(editor::dock::TerminalLine::Command {
                 user_host: session.user_host.clone(),
                 dir: session.dir_label(),
@@ -1226,16 +1485,34 @@ impl DartIde {
             });
         }
 
-        match core_flutter::FlutterDaemon::spawn(&self.root, &device.id) {
+        match core_flutter::FlutterDaemon::spawn_with_options(
+            &project_dir,
+            &self.root,
+            &device.id,
+            &extra_args,
+            &extra_env,
+        ) {
             Ok(daemon) => {
                 let events = daemon.events.clone();
                 let daemon_arc = std::sync::Arc::new(std::sync::Mutex::new(daemon));
                 self.flutter_daemon = Some(daemon_arc);
                 self.flutter_app_id = None;
-                self.flutter_status = Some(format!("Launching on {}\u{2026}", device.name));
+                let launch_title = active_launch
+                    .as_ref()
+                    .map(|c| c.name.as_str())
+                    .unwrap_or("Flutter");
+                self.flutter_status = Some(format!(
+                    "Launching {launch_title} on {}\u{2026}",
+                    device.name
+                ));
                 self.push_flutter_log(&format!(
-                    "\x1b[36m\u{25b6} Starting Flutter on {} ({})...\x1b[0m",
-                    device.name, device.id
+                    "\x1b[36m\u{25b6} Starting {launch_title} on {} ({}){}...\x1b[0m",
+                    device.name,
+                    device.id,
+                    rel_cwd
+                        .as_ref()
+                        .map(|d| format!(" in {d}"))
+                        .unwrap_or_default(),
                 ));
                 cx.notify();
 
@@ -1803,6 +2080,337 @@ impl DartIde {
         )
     }
 
+    fn render_launch_picker_popover(
+        &self,
+        view: &Entity<Self>,
+        cx: &mut Context<Self>,
+    ) -> Option<Stateful<Div>> {
+        if !self.launch_picker_open {
+            return None;
+        }
+
+        let fg = cx.theme().foreground;
+        let muted = cx.theme().muted_foreground;
+        let green = cx.theme().green;
+        let info = cx.theme().info;
+        let primary = cx.theme().primary;
+        let list_hover = cx.theme().list_hover;
+        let selected_ix = self.selected_launch_config;
+        let active_test_path = self
+            .active_editor()
+            .and_then(|ed| ed.read(cx).buffer().path())
+            .map(Path::to_path_buf);
+
+        Some(
+            div()
+                .id("launch-picker-backdrop")
+                .absolute()
+                .inset_0()
+                .on_mouse_down(MouseButton::Left, {
+                    let view = view.clone();
+                    move |_event, _window, cx| {
+                        view.update(cx, |this, cx| {
+                            this.launch_picker_open = false;
+                            cx.notify();
+                        });
+                    }
+                })
+                .child(
+                    v_flex()
+                        .id("launch-picker-card")
+                        .absolute()
+                        .top(px(tokens::TITLEBAR_H + 4.))
+                        .right(px(230.))
+                        .w(px(360.))
+                        .p(px(tokens::SPACE_2))
+                        .gap(px(tokens::SPACE_1))
+                        .bg(cx.theme().popover)
+                        .border_1()
+                        .border_color(cx.theme().border)
+                        .rounded(px(tokens::RADIUS_CARD))
+                        .shadow_xl()
+                        .on_mouse_down(MouseButton::Left, |_event, _window, cx| {
+                            cx.stop_propagation();
+                        })
+                        .child(
+                            h_flex()
+                                .px(px(tokens::SPACE_2))
+                                .py(px(2.))
+                                .items_center()
+                                .justify_between()
+                                .child(
+                                    div()
+                                        .text_size(px(tokens::UI_XS))
+                                        .font_medium()
+                                        .text_color(muted)
+                                        .child("LAUNCH CONFIGURATIONS (.vscode/launch.json)"),
+                                )
+                                .child({
+                                    let view = view.clone();
+                                    h_flex()
+                                        .id("reload-launch-btn")
+                                        .px_1p5()
+                                        .py_0p5()
+                                        .gap_1()
+                                        .items_center()
+                                        .rounded(px(tokens::RADIUS_SM))
+                                        .cursor_pointer()
+                                        .text_size(px(tokens::UI_XS))
+                                        .text_color(info)
+                                        .hover(move |s| s.bg(list_hover))
+                                        .child(
+                                            gpui_kit::component::Icon::new(
+                                                gpui_kit::assets::IconName::RotateCw,
+                                            )
+                                            .with_size(px(10.)),
+                                        )
+                                        .child("Reload")
+                                        .on_click(move |_event, _window, cx| {
+                                            view.update(cx, |this, cx| {
+                                                this.reload_launch_configs(cx);
+                                                cx.notify();
+                                            });
+                                        })
+                                }),
+                        )
+                        .when(self.launch_configs.is_empty(), |el| {
+                            el.child(
+                                div()
+                                    .px(px(tokens::SPACE_3))
+                                    .py(px(6.))
+                                    .text_size(px(tokens::UI_SM))
+                                    .text_color(muted)
+                                    .child(
+                                        "No app launch configurations found in .vscode/launch.json",
+                                    ),
+                            )
+                        })
+                        .children(self.launch_configs.iter().enumerate().map(|(ix, cfg)| {
+                            let is_sel = selected_ix == Some(ix);
+                            let name = cfg.name.clone();
+                            let rel_cwd = cfg.relative_cwd_label(&self.root);
+                            let flavor = cfg.flavor();
+                            let view_select = view.clone();
+                            let view_run = view.clone();
+
+                            h_flex()
+                                .id(("launch-cfg-item", ix))
+                                .w_full()
+                                .min_h(px(30.))
+                                .px(px(tokens::SPACE_3))
+                                .py(px(3.))
+                                .items_center()
+                                .justify_between()
+                                .rounded(px(tokens::RADIUS_SM))
+                                .border_1()
+                                .border_color(if is_sel {
+                                    rgba(0xea7a3c44)
+                                } else {
+                                    rgba(0x00000000)
+                                })
+                                .when(is_sel, |el| el.bg(rgba(0xea7a3c18)))
+                                .when(!is_sel, |el| el.hover(move |s| s.bg(list_hover)))
+                                .cursor_pointer()
+                                .on_click(move |_event, _window, cx| {
+                                    view_select.update(cx, |this, cx| {
+                                        this.selected_launch_config = Some(ix);
+                                        this.launch_picker_open = false;
+                                        cx.notify();
+                                    });
+                                })
+                                .child(
+                                    v_flex()
+                                        .min_w(px(0.))
+                                        .flex_1()
+                                        .child(
+                                            h_flex()
+                                                .items_center()
+                                                .gap_1p5()
+                                                .child(
+                                                    gpui_kit::component::Icon::new(
+                                                        gpui_kit::assets::IconName::Play,
+                                                    )
+                                                    .with_size(px(11.))
+                                                    .text_color(if is_sel { primary } else { green }),
+                                                )
+                                                .child(
+                                                    div()
+                                                        .text_size(px(tokens::UI_SM))
+                                                        .font_medium()
+                                                        .text_color(fg)
+                                                        .truncate()
+                                                        .child(name),
+                                                )
+                                                .when_some(flavor, |el, flv| {
+                                                    el.child(
+                                                        div()
+                                                            .px_1p5()
+                                                            .rounded(px(3.))
+                                                            .bg(info.opacity(0.16))
+                                                            .font_family("SF Mono")
+                                                            .text_size(px(9.5))
+                                                            .text_color(info)
+                                                            .child(flv),
+                                                    )
+                                                }),
+                                        )
+                                        .when_some(rel_cwd, |el, cwd| {
+                                            el.child(
+                                                div()
+                                                    .pl(px(17.))
+                                                    .font_family("SF Mono")
+                                                    .text_size(px(10.))
+                                                    .text_color(muted)
+                                                    .truncate()
+                                                    .child(cwd),
+                                            )
+                                        }),
+                                )
+                                .child(
+                                    h_flex()
+                                        .id(("launch-cfg-run-now", ix))
+                                        .px_2()
+                                        .h(px(22.))
+                                        .items_center()
+                                        .gap_1()
+                                        .rounded(px(tokens::RADIUS_SM))
+                                        .bg(green.opacity(0.15))
+                                        .border_1()
+                                        .border_color(green.opacity(0.32))
+                                        .text_size(px(10.))
+                                        .text_color(green)
+                                        .child("\u{25b6} Run")
+                                        .on_mouse_down(MouseButton::Left, |_event, _window, cx| {
+                                            cx.stop_propagation();
+                                        })
+                                        .on_click(move |_event, window, cx| {
+                                            cx.stop_propagation();
+                                            view_run.update(cx, |this, cx| {
+                                                this.selected_launch_config = Some(ix);
+                                                this.launch_picker_open = false;
+                                                this.start_flutter_run(window, cx);
+                                            });
+                                        }),
+                                )
+                        }))
+                        .when(!self.test_launch_templates.is_empty(), |el| {
+                            el.child(div().h(px(1.)).w_full().my_1().bg(cx.theme().border))
+                                .child(
+                                    div()
+                                        .px(px(tokens::SPACE_2))
+                                        .py(px(2.))
+                                        .text_size(px(tokens::UI_XS))
+                                        .font_medium()
+                                        .text_color(muted)
+                                        .child("TEST TEMPLATES & CODELENS (templateFor: \"test\")"),
+                                )
+                                .children(self.test_launch_templates.iter().enumerate().map(
+                                    |(ix, tpl)| {
+                                        let title = tpl.code_lens_title().to_string();
+                                        let args = tpl.resolved_cli_args(&self.root);
+                                        let flags = args.join(" ");
+                                        let view = view.clone();
+                                        let path_opt = active_test_path.clone();
+
+                                        h_flex()
+                                            .id(("test-tpl-item", ix))
+                                            .w_full()
+                                            .h(px(28.))
+                                            .px(px(tokens::SPACE_3))
+                                            .items_center()
+                                            .justify_between()
+                                            .rounded(px(tokens::RADIUS_SM))
+                                            .cursor_pointer()
+                                            .hover(move |s| s.bg(list_hover))
+                                            .on_click(move |_event, _window, cx| {
+                                                let title = title.clone();
+                                                let args = args.clone();
+                                                let path = path_opt
+                                                    .clone()
+                                                    .unwrap_or_else(|| PathBuf::from("test"));
+                                                view.update(cx, |this, cx| {
+                                                    this.launch_picker_open = false;
+                                                    this.run_flutter_test(
+                                                        path, None, args, title, cx,
+                                                    );
+                                                });
+                                            })
+                                            .child(
+                                                h_flex()
+                                                    .items_center()
+                                                    .gap_2()
+                                                    .child(
+                                                        div()
+                                                            .text_size(px(10.5))
+                                                            .text_color(info)
+                                                            .child("\u{25b6}"),
+                                                    )
+                                                    .child(
+                                                        div()
+                                                            .text_size(px(tokens::UI_SM))
+                                                            .text_color(fg)
+                                                            .child(tpl.code_lens_title().to_string()),
+                                                    ),
+                                            )
+                                            .child(
+                                                div()
+                                                    .font_family("SF Mono")
+                                                    .text_size(px(10.))
+                                                    .text_color(muted)
+                                                    .child(flags),
+                                            )
+                                    },
+                                ))
+                        })
+                        .child(div().h(px(1.)).w_full().my_1().bg(cx.theme().border))
+                        .child({
+                            let view = view.clone();
+                            h_flex()
+                                .id("open-launch-json-btn")
+                                .w_full()
+                                .h(px(28.))
+                                .px(px(tokens::SPACE_3))
+                                .items_center()
+                                .justify_between()
+                                .rounded(px(tokens::RADIUS_SM))
+                                .cursor_pointer()
+                                .hover(move |s| s.bg(list_hover))
+                                .child(
+                                    h_flex()
+                                        .items_center()
+                                        .gap_2()
+                                        .child(
+                                            gpui_kit::component::Icon::new(
+                                                gpui_kit::assets::IconName::Settings,
+                                            )
+                                            .with_size(px(12.))
+                                            .text_color(primary),
+                                        )
+                                        .child(
+                                            div()
+                                                .text_size(px(tokens::UI_SM))
+                                                .text_color(fg)
+                                                .child("Edit .vscode/launch.json"),
+                                        ),
+                                )
+                                .child(
+                                    div()
+                                        .font_family("SF Mono")
+                                        .text_size(px(10.))
+                                        .text_color(muted)
+                                        .child("Open"),
+                                )
+                                .on_click(move |_event, window, cx| {
+                                    view.update(cx, |this, cx| {
+                                        this.launch_picker_open = false;
+                                        this.open_or_create_launch_json(window, cx);
+                                    });
+                                })
+                        }),
+                )
+        )
+    }
+
     fn render_device_picker_popover(
         &self,
         view: &Entity<Self>,
@@ -2106,6 +2714,9 @@ impl Render for DartIde {
             .child(self.render_titlebar(window, cx))
             .child(self.render_shell(&view, window, cx))
             .child(self.render_status_bar(cx))
+            .when_some(self.render_launch_picker_popover(&view, cx), |el, pop| {
+                el.child(pop)
+            })
             .when_some(self.render_device_picker_popover(&view, cx), |el, pop| {
                 el.child(pop)
             })

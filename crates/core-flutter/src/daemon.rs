@@ -73,15 +73,44 @@ impl FlutterDaemon {
     /// Spawn `flutter run --machine -d <device_id>` in `project_dir`,
     /// preferring `.fvm/flutter_sdk/bin/flutter` if the project uses FVM.
     pub fn spawn(project_dir: &Path, device_id: &str) -> io::Result<Self> {
-        let fvm_flutter = project_dir.join(".fvm/flutter_sdk/bin/flutter");
-        let flutter_bin = if fvm_flutter.is_file() {
-            fvm_flutter.to_string_lossy().into_owned()
+        Self::spawn_with_options(
+            project_dir,
+            project_dir,
+            device_id,
+            &[],
+            &std::collections::HashMap::new(),
+        )
+    }
+
+    /// Spawn `flutter run --machine -d <device_id> <extra_args...>` in `project_dir`,
+    /// checking both `project_dir` and `workspace_root` for `.fvm/flutter_sdk/bin/flutter`
+    /// so monorepo apps under `apps/*` inherit workspace-level FVM automatically.
+    pub fn spawn_with_options(
+        project_dir: &Path,
+        workspace_root: &Path,
+        device_id: &str,
+        extra_args: &[String],
+        env: &std::collections::HashMap<String, String>,
+    ) -> io::Result<Self> {
+        let local_fvm = project_dir.join(".fvm/flutter_sdk/bin/flutter");
+        let root_fvm = workspace_root.join(".fvm/flutter_sdk/bin/flutter");
+        let flutter_bin = if local_fvm.is_file() {
+            local_fvm.to_string_lossy().into_owned()
+        } else if root_fvm.is_file() {
+            root_fvm.to_string_lossy().into_owned()
         } else {
             "flutter".to_string()
         };
 
-        let mut child = Command::new(&flutter_bin)
-            .args(["run", "--machine", "-d", device_id])
+        let mut cmd = Command::new(&flutter_bin);
+        cmd.args(["run", "--machine", "-d", device_id]);
+        for arg in extra_args {
+            cmd.arg(arg);
+        }
+        for (k, v) in env {
+            cmd.env(k, v);
+        }
+        let mut child = cmd
             .current_dir(project_dir)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())

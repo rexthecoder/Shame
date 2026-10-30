@@ -364,10 +364,12 @@ impl DartIde {
                                                 div()
                                                     .relative()
                                                     .size_full()
-                                                    .rounded(px(38.5))
+                                                    .rounded(px(38.))
                                                     .overflow_hidden()
                                                     .bg(rgb(0x000000))
                                                     // 0. Double-buffered previous frame underneath so async PNG decode NEVER flashes black!
+                                                    // IMPORTANT: `.rounded(px(38.))` MUST be on `img(...)` itself so GPUI's quad shader
+                                                    // clips the texture's 4 corners rather than letting square corners poke out of the bezel.
                                                     .when_some(
                                                         self.simulator_prev_frame_path.clone(),
                                                         |el, prev_path| {
@@ -377,7 +379,8 @@ impl DartIde {
                                                                     .top_0()
                                                                     .left_0()
                                                                     .size_full()
-                                                                    .object_fit(ObjectFit::Cover),
+                                                                    .rounded(px(38.))
+                                                                    .object_fit(ObjectFit::Fill),
                                                             )
                                                         },
                                                     )
@@ -390,11 +393,14 @@ impl DartIde {
                                                             div()
                                                                 .relative()
                                                                 .size_full()
+                                                                .rounded(px(38.))
+                                                                .overflow_hidden()
                                                                 .cursor_pointer()
                                                                 .child(
                                                                     img(frame_path)
                                                                         .size_full()
-                                                                        .object_fit(ObjectFit::Cover),
+                                                                        .rounded(px(38.))
+                                                                        .object_fit(ObjectFit::Fill),
                                                                 )
                                                                 .child(
                                                                     canvas(

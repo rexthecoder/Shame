@@ -72,12 +72,27 @@ const FONT_FAMILY: &str = "SF Mono";
 /// picker for more than one code action (no text input or list widget
 /// here — see the crate's module docs on why). `app` subscribes to all
 /// three per tab.
+/// A test CodeLens template configured via `.vscode/launch.json` (`"templateFor": "test"`).
+#[derive(Debug, Clone)]
+pub struct TestCodeLensTemplate {
+    pub title: String,
+    pub args: Vec<String>,
+    pub for_test: bool,
+    pub for_file: bool,
+}
+
 #[derive(Debug, Clone)]
 pub enum EditorEvent {
     OpenAt { path: PathBuf, line: u32, column: u32 },
     RequestRename { line: u32, column: u32 },
     ShowCodeActions { actions: Vec<lsp_types::CodeActionOrCommand> },
     Saved { path: PathBuf },
+    RunTest {
+        path: PathBuf,
+        test_name: Option<String>,
+        extra_args: Vec<String>,
+        label: String,
+    },
 }
 
 /// Maximum file size (256 KiB) for tree-sitter parsing and syntax queries.
@@ -127,6 +142,8 @@ pub struct EditorView {
     completion_selected: usize,
     /// Optional end-of-line closing annotations provided by `language.closing_labels(...)`.
     closing_labels: std::collections::HashMap<usize, String>,
+    /// Test CodeLens templates loaded from `.vscode/launch.json` (`templateFor: "test"`).
+    test_code_lenses: Vec<TestCodeLensTemplate>,
 }
 
 impl EditorView {
@@ -174,9 +191,19 @@ impl EditorView {
             completions: Vec::new(),
             completion_selected: 0,
             closing_labels,
+            test_code_lenses: Vec::new(),
         };
         this.maybe_start_lsp(cx);
         this
+    }
+
+    pub fn set_test_code_lenses(
+        &mut self,
+        lenses: Vec<TestCodeLensTemplate>,
+        cx: &mut Context<Self>,
+    ) {
+        self.test_code_lenses = lenses;
+        cx.notify();
     }
 
     pub fn buffer(&self) -> &Buffer {
@@ -1708,6 +1735,85 @@ impl EditorView {
                     .flex_1()
                     .h_full()
                     .child(line_canvas)
+                    .when_some(
+                        self.language
+                            .detect_test_target(self.buffer.path(), display_text)
+                            .and_then(|(is_whole_file, test_name)| {
+                                self.buffer
+                                    .path()
+                                    .map(|p| (p.to_path_buf(), is_whole_file, test_name))
+                            }),
+                        |el, (file_path, is_whole_file, test_name)| {
+                            let green = cx.theme().green;
+                            let info = cx.theme().info;
+                            let mut actions: Vec<(String, Vec<String>, Hsla)> = vec![(
+                                if is_whole_file {
+                                    "Run Test File".to_string()
+                                } else {
+                                    "Run".to_string()
+                                },
+                                Vec::new(),
+                                green,
+                            )];
+                            for tpl in &self.test_code_lenses {
+                                if (is_whole_file && tpl.for_file) || (!is_whole_file && tpl.for_test) {
+                                    actions.push((tpl.title.clone(), tpl.args.clone(), info));
+                                }
+                            }
+                            let view = cx.entity();
+                            el.child(
+                                h_flex()
+                                    .absolute()
+                                    .right_4()
+                                    .top_0()
+                                    .bottom_0()
+                                    .items_center()
+                                    .gap_1p5()
+                                    .children(actions.into_iter().enumerate().map(
+                                        |(btn_ix, (label, extra_args, color))| {
+                                            let view = view.clone();
+                                            let path = file_path.clone();
+                                            let t_name = test_name.clone();
+                                            let lbl = label.clone();
+                                            h_flex()
+                                                .id(("test-lens", index * 16 + btn_ix))
+                                                .h(px(17.))
+                                                .px_2()
+                                                .gap_1()
+                                                .items_center()
+                                                .rounded(px(4.))
+                                                .bg(color.opacity(0.14))
+                                                .border_1()
+                                                .border_color(color.opacity(0.34))
+                                                .cursor_pointer()
+                                                .hover(move |s| s.bg(color.opacity(0.24)))
+                                                .text_size(px(10.5))
+                                                .text_color(color)
+                                                .child("\u{25b6}")
+                                                .child(label)
+                                                .on_mouse_down(
+                                                    MouseButton::Left,
+                                                    move |_event, _window, cx| {
+                                                        cx.stop_propagation();
+                                                        let path = path.clone();
+                                                        let t_name = t_name.clone();
+                                                        let extra_args = extra_args.clone();
+                                                        let lbl = lbl.clone();
+                                                        view.update(cx, |_this, cx| {
+                                                            cx.emit(EditorEvent::RunTest {
+                                                                path,
+                                                                test_name: t_name,
+                                                                extra_args,
+                                                                label: lbl,
+                                                            });
+                                                        });
+                                                    },
+                                                )
+                                        },
+                                    )),
+                            )
+                        },
+                    )
                     .when(
                         is_active_line && !self.completions.is_empty(),
                         |el| {

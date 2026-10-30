@@ -24,6 +24,7 @@
 
 mod daemon;
 mod devices;
+mod launch;
 mod pubspec;
 mod sdk;
 
@@ -32,6 +33,10 @@ pub use devices::{
     Device, IosSimulator, attach_simulator_window, boot_ios_simulator,
     capture_simulator_screenshot, list_devices, list_ios_simulators, simulator_press_home,
     tap_simulator_window,
+};
+pub use launch::{
+    LaunchCodeLens, LaunchConfig, LaunchFile, expand_workspace_vars, load_launch_file,
+    parse_launch_json,
 };
 pub use pubspec::{PubOutput, add_package, pub_get};
 pub use sdk::{FlutterSdk, detect_sdk};
