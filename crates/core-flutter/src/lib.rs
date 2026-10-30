@@ -31,8 +31,8 @@ mod sdk;
 pub use daemon::{DaemonOutput, FlutterDaemon};
 pub use devices::{
     Device, IosSimulator, attach_simulator_window, boot_ios_simulator,
-    capture_simulator_screenshot, list_devices, list_ios_simulators, simulator_press_home,
-    tap_simulator_window,
+    capture_simulator_screenshot, find_idb, list_devices, list_ios_simulators,
+    simulator_input_available, simulator_press_home, tap_simulator_window,
 };
 pub use launch::{
     LaunchCodeLens, LaunchConfig, LaunchFile, expand_workspace_vars, load_launch_file,

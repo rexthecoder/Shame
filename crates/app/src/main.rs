@@ -1898,7 +1898,7 @@ impl DartIde {
         let (tx, rx) = async_channel::bounded(1);
         std::thread::spawn(move || {
             let temp_dir = std::env::temp_dir();
-            let stage_path = temp_dir.join("dart_ide_sim_stage.png");
+            let stage_path = temp_dir.join("dart_ide_sim_stage.jpg");
             let ok =
                 core_flutter::capture_simulator_screenshot(udid.as_deref(), &stage_path).is_ok();
             let result = if ok {
@@ -1914,11 +1914,11 @@ impl DartIde {
                         None
                     } else {
                         let out_path =
-                            temp_dir.join(format!("dart_ide_sim_frame_{}.png", seq % 16));
+                            temp_dir.join(format!("dart_ide_sim_frame_{}.jpg", seq % 16));
                         if std::fs::rename(&stage_path, &out_path).is_ok() {
                             if seq >= 6 {
                                 let old_path = temp_dir.join(format!(
-                                    "dart_ide_sim_frame_{}.png",
+                                    "dart_ide_sim_frame_{}.jpg",
                                     seq.wrapping_sub(6) % 16
                                 ));
                                 let _ = std::fs::remove_file(old_path);
@@ -1956,12 +1956,16 @@ impl DartIde {
     }
 
     /// Forward a normalized click `(norm_x, norm_y)` inside the embedded iPhone screen
-    /// to `Simulator.app` and refresh the frame twice (180ms + 500ms) to capture animations.
+    /// to the simulator (via `idb` HID injection) and refresh the frame several times
+    /// afterwards to capture the resulting animation.
     pub(crate) fn tap_simulator(&mut self, norm_x: f32, norm_y: f32, cx: &mut Context<Self>) {
-        let (tx, rx) = async_channel::bounded::<()>(4);
+        let udid = self.active_simulator_udid();
         std::thread::spawn(move || {
-            let _ = core_flutter::tap_simulator_window(norm_x, norm_y);
-            for delay_ms in [90u64, 220, 450] {
+            let _ = core_flutter::tap_simulator_window(udid.as_deref(), norm_x, norm_y);
+        });
+        let (tx, rx) = async_channel::bounded::<()>(6);
+        std::thread::spawn(move || {
+            for delay_ms in [120u64, 200, 300, 500] {
                 std::thread::sleep(std::time::Duration::from_millis(delay_ms));
                 let _ = tx.send_blocking(());
             }
@@ -1976,15 +1980,32 @@ impl DartIde {
         .detach();
     }
 
-    /// Trigger the iOS Simulator Home gesture (`Cmd+Shift+H`) and capture the resulting frame.
+    /// UDID of the simulator currently mirrored in the rail (selected iOS device, else the first booted one).
+    pub(crate) fn active_simulator_udid(&self) -> Option<String> {
+        self.selected_device
+            .as_ref()
+            .filter(|d| d.target_platform.contains("ios") || d.id.contains('-'))
+            .map(|d| d.id.clone())
+            .or_else(|| {
+                self.ios_simulators
+                    .iter()
+                    .find(|s| s.is_booted())
+                    .map(|s| s.udid.clone())
+            })
+    }
+
+    /// Press the iOS Home button and capture the resulting frames.
     pub(crate) fn press_simulator_home(&mut self, cx: &mut Context<Self>) {
-        let (tx, rx) = async_channel::bounded::<()>(2);
+        let udid = self.active_simulator_udid();
         std::thread::spawn(move || {
-            let _ = core_flutter::simulator_press_home();
-            std::thread::sleep(std::time::Duration::from_millis(220));
-            let _ = tx.send_blocking(());
-            std::thread::sleep(std::time::Duration::from_millis(450));
-            let _ = tx.send_blocking(());
+            let _ = core_flutter::simulator_press_home(udid.as_deref());
+        });
+        let (tx, rx) = async_channel::bounded::<()>(4);
+        std::thread::spawn(move || {
+            for delay_ms in [150u64, 250, 450] {
+                std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+                let _ = tx.send_blocking(());
+            }
         });
         cx.spawn(async move |weak, cx| {
             while rx.recv().await.is_ok() {
@@ -2002,7 +2023,7 @@ impl DartIde {
         let (tx, rx) = async_channel::bounded::<()>(1);
         std::thread::spawn(move || {
             loop {
-                std::thread::sleep(std::time::Duration::from_millis(280));
+                std::thread::sleep(std::time::Duration::from_millis(160));
                 if tx.send_blocking(()).is_err() {
                     break;
                 }

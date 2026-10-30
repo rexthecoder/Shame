@@ -155,12 +155,14 @@ pub fn capture_simulator_screenshot(udid: Option<&str>, out_path: &Path) -> io::
     let target = udid
         .filter(|id| !id.is_empty() && *id != "macos" && *id != "chrome")
         .unwrap_or("booted");
+    // JPEG encodes several times faster than PNG, which is what makes live mirroring smooth.
     let status = Command::new("xcrun")
         .args([
             "simctl",
             "io",
             target,
             "screenshot",
+            "--type=jpeg",
             &out_path.to_string_lossy(),
         ])
         .status()?;
@@ -174,32 +176,140 @@ pub fn capture_simulator_screenshot(udid: Option<&str>, out_path: &Path) -> io::
 }
 
 /// Run a JXA (JavaScript for Automation) snippet via `osascript -l JavaScript`.
+/// Errors if the script throws (e.g. no Simulator window).
 fn run_jxa(script: &str) -> io::Result<()> {
-    Command::new("osascript")
+    let status = Command::new("osascript")
         .args(["-l", "JavaScript", "-e", script])
-        .status()
-        .map(|_| ())
+        .stderr(std::process::Stdio::null())
+        .status()?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(io::Error::new(io::ErrorKind::NotFound, "no Simulator window"))
+    }
 }
 
-/// JXA prelude: finds the on-screen `Simulator` window (`win`, with `win.kCGWindowBounds`)
+/// Run a JXA snippet, and if it fails because `Simulator.app` has no window yet,
+/// launch Simulator in the background and retry once.
+fn run_jxa_with_simulator(script: &str) -> io::Result<()> {
+    if run_jxa(script).is_ok() {
+        return Ok(());
+    }
+    let _ = Command::new("open").args(["-g", "-a", "Simulator"]).status();
+    for _ in 0..8 {
+        std::thread::sleep(std::time::Duration::from_millis(400));
+        if run_jxa(script).is_ok() {
+            return Ok(());
+        }
+    }
+    Err(io::Error::new(io::ErrorKind::NotFound, "no Simulator window"))
+}
+
+/// JXA prelude: finds the `Simulator` device window (`win`, with `win.kCGWindowBounds`)
 /// and its owner pid (`pid`) via CoreGraphics, without needing Accessibility APIs and
-/// without activating the app.
+/// without activating the app. Lists *all* windows (not only on-screen ones, which
+/// omits windows on other Spaces) and ignores the menu-bar-sized helper windows.
 const JXA_FIND_SIMULATOR: &str = r#"
 ObjC.import('CoreGraphics');
-const infos = ObjC.deepUnwrap(ObjC.castRefToObject($.CGWindowListCopyWindowInfo(17, 0)));
-const win = infos.find(w => w.kCGWindowOwnerName === 'Simulator'
-    && w.kCGWindowLayer === 0 && w.kCGWindowBounds.Height > 200);
+const infos = ObjC.deepUnwrap(ObjC.castRefToObject($.CGWindowListCopyWindowInfo(0, 0)));
+const cands = infos.filter(w => w.kCGWindowOwnerName === 'Simulator'
+    && w.kCGWindowLayer === 0 && w.kCGWindowBounds.Height > 200 && w.kCGWindowBounds.Width > 150);
+const win = cands.find(w => w.kCGWindowIsOnscreen) || cands[0];
 if (!win) { throw new Error('no simulator window'); }
 const pid = win.kCGWindowOwnerPID;
 const b = win.kCGWindowBounds;
 "#;
 
+/// Locate Facebook's `idb` CLI (`brew install idb-companion && pip3 install fb-idb`).
+/// `idb` injects real HID touches into a booted simulator **headlessly** — no
+/// `Simulator.app` window needed — which is what makes the embedded view interactive.
+pub fn find_idb() -> Option<String> {
+    static IDB: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    IDB.get_or_init(|| {
+        let home = std::env::var("HOME").unwrap_or_default();
+        [
+            "/opt/homebrew/bin/idb".to_string(),
+            "/usr/local/bin/idb".to_string(),
+            format!("{home}/.local/bin/idb"),
+            format!("{home}/Library/Python/3.12/bin/idb"),
+            format!("{home}/Library/Python/3.11/bin/idb"),
+            format!("{home}/Library/Python/3.10/bin/idb"),
+            format!("{home}/Library/Python/3.9/bin/idb"),
+        ]
+        .into_iter()
+        .find(|p| Path::new(p).is_file())
+        .or_else(|| {
+            Command::new("which")
+                .arg("idb")
+                .output()
+                .ok()
+                .filter(|o| o.status.success())
+                .and_then(|o| String::from_utf8(o.stdout).ok())
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+        })
+    })
+    .clone()
+}
+
+/// Whether taps can be injected into a headless simulator (i.e. `idb` is installed).
+pub fn simulator_input_available() -> bool {
+    find_idb().is_some()
+}
+
+/// Screen size in points of a simulator, via `idb describe` (cached per udid).
+fn simulator_screen_points(idb: &str, udid: &str) -> Option<(f32, f32)> {
+    static CACHE: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, (f32, f32)>>> =
+        std::sync::OnceLock::new();
+    let cache = CACHE.get_or_init(Default::default);
+    if let Some(v) = cache.lock().ok().and_then(|c| c.get(udid).copied()) {
+        return Some(v);
+    }
+    let out = Command::new(idb)
+        .args(["describe", "--udid", udid, "--json"])
+        .output()
+        .ok()?;
+    let json: Value = serde_json::from_slice(&out.stdout).ok()?;
+    let dims = json.get("screen_dimensions")?;
+    let w = dims.get("width_points").and_then(Value::as_f64)? as f32;
+    let h = dims.get("height_points").and_then(Value::as_f64)? as f32;
+    if let Ok(mut c) = cache.lock() {
+        c.insert(udid.to_string(), (w, h));
+    }
+    Some((w, h))
+}
+
 /// Forward a normalized `(norm_x, norm_y)` tap (`0.0..=1.0`) from the embedded
-/// iPhone screen in the IDE rail to the native `Simulator.app` window.
+/// iPhone screen to the simulator.
 ///
-/// Events are posted directly to the Simulator's pid (`CGEventPostToPid`), so the
-/// Simulator is **never raised or activated** and the IDE keeps focus.
-pub fn tap_simulator_window(norm_x: f32, norm_y: f32) -> io::Result<()> {
+/// Uses `idb` HID injection when available (works headless, never raises
+/// `Simulator.app`). Otherwise falls back to posting a click to the Simulator
+/// window, which only works while that window exists.
+pub fn tap_simulator_window(udid: Option<&str>, norm_x: f32, norm_y: f32) -> io::Result<()> {
+    let nx = norm_x.clamp(0.0, 1.0);
+    let ny = norm_y.clamp(0.0, 1.0);
+    if let (Some(idb), Some(udid)) = (find_idb(), udid.filter(|u| !u.is_empty())) {
+        if let Some((w, h)) = simulator_screen_points(&idb, udid) {
+            let status = Command::new(&idb)
+                .args([
+                    "ui",
+                    "tap",
+                    "--udid",
+                    udid,
+                    &format!("{}", (nx * w).round() as i32),
+                    &format!("{}", (ny * h).round() as i32),
+                ])
+                .status()?;
+            if status.success() {
+                return Ok(());
+            }
+        }
+    }
+    tap_simulator_window_via_events(nx, ny)
+}
+
+/// Fallback tap: post mouse events straight to a visible `Simulator.app` window's pid.
+fn tap_simulator_window_via_events(norm_x: f32, norm_y: f32) -> io::Result<()> {
     let nx = norm_x.clamp(0.02, 0.98);
     let ny = norm_y.clamp(0.02, 0.98);
     let script = format!(
@@ -217,11 +327,20 @@ delay(0.05);
 post(2);
 "#
     );
-    run_jxa(&script)
+    run_jxa_with_simulator(&script)
 }
 
-/// Trigger the iOS Home gesture (`Cmd+Shift+H`) on `Simulator.app` without raising it.
-pub fn simulator_press_home() -> io::Result<()> {
+/// Press the iOS Home button on the simulator (`idb` when available, else `Cmd+Shift+H`).
+pub fn simulator_press_home(udid: Option<&str>) -> io::Result<()> {
+    if let (Some(idb), Some(udid)) = (find_idb(), udid.filter(|u| !u.is_empty())) {
+        if Command::new(&idb)
+            .args(["ui", "button", "--udid", udid, "HOME"])
+            .status()
+            .is_ok_and(|s| s.success())
+        {
+            return Ok(());
+        }
+    }
     let script = format!(
         r#"{JXA_FIND_SIMULATOR}
 function key(down) {{
@@ -233,7 +352,7 @@ key(true);
 key(false);
 "#
     );
-    run_jxa(&script)
+    run_jxa_with_simulator(&script)
 }
 
 #[cfg(test)]
