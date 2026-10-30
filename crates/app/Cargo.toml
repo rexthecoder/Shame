@@ -19,5 +19,6 @@ core-buffer = { path = "../core-buffer" }
 core-flutter = { path = "../core-flutter" }
 core-syntax = { path = "../core-syntax" }
 core-lsp = { path = "../core-lsp" }
+core-dap = { path = "../core-dap" }
 core-workspace = { path = "../core-workspace" }
 editor-view = { path = "../editor-view" }

@@ -492,16 +492,27 @@ impl EditorView {
     }
 
     /// Apply a `WorkspaceEdit`'s changes (`changes` or `document_changes`) to
-    /// this buffer's own file, including Dart auto-import quick fixes and
-    /// widget refactors.
+    /// this buffer's own file, and emit `EditorEvent::ExternalFileEdits` for any
+    /// other files in the workspace so cross-file renames and refactors apply
+    /// project-wide.
     fn apply_workspace_edit(&mut self, edit: WorkspaceEdit, cx: &mut Context<Self>) {
-        let Some(own_uri) = self.lsp.as_ref().map(|lsp| lsp.uri.clone()) else {
+        let Some(own_uri) = self
+            .lsp
+            .as_ref()
+            .map(|lsp| lsp.uri.clone())
+            .or_else(|| {
+                let path = self.buffer.path()?;
+                Uri::from_str(&format!("file://{}", path.display())).ok()
+            })
+        else {
             return;
         };
         if let Some(changes) = edit.changes {
             for (uri, edits) in changes {
                 if uri.as_str() == own_uri.as_str() {
                     self.apply_text_edits(edits, cx);
+                } else if let Some(path) = uri_to_path(&uri) {
+                    cx.emit(EditorEvent::ExternalFileEdits { path, edits });
                 }
             }
         }
@@ -509,8 +520,25 @@ impl EditorView {
             match doc_changes {
                 DocumentChanges::Edits(text_doc_edits) => {
                     for tde in text_doc_edits {
+                        let edits: Vec<TextEdit> = tde
+                            .edits
+                            .into_iter()
+                            .map(|e| match e {
+                                OneOf::Left(te) => te,
+                                OneOf::Right(ate) => ate.text_edit,
+                            })
+                            .collect();
                         if tde.text_document.uri.as_str() == own_uri.as_str() {
-                            let edits = tde
+                            self.apply_text_edits(edits, cx);
+                        } else if let Some(path) = uri_to_path(&tde.text_document.uri) {
+                            cx.emit(EditorEvent::ExternalFileEdits { path, edits });
+                        }
+                    }
+                }
+                DocumentChanges::Operations(ops) => {
+                    for op in ops {
+                        if let DocumentChangeOperation::Edit(tde) = op {
+                            let edits: Vec<TextEdit> = tde
                                 .edits
                                 .into_iter()
                                 .map(|e| match e {
@@ -518,23 +546,10 @@ impl EditorView {
                                     OneOf::Right(ate) => ate.text_edit,
                                 })
                                 .collect();
-                            self.apply_text_edits(edits, cx);
-                        }
-                    }
-                }
-                DocumentChanges::Operations(ops) => {
-                    for op in ops {
-                        if let DocumentChangeOperation::Edit(tde) = op {
                             if tde.text_document.uri.as_str() == own_uri.as_str() {
-                                let edits = tde
-                                    .edits
-                                    .into_iter()
-                                    .map(|e| match e {
-                                        OneOf::Left(te) => te,
-                                        OneOf::Right(ate) => ate.text_edit,
-                                    })
-                                    .collect();
                                 self.apply_text_edits(edits, cx);
+                            } else if let Some(path) = uri_to_path(&tde.text_document.uri) {
+                                cx.emit(EditorEvent::ExternalFileEdits { path, edits });
                             }
                         }
                     }
@@ -543,13 +558,7 @@ impl EditorView {
         }
     }
 
-    /// Apply a server's `TextEdit`s to the buffer. Edits are applied from
-    /// the end of the document backwards so that earlier edits' (line,
-    /// character) positions stay valid as later ones are applied —
-    /// standard multi-edit application, needed because each edit's
-    /// position is defined relative to the *original* document, not to
-    /// the result of previous edits in the same batch.
-    fn apply_text_edits(&mut self, mut edits: Vec<TextEdit>, cx: &mut Context<Self>) {
+    pub(crate) fn apply_text_edits(&mut self, mut edits: Vec<TextEdit>, cx: &mut Context<Self>) {
         edits.sort_by_key(|edit| (edit.range.start.line, edit.range.start.character));
         for edit in edits.into_iter().rev() {
             let start = self.buffer.line_to_byte(edit.range.start.line as usize)
@@ -656,8 +665,14 @@ impl EditorView {
             }
             ServerMessage::Response { id, result } if lsp.pending_format_id == Some(id) => {
                 lsp.pending_format_id = None;
+                let save_after = std::mem::take(&mut self.save_after_format);
                 if let Ok(Some(edits)) = result.map(|v| serde_json::from_value::<Option<Vec<TextEdit>>>(v).unwrap_or(None)) {
-                    self.apply_text_edits(edits, cx);
+                    if !edits.is_empty() {
+                        self.apply_text_edits(edits, cx);
+                        if save_after {
+                            self.flush_save(cx);
+                        }
+                    }
                 }
             }
             ServerMessage::Response { id, result } if lsp.pending_rename_id == Some(id) => {

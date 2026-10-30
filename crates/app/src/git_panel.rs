@@ -18,6 +18,7 @@ use crate::DartIde;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SidebarTab {
     Files,
+    Search,
     Git,
 }
 
@@ -41,6 +42,13 @@ pub(crate) struct GitState {
     pub(crate) amend: bool,
     pub(crate) staged_collapsed: bool,
     pub(crate) changes_collapsed: bool,
+    pub(crate) stashes_collapsed: bool,
+    pub(crate) commits_collapsed: bool,
+    /// Hash of the commit currently expanded in the Recent Commits list, if any.
+    pub(crate) expanded_commit: Option<String>,
+    pub(crate) expanded_commit_files: Vec<ChangedFile>,
+    /// Whether the diff view shows side-by-side (`false`) or unified inline (`true`) rows.
+    pub(crate) unified_diff: bool,
     /// Discard is destructive: the first click arms it (for a few seconds), the second runs it.
     pub(crate) confirm_discard: Option<String>,
     /// Files (path, staged?) the developer has marked reviewed in the diff view.
@@ -63,12 +71,18 @@ impl GitState {
                     .placeholder("Describe this change\u{2026}")
                     .auto_grow(1, 6)
             }),
-            branch_input: cx.new(|cx| InputState::new(window, cx).placeholder("New branch name…")),
+            branch_input: cx
+                .new(|cx| InputState::new(window, cx).placeholder("Filter or create branch…")),
             branches: Vec::new(),
             branches_open: false,
             amend: false,
             staged_collapsed: false,
             changes_collapsed: false,
+            stashes_collapsed: false,
+            commits_collapsed: false,
+            expanded_commit: None,
+            expanded_commit_files: Vec::new(),
+            unified_diff: false,
             confirm_discard: None,
             reviewed: Default::default(),
             commit_types: None,
@@ -151,6 +165,7 @@ impl DartIde {
             while rx.recv().await.is_ok() {
                 let alive = weak
                     .update(cx, |this, cx| {
+                        this.sync_workspace_files_if_changed(cx);
                         if this.sidebar_open && this.sidebar_tab == SidebarTab::Git {
                             this.refresh_git(cx);
                         }
@@ -233,9 +248,16 @@ impl DartIde {
                 }
                 this.refresh_git(cx);
                 // The open diff shows what just changed (a staged hunk, a reverted one, ...).
-                if let Some((file, staged)) = this.diff.as_ref().map(|d| (d.file.clone(), d.staged))
+                if let Some((file, staged, commit)) = this
+                    .diff
+                    .as_ref()
+                    .map(|d| (d.file.clone(), d.staged, d.commit.clone()))
                 {
-                    this.open_git_diff(file, staged, cx);
+                    if let Some(hash) = commit {
+                        this.open_git_commit_diff(hash, file, cx);
+                    } else {
+                        this.open_git_diff(file, staged, cx);
+                    }
                 }
                 cx.notify();
             });
@@ -320,6 +342,163 @@ impl DartIde {
         self.git_run(window, None, false, cx, move |root, _| {
             core_workspace::discard(root, &file).map(|_| String::new())
         });
+    }
+
+    pub(crate) fn git_discard_all_clicked(&mut self, window: &Window, cx: &mut Context<Self>) {
+        if self.git.confirm_discard.as_deref() == Some("discard-all") {
+            let Some(files) = self.git.status.as_ref().map(|s| s.unstaged.clone()) else {
+                return;
+            };
+            self.git_run(
+                window,
+                Some("Discarding changes\u{2026}"),
+                false,
+                cx,
+                move |root, _| {
+                    core_workspace::discard_files(root, &files)
+                        .map(|_| "Discarded unstaged changes".to_string())
+                },
+            );
+            return;
+        }
+        self.arm_confirm("discard-all".to_string(), cx);
+    }
+
+    pub(crate) fn git_stash_save(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let msg = self.git.message.read(cx).value().trim().to_string();
+        let has_msg = !msg.is_empty();
+        self.git_run(
+            window,
+            Some("Stashing\u{2026}"),
+            has_msg,
+            cx,
+            move |root, _| {
+                core_workspace::stash_save(root, has_msg.then_some(msg.as_str()))
+            },
+        );
+    }
+
+    pub(crate) fn git_stash_pop(&mut self, index: usize, window: &Window, cx: &mut Context<Self>) {
+        self.git_run(window, Some("Popping stash\u{2026}"), false, cx, move |root, _| {
+            core_workspace::stash_pop(root, index)
+        });
+    }
+
+    pub(crate) fn git_stash_apply(
+        &mut self,
+        index: usize,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.git_run(window, Some("Applying stash\u{2026}"), false, cx, move |root, _| {
+            core_workspace::stash_apply(root, index)
+        });
+    }
+
+    pub(crate) fn git_stash_drop_clicked(
+        &mut self,
+        index: usize,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) {
+        let key = format!("stash-drop:{index}");
+        if self.git.confirm_discard.as_deref() == Some(key.as_str()) {
+            self.git_run(window, Some("Dropping stash\u{2026}"), false, cx, move |root, _| {
+                core_workspace::stash_drop(root, index)
+            });
+            return;
+        }
+        self.arm_confirm(key, cx);
+    }
+
+    /// Undo the last commit (`HEAD`), keeping its changes staged and restoring its commit message.
+    pub(crate) fn git_uncommit_last(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.git.busy.is_some() {
+            return;
+        }
+        let Some(status) = self.git.status.clone() else {
+            return;
+        };
+        self.git.confirm_discard = None;
+        self.git.busy = Some("Undoing commit\u{2026}");
+        self.git.notice = None;
+        cx.notify();
+
+        let (tx, rx) = async_channel::bounded(1);
+        std::thread::spawn(move || {
+            let _guard = GIT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            let _ = tx.send_blocking(core_workspace::uncommit_last(&status.root));
+        });
+        cx.spawn_in(window, async move |weak, cx| {
+            let Ok(result) = rx.recv().await else { return };
+            let _ = weak.update_in(cx, |this, window, cx| {
+                this.git.busy = None;
+                match result {
+                    Ok(restored_msg) => {
+                        if this.git.message.read(cx).value().trim().is_empty()
+                            && !restored_msg.is_empty()
+                        {
+                            this.git.message.update(cx, |state, cx| {
+                                state.set_value(restored_msg, window, cx)
+                            });
+                        }
+                        this.git.expanded_commit = None;
+                        this.git.expanded_commit_files.clear();
+                        this.git.notice = Some(GitNotice {
+                            text: "Undid last commit (changes kept staged)".to_string(),
+                            is_error: false,
+                        });
+                    }
+                    Err(text) => {
+                        this.git.notice = Some(GitNotice {
+                            text,
+                            is_error: true,
+                        });
+                    }
+                }
+                this.refresh_git(cx);
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Expand or collapse a commit row in the Recent Commits list to inspect the files it changed.
+    pub(crate) fn git_toggle_commit(&mut self, hash: String, cx: &mut Context<Self>) {
+        if self.git.expanded_commit.as_deref() == Some(hash.as_str()) {
+            self.git.expanded_commit = None;
+            self.git.expanded_commit_files.clear();
+            if self.diff.as_ref().is_some_and(|d| d.commit.is_some()) {
+                self.close_diff(cx);
+            }
+            cx.notify();
+            return;
+        }
+        let Some(root) = self.git.status.as_ref().map(|s| s.root.clone()) else {
+            return;
+        };
+        self.git.expanded_commit = Some(hash.clone());
+        self.git.expanded_commit_files.clear();
+        cx.notify();
+
+        let (tx, rx) = async_channel::bounded(1);
+        let job_hash = hash.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send_blocking(core_workspace::commit_files(&root, &job_hash));
+        });
+        cx.spawn(async move |weak, cx| {
+            let Ok(result) = rx.recv().await else { return };
+            let _ = weak.update(cx, |this, cx| {
+                if this.git.expanded_commit.as_deref() != Some(hash.as_str()) {
+                    return;
+                }
+                if let Ok(files) = result {
+                    this.git.expanded_commit_files = files;
+                }
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     pub(crate) fn git_init(&mut self, cx: &mut Context<Self>) {

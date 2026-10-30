@@ -1002,12 +1002,30 @@ impl DartIde {
         };
 
         let debug_body = {
-            let running = self.flutter_daemon.is_some();
+            let running = self.flutter_daemon.is_some() || self.dap_client.is_some();
+            let dap_paused = self.dap_paused_thread.is_some();
             let status_text = self
                 .flutter_status
                 .clone()
+                .or_else(|| {
+                    self.dap_client.as_ref().map(|_| {
+                        if dap_paused {
+                            self.dap_stack_summary
+                                .clone()
+                                .unwrap_or_else(|| "Paused at breakpoint".to_string())
+                        } else {
+                            "Debugging (DAP)".to_string()
+                        }
+                    })
+                })
                 .unwrap_or_else(|| "No debug session".to_string());
-            let dot = if running { green } else { muted };
+            let dot = if dap_paused {
+                yellow
+            } else if running {
+                green
+            } else {
+                muted
+            };
 
             let rows: Vec<AnyElement> = self
                 .debug_lines
@@ -1123,6 +1141,82 @@ impl DartIde {
                                 .items_center()
                                 .gap(px(2.))
                                 .child(
+                                    Button::new("dbg-start-dap")
+                                        .ghost()
+                                        .xsmall()
+                                        .icon(
+                                            Icon::new(gpui_kit::assets::IconName::Bug)
+                                                .xsmall()
+                                                .text_color(if self.dap_client.is_some() {
+                                                    primary
+                                                } else {
+                                                    green
+                                                }),
+                                        )
+                                        .tooltip("Start Dart DAP Debugger on active file")
+                                        .on_click(cx.listener(|this, _e, window, cx| {
+                                            this.start_dap_debug(window, cx);
+                                        })),
+                                )
+                                .when(dap_paused, |row| {
+                                    row.child(
+                                        Button::new("dap-continue")
+                                            .ghost()
+                                            .xsmall()
+                                            .icon(
+                                                Icon::new(gpui_kit::assets::IconName::Play)
+                                                    .xsmall()
+                                                    .text_color(green),
+                                            )
+                                            .tooltip("Continue (F5)")
+                                            .on_click(cx.listener(|this, _e, _w, cx| {
+                                                this.dap_continue(cx);
+                                            })),
+                                    )
+                                    .child(
+                                        Button::new("dap-step-over")
+                                            .ghost()
+                                            .xsmall()
+                                            .icon(
+                                                Icon::new(gpui_kit::assets::IconName::ArrowRight)
+                                                    .xsmall()
+                                                    .text_color(fg),
+                                            )
+                                            .tooltip("Step Over (F10)")
+                                            .on_click(cx.listener(|this, _e, _w, cx| {
+                                                this.dap_step_over(cx);
+                                            })),
+                                    )
+                                    .child(
+                                        Button::new("dap-step-in")
+                                            .ghost()
+                                            .xsmall()
+                                            .icon(
+                                                Icon::new(gpui_kit::assets::IconName::ArrowDown)
+                                                    .xsmall()
+                                                    .text_color(fg),
+                                            )
+                                            .tooltip("Step Into (F11)")
+                                            .on_click(cx.listener(|this, _e, _w, cx| {
+                                                this.dap_step_in(cx);
+                                            })),
+                                    )
+                                    .child(
+                                        Button::new("dap-step-out")
+                                            .ghost()
+                                            .xsmall()
+                                            .icon(
+                                                Icon::new(gpui_kit::assets::IconName::ArrowUp)
+                                                    .xsmall()
+                                                    .text_color(fg),
+                                            )
+                                            .tooltip("Step Out (Shift+F11)")
+                                            .on_click(cx.listener(|this, _e, _w, cx| {
+                                                this.dap_step_out(cx);
+                                            })),
+                                    )
+                                })
+                                .child(
                                     Button::new("dbg-reload")
                                         .ghost()
                                         .xsmall()
@@ -1162,10 +1256,34 @@ impl DartIde {
                                         .tooltip("Stop")
                                         .on_click(cx.listener(|this, _e, _w, cx| {
                                             this.stop_flutter_run(cx);
+                                            this.stop_dap_debug(cx);
                                         })),
                                 ),
                         ),
                 )
+                .when(!self.dap_variables.is_empty(), |el| {
+                    el.child(
+                        h_flex()
+                            .w_full()
+                            .px(px(tokens::SPACE_4))
+                            .py(px(tokens::SPACE_1))
+                            .gap(px(tokens::SPACE_3))
+                            .flex_wrap()
+                            .items_center()
+                            .bg(cx.theme().tab_bar)
+                            .border_b_1()
+                            .border_color(cx.theme().border)
+                            .font_family("SF Mono")
+                            .text_size(px(tokens::UI_XS))
+                            .child(div().text_color(muted).child("Locals:"))
+                            .children(self.dap_variables.iter().map(|(k, v)| {
+                                h_flex()
+                                    .gap(px(3.))
+                                    .child(div().text_color(cyan).child(format!("{k} =")))
+                                    .child(div().text_color(yellow).child(v.clone()))
+                            })),
+                    )
+                })
                 .child(
                     v_flex()
                         .id("debug-scrollback")

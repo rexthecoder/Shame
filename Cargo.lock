@@ -194,6 +194,7 @@ dependencies = [
  "anyhow",
  "async-channel",
  "core-buffer",
+ "core-dap",
  "core-flutter",
  "core-lsp",
  "core-syntax",

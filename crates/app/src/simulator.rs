@@ -5,7 +5,7 @@
 
 use gpui_kit::*;
 
-use crate::{DartIde, RightRailTab};
+use crate::DartIde;
 
 /// Everything the editor tracks about the embedded simulator.
 pub(crate) struct SimulatorState {
@@ -59,8 +59,6 @@ impl DartIde {
     /// Open and attach the embedded Simulator panel inside the IDE (headless;
     /// `Simulator.app` is not opened or moved).
     pub(crate) fn attach_simulator(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
-        self.agent_open = true;
-        self.right_rail_tab = RightRailTab::Simulator;
         self.sim.attached = true;
         self.start_simulator_live_loop(cx);
 
@@ -225,7 +223,6 @@ impl DartIde {
         self.sim.attached = false;
         self.sim.touching = false;
         self.sim.status = None;
-        self.agent_open = false;
         if let Some(old) = self.sim.frame.take() {
             cx.drop_image(old, None);
         }
@@ -467,10 +464,7 @@ impl DartIde {
                         this.sim.live_loop_running = false;
                         return None;
                     }
-                    if this.agent_open
-                        && this.right_rail_tab == RightRailTab::Simulator
-                        && this.sim.live_sync
-                    {
+                    if this.sim.live_sync {
                         this.start_simulator_stream(cx);
                         this.refresh_simulator_screenshot(cx);
                     }

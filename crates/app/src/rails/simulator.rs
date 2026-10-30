@@ -15,6 +15,71 @@ use gpui_kit::*;
 use crate::{DartIde, tokens};
 
 impl DartIde {
+    /// Standalone Simulator rail, completely independent of the Agent rail so both can be
+    /// viewed side-by-side or toggled individually.
+    pub(crate) fn render_simulator_rail(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let fg = cx.theme().foreground;
+        let muted = cx.theme().muted_foreground;
+        let green = cx.theme().green;
+        let primary = cx.theme().primary;
+        let has_sim_frame = self.sim.frame.is_some();
+
+        v_flex()
+            .size_full()
+            .bg(cx.theme().sidebar)
+            .border_1()
+            .border_color(cx.theme().border)
+            .rounded(px(tokens::RADIUS_CARD))
+            .overflow_hidden()
+            .child(
+                h_flex()
+                    .w_full()
+                    .h(px(tokens::TABSTRIP_H))
+                    .flex_shrink_0()
+                    .items_center()
+                    .justify_between()
+                    .px(px(tokens::SPACE_3))
+                    .border_b_1()
+                    .border_color(cx.theme().border)
+                    .child(
+                        h_flex()
+                            .id("rail-tab-simulator")
+                            .items_center()
+                            .gap(px(tokens::SPACE_2))
+                            .h(px(30.))
+                            .px(px(tokens::SPACE_3))
+                            .rounded(px(tokens::RADIUS_PANEL))
+                            .border_1()
+                            .border_color(tokens::accent_dim())
+                            .bg(cx.theme().tab_active)
+                            .text_size(px(tokens::UI))
+                            .text_color(fg)
+                            .child(Icon::new(IconName::Smartphone).small().text_color(primary))
+                            .child("Simulator")
+                            .when(has_sim_frame, |el| {
+                                el.child(
+                                    div()
+                                        .w(px(6.))
+                                        .h(px(6.))
+                                        .rounded(px(3.))
+                                        .bg(green),
+                                )
+                            }),
+                    )
+                    .child(
+                        Button::new("close-simulator-rail")
+                            .ghost()
+                            .small()
+                            .icon(Icon::new(IconName::X).xsmall().text_color(muted))
+                            .tooltip("Detach simulator")
+                            .on_click(cx.listener(|this, _event, _window, cx| {
+                                this.detach_simulator(cx);
+                            })),
+                    ),
+            )
+            .child(self.render_simulator_panel(cx))
+    }
+
     pub(crate) fn render_simulator_panel(&self, cx: &mut Context<Self>) -> Div {
         v_flex()
             .flex_1()

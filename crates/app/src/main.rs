@@ -72,12 +72,6 @@ pub(crate) enum MarkdownMode {
     Preview,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum RightRailTab {
-    Simulator,
-    Agent,
-}
-
 /// Which view the bottom dock currently shows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DockTab {
@@ -158,7 +152,14 @@ pub struct DartIde {
     pub(crate) git: git_panel::GitState,
     pub(crate) sim: crate::simulator::SimulatorState,
     pub(crate) agent_open: bool,
-    pub(crate) right_rail_tab: RightRailTab,
+    pub(crate) agent: rails::agent::AgentState,
+    pub(crate) project_search_input: Entity<InputState>,
+    pub(crate) project_search_matches: Vec<core_workspace::SearchMatch>,
+    pub(crate) dap_client: Option<std::sync::Arc<std::sync::Mutex<core_dap::DapClient>>>,
+    pub(crate) dap_breakpoints: HashMap<PathBuf, Vec<u32>>,
+    pub(crate) dap_paused_thread: Option<i64>,
+    pub(crate) dap_stack_summary: Option<String>,
+    pub(crate) dap_variables: Vec<(String, String)>,
     pub(crate) show_hidden: bool,
     pub(crate) tree_state: Entity<TreeState>,
     pub(crate) tabs: Vec<Tab>,
@@ -218,6 +219,10 @@ impl DartIde {
             InputState::new(window, cx)
                 .placeholder("Package name (e.g. provider, http, dev:build_runner)...")
         });
+        let project_search_input = cx.new(|cx| {
+            InputState::new(window, cx).placeholder("Search across files...")
+        });
+        let agent = rails::agent::AgentState::new(window, cx);
 
         // Filled in by the first `refresh_git` (off the UI thread) right after construction.
         let git_branch = None;
@@ -262,7 +267,14 @@ impl DartIde {
             git: git_panel::GitState::new(window, cx),
             sim: Default::default(),
             agent_open: false,
-            right_rail_tab: RightRailTab::Simulator,
+            agent,
+            project_search_input,
+            project_search_matches: Vec::new(),
+            dap_client: None,
+            dap_breakpoints: HashMap::new(),
+            dap_paused_thread: None,
+            dap_stack_summary: None,
+            dap_variables: Vec::new(),
             show_hidden,
             tree_state,
             tabs: Vec::new(),
@@ -307,6 +319,8 @@ impl DartIde {
         this.refresh_git(cx);
         // The Commit button depends on whether the message box is empty.
         cx.observe(&this.git.message, |_, _, cx| cx.notify()).detach();
+        cx.observe(&this.git.branch_input, |_, _, cx| cx.notify())
+            .detach();
 
         let palette_changes = cx.subscribe(
             &this.palette_input,
@@ -331,7 +345,72 @@ impl DartIde {
         );
         this._subscriptions.push(palette_changes);
         this._subscriptions.push(find_changes);
+        let search_changes = cx.subscribe(
+            &this.project_search_input,
+            |this, state, event: &gpui_kit::component::input::InputEvent, cx| {
+                if matches!(event, gpui_kit::component::input::InputEvent::Change) {
+                    let query = state.read(cx).value().trim().to_string();
+                    this.run_project_search(query, cx);
+                }
+            },
+        );
+        this._subscriptions.push(search_changes);
         this
+    }
+
+    pub(crate) fn run_project_search(&mut self, query: String, cx: &mut Context<Self>) {
+        if query.is_empty() {
+            self.project_search_matches.clear();
+            cx.notify();
+            return;
+        }
+        let root = self.root.clone();
+        let q = query.clone();
+        let (tx, rx) = async_channel::bounded(1);
+        std::thread::spawn(move || {
+            let _ = tx.send_blocking(core_workspace::search_text(&root, &q));
+        });
+        cx.spawn(async move |weak, cx| {
+            let Ok(matches) = rx.recv().await else { return };
+            let _ = weak.update(cx, |this, cx| {
+                if this.project_search_input.read(cx).value().trim() == query {
+                    this.project_search_matches = matches;
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// Background check: if files were added, renamed, or deleted on disk outside the editor,
+    /// refresh `all_files` and `tree_state` automatically.
+    pub(crate) fn sync_workspace_files_if_changed(&mut self, cx: &mut Context<Self>) {
+        let root = self.root.clone();
+        let prev_len = self.all_files.len();
+        let prev_files = self.all_files.clone();
+        let (tx, rx) = async_channel::bounded(1);
+        std::thread::spawn(move || {
+            let files = flatten_files(&root);
+            if files.len() != prev_len || files != prev_files {
+                let _ = tx.send_blocking(Some(files));
+            } else {
+                let _ = tx.send_blocking(None);
+            }
+        });
+        cx.spawn(async move |weak, cx| {
+            let Ok(Some(files)) = rx.recv().await else {
+                return;
+            };
+            let _ = weak.update(cx, |this, cx| {
+                let items = build_tree_items(&this.root, this.show_hidden);
+                this.all_files = files;
+                this.tree_state.update(cx, |state, cx| {
+                    state.set_items(items, cx);
+                });
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     fn palette_matches(&self, cx: &Context<Self>) -> Vec<PathBuf> {
@@ -383,6 +462,22 @@ impl DartIde {
                 }
                 EditorEvent::ShowCodeActions { actions } => {
                     this.code_actions = Some((editor.clone(), actions.clone()));
+                    cx.notify();
+                }
+                EditorEvent::ExternalFileEdits { path, edits } => {
+                    this.apply_external_file_edits(path.clone(), edits.clone(), cx);
+                }
+                EditorEvent::BreakpointsChanged { path, lines } => {
+                    if lines.is_empty() {
+                        this.dap_breakpoints.remove(path);
+                    } else {
+                        this.dap_breakpoints.insert(path.clone(), lines.clone());
+                    }
+                    if let Some(dap) = &this.dap_client {
+                        if let Ok(guard) = dap.lock() {
+                            let _ = guard.set_breakpoints(&path.to_string_lossy(), lines);
+                        }
+                    }
                     cx.notify();
                 }
                 EditorEvent::Saved { path } => {
@@ -659,6 +754,15 @@ impl DartIde {
             return;
         }
 
+        if primary_mod && keystroke.modifiers.shift && keystroke.key.as_str() == "f" {
+            self.sidebar_open = true;
+            self.set_sidebar_tab(git_panel::SidebarTab::Search, cx);
+            self.project_search_input
+                .update(cx, |state, cx| state.focus(window, cx));
+            cx.notify();
+            return;
+        }
+
         if primary_mod && !keystroke.modifiers.shift && keystroke.key.as_str() == "f" {
             if self.active_editor().is_some() {
                 self.find_open = true;
@@ -672,6 +776,17 @@ impl DartIde {
                     .update(cx, |state, cx| state.focus(window, cx));
                 cx.notify();
             }
+            return;
+        }
+
+        if primary_mod && keystroke.modifiers.shift && keystroke.key.as_str() == "g" {
+            if self.sidebar_open && self.sidebar_tab == git_panel::SidebarTab::Git {
+                self.sidebar_open = false;
+            } else {
+                self.sidebar_open = true;
+                self.set_sidebar_tab(git_panel::SidebarTab::Git, cx);
+            }
+            cx.notify();
             return;
         }
 
@@ -726,6 +841,11 @@ impl DartIde {
                 "enter" => self.open_palette_selection(window, cx),
                 _ => {}
             }
+            return;
+        }
+
+        if keystroke.key.as_str() == "escape" && self.diff.is_some() {
+            self.close_diff(cx);
         }
     }
 
@@ -1067,9 +1187,13 @@ impl DartIde {
             };
             let opened_revision = buffer.revision();
             let lenses = self.current_test_code_lenses();
+            let saved_bps = self.dap_breakpoints.get(&canonical).cloned();
             let editor = cx.new(|cx| {
                 let mut ed = EditorView::from_buffer(buffer, cx);
                 ed.set_test_code_lenses(lenses, cx);
+                if let Some(bps) = saved_bps {
+                    ed.set_breakpoints(bps, cx);
+                }
                 ed
             });
             self.watch_editor(&editor, window, cx);
@@ -1710,6 +1834,329 @@ impl DartIde {
             self.push_flutter_log("\x1b[90m\u{25a0} Stopped Flutter run session.\x1b[0m");
             cx.notify();
         }
+    }
+
+    /// Apply cross-file `WorkspaceEdit` changes to an open tab or directly to disk.
+    pub(crate) fn apply_external_file_edits(
+        &mut self,
+        path: PathBuf,
+        mut edits: Vec<lsp_types::TextEdit>,
+        cx: &mut Context<Self>,
+    ) {
+        let canonical = std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
+        if let Some(tab) = self.tabs.iter().find(|t| {
+            t.path.as_ref().is_some_and(|existing| {
+                existing == &canonical
+                    || std::fs::canonicalize(existing)
+                        .map(|c| c == canonical)
+                        .unwrap_or(false)
+            })
+        }) {
+            let editor = tab.editor.clone();
+            editor.update(cx, |ed, cx| ed.apply_external_edits(edits, cx));
+        } else if let Ok(mut buffer) = Buffer::open(&canonical) {
+            edits.sort_by_key(|edit| (edit.range.start.line, edit.range.start.character));
+            for edit in edits.into_iter().rev() {
+                let start = buffer.line_to_byte(edit.range.start.line as usize)
+                    + edit.range.start.character as usize;
+                let end = buffer.line_to_byte(edit.range.end.line as usize)
+                    + edit.range.end.character as usize;
+                buffer.edit(start..end, &edit.new_text);
+            }
+            let _ = buffer.save();
+        }
+        self.refresh_git(cx);
+        cx.notify();
+    }
+
+    /// Launch a `core_dap::DapClient` (`dart debug_adapter`) session for the active Dart file
+    /// (or `bin/main.dart` / `lib/main.dart`), registering all gutter breakpoints.
+    pub(crate) fn start_dap_debug(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.stop_dap_debug(cx);
+        let program = self
+            .active_editor()
+            .and_then(|ed| ed.read(cx).buffer().path().map(Path::to_path_buf))
+            .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("dart"))
+            .or_else(|| {
+                let bin = self.root.join("bin/main.dart");
+                let lib = self.root.join("lib/main.dart");
+                if bin.is_file() {
+                    Some(bin)
+                } else if lib.is_file() {
+                    Some(lib)
+                } else {
+                    None
+                }
+            });
+        let Some(program_path) = program else {
+            self.terminal_open = true;
+            self.dock_tab = DockTab::DebugConsole;
+            self.push_flutter_log(
+                "\x1b[33mOpen a `.dart` file to start a DAP debug session.\x1b[0m",
+            );
+            cx.notify();
+            return;
+        };
+
+        self.terminal_open = true;
+        self.dock_tab = DockTab::DebugConsole;
+
+        let dart_bin = if self.root.join(".fvm/flutter_sdk/bin/dart").is_file() {
+            self.root
+                .join(".fvm/flutter_sdk/bin/dart")
+                .to_string_lossy()
+                .into_owned()
+        } else {
+            "dart".to_string()
+        };
+
+        let client = match core_dap::DapClient::spawn(&dart_bin, &["debug_adapter"]) {
+            Ok(c) => c,
+            Err(err) => {
+                self.push_flutter_log(&format!(
+                    "\x1b[31mFailed to spawn `dart debug_adapter`: {err}\x1b[0m"
+                ));
+                cx.notify();
+                return;
+            }
+        };
+
+        let events = client.events.clone();
+        let _ = client.request(
+            "initialize",
+            serde_json::json!({
+                "adapterID": "dart",
+                "linesStartAt1": true,
+                "columnsStartAt1": true,
+            }),
+        );
+        let program_str = program_path.to_string_lossy().to_string();
+        let cwd_str = self.root.to_string_lossy().to_string();
+        let _ = client.launch(&program_str, &cwd_str);
+        for (bp_path, lines) in &self.dap_breakpoints {
+            if !lines.is_empty() {
+                let _ = client.set_breakpoints(&bp_path.to_string_lossy(), lines);
+            }
+        }
+        let _ = client.configuration_done();
+
+        self.push_flutter_log(&format!(
+            "\x1b[36m\u{25b6} Started DAP debugger on {}\x1b[0m",
+            program_path
+                .strip_prefix(&self.root)
+                .unwrap_or(&program_path)
+                .display()
+        ));
+        let client_arc = std::sync::Arc::new(std::sync::Mutex::new(client));
+        self.dap_client = Some(client_arc);
+        cx.notify();
+
+        cx.spawn_in(window, async move |weak, cx| {
+            while let Ok(msg) = events.recv().await {
+                let alive = weak
+                    .update_in(cx, |this, window, cx| {
+                        this.handle_dap_message(msg, window, cx);
+                    })
+                    .is_ok();
+                if !alive {
+                    break;
+                }
+            }
+            let _ = weak.update(cx, |this, cx| {
+                this.stop_dap_debug(cx);
+            });
+        })
+        .detach();
+    }
+
+    fn handle_dap_message(
+        &mut self,
+        msg: core_dap::DapMessage,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match msg {
+            core_dap::DapMessage::Event { event, body } => match event.as_str() {
+                "stopped" => {
+                    let thread_id = body.get("threadId").and_then(|v| v.as_i64()).unwrap_or(1);
+                    let reason = body
+                        .get("reason")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("breakpoint");
+                    self.dap_paused_thread = Some(thread_id);
+                    self.dap_stack_summary = Some(format!("Paused ({reason})"));
+                    if let Some(dap) = &self.dap_client {
+                        if let Ok(guard) = dap.lock() {
+                            let _ = guard.stack_trace(thread_id);
+                        }
+                    }
+                    cx.notify();
+                }
+                "continued" => {
+                    self.dap_paused_thread = None;
+                    self.dap_stack_summary = None;
+                    self.dap_variables.clear();
+                    self.clear_all_debug_lines(cx);
+                    cx.notify();
+                }
+                "output" => {
+                    if let Some(out) = body.get("output").and_then(|v| v.as_str()) {
+                        for line in out.lines() {
+                            if !line.trim().is_empty() {
+                                self.push_flutter_log(line);
+                            }
+                        }
+                        cx.notify();
+                    }
+                }
+                "terminated" | "exited" => {
+                    self.stop_dap_debug(cx);
+                }
+                _ => {}
+            },
+            core_dap::DapMessage::Response {
+                command,
+                result: Ok(body),
+                ..
+            } => match command.as_str() {
+                "stackTrace" => {
+                    if let Some(frame) = body
+                        .get("stackFrames")
+                        .and_then(|v| v.as_array())
+                        .and_then(|a| a.first())
+                    {
+                        let frame_id = frame.get("id").and_then(|v| v.as_i64()).unwrap_or(0);
+                        let fn_name = frame.get("name").and_then(|v| v.as_str()).unwrap_or("main");
+                        let line_1 = frame.get("line").and_then(|v| v.as_u64()).unwrap_or(1) as u32;
+                        let src_path = frame
+                            .get("source")
+                            .and_then(|s| s.get("path"))
+                            .and_then(|v| v.as_str())
+                            .map(PathBuf::from);
+                        self.dap_stack_summary = Some(format!("Paused in {fn_name}:{line_1}"));
+                        if let Some(path) = src_path {
+                            self.open_path(path, window, cx);
+                            if let Some(ed) = self.active_editor().cloned() {
+                                ed.update(cx, |editor, cx| {
+                                    editor.set_active_debug_line(Some(line_1), cx);
+                                });
+                            }
+                        }
+                        if let Some(dap) = &self.dap_client {
+                            if let Ok(guard) = dap.lock() {
+                                let _ = guard.scopes(frame_id);
+                            }
+                        }
+                        cx.notify();
+                    }
+                }
+                "scopes" => {
+                    if let Some(var_ref) = body
+                        .get("scopes")
+                        .and_then(|v| v.as_array())
+                        .and_then(|a| a.first())
+                        .and_then(|s| s.get("variablesReference"))
+                        .and_then(|v| v.as_i64())
+                        .filter(|&r| r > 0)
+                    {
+                        if let Some(dap) = &self.dap_client {
+                            if let Ok(guard) = dap.lock() {
+                                let _ = guard.variables(var_ref);
+                            }
+                        }
+                    }
+                }
+                "variables" => {
+                    if let Some(arr) = body.get("variables").and_then(|v| v.as_array()) {
+                        self.dap_variables = arr
+                            .iter()
+                            .take(8)
+                            .filter_map(|v| {
+                                Some((
+                                    v.get("name")?.as_str()?.to_string(),
+                                    v.get("value")?.as_str()?.to_string(),
+                                ))
+                            })
+                            .collect();
+                        cx.notify();
+                    }
+                }
+                _ => {}
+            },
+            core_dap::DapMessage::Request { seq, command, .. } => {
+                if let Some(dap) = &self.dap_client {
+                    if let Ok(guard) = dap.lock() {
+                        let _ = guard.respond(seq, &command, serde_json::json!({}));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    pub(crate) fn clear_all_debug_lines(&mut self, cx: &mut Context<Self>) {
+        let editors: Vec<_> = self.tabs.iter().map(|t| t.editor.clone()).collect();
+        for ed in editors {
+            ed.update(cx, |editor, cx| editor.set_active_debug_line(None, cx));
+        }
+    }
+
+    pub(crate) fn stop_dap_debug(&mut self, cx: &mut Context<Self>) {
+        if let Some(dap) = self.dap_client.take() {
+            if let Ok(mut guard) = dap.lock() {
+                let _ = guard.disconnect(true);
+                let _ = guard.kill();
+            }
+            self.dap_paused_thread = None;
+            self.dap_stack_summary = None;
+            self.dap_variables.clear();
+            self.clear_all_debug_lines(cx);
+            self.push_flutter_log("\x1b[90m\u{25a0} DAP debug session ended.\x1b[0m");
+            cx.notify();
+        }
+    }
+
+    pub(crate) fn dap_continue(&mut self, cx: &mut Context<Self>) {
+        let (Some(dap), Some(tid)) = (&self.dap_client, self.dap_paused_thread) else {
+            return;
+        };
+        if let Ok(guard) = dap.lock() {
+            let _ = guard.continue_thread(tid);
+        }
+        self.dap_paused_thread = None;
+        self.dap_variables.clear();
+        self.clear_all_debug_lines(cx);
+        cx.notify();
+    }
+
+    pub(crate) fn dap_step_over(&mut self, cx: &mut Context<Self>) {
+        let (Some(dap), Some(tid)) = (&self.dap_client, self.dap_paused_thread) else {
+            return;
+        };
+        if let Ok(guard) = dap.lock() {
+            let _ = guard.next(tid);
+        }
+        cx.notify();
+    }
+
+    pub(crate) fn dap_step_in(&mut self, cx: &mut Context<Self>) {
+        let (Some(dap), Some(tid)) = (&self.dap_client, self.dap_paused_thread) else {
+            return;
+        };
+        if let Ok(guard) = dap.lock() {
+            let _ = guard.step_in(tid);
+        }
+        cx.notify();
+    }
+
+    pub(crate) fn dap_step_out(&mut self, cx: &mut Context<Self>) {
+        let (Some(dap), Some(tid)) = (&self.dap_client, self.dap_paused_thread) else {
+            return;
+        };
+        if let Ok(guard) = dap.lock() {
+            let _ = guard.step_out(tid);
+        }
+        cx.notify();
     }
 
     /// Run `flutter pub get` in `self.root` asynchronously and stream output to the terminal.

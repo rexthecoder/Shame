@@ -32,6 +32,9 @@ type Spans = Vec<(Range<usize>, HighlightKind)>;
 
 enum DisplayItem {
     Row(usize),
+    /// In unified mode, a `RowKind::Changed` row splits into its removed half and added half.
+    UnifiedLeft(usize),
+    UnifiedRight(usize),
     /// A folded run of unchanged rows `start..end`.
     Gap {
         start: usize,
@@ -42,6 +45,9 @@ enum DisplayItem {
 pub(crate) struct DiffState {
     pub(crate) file: ChangedFile,
     pub(crate) staged: bool,
+    /// `Some(hash)` when viewing a historical commit rather than staged / working-tree changes.
+    pub(crate) commit: Option<String>,
+    pub(crate) unified: bool,
     pub(crate) full_path: PathBuf,
     diff: FileDiff,
     /// Syntax spans per line (0-based) of the old / new text.
@@ -66,6 +72,7 @@ pub(crate) struct DiffState {
 impl DiffState {
     fn rebuild_display(&mut self) {
         let n = self.diff.rows.len();
+        let unified = self.unified;
         let mut near_change = vec![false; n];
         for (i, row) in self.diff.rows.iter().enumerate() {
             if row.is_change() {
@@ -74,11 +81,19 @@ impl DiffState {
                 }
             }
         }
+        let push_row = |display: &mut Vec<DisplayItem>, ix: usize, rows: &[core_workspace::DiffRow]| {
+            if unified && rows[ix].kind == RowKind::Changed {
+                display.push(DisplayItem::UnifiedLeft(ix));
+                display.push(DisplayItem::UnifiedRight(ix));
+            } else {
+                display.push(DisplayItem::Row(ix));
+            }
+        };
         let mut display = Vec::new();
         let mut i = 0;
         while i < n {
             if near_change[i] {
-                display.push(DisplayItem::Row(i));
+                push_row(&mut display, i, &self.diff.rows);
                 i += 1;
                 continue;
             }
@@ -87,7 +102,9 @@ impl DiffState {
                 i += 1;
             }
             if self.expanded.contains(&start) {
-                display.extend((start..i).map(DisplayItem::Row));
+                for r in start..i {
+                    push_row(&mut display, r, &self.diff.rows);
+                }
             } else {
                 display.push(DisplayItem::Gap { start, end: i });
             }
@@ -99,7 +116,12 @@ impl DiffState {
             .map(|b| {
                 self.display
                     .iter()
-                    .position(|d| matches!(d, DisplayItem::Row(r) if *r == b.start))
+                    .position(|d| {
+                        matches!(
+                            d,
+                            DisplayItem::Row(r) | DisplayItem::UnifiedLeft(r) if *r == b.start
+                        )
+                    })
                     .unwrap_or(0)
             })
             .collect();
@@ -146,6 +168,26 @@ impl DartIde {
         staged: bool,
         cx: &mut Context<Self>,
     ) {
+        self.load_git_diff(file, staged, None, cx);
+    }
+
+    /// Open `file`'s diff from a specific commit `hash` in the editor area.
+    pub(crate) fn open_git_commit_diff(
+        &mut self,
+        commit: String,
+        file: ChangedFile,
+        cx: &mut Context<Self>,
+    ) {
+        self.load_git_diff(file, false, Some(commit), cx);
+    }
+
+    fn load_git_diff(
+        &mut self,
+        file: ChangedFile,
+        staged: bool,
+        commit: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
         let Some(root) = self.git.status.as_ref().map(|s| s.root.clone()) else {
             return;
         };
@@ -154,14 +196,19 @@ impl DartIde {
         let expanded = self
             .diff
             .as_ref()
-            .filter(|d| d.file.path == file.path)
+            .filter(|d| d.file.path == file.path && d.commit == commit)
             .map(|d| d.expanded.clone())
             .unwrap_or_default();
         let (tx, rx) = async_channel::bounded(1);
         let job_file = file.clone();
         let job_root = root.clone();
+        let job_commit = commit.clone();
         std::thread::spawn(move || {
-            let result = core_workspace::file_diff(&job_root, &job_file, staged).map(|diff| {
+            let raw = match &job_commit {
+                Some(hash) => core_workspace::commit_file_diff(&job_root, hash, &job_file),
+                None => core_workspace::file_diff(&job_root, &job_file, staged),
+            };
+            let result = raw.map(|diff| {
                 let is_dart = job_file.path.ends_with(".dart");
                 let (old_spans, new_spans) = if is_dart && !diff.binary {
                     (line_spans(&diff.old_text()), line_spans(&diff.new_text()))
@@ -193,8 +240,10 @@ impl DartIde {
                 }
                 match result {
                     Ok((diff, old_spans, new_spans, intra)) => {
-                        let same_file =
-                            this.diff.as_ref().is_some_and(|d| d.file.path == file.path);
+                        let same_file = this
+                            .diff
+                            .as_ref()
+                            .is_some_and(|d| d.file.path == file.path && d.commit == commit);
                         let blocks = core_workspace::blocks(&diff.rows);
                         let block_at_row = blocks
                             .iter()
@@ -211,6 +260,8 @@ impl DartIde {
                             full_path: root.join(&file.path),
                             file,
                             staged,
+                            commit,
+                            unified: this.git.unified_diff,
                             diff,
                             old_spans,
                             new_spans,
@@ -245,6 +296,15 @@ impl DartIde {
         .detach();
     }
 
+    pub(crate) fn toggle_diff_unified(&mut self, cx: &mut Context<Self>) {
+        self.git.unified_diff = !self.git.unified_diff;
+        if let Some(diff) = self.diff.as_mut() {
+            diff.unified = self.git.unified_diff;
+            diff.rebuild_display();
+        }
+        cx.notify();
+    }
+
     pub(crate) fn close_diff(&mut self, cx: &mut Context<Self>) {
         if self.diff.take().is_some() {
             self.diff_seq += 1;
@@ -256,6 +316,9 @@ impl DartIde {
     /// Staged and Changes lists, or closing the view once the file has no changes left.
     pub(crate) fn refresh_open_diff(&mut self, cx: &mut Context<Self>) {
         let Some(open) = &self.diff else { return };
+        if open.commit.is_some() {
+            return;
+        }
         let Some(status) = &self.git.status else {
             return self.close_diff(cx);
         };
@@ -302,8 +365,16 @@ impl DartIde {
         cx.notify();
     }
 
-    /// Every file shown in the Staged and Changes lists, in the order the panel shows them.
+    /// Every file shown in the active list (either the expanded commit's files, or Staged + Changes).
     fn diff_file_list(&self) -> Vec<(ChangedFile, bool)> {
+        if self.diff.as_ref().is_some_and(|d| d.commit.is_some()) {
+            return self
+                .git
+                .expanded_commit_files
+                .iter()
+                .map(|f| (f.clone(), false))
+                .collect();
+        }
         let Some(status) = &self.git.status else {
             return Vec::new();
         };
@@ -319,6 +390,7 @@ impl DartIde {
     pub(crate) fn diff_goto_file(&mut self, delta: isize, cx: &mut Context<Self>) {
         let list = self.diff_file_list();
         let Some(open) = &self.diff else { return };
+        let commit = open.commit.clone();
         let Some(here) = list
             .iter()
             .position(|(f, s)| f.path == open.file.path && *s == open.staged)
@@ -327,7 +399,11 @@ impl DartIde {
         };
         let (file, staged) =
             list[(here as isize + delta).rem_euclid(list.len() as isize) as usize].clone();
-        self.open_git_diff(file, staged, cx);
+        if let Some(hash) = commit {
+            self.open_git_commit_diff(hash, file, cx);
+        } else {
+            self.open_git_diff(file, staged, cx);
+        }
     }
 
     /// Mark the open file reviewed (or not) and, when marking, move on to the next unreviewed one.
@@ -426,11 +502,16 @@ impl DartIde {
             .and_then(|p| p.to_str())
             .filter(|p| !p.is_empty())
             .map(str::to_string);
-        let (label, tone) = match (state.file.kind, state.staged) {
-            (ChangeKind::Untracked, _) => ("Untracked", cx.theme().green),
-            (_, true) => ("Staged", cx.theme().info),
-            (_, false) => ("Working tree", cx.theme().warning),
+        let (label, tone) = if let Some(hash) = &state.commit {
+            (format!("Commit {hash}"), cx.theme().magenta)
+        } else {
+            match (state.file.kind, state.staged) {
+                (ChangeKind::Untracked, _) => ("Untracked".to_string(), cx.theme().green),
+                (_, true) => ("Staged".to_string(), cx.theme().info),
+                (_, false) => ("Working tree".to_string(), cx.theme().warning),
+            }
         };
+        let is_commit_diff = state.commit.is_some();
         let staged = state.staged;
         let stage_file = state.file.clone();
         let open_path = state.full_path.clone();
@@ -444,6 +525,7 @@ impl DartIde {
             .reviewed
             .contains(&(state.file.path.clone(), staged));
         let change_count = state.blocks.len();
+        let unified = state.unified;
 
         // A little "‹ 3 / 12 ›" stepper.
         let stepper = |id: &'static str,
@@ -583,24 +665,49 @@ impl DartIde {
                         cx,
                     ))
                     .child(
-                        Button::new("diff-reviewed")
+                        Button::new("diff-toggle-unified")
                             .ghost()
                             .small()
                             .icon(
-                                Icon::new(IconName::Check)
-                                    .with_size(px(13.))
-                                    .text_color(if reviewed { cx.theme().green } else { muted }),
+                                Icon::new(IconName::Columns2)
+                                    .with_size(px(12.))
+                                    .text_color(if !unified {
+                                        cx.theme().primary
+                                    } else {
+                                        muted
+                                    }),
                             )
-                            .label(if reviewed {
-                                "Reviewed"
-                            } else {
-                                "Mark reviewed"
-                            })
-                            .tooltip("Mark this file reviewed and move to the next one")
+                            .label(if unified { "Unified" } else { "Split" })
+                            .tooltip("Toggle between Split (side-by-side) and Unified diff views")
                             .on_click(
-                                cx.listener(|this, _e, _w, cx| this.diff_toggle_reviewed(cx)),
+                                cx.listener(|this, _e, _w, cx| this.toggle_diff_unified(cx)),
                             ),
                     )
+                    .when(!is_commit_diff, |el| {
+                        el.child(
+                            Button::new("diff-reviewed")
+                                .ghost()
+                                .small()
+                                .icon(
+                                    Icon::new(IconName::Check)
+                                        .with_size(px(13.))
+                                        .text_color(if reviewed {
+                                            cx.theme().green
+                                        } else {
+                                            muted
+                                        }),
+                                )
+                                .label(if reviewed {
+                                    "Reviewed"
+                                } else {
+                                    "Mark reviewed"
+                                })
+                                .tooltip("Mark this file reviewed and move to the next one")
+                                .on_click(cx.listener(|this, _e, _w, cx| {
+                                    this.diff_toggle_reviewed(cx)
+                                })),
+                        )
+                    })
                     .when(can_open, |el| {
                         el.child(
                             Button::new("diff-open-file")
@@ -612,18 +719,28 @@ impl DartIde {
                                 })),
                         )
                     })
-                    .child(
-                        Button::new("diff-stage")
-                            .small()
-                            .label(if staged { "Unstage" } else { "Stage" })
-                            .on_click(cx.listener(move |this, _event, window, cx| {
-                                if staged {
-                                    this.git_unstage(std::slice::from_ref(&stage_file), window, cx);
-                                } else {
-                                    this.git_stage(std::slice::from_ref(&stage_file), window, cx);
-                                }
-                            })),
-                    )
+                    .when(!is_commit_diff, |el| {
+                        el.child(
+                            Button::new("diff-stage")
+                                .small()
+                                .label(if staged { "Unstage" } else { "Stage" })
+                                .on_click(cx.listener(move |this, _event, window, cx| {
+                                    if staged {
+                                        this.git_unstage(
+                                            std::slice::from_ref(&stage_file),
+                                            window,
+                                            cx,
+                                        );
+                                    } else {
+                                        this.git_stage(
+                                            std::slice::from_ref(&stage_file),
+                                            window,
+                                            cx,
+                                        );
+                                    }
+                                })),
+                        )
+                    })
                     .child(
                         Button::new("diff-close")
                             .ghost()
@@ -756,23 +873,101 @@ fn render_diff_item(
                 }))
                 .into_any_element()
         }
+        DisplayItem::UnifiedLeft(row_ix) => {
+            let row = &state.diff.rows[row_ix];
+            let spans = row
+                .left
+                .as_ref()
+                .and_then(|c| state.old_spans.get(c.line as usize - 1))
+                .cloned()
+                .unwrap_or_default();
+            let (old_marks, _) = state.intra.get(&row_ix).cloned().unwrap_or_default();
+            let chips = state
+                .block_at_row
+                .get(&row_ix)
+                .copied()
+                .filter(|_| state.commit.is_none() && state.file.kind != ChangeKind::Untracked)
+                .map(|block| hunk_chips(state, block, armed, cx));
+            diff_unified_row(
+                row.left.as_ref().map(|c| c.line),
+                None,
+                row.left.as_ref().map_or("", |c| c.text.as_str()),
+                spans,
+                old_marks,
+                Some(Side::Removed),
+                chips,
+                cx,
+            )
+            .into_any_element()
+        }
+        DisplayItem::UnifiedRight(row_ix) => {
+            let row = &state.diff.rows[row_ix];
+            let spans = row
+                .right
+                .as_ref()
+                .and_then(|c| state.new_spans.get(c.line as usize - 1))
+                .cloned()
+                .unwrap_or_default();
+            let (_, new_marks) = state.intra.get(&row_ix).cloned().unwrap_or_default();
+            diff_unified_row(
+                None,
+                row.right.as_ref().map(|c| c.line),
+                row.right.as_ref().map_or("", |c| c.text.as_str()),
+                spans,
+                new_marks,
+                Some(Side::Added),
+                None,
+                cx,
+            )
+            .into_any_element()
+        }
         DisplayItem::Row(row_ix) => {
             let row = &state.diff.rows[row_ix];
-            let removed_side = matches!(row.kind, RowKind::Removed | RowKind::Changed);
-            let added_side = matches!(row.kind, RowKind::Added | RowKind::Changed);
             let spans_of = |spans: &[Spans], cell: &Option<DiffCell>| -> Spans {
                 cell.as_ref()
                     .and_then(|c| spans.get(c.line as usize - 1))
                     .cloned()
                     .unwrap_or_default()
             };
-            let (old_marks, new_marks) = state.intra.get(&row_ix).cloned().unwrap_or_default();
             let chips = state
                 .block_at_row
                 .get(&row_ix)
                 .copied()
-                .filter(|_| state.file.kind != ChangeKind::Untracked)
+                .filter(|_| state.commit.is_none() && state.file.kind != ChangeKind::Untracked)
                 .map(|block| hunk_chips(state, block, armed, cx));
+            if state.unified {
+                let (tint, spans, text) = match row.kind {
+                    RowKind::Removed => (
+                        Some(Side::Removed),
+                        spans_of(&state.old_spans, &row.left),
+                        row.left.as_ref().map_or("", |c| c.text.as_str()),
+                    ),
+                    RowKind::Added => (
+                        Some(Side::Added),
+                        spans_of(&state.new_spans, &row.right),
+                        row.right.as_ref().map_or("", |c| c.text.as_str()),
+                    ),
+                    _ => (
+                        None,
+                        spans_of(&state.new_spans, &row.right),
+                        row.right.as_ref().map_or("", |c| c.text.as_str()),
+                    ),
+                };
+                return diff_unified_row(
+                    row.left.as_ref().map(|c| c.line),
+                    row.right.as_ref().map(|c| c.line),
+                    text,
+                    spans,
+                    Vec::new(),
+                    tint,
+                    chips,
+                    cx,
+                )
+                .into_any_element();
+            }
+            let removed_side = matches!(row.kind, RowKind::Removed | RowKind::Changed);
+            let added_side = matches!(row.kind, RowKind::Added | RowKind::Changed);
+            let (old_marks, new_marks) = state.intra.get(&row_ix).cloned().unwrap_or_default();
             h_flex()
                 .w_full()
                 .h(px(ROW_H))
@@ -994,6 +1189,108 @@ fn diff_half(
         )
 }
 
+/// One full-width unified diff row: old line column, new line column, `+/-` marker, and styled text.
+#[allow(clippy::too_many_arguments)]
+fn diff_unified_row(
+    old_line: Option<u32>,
+    new_line: Option<u32>,
+    raw_text: &str,
+    spans: Spans,
+    marks: Vec<Range<usize>>,
+    tint: Option<Side>,
+    chips: Option<Div>,
+    cx: &mut Context<DartIde>,
+) -> Div {
+    let theme = cx.theme();
+    let (bg, bar, sign, sign_color) = match tint {
+        Some(Side::Removed) => (
+            Some(rgba(tokens::LINE_DEL).into()),
+            Some(theme.red),
+            "\u{2212}",
+            theme.red,
+        ),
+        Some(Side::Added) => (
+            Some(rgba(tokens::LINE_ADD).into()),
+            Some(theme.green),
+            "+",
+            theme.green,
+        ),
+        None => (None, None, " ", theme.muted_foreground),
+    };
+    let gutter_color = if bar.is_some() {
+        theme.foreground.opacity(0.8)
+    } else {
+        theme.muted_foreground.opacity(0.7)
+    };
+    let plain = spans.is_empty() && marks.is_empty();
+    let text: SharedString = if plain {
+        raw_text.replace('\t', "    ")
+    } else {
+        raw_text.to_string()
+    }
+    .into();
+    let mark_bg = match tint {
+        Some(Side::Removed) => theme.red.opacity(0.35),
+        _ => theme.green.opacity(0.35),
+    };
+    let styles = merge_styles(text.len(), &spans, &marks, mark_bg);
+    h_flex()
+        .relative()
+        .w_full()
+        .h(px(ROW_H))
+        .overflow_hidden()
+        .items_center()
+        .font_family(theme.mono_font_family.clone())
+        .text_size(px(tokens::MONO))
+        .when_some(bg, |el: Div, bg: Hsla| el.bg(bg))
+        .when_some(bar, |el, bar| {
+            el.child(
+                div()
+                    .absolute()
+                    .left_0()
+                    .top_0()
+                    .bottom_0()
+                    .w(px(3.))
+                    .bg(bar),
+            )
+        })
+        .child(
+            div()
+                .flex_shrink_0()
+                .w(px(40.))
+                .pr(px(tokens::SPACE_2))
+                .text_right()
+                .text_color(gutter_color)
+                .child(old_line.map_or(String::new(), |n| n.to_string())),
+        )
+        .child(
+            div()
+                .flex_shrink_0()
+                .w(px(40.))
+                .pr(px(tokens::SPACE_3))
+                .text_right()
+                .text_color(gutter_color)
+                .child(new_line.map_or(String::new(), |n| n.to_string())),
+        )
+        .child(
+            div()
+                .flex_shrink_0()
+                .w(px(16.))
+                .text_center()
+                .text_color(sign_color)
+                .child(sign),
+        )
+        .child(
+            div()
+                .flex_1()
+                .min_w(px(0.))
+                .whitespace_nowrap()
+                .text_color(theme.foreground)
+                .child(StyledText::new(text).with_highlights(styles)),
+        )
+        .when_some(chips, |el, chips| el.child(chips))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1033,6 +1330,8 @@ mod tests {
                 kind: ChangeKind::Modified,
             },
             staged: false,
+            commit: None,
+            unified: false,
             full_path: PathBuf::from("/a.dart"),
             diff: FileDiff {
                 rows,
@@ -1056,6 +1355,8 @@ mod tests {
             .iter()
             .map(|d| match d {
                 DisplayItem::Row(i) => format!("r{i}"),
+                DisplayItem::UnifiedLeft(i) => format!("u-{i}"),
+                DisplayItem::UnifiedRight(i) => format!("u+{i}"),
                 DisplayItem::Gap { start, end } => format!("gap{start}..{end}"),
             })
             .collect()
@@ -1174,5 +1475,30 @@ mod tests {
             DisplayItem::Row(25)
         ));
         assert!(s.block_display[0] < s.block_display[1]);
+    }
+
+    #[core::prelude::v1::test]
+    fn unified_mode_splits_changed_rows_into_left_and_right_items() {
+        let rows = vec![
+            row(RowKind::Context, 1),
+            DiffRow {
+                left: Some(DiffCell {
+                    line: 2,
+                    text: "old".into(),
+                }),
+                right: Some(DiffCell {
+                    line: 2,
+                    text: "new".into(),
+                }),
+                kind: RowKind::Changed,
+            },
+            row(RowKind::Context, 3),
+        ];
+        let mut s = state(rows);
+        s.blocks = core_workspace::blocks(&s.diff.rows);
+        s.unified = true;
+        s.rebuild_display();
+        assert_eq!(shape(&s), ["r0", "u-1", "u+1", "r2"]);
+        assert_eq!(s.block_display, [1]);
     }
 }

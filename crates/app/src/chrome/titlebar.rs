@@ -148,10 +148,16 @@ impl DartIde {
                     .when_some(self.git_branch.clone(), |el, branch| {
                         // From the cached status: never run `git` while rendering.
                         let ahead = self.git.status.as_ref().map_or(0, |s| s.ahead);
+                        let behind = self.git.status.as_ref().map_or(0, |s| s.behind);
                         el.child(
                             h_flex()
+                                .id("titlebar-branch-chip")
                                 .items_center()
                                 .gap_1()
+                                .px_1p5()
+                                .py_0p5()
+                                .rounded(px(tokens::RADIUS_PILL))
+                                .hover(|s| s.bg(rgba(0xffffff10)))
                                 .text_size(px(tokens::UI_SM))
                                 .child(
                                     Icon::new(gpui_kit::assets::IconName::GitBranch)
@@ -173,7 +179,22 @@ impl DartIde {
                                             .text_color(info)
                                             .child(format!("\u{2191}{ahead}")),
                                     )
-                                }),
+                                })
+                                .when(behind > 0, |el| {
+                                    el.child(
+                                        div()
+                                            .text_color(cx.theme().warning)
+                                            .child(format!("\u{2193}{behind}")),
+                                    )
+                                })
+                                .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                                    cx.stop_propagation();
+                                })
+                                .on_click(cx.listener(|this, _event, _window, cx| {
+                                    cx.stop_propagation();
+                                    this.sidebar_open = true;
+                                    this.set_sidebar_tab(crate::git_panel::SidebarTab::Git, cx);
+                                })),
                         )
                     })
                     .on_click(cx.listener(|this, _event, window, cx| {
@@ -448,6 +469,21 @@ impl DartIde {
                             )
                             .child(
                                 icon_button(
+                                    "debug-dap",
+                                    gpui_kit::assets::IconName::Bug,
+                                    Some(if self.dap_client.is_some() {
+                                        cx.theme().primary
+                                    } else {
+                                        muted
+                                    }),
+                                    "Debug Dart file with breakpoints (DAP)",
+                                )
+                                .on_click(cx.listener(|this, _event, window, cx| {
+                                    this.start_dap_debug(window, cx);
+                                })),
+                            )
+                            .child(
+                                icon_button(
                                     "hot-restart",
                                     gpui_kit::assets::IconName::RotateCw,
                                     Some(if self.flutter_app_id.is_some() {
@@ -491,12 +527,22 @@ impl DartIde {
                                 )
                             }),
                     )
-                    .child(icon_button(
-                        "agent-wand",
-                        gpui_kit::assets::IconName::WandSparkles,
-                        Some(info),
-                        "Inline assistant",
-                    ))
+                    .child(
+                        icon_button(
+                            "agent-wand",
+                            gpui_kit::assets::IconName::WandSparkles,
+                            Some(if self.agent_open {
+                                cx.theme().primary
+                            } else {
+                                info
+                            }),
+                            "Toggle Agent rail",
+                        )
+                        .on_click(cx.listener(|this, _event, _window, cx| {
+                            this.agent_open = !this.agent_open;
+                            cx.notify();
+                        })),
+                    )
                     .child(
                         Button::new("quick-open")
                             .ghost()

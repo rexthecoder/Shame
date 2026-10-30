@@ -516,11 +516,15 @@ impl DartIde {
                 .into_any_element()
         };
 
-        let split_id = match (self.sidebar_open, self.agent_open) {
-            (true, true) => "shell-split-both",
-            (true, false) => "shell-split-left",
-            (false, true) => "shell-split-right",
-            (false, false) => "shell-split-center",
+        let split_id = match (self.sidebar_open, self.sim.attached, self.agent_open) {
+            (true, true, true) => "shell-split-all",
+            (true, true, false) => "shell-split-left-sim",
+            (true, false, true) => "shell-split-both",
+            (true, false, false) => "shell-split-left",
+            (false, true, true) => "shell-split-sim-agent",
+            (false, true, false) => "shell-split-sim",
+            (false, false, true) => "shell-split-right",
+            (false, false, false) => "shell-split-center",
         };
         let mut split = h_resizable(split_id);
 
@@ -535,12 +539,29 @@ impl DartIde {
                         crate::git_panel::SidebarTab::Files => {
                             self.render_files_rail(view, cx).into_any_element()
                         }
-                        crate::git_panel::SidebarTab::Git => self.render_git_rail(cx).into_any_element(),
+                        crate::git_panel::SidebarTab::Search => {
+                            self.render_search_rail(cx).into_any_element()
+                        }
+                        crate::git_panel::SidebarTab::Git => {
+                            self.render_git_rail(cx).into_any_element()
+                        }
                     }),
             );
         }
 
         split = split.child(resizable_panel().child(editor_column));
+
+        if self.sim.attached {
+            split = split.child(
+                resizable_panel()
+                    .size(px(312.))
+                    .size_range(px(292.)..px(400.))
+                    .fixed()
+                    .pl(px(tokens::GUTTER / 2.))
+                    .when(self.agent_open, |p| p.pr(px(tokens::GUTTER / 2.)))
+                    .child(self.render_simulator_rail(cx)),
+            );
+        }
 
         if self.agent_open {
             split = split.child(

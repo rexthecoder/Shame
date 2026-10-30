@@ -100,6 +100,28 @@ pub fn file_diff(root: &Path, file: &ChangedFile, staged: bool) -> Result<FileDi
     parse_unified(&git(root, &args, None)?)
 }
 
+/// The diff of `file` introduced by a specific commit `hash`.
+pub fn commit_file_diff(root: &Path, hash: &str, file: &ChangedFile) -> Result<FileDiff, String> {
+    let mut args = vec![
+        "-c",
+        "core.quotepath=off",
+        "show",
+        "--format=",
+        "--first-parent",
+        "-U1000000",
+        "--no-color",
+        "--no-ext-diff",
+        "-M",
+        hash,
+        "--",
+    ];
+    if let Some(orig) = file.orig_path.as_deref() {
+        args.push(orig);
+    }
+    args.push(&file.path);
+    parse_unified(&git(root, &args, None)?)
+}
+
 /// Parse a unified diff of a single file into aligned rows.
 pub fn parse_unified(diff: &str) -> Result<FileDiff, String> {
     let mut out = FileDiff::default();

@@ -62,7 +62,7 @@ impl DartIde {
                             .items_center()
                             .gap(px(tokens::SPACE_2))
                             .children(self.tabs.iter().enumerate().map(|(ix, tab)| {
-                                let is_active = ix == self.active_tab;
+                                let is_active = ix == self.active_tab && self.diff.is_none();
                                 let is_dirty = tab.editor.read(cx).buffer().is_dirty();
                                 let is_preview = !tab.is_pinned(cx);
                                 let title = tab.title();

@@ -21,15 +21,17 @@ mod repo;
 mod search;
 
 pub use diff::{
-    Block, DiffCell, DiffRow, FileDiff, RowKind, blocks, file_diff, hunk_patch, intraline, parse_unified, revert_hunk,
-    stage_hunk, unstage_hunk,
+    Block, DiffCell, DiffRow, FileDiff, RowKind, blocks, commit_file_diff, file_diff, hunk_patch,
+    intraline, parse_unified, revert_hunk, stage_hunk, unstage_hunk,
 };
 pub use git::{
     LineChange, ahead_behind, current_branch, has_uncommitted_changes, line_changes, status_map,
 };
 pub use message::{apply_commit_type, commit_type_of, commit_types, suggest_message};
 pub use repo::{
-    BranchInfo, ChangeKind, ChangedFile, RepoStatus, branches, checkout, commit, create_branch, discard, fetch,
-    init, last_commit_message, pull, push, repo_root, repo_status, stage, stage_all, unstage, unstage_all,
+    BranchInfo, ChangeKind, ChangedFile, CommitInfo, RepoStatus, StashEntry, branches, checkout,
+    commit, commit_files, create_branch, discard, discard_files, fetch, init, last_commit_message,
+    pull, push, recent_commits, repo_root, repo_status, stage, stage_all, stash_apply, stash_drop,
+    stash_pop, stash_save, stashes, uncommit_last, unstage, unstage_all,
 };
 pub use search::{SearchMatch, search_text};

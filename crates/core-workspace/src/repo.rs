@@ -74,6 +74,25 @@ pub struct RepoStatus {
     pub staged: Vec<ChangedFile>,
     /// Working-tree changes, including untracked files.
     pub unstaged: Vec<ChangedFile>,
+    /// Saved stashes (`stash@{0}`, ...), newest first.
+    pub stashes: Vec<StashEntry>,
+    /// Recent commits on the current branch/HEAD, newest first.
+    pub recent_commits: Vec<CommitInfo>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StashEntry {
+    pub index: usize,
+    pub message: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CommitInfo {
+    pub hash: String,
+    pub subject: String,
+    pub author: String,
+    pub relative_time: String,
+    pub unpushed: bool,
 }
 
 impl RepoStatus {
@@ -150,8 +169,17 @@ pub fn repo_status(dir: &Path) -> Option<RepoStatus> {
         None,
     )
     .ok()?;
-    let mut status = parse_status(&out, root);
+    let mut status = parse_status(&out, root.clone());
     status.prefix = prefix;
+    status.stashes = stashes(&root);
+    if status.head.is_some() {
+        let unpushed_count = if status.upstream.is_some() {
+            status.ahead as usize
+        } else {
+            usize::MAX
+        };
+        status.recent_commits = recent_commits(&root, 15, unpushed_count);
+    }
     Some(status)
 }
 
@@ -309,6 +337,182 @@ pub fn discard(root: &Path, file: &ChangedFile) -> Result<(), String> {
     } else {
         git(root, &["restore", "--", &file.path], None).map(|_| ())
     }
+}
+
+/// Throw away all working-tree changes across `files` (restoring tracked files from the index and
+/// removing untracked ones), leaving any staged index changes untouched.
+pub fn discard_files(root: &Path, files: &[ChangedFile]) -> Result<(), String> {
+    let tracked: Vec<&str> = files
+        .iter()
+        .filter(|f| f.kind != ChangeKind::Untracked)
+        .map(|f| f.path.as_str())
+        .collect();
+    let untracked: Vec<&str> = files
+        .iter()
+        .filter(|f| f.kind == ChangeKind::Untracked)
+        .map(|f| f.path.as_str())
+        .collect();
+    if !tracked.is_empty() {
+        let mut args = vec!["restore", "--"];
+        args.extend(tracked);
+        git(root, &args, None)?;
+    }
+    if !untracked.is_empty() {
+        let mut args = vec!["clean", "-fdq", "--"];
+        args.extend(untracked);
+        git(root, &args, None)?;
+    }
+    Ok(())
+}
+
+/// Saved stashes in `root`, newest (`stash@{0}`) first.
+pub fn stashes(root: &Path) -> Vec<StashEntry> {
+    let Ok(out) = git(root, &["stash", "list", "--format=%gd%x00%gs"], None) else {
+        return Vec::new();
+    };
+    out.lines()
+        .filter_map(|line| {
+            let (gd, gs) = line.split_once('\0')?;
+            let index: usize = gd
+                .strip_prefix("stash@{")?
+                .strip_suffix('}')?
+                .parse()
+                .ok()?;
+            let cleaned = gs
+                .split_once(": ")
+                .map(|(_, rest)| rest)
+                .unwrap_or(gs)
+                .trim()
+                .to_string();
+            Some(StashEntry {
+                index,
+                message: if cleaned.is_empty() {
+                    gs.to_string()
+                } else {
+                    cleaned
+                },
+            })
+        })
+        .collect()
+}
+
+/// Stash uncommitted changes (including untracked files) with an optional description.
+pub fn stash_save(root: &Path, message: Option<&str>) -> Result<String, String> {
+    let msg = message.map(str::trim).filter(|s| !s.is_empty());
+    let mut args = vec!["stash", "push", "--include-untracked"];
+    if let Some(m) = msg {
+        args.extend(["-m", m]);
+    }
+    git(root, &args, None).map(|_| "Stashed changes".to_string())
+}
+
+/// Apply and remove `stash@{index}`.
+pub fn stash_pop(root: &Path, index: usize) -> Result<String, String> {
+    let spec = format!("stash@{{{index}}}");
+    git(root, &["stash", "pop", &spec], None).map(|_| format!("Popped {spec}"))
+}
+
+/// Apply `stash@{index}` without removing it from the stash list.
+pub fn stash_apply(root: &Path, index: usize) -> Result<String, String> {
+    let spec = format!("stash@{{{index}}}");
+    git(root, &["stash", "apply", &spec], None).map(|_| format!("Applied {spec}"))
+}
+
+/// Delete `stash@{index}` from the stash list.
+pub fn stash_drop(root: &Path, index: usize) -> Result<String, String> {
+    let spec = format!("stash@{{{index}}}");
+    git(root, &["stash", "drop", &spec], None).map(|_| format!("Dropped {spec}"))
+}
+
+/// Recent commits on `HEAD`, newest first. The first `unpushed_count` commits are marked
+/// `unpushed = true`.
+pub fn recent_commits(root: &Path, limit: usize, unpushed_count: usize) -> Vec<CommitInfo> {
+    let n = format!("-{limit}");
+    let Ok(out) = git(
+        root,
+        &["log", &n, "--format=%h%x00%s%x00%an%x00%cr"],
+        None,
+    ) else {
+        return Vec::new();
+    };
+    out.lines()
+        .enumerate()
+        .filter_map(|(ix, line)| {
+            let mut parts = line.splitn(4, '\0');
+            Some(CommitInfo {
+                hash: parts.next()?.to_string(),
+                subject: parts.next()?.to_string(),
+                author: parts.next()?.to_string(),
+                relative_time: parts.next()?.to_string(),
+                unpushed: ix < unpushed_count,
+            })
+        })
+        .collect()
+}
+
+/// Undo the last commit (`HEAD`), keeping all of its changes staged in the index, and return the
+/// undone commit's message so the composer can restore it.
+pub fn uncommit_last(root: &Path) -> Result<String, String> {
+    let msg = last_commit_message(root).unwrap_or_default();
+    if git(root, &["rev-parse", "--verify", "-q", "HEAD~1"], None).is_ok() {
+        git(root, &["reset", "--soft", "HEAD~1"], None)?;
+    } else {
+        git(root, &["update-ref", "-d", "HEAD"], None)?;
+    }
+    Ok(msg)
+}
+
+/// Files changed in a specific commit `hash` (works for root commits too via `--root`).
+pub fn commit_files(root: &Path, hash: &str) -> Result<Vec<ChangedFile>, String> {
+    let out = git(
+        root,
+        &[
+            "-c",
+            "core.quotepath=off",
+            "diff-tree",
+            "--root",
+            "--no-commit-id",
+            "-m",
+            "--first-parent",
+            "--name-status",
+            "-r",
+            "-M",
+            "-z",
+            hash,
+        ],
+        None,
+    )?;
+    let mut records = out.split('\0').filter(|s| !s.is_empty());
+    let mut files = Vec::new();
+    while let Some(status_token) = records.next() {
+        let code = status_token.chars().next().unwrap_or('M');
+        let Some(kind) = ChangeKind::from_code(code) else {
+            continue;
+        };
+        if matches!(kind, ChangeKind::Renamed | ChangeKind::Copied) {
+            let Some(orig_path) = records.next() else {
+                break;
+            };
+            let Some(path) = records.next() else {
+                break;
+            };
+            files.push(ChangedFile {
+                path: path.to_string(),
+                orig_path: Some(orig_path.to_string()),
+                kind,
+            });
+        } else {
+            let Some(path) = records.next() else {
+                break;
+            };
+            files.push(ChangedFile {
+                path: path.to_string(),
+                orig_path: None,
+                kind,
+            });
+        }
+    }
+    Ok(files)
 }
 
 /// Commit the index with `message` (or, when amending with an empty message, keep the old one).
@@ -689,5 +893,71 @@ mod tests {
         let whole = repo_status(&root).unwrap().badge_map(&root);
         assert_eq!(whole.get(&root.join("top.txt")), Some(&'M'));
         assert_eq!(whole.len(), 3);
+    }
+
+    #[test]
+    fn stash_save_apply_pop_and_drop_roundtrip() {
+        let root = init_repo("stash");
+        write(&root, "a.txt", "1");
+        stage_all(&root).unwrap();
+        commit(&root, "init", false).unwrap();
+
+        write(&root, "a.txt", "2");
+        write(&root, "new.txt", "untracked");
+        stash_save(&root, Some("work in progress")).unwrap();
+
+        let s = repo_status(&root).unwrap();
+        assert!(s.is_clean());
+        assert_eq!(s.stashes.len(), 1);
+        assert_eq!(s.stashes[0].index, 0);
+        assert_eq!(s.stashes[0].message, "work in progress");
+
+        stash_apply(&root, 0).unwrap();
+        assert_eq!(repo_status(&root).unwrap().unstaged.len(), 2);
+        assert_eq!(repo_status(&root).unwrap().stashes.len(), 1);
+
+        let unstaged = repo_status(&root).unwrap().unstaged;
+        discard_files(&root, &unstaged).unwrap();
+        assert!(repo_status(&root).unwrap().is_clean());
+
+        stash_pop(&root, 0).unwrap();
+        let s = repo_status(&root).unwrap();
+        assert!(s.stashes.is_empty());
+        assert_eq!(s.unstaged.len(), 2);
+
+        stash_save(&root, None).unwrap();
+        assert_eq!(repo_status(&root).unwrap().stashes.len(), 1);
+        stash_drop(&root, 0).unwrap();
+        assert!(repo_status(&root).unwrap().stashes.is_empty());
+    }
+
+    #[test]
+    fn recent_commits_commit_files_and_uncommit_last() {
+        let root = init_repo("history");
+        write(&root, "a.txt", "one\n");
+        stage_all(&root).unwrap();
+        commit(&root, "first commit", false).unwrap();
+
+        write(&root, "a.txt", "one\ntwo\n");
+        write(&root, "b.txt", "hello\n");
+        stage_all(&root).unwrap();
+        commit(&root, "second commit", false).unwrap();
+
+        let s = repo_status(&root).unwrap();
+        assert_eq!(s.recent_commits.len(), 2);
+        assert_eq!(s.recent_commits[0].subject, "second commit");
+        assert_eq!(s.recent_commits[1].subject, "first commit");
+
+        let changed = commit_files(&root, &s.recent_commits[0].hash).unwrap();
+        assert_eq!(names(&changed), ["a.txt", "b.txt"]);
+        let diff = crate::diff::commit_file_diff(&root, &s.recent_commits[0].hash, &changed[0]).unwrap();
+        assert_eq!((diff.added, diff.removed), (1, 0));
+
+        // Undoing the second commit keeps its changes staged and returns its message.
+        let msg = uncommit_last(&root).unwrap();
+        assert_eq!(msg, "second commit");
+        let s = repo_status(&root).unwrap();
+        assert_eq!(s.recent_commits.len(), 1);
+        assert_eq!(names(&s.staged), ["a.txt", "b.txt"]);
     }
 }

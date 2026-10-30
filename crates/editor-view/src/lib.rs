@@ -86,6 +86,8 @@ pub enum EditorEvent {
     OpenAt { path: PathBuf, line: u32, column: u32 },
     RequestRename { line: u32, column: u32 },
     ShowCodeActions { actions: Vec<lsp_types::CodeActionOrCommand> },
+    ExternalFileEdits { path: PathBuf, edits: Vec<lsp_types::TextEdit> },
+    BreakpointsChanged { path: PathBuf, lines: Vec<u32> },
     Saved { path: PathBuf },
     RunTest {
         path: PathBuf,
@@ -144,6 +146,12 @@ pub struct EditorView {
     closing_labels: std::collections::HashMap<usize, String>,
     /// Test CodeLens templates loaded from `.vscode/launch.json` (`templateFor: "test"`).
     test_code_lenses: Vec<TestCodeLensTemplate>,
+    /// 1-indexed line numbers where a debugger breakpoint is set.
+    breakpoints: std::collections::BTreeSet<u32>,
+    /// 1-indexed line where the debugger is currently paused, if any.
+    active_debug_line: Option<u32>,
+    /// Whether a `save()` triggered an LSP format request that should re-flush once applied.
+    pub(crate) save_after_format: bool,
 }
 
 impl EditorView {
@@ -192,6 +200,9 @@ impl EditorView {
             completion_selected: 0,
             closing_labels,
             test_code_lenses: Vec::new(),
+            breakpoints: std::collections::BTreeSet::new(),
+            active_debug_line: None,
+            save_after_format: false,
         };
         this.maybe_start_lsp(cx);
         this
@@ -204,6 +215,42 @@ impl EditorView {
     ) {
         self.test_code_lenses = lenses;
         cx.notify();
+    }
+
+    pub fn set_breakpoints(&mut self, lines: Vec<u32>, cx: &mut Context<Self>) {
+        self.breakpoints = lines.into_iter().collect();
+        cx.notify();
+    }
+
+    pub fn breakpoints(&self) -> Vec<u32> {
+        self.breakpoints.iter().copied().collect()
+    }
+
+    pub fn set_active_debug_line(&mut self, line: Option<u32>, cx: &mut Context<Self>) {
+        if self.active_debug_line != line {
+            self.active_debug_line = line;
+            if let Some(l1) = line {
+                self.scroll_handle
+                    .scroll_to_item(l1.saturating_sub(1) as usize, ScrollStrategy::Center);
+            }
+            cx.notify();
+        }
+    }
+
+    pub fn toggle_breakpoint(&mut self, line_1: u32, cx: &mut Context<Self>) {
+        if !self.breakpoints.remove(&line_1) {
+            self.breakpoints.insert(line_1);
+        }
+        if let Some(path) = self.buffer.path().map(Path::to_path_buf) {
+            let lines = self.breakpoints.iter().copied().collect();
+            cx.emit(EditorEvent::BreakpointsChanged { path, lines });
+        }
+        cx.notify();
+    }
+
+    pub fn apply_external_edits(&mut self, edits: Vec<lsp_types::TextEdit>, cx: &mut Context<Self>) {
+        self.apply_text_edits(edits, cx);
+        let _ = self.buffer.save();
     }
 
     pub fn buffer(&self) -> &Buffer {
@@ -250,6 +297,17 @@ impl EditorView {
     }
 
     pub fn save(&mut self, cx: &mut Context<Self>) {
+        if should_parse_syntax(&self.buffer) {
+            let text = self.buffer.text();
+            self.sync_lsp_text(&text);
+            if self.request_format() {
+                self.save_after_format = true;
+            }
+        }
+        self.flush_save(cx);
+    }
+
+    pub(crate) fn flush_save(&mut self, cx: &mut Context<Self>) {
         if self.buffer.save().is_ok() {
             if let Some(path) = self.buffer.path().map(Path::to_path_buf) {
                 cx.emit(EditorEvent::Saved { path });
@@ -1253,7 +1311,11 @@ impl EditorView {
             _ if is_active_line => cx.theme().foreground.opacity(0.95),
             _ => cx.theme().muted_foreground.opacity(0.45),
         };
+        let line_1 = (index + 1) as u32;
+        let has_breakpoint = self.breakpoints.contains(&line_1);
+        let is_debug_line = self.active_debug_line == Some(line_1);
         let mono_family = cx.theme().mono_font_family.clone();
+        let bp_view = cx.entity();
         let gutter = h_flex()
             .w(px(GUTTER_WIDTH))
             .h_full()
@@ -1263,14 +1325,41 @@ impl EditorView {
             .text_size(px(GUTTER_FONT_SIZE))
             .text_color(gutter_color)
             .child(
-                div()
-                    .w(px(38.))
-                    .text_right()
-                    .child((index + 1).to_string()),
+                h_flex()
+                    .w(px(40.))
+                    .h_full()
+                    .items_center()
+                    .justify_end()
+                    .gap(px(3.))
+                    .cursor_pointer()
+                    .on_mouse_down(MouseButton::Left, move |_event, _window, cx| {
+                        cx.stop_propagation();
+                        bp_view.update(cx, |this, cx| {
+                            this.toggle_breakpoint(line_1, cx);
+                        });
+                    })
+                    .when(has_breakpoint, |el| {
+                        el.child(
+                            div()
+                                .w(px(7.))
+                                .h(px(7.))
+                                .rounded(px(4.))
+                                .bg(cx.theme().danger),
+                        )
+                    })
+                    .when(is_debug_line && !has_breakpoint, |el| {
+                        el.child(
+                            div()
+                                .text_size(px(9.5))
+                                .text_color(cx.theme().warning)
+                                .child("\u{25b6}"),
+                        )
+                    })
+                    .child(div().child(line_1.to_string())),
             )
             .child(
                 div()
-                    .w(px(GUTTER_WIDTH - 38.))
+                    .w(px(GUTTER_WIDTH - 40.))
                     .flex()
                     .items_center()
                     .justify_center()
@@ -1725,7 +1814,8 @@ impl EditorView {
             // That's the whole cue; the gutter number brightening to match
             // is enough to say "and here's where", without a second marker
             // competing for the same job.
-            .when(is_active_line, |el| el.bg(rgb(ACTIVE_LINE_BG)))
+            .when(is_active_line && !is_debug_line, |el| el.bg(rgb(ACTIVE_LINE_BG)))
+            .when(is_debug_line, |el| el.bg(cx.theme().warning.opacity(0.16)))
             .when_some(change_marker, |el, marker| el.child(marker))
             .when_some(active_right_marker, |el, marker| el.child(marker))
             .child(gutter)
