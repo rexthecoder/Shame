@@ -259,13 +259,31 @@ pub(crate) fn parse_slash_command(input: &str) -> Option<SlashCommand> {
     })
 }
 
-/// Whether typing just completed an `@` mention trigger: the text ends in `@`
-/// that starts a word (so an email address doesn't trigger it).
-pub(crate) fn mention_trigger(text: &str) -> bool {
-    let Some(before) = text.strip_suffix('@') else {
-        return false;
-    };
-    before.chars().last().is_none_or(char::is_whitespace)
+/// The `@query` being typed at `cursor`: the byte range from the `@` to the
+/// cursor, if that `@` starts a word and nothing but non-space characters sit
+/// between. `tokens` are the byte ranges of finished inline mentions, which
+/// are never treated as a new one.
+pub(crate) fn active_mention(
+    text: &str,
+    cursor: usize,
+    tokens: &[std::ops::Range<usize>],
+) -> Option<std::ops::Range<usize>> {
+    if cursor > text.len() || !text.is_char_boundary(cursor) {
+        return None;
+    }
+    let before = &text[..cursor];
+    let at = before.rfind(|c: char| c == '@' || c.is_whitespace())?;
+    if !before[at..].starts_with('@') {
+        return None;
+    }
+    if before[..at].chars().last().is_some_and(|c| !c.is_whitespace()) {
+        return None; // `me@example.com`, not a mention
+    }
+    let range = at..cursor;
+    if tokens.iter().any(|t| t.start < range.end && range.start < t.end) {
+        return None;
+    }
+    Some(range)
 }
 
 /// Step through prompt history: `Up` goes to older prompts, `Down` to newer
@@ -392,11 +410,28 @@ mod tests {
     }
 
     #[core::prelude::v1::test]
-    fn at_mention_triggers_only_at_a_word_start() {
-        assert!(mention_trigger("@"));
-        assert!(mention_trigger("look at @"));
-        assert!(!mention_trigger("mail me@"));
-        assert!(!mention_trigger("no trigger"));
+    fn active_mention_finds_the_word_being_typed() {
+        // "check this file @gha|"
+        let text = "check this file @gha";
+        assert_eq!(active_mention(text, text.len(), &[]), Some(16..20));
+        // Just the `@`.
+        assert_eq!(active_mention("look @", 6, &[]), Some(5..6));
+        // The cursor in the middle of the query only counts up to the cursor.
+        assert_eq!(active_mention("see @main now", 9, &[]), Some(4..9));
+        // Email addresses and plain words are not mentions.
+        assert_eq!(active_mention("mail me@example.com", 19, &[]), None);
+        assert_eq!(active_mention("no mention here", 15, &[]), None);
+        // Whitespace after the query ends it.
+        assert_eq!(active_mention("see @main now", 13, &[]), None);
+    }
+
+    #[core::prelude::v1::test]
+    fn finished_mentions_do_not_reopen_the_picker() {
+        let text = "see @main.dart";
+        assert_eq!(active_mention(text, text.len(), &[4..14]), None);
+        // A different, new mention right after is still found.
+        let text = "see @main.dart @te";
+        assert_eq!(active_mention(text, text.len(), &[4..14]), Some(15..18));
     }
 
     #[core::prelude::v1::test]

@@ -9,14 +9,15 @@ use gpui_kit::base::StyledExt as _;
 use gpui_kit::component::{
     ActiveTheme as _, Icon, Sizable as _,
     h_flex,
-    input::{Input, Textarea},
+    input::{InlineToken, Input, Textarea},
     v_flex,
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 use crate::agent_ctx::{
-    AGENT_MODES, Attachment, ModeId, SlashCommand, add_attachment, classify_path, history_step,
+    AGENT_MODES, Attachment, ModeId, SlashCommand, active_mention, add_attachment, classify_path,
+    history_step,
 };
 use crate::rails::agent::{AgentHarness, ModelOption, filter_models};
 use crate::{DartIde, tokens};
@@ -94,6 +95,35 @@ fn save_pasted_image(bytes: &[u8], extension: &str) -> Option<PathBuf> {
     Some(path)
 }
 
+/// The small second line on an attachment tile: where the file lives, or which
+/// lines were selected.
+pub(crate) fn attachment_sub(attachment: &Attachment) -> String {
+    match attachment {
+        Attachment::File { rel } => {
+            let dir = Path::new(rel)
+                .parent()
+                .map(|p| p.to_string_lossy().to_string())
+                .unwrap_or_default();
+            if dir.is_empty() {
+                String::new()
+            } else if Path::new(rel).is_absolute() {
+                // Outside the project: the last two folders are enough to place it.
+                let parts: Vec<&str> = dir.split('/').filter(|p| !p.is_empty()).collect();
+                format!("\u{2026}/{}", parts[parts.len().saturating_sub(2)..].join("/"))
+            } else {
+                dir
+            }
+        }
+        Attachment::Selection { start_line, end_line, .. } if start_line == end_line => {
+            format!("line {start_line}")
+        }
+        Attachment::Selection { start_line, end_line, .. } => {
+            format!("lines {start_line}\u{2013}{end_line}")
+        }
+        Attachment::Image { .. } => String::new(),
+    }
+}
+
 impl DartIde {
     /// Start a fresh conversation (the `+` button and `/clear`).
     pub(crate) fn agent_new_thread(&mut self, cx: &mut Context<Self>) {
@@ -128,8 +158,22 @@ impl DartIde {
             .to_string()
     }
 
+    /// What the file picker is filtering by: the `@query` being typed in the
+    /// message, or the picker's own search box when opened with the + button.
+    fn attach_query(&self, cx: &App) -> String {
+        match &self.agent.mention_range {
+            Some(range) => {
+                let text = self.agent.input.read(cx).value();
+                text.get(range.clone())
+                    .map(|q| q.trim_start_matches('@').to_string())
+                    .unwrap_or_default()
+            }
+            None => self.agent.attach_search.read(cx).value().to_string(),
+        }
+    }
+
     fn attach_candidates(&self, cx: &App) -> Vec<String> {
-        let query = self.agent.attach_search.read(cx).value().to_string();
+        let query = self.attach_query(cx);
         let all: Vec<String> = self.all_files.iter().map(|p| self.rel_path(p)).collect();
         let open: Vec<String> = self
             .tabs
@@ -141,6 +185,7 @@ impl DartIde {
     }
 
     pub(crate) fn open_attach_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.agent.mention_range = None;
         self.agent.attach_open = true;
         self.agent.tool_picker_open = false;
         self.agent.model_picker_open = false;
@@ -153,6 +198,7 @@ impl DartIde {
     }
 
     pub(crate) fn close_agent_pickers(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.agent.mention_range = None;
         self.agent.attach_open = false;
         self.agent.tool_picker_open = false;
         self.agent.model_picker_open = false;
@@ -224,9 +270,77 @@ impl DartIde {
         }
     }
 
-    pub(crate) fn attach_file(&mut self, rel: String, cx: &mut Context<Self>) {
-        add_attachment(&mut self.agent.attachments, Attachment::File { rel });
+    /// Track an `@query` being typed: open the live picker while there is one,
+    /// close it when there isn't.
+    pub(crate) fn update_mention_state(&mut self, cx: &mut Context<Self>) {
+        let (text, cursor, tokens) = {
+            let input = self.agent.input.read(cx);
+            (
+                input.value().to_string(),
+                input.selected_range().end,
+                input.tokens().iter().map(|t| t.range()).collect::<Vec<_>>(),
+            )
+        };
+        match active_mention(&text, cursor, &tokens) {
+            Some(range) => {
+                let query = text[range.clone()].trim_start_matches('@').to_string();
+                if query != self.agent.last_mention_query || self.agent.mention_range.is_none() {
+                    self.agent.attach_selected = 0;
+                }
+                self.agent.last_mention_query = query;
+                self.agent.mention_range = Some(range);
+                self.agent.attach_open = true;
+                self.agent.tool_picker_open = false;
+                self.agent.model_picker_open = false;
+            }
+            None => {
+                if self.agent.mention_range.take().is_some() {
+                    self.agent.attach_open = false;
+                }
+            }
+        }
         cx.notify();
+    }
+
+    /// Put `attachment` into the message as an inline pill, replacing the
+    /// `@query` being typed (or the cursor position when opened from the
+    /// + button), followed by a space so typing carries on.
+    pub(crate) fn insert_mention(
+        &mut self,
+        attachment: Attachment,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let id = format!("mention-{}", self.agent.next_mention);
+        self.agent.next_mention += 1;
+        let label = attachment.label();
+        let token = InlineToken::new(id.clone(), format!("@{label}")).with_label(label);
+        self.agent.mentions.insert(id, attachment);
+        let range = self.agent.mention_range.take();
+        self.agent.attach_open = false;
+        self.agent.input.update(cx, |state, cx| {
+            let _ = match range {
+                Some(range) => state.replace_range_with_token(range, token, window, cx),
+                None => state.replace_with_token(token, window, cx),
+            };
+            state.insert(" ", window, cx);
+            state.focus(window, cx);
+        });
+        cx.notify();
+    }
+
+    /// Click on a pill: open that file (at the selected line, for a selection).
+    pub(crate) fn open_mention(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(attachment) = self.agent.mentions.get(id).cloned() else { return };
+        let (rel, line) = match attachment {
+            Attachment::File { rel } => (rel, None),
+            Attachment::Selection { rel, start_line, .. } => (rel, Some(start_line as u32 - 1)),
+            Attachment::Image { .. } => return,
+        };
+        self.open_path(self.root.join(rel), window, cx);
+        if let (Some(line), Some(editor)) = (line, self.active_editor().cloned()) {
+            editor.update(cx, |editor, cx| editor.set_cursor_to_position(line, 0, cx));
+        }
     }
 
     /// ⌘L: attach the editor's selection (or, with none, the whole file) to the
@@ -245,10 +359,8 @@ impl DartIde {
             }
             None => Attachment::File { rel },
         };
-        add_attachment(&mut self.agent.attachments, attachment);
         self.agent_open = true;
-        self.agent.input.update(cx, |state, cx| state.focus(window, cx));
-        cx.notify();
+        self.insert_mention(attachment, window, cx);
     }
 
     pub(crate) fn open_model_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -292,8 +404,7 @@ impl DartIde {
         if self.agent.attach_open {
             let candidates = self.attach_candidates(cx);
             if let Some(rel) = candidates.get(self.agent.attach_selected).cloned() {
-                self.attach_file(rel, cx);
-                self.close_agent_pickers(window, cx);
+                self.insert_mention(Attachment::File { rel }, window, cx);
             }
         } else if self.agent.model_picker_open {
             let (matches, custom) = self.model_candidates(cx);
@@ -348,6 +459,10 @@ impl DartIde {
                     true
                 }
                 "enter" if !self.agent.tool_picker_open => {
+                    self.accept_picker_selection(window, cx);
+                    true
+                }
+                "tab" if self.agent.mention_range.is_some() => {
                     self.accept_picker_selection(window, cx);
                     true
                 }
@@ -409,25 +524,6 @@ impl DartIde {
             .iter()
             .map(|t| t.editor.read(cx).diagnostics().len())
             .sum();
-        let selection = self
-            .active_editor()
-            .and_then(|ed| ed.read(cx).selection_line_range());
-
-        let chip = |id: ElementId| {
-            h_flex()
-                .id(id)
-                .h(px(24.))
-                .px(px(8.))
-                .gap(px(5.))
-                .items_center()
-                .flex_shrink_0()
-                .rounded(px(tokens::RADIUS_PILL))
-                .border_1()
-                .border_color(border)
-                .bg(cx.theme().background)
-                .text_size(px(tokens::UI_XS))
-                .text_color(fg)
-        };
 
         // What the agent will see automatically: quiet, borderless toggles in the
         // header. Click to leave one out of the next message.
@@ -475,29 +571,67 @@ impl DartIde {
             );
         }
 
-        // Things you chose to send: only shown when there are any.
-        let mut chips: Vec<AnyElement> = Vec::new();
+        // What you attached from your Mac (dropped, pasted or chosen files and images),
+        // at the top of the composer as plain inline items:
+        // an icon and a name, no boxes. The remove button shows on hover. Hidden
+        // when nothing is attached.
+        let mut tiles: Vec<AnyElement> = Vec::new();
         for (ix, attachment) in self.agent.attachments.iter().enumerate() {
             let label = attachment.label();
-            chips.push(
-                chip(("agent-chip-attached", ix).into())
+            let group = format!("agent-attached-{ix}");
+            let sub = match attachment {
+                Attachment::Selection { .. } => attachment_sub(attachment),
+                _ => String::new(),
+            };
+            tiles.push(
+                h_flex()
+                    .id(("agent-attached", ix))
+                    .group(group.clone())
+                    .max_w(px(190.))
+                    .flex_shrink_0()
+                    .h(px(26.))
+                    .pl(px(5.))
+                    .pr(px(7.))
+                    .gap(px(6.))
+                    .items_center()
+                    .rounded(px(tokens::RADIUS_SM))
                     .bg(tokens::accent_dim())
+                    .text_size(px(tokens::UI_SM))
+                    .text_color(fg)
                     .child(match attachment {
                         Attachment::Image { path } => img(std::path::PathBuf::from(path))
-                            .size(px(16.))
-                            .rounded(px(3.))
+                            .size(px(18.))
+                            .rounded(px(4.))
+                            .flex_shrink_0()
                             .object_fit(ObjectFit::Cover)
                             .into_any_element(),
-                        _ => crate::rails::files::render_file_icon(&label).into_any_element(),
+                        _ => crate::rails::files::render_file_icon_sized(&label, 14.).into_any_element(),
                     })
-                    .child(div().max_w(px(150.)).truncate().child(label))
+                    .child(div().min_w(px(0.)).truncate().child(label))
+                    .when(!sub.is_empty(), |row| {
+                        row.child(
+                            div()
+                                .flex_shrink_0()
+                                .text_size(px(tokens::UI_XS))
+                                .text_color(muted)
+                                .child(sub),
+                        )
+                    })
                     .child(
                         div()
-                            .id(("agent-chip-remove", ix))
+                            .id(("agent-attached-remove", ix))
+                            .size(px(14.))
+                            .flex_shrink_0()
+                            .rounded(px(tokens::RADIUS_PILL))
+                            .flex()
+                            .items_center()
+                            .justify_center()
                             .cursor_pointer()
                             .text_color(muted)
-                            .hover(|s| s.text_color(red))
-                            .child(Icon::new(IconName::X).with_size(px(10.)))
+                            .invisible()
+                            .group_hover(group, |s| s.visible())
+                            .hover(|s| s.bg(rgba(0xffffff1f)).text_color(red))
+                            .child(Icon::new(IconName::X).with_size(px(9.)))
                             .on_click(cx.listener(move |this, _e, _w, cx| {
                                 if ix < this.agent.attachments.len() {
                                     this.agent.attachments.remove(ix);
@@ -507,31 +641,6 @@ impl DartIde {
                     )
                     .into_any_element(),
             );
-        }
-        if let Some((start, end)) = selection {
-            let already = self.agent.attachments.iter().any(|a| {
-                matches!(a, Attachment::Selection { start_line, end_line, .. } if *start_line == start && *end_line == end)
-            });
-            if !already {
-                let label = if start == end {
-                    format!("selection (line {start})")
-                } else {
-                    format!("selection (lines {start}\u{2013}{end})")
-                };
-                chips.push(
-                    chip("agent-chip-selection".into())
-                        .cursor_pointer()
-                        .border_dashed()
-                        .text_color(muted)
-                        .hover(|s| s.text_color(fg))
-                        .child(Icon::new(IconName::Plus).with_size(px(10.)))
-                        .child(label)
-                        .on_click(cx.listener(|this, _e, window, cx| {
-                            this.attach_editor_context(window, cx);
-                        }))
-                        .into_any_element(),
-                );
-            }
         }
         // --- mode switch ---
         let mode_switch = h_flex()
@@ -710,6 +819,19 @@ impl DartIde {
                     .on_drop(cx.listener(|this, paths: &ExternalPaths, _window, cx| {
                         this.attach_paths(paths.paths().to_vec(), cx);
                     }))
+                    // Attached files, at the top: one quiet line, wrapping if needed.
+                    .when(!tiles.is_empty(), |card| {
+                        card.child(
+                            h_flex()
+                                .w_full()
+                                .px(px(tokens::SPACE_3))
+                                .pt(px(tokens::SPACE_3))
+                                .pb(px(2.))
+                                .flex_wrap()
+                                .gap(px(6.))
+                                .children(tiles),
+                        )
+                    })
                     // Header: the mode on the left, what the agent sees on the right.
                     .child(
                         h_flex()
@@ -727,24 +849,48 @@ impl DartIde {
                                     .children(header_chips),
                             ),
                     )
-                    .when(!chips.is_empty(), |card| {
-                        card.child(
-                            h_flex()
-                                .w_full()
-                                .px(px(tokens::SPACE_3))
-                                .pt(px(tokens::SPACE_2))
-                                .pb(px(2.))
-                                .flex_wrap()
-                                .gap(px(6.))
-                                .children(chips),
-                        )
-                    })
                     .child(
                         div().w_full().px(px(tokens::SPACE_3)).pt(px(2.)).child(
                             Textarea::new(&self.agent.input)
                                 .small()
                                 .appearance(false)
-                                .bordered(false),
+                                .bordered(false)
+                                // `@file` mentions render as pills inside the sentence.
+                                .token(move |ctx, _window, cx| {
+                                    let label = ctx.token().label().to_string();
+                                    let name = label.split(':').next().unwrap_or(&label).to_string();
+                                    let line = ctx.line_height().to_f64() as f32;
+                                    // The pill is shorter than the line and centered in it, so
+                                    // wrapped lines keep their spacing and nothing sits low.
+                                    div()
+                                        .h(px(line))
+                                        .flex()
+                                        .items_center()
+                                        .child(
+                                            h_flex()
+                                                .h(px((line - 4.).max(16.)))
+                                                .mx(px(1.))
+                                                .pl(px(4.))
+                                                .pr(px(6.))
+                                                .gap(px(4.))
+                                                .items_center()
+                                                .rounded(px(tokens::RADIUS_SM))
+                                                .bg(tokens::accent_dim())
+                                                .when(ctx.is_selected(), |p| p.bg(cx.theme().selection))
+                                                .text_size(px(tokens::UI_SM))
+                                                .line_height(px((line - 4.).max(16.)))
+                                                .text_color(cx.theme().foreground)
+                                                .child(crate::rails::files::render_file_icon_sized(&name, 12.))
+                                                .child(label),
+                                        )
+                                })
+                                .on_token_click({
+                                    let view = cx.entity();
+                                    move |event, window, cx| {
+                                        let id = event.token().id().to_string();
+                                        view.update(cx, |this, cx| this.open_mention(&id, window, cx));
+                                    }
+                                }),
                         ),
                     )
                     .child(footer),
@@ -916,10 +1062,12 @@ impl DartIde {
             let candidates = self.attach_candidates(cx);
             let selected = self.agent.attach_selected;
             let empty = candidates.is_empty();
+            let typing_mention = self.agent.mention_range.is_some();
             return Some(
                 panel()
-                    .child(search_box(&self.agent.attach_search))
-                    .child(
+                    .when(!typing_mention, |p| p.child(search_box(&self.agent.attach_search)))
+                    .when(!typing_mention, |p| {
+                        p.child(
                         row("agent-attach-browse".into(), false)
                             .child(
                                 div()
@@ -936,7 +1084,8 @@ impl DartIde {
                             .on_click(cx.listener(|this, _e, window, cx| {
                                 this.choose_files_from_disk(window, cx);
                             })),
-                    )
+                        )
+                    })
                     .child(
                         v_flex()
                             .id("agent-attach-list")
@@ -987,8 +1136,11 @@ impl DartIde {
                                             .child(dir),
                                     )
                                     .on_click(cx.listener(move |this, _e, window, cx| {
-                                        this.attach_file(rel_for_click.clone(), cx);
-                                        this.close_agent_pickers(window, cx);
+                                        this.insert_mention(
+                                            Attachment::File { rel: rel_for_click.clone() },
+                                            window,
+                                            cx,
+                                        );
                                     }))
                             })),
                     ),
@@ -1000,7 +1152,20 @@ impl DartIde {
 
 #[cfg(test)]
 mod tests {
-    use super::attach_matches;
+    use super::{attach_matches, attachment_sub};
+    use crate::agent_ctx::Attachment;
+
+    #[core::prelude::v1::test]
+    fn tile_subtitles_place_the_file_or_selection() {
+        let file = |rel: &str| Attachment::File { rel: rel.into() };
+        assert_eq!(attachment_sub(&file("main.dart")), "");
+        assert_eq!(attachment_sub(&file("lib/src/a.dart")), "lib/src");
+        assert_eq!(attachment_sub(&file("/Users/me/Documents/notes/todo.txt")), "\u{2026}/Documents/notes");
+        let sel = |a, b| Attachment::Selection { rel: "x.dart".into(), start_line: a, end_line: b, text: String::new() };
+        assert_eq!(attachment_sub(&sel(7, 7)), "line 7");
+        assert_eq!(attachment_sub(&sel(7, 12)), "lines 7\u{2013}12");
+        assert_eq!(attachment_sub(&Attachment::Image { path: "/a/b.png".into() }), "");
+    }
 
     fn files() -> Vec<String> {
         ["lib/main.dart", "lib/src/user_model.dart", "test/main_test.dart", "README.md"]

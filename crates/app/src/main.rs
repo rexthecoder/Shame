@@ -805,19 +805,14 @@ impl DartIde {
             },
         );
         this._subscriptions.push(search_changes);
-        // Agent composer: typing `@` opens the file picker; searching resets the highlighted row.
+        // Agent composer: typing `@name` opens a live file picker; picking one turns
+        // the text into an inline pill. (Searching the picker resets its highlight below.)
         let mention_changes = cx.subscribe_in(
             &this.agent.input,
             window,
-            |this, state, event: &gpui_kit::component::input::InputEvent, window, cx| {
-                if !matches!(event, gpui_kit::component::input::InputEvent::Change) {
-                    return;
-                }
-                let text = state.read(cx).value().to_string();
-                if agent_ctx::mention_trigger(&text) {
-                    let cleaned = text[..text.len() - 1].to_string();
-                    state.update(cx, |s, cx| s.set_value(cleaned, window, cx));
-                    this.open_attach_picker(window, cx);
+            |this, _state, event: &gpui_kit::component::input::InputEvent, _window, cx| {
+                if matches!(event, gpui_kit::component::input::InputEvent::Change) {
+                    this.update_mention_state(cx);
                 }
             },
         );

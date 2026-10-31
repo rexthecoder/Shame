@@ -492,6 +492,15 @@ pub(crate) struct AgentState {
     pub(crate) scroll: ScrollHandle,
     /// Files and selections attached to the *next* message.
     pub(crate) attachments: Vec<Attachment>,
+    /// Files and selections mentioned inline (`@name` pills in the text),
+    /// keyed by the pill's id, plus the next id to hand out.
+    pub(crate) mentions: std::collections::HashMap<String, Attachment>,
+    pub(crate) next_mention: usize,
+    /// Mentions resolved from the text of the message being sent.
+    pub(crate) pending_mentions: Vec<Attachment>,
+    /// While an `@query` is being typed: its byte range in the input.
+    pub(crate) mention_range: Option<std::ops::Range<usize>>,
+    pub(crate) last_mention_query: String,
     /// Send the active file and open tabs as context.
     pub(crate) include_active_file: bool,
     /// Send current editor diagnostics as context.
@@ -541,6 +550,11 @@ impl AgentState {
             input,
             scroll: ScrollHandle::new(),
             attachments: Vec::new(),
+            mentions: std::collections::HashMap::new(),
+            next_mention: 0,
+            pending_mentions: Vec::new(),
+            mention_range: None,
+            last_mention_query: String::new(),
             include_active_file: true,
             include_problems: true,
             attach_open: false,
@@ -649,9 +663,19 @@ impl DartIde {
         if prompt.is_empty() {
             return;
         }
+        // Inline @mentions in the text become attachments for this message.
+        let mut mentioned: Vec<Attachment> = Vec::new();
+        for span in self.agent.input.read(cx).tokens() {
+            if let Some(found) = self.agent.mentions.get(span.token().id().as_ref()) {
+                crate::agent_ctx::add_attachment(&mut mentioned, found.clone());
+            }
+        }
         self.agent
             .input
             .update(cx, |s, cx| s.set_value("", window, cx));
+        self.agent.mentions.clear();
+        self.agent.mention_range = None;
+        self.agent.attach_open = false;
         if let Some(command) = parse_slash_command(&prompt) {
             self.run_slash_command(command, window, cx);
             return;
@@ -660,6 +684,7 @@ impl DartIde {
             self.agent.history.push(prompt.clone());
         }
         self.agent.history_ix = None;
+        self.agent.pending_mentions = mentioned;
         self.agent_run_prompt(prompt, window, cx);
     }
 
@@ -692,6 +717,7 @@ impl DartIde {
         let was_resumed = resume_id.is_some();
         // Attachments belong to this one message; show them in the transcript.
         let attachments = std::mem::take(&mut self.agent.attachments);
+        let mentions = std::mem::take(&mut self.agent.pending_mentions);
         let shown_prompt = if attachments.is_empty() {
             prompt.clone()
         } else {
@@ -792,7 +818,9 @@ impl DartIde {
         if let Some(rule) = mode.instruction() {
             sections.push(rule.to_string());
         }
-        let attached = attachment_prompt(&self.root, &attachments);
+        let everything: Vec<Attachment> =
+            attachments.iter().chain(mentions.iter()).cloned().collect();
+        let attached = attachment_prompt(&self.root, &everything);
         if !attached.is_empty() {
             sections.push(attached.trim_end().to_string());
         }

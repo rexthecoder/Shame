@@ -138,13 +138,20 @@ pub(crate) fn file_icon_color(name: &str) -> Rgba {
 /// `pubspec.yaml`, `Cargo.toml`, `.json`, `.md`, etc. are immediately
 /// distinguishable at a glance.
 pub(crate) fn render_file_icon(name: &str) -> Div {
+    render_file_icon_sized(name, 16.)
+}
+
+/// The same badge at another size (`16.` is the file tree's). Glyphs and
+/// monogram text scale with it, so a small badge can sit inline with text.
+pub(crate) fn render_file_icon_sized(name: &str, size: f32) -> Div {
+    let k = size / 16.;
     let color: Hsla = file_icon_color(name).into();
     let lower = name.to_ascii_lowercase();
 
     let badge_base = div()
         .flex_shrink_0()
-        .size(px(16.))
-        .rounded(px(4.))
+        .size(px(size))
+        .rounded(px(4. * k))
         .bg(color.opacity(0.15))
         .border_1()
         .border_color(color.opacity(0.36))
@@ -157,21 +164,21 @@ pub(crate) fn render_file_icon(name: &str) -> Div {
         ".gitignore" | ".metadata" | ".gitattributes" | ".gitmodules" => {
             return badge_base.child(
                 Icon::new(gpui_kit::assets::IconName::GitBranch)
-                    .with_size(px(10.5))
+                    .with_size(px(10.5 * k))
                     .text_color(color),
             );
         }
         "CHANGELOG.md" => {
             return badge_base.child(
                 Icon::new(gpui_kit::assets::IconName::RotateCcwClock)
-                    .with_size(px(10.5))
+                    .with_size(px(10.5 * k))
                     .text_color(color),
             );
         }
         "LICENSE" | "LICENSE.md" | "LICENSE.txt" => {
             return badge_base.child(
                 Icon::new(gpui_kit::assets::IconName::Scale)
-                    .with_size(px(10.5))
+                    .with_size(px(10.5 * k))
                     .text_color(color),
             );
         }
@@ -231,13 +238,13 @@ pub(crate) fn render_file_icon(name: &str) -> Div {
     };
 
     if let Some(code) = monogram {
-        let font_sz = if code.len() > 1 { 8.0 } else { 9.5 };
+        let font_sz = (if code.len() > 1 { 8.0 } else { 9.5 }) * k;
         return badge_base.child(
             div()
                 .font_family("SF Mono")
                 .font_semibold()
                 .text_size(px(font_sz))
-                .line_height(px(10.))
+                .line_height(px(10. * k))
                 .text_color(color)
                 .child(code),
         );
@@ -252,7 +259,7 @@ pub(crate) fn render_file_icon(name: &str) -> Div {
 
     badge_base.child(
         Icon::new(fallback_icon)
-            .with_size(px(10.5))
+            .with_size(px(10.5 * k))
             .text_color(color),
     )
 }
