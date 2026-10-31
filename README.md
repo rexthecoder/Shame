@@ -51,6 +51,7 @@ cargo run -p app
 | ⌘P / ⇧⌘O / ⌘G | Quick open / go to symbol / go to line |
 | ⇧⌘F | Find in project |
 | ⌘T | Go to symbol in workspace |
+| ⌘L | Add selection (or file) to the agent chat |
 | ⌘D | Select next occurrence (multi-cursor) |
 | ⌥⌘↑ / ⌥⌘↓ | Add cursor above / below |
 | ⇧F12 | Find references |

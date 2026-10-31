@@ -13,12 +13,15 @@ use gpui_kit::component::{
     ActiveTheme as _, Icon, Sizable as _,
     button::{Button, ButtonVariants as _},
     h_flex,
-    input::{Input, InputState},
+    input::{InputState, TextareaState},
     v_flex,
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
+use crate::agent_ctx::{
+    AGENT_MODES, Attachment, ModeId, attachment_prompt, parse_slash_command,
+};
 use crate::{DartIde, tokens};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -117,24 +120,27 @@ impl AgentHarness {
     /// Available models under this coding tool (discovering cached models from disk when present).
     pub(crate) fn models(self) -> Vec<ModelOption> {
         match self {
-            AgentHarness::ClaudeCode => vec![
-                ModelOption {
-                    id: "sonnet".into(),
-                    label: "Claude Sonnet 4.6".into(),
-                },
-                ModelOption {
-                    id: "opus".into(),
-                    label: "Claude Opus 4.7".into(),
-                },
-                ModelOption {
-                    id: "haiku".into(),
-                    label: "Claude Haiku 4.5".into(),
-                },
-                ModelOption {
-                    id: "default".into(),
-                    label: "Default (Account)".into(),
-                },
-            ],
+            AgentHarness::ClaudeCode => {
+                // (id passed to `--model`, label). The bare aliases always track
+                // the newest release of that family; the dated ids pin one.
+                [
+                    ("default", "Default (your account)"),
+                    ("claude-fable-5-1", "Claude Fable 5.1"),
+                    ("claude-opus-5-5", "Claude Opus 5.5"),
+                    ("claude-sonnet-5-5", "Claude Sonnet 5.5"),
+                    ("claude-haiku-5-5", "Claude Haiku 5.5"),
+                    ("opus", "Opus (latest alias)"),
+                    ("sonnet", "Sonnet (latest alias)"),
+                    ("haiku", "Haiku (latest alias)"),
+                    ("claude-opus-4-5", "Claude Opus 4.5"),
+                    ("claude-sonnet-4-5", "Claude Sonnet 4.5"),
+                    ("claude-opus-4-1", "Claude Opus 4.1"),
+                    ("claude-haiku-4-5", "Claude Haiku 4.5"),
+                ]
+                .into_iter()
+                .map(|(id, label)| ModelOption { id: id.into(), label: label.into() })
+                .collect()
+            }
             AgentHarness::OpenCode => vec![
                 ModelOption {
                     id: "opencode-go/gemini-4-argon".into(),
@@ -214,6 +220,21 @@ fn load_codex_cached_models() -> Vec<ModelOption> {
                 label: display.to_string(),
             })
         })
+        .collect()
+}
+
+/// Indices of `models` matching `query` (case-insensitive, over label and id).
+/// Every word of the query must appear, so `sonnet 4.5` finds "Claude Sonnet 4.5".
+pub(crate) fn filter_models(models: &[ModelOption], query: &str) -> Vec<usize> {
+    let words: Vec<String> = query.split_whitespace().map(str::to_lowercase).collect();
+    models
+        .iter()
+        .enumerate()
+        .filter(|(_, m)| {
+            let hay = format!("{} {}", m.label, m.id).to_lowercase();
+            words.iter().all(|w| hay.contains(w.as_str()))
+        })
+        .map(|(ix, _)| ix)
         .collect()
 }
 
@@ -467,15 +488,36 @@ pub(crate) struct AgentState {
     /// Conversation id of the running thread (Claude Code / Codex), so the next
     /// message resumes it instead of starting a fresh, memoryless process.
     pub(crate) session_id: Option<String>,
-    pub(crate) input: Entity<InputState>,
+    pub(crate) input: Entity<TextareaState>,
     pub(crate) scroll: ScrollHandle,
+    /// Files and selections attached to the *next* message.
+    pub(crate) attachments: Vec<Attachment>,
+    /// Send the active file and open tabs as context.
+    pub(crate) include_active_file: bool,
+    /// Send current editor diagnostics as context.
+    pub(crate) include_problems: bool,
+    pub(crate) attach_open: bool,
+    pub(crate) attach_search: Entity<InputState>,
+    pub(crate) attach_selected: usize,
+    pub(crate) model_search: Entity<InputState>,
+    pub(crate) model_selected: usize,
+    /// Previously sent prompts (oldest first) and the one being recalled with ↑.
+    pub(crate) history: Vec<String>,
+    pub(crate) history_ix: Option<usize>,
 }
-
-const MODES: &[&str] = &["Default", "Plan", "Auto-Edit"];
 
 impl AgentState {
     pub(crate) fn new(window: &mut Window, cx: &mut Context<DartIde>) -> Self {
-        let input = cx.new(|cx| InputState::new(window, cx).placeholder("Message agent\u{2026}"));
+        let input = cx.new(|cx| {
+            TextareaState::new(window, cx)
+                .placeholder("Ask anything\u{2026}")
+                .auto_grow(1, 8)
+        });
+        let attach_search =
+            cx.new(|cx| InputState::new(window, cx).placeholder("Search files to attach\u{2026}"));
+        let model_search = cx.new(|cx| {
+            InputState::new(window, cx).placeholder("Search models, or type a model id\u{2026}")
+        });
         let default_harness = if AgentHarness::ClaudeCode.resolve_binary().is_some() {
             AgentHarness::ClaudeCode
         } else if AgentHarness::OpenCode.resolve_binary().is_some() {
@@ -488,7 +530,7 @@ impl AgentState {
             harness: default_harness,
             models,
             model_ix: 0,
-            mode_ix: 0,
+            mode_ix: ModeId::Edit.index(),
             tool_picker_open: false,
             model_picker_open: false,
             running_pid: None,
@@ -498,6 +540,16 @@ impl AgentState {
             session_id: None,
             input,
             scroll: ScrollHandle::new(),
+            attachments: Vec::new(),
+            include_active_file: true,
+            include_problems: true,
+            attach_open: false,
+            attach_search,
+            attach_selected: 0,
+            model_search,
+            model_selected: 0,
+            history: Vec::new(),
+            history_ix: None,
         }
     }
 
@@ -600,6 +652,14 @@ impl DartIde {
         self.agent
             .input
             .update(cx, |s, cx| s.set_value("", window, cx));
+        if let Some(command) = parse_slash_command(&prompt) {
+            self.run_slash_command(command, window, cx);
+            return;
+        }
+        if self.agent.history.last() != Some(&prompt) {
+            self.agent.history.push(prompt.clone());
+        }
+        self.agent.history_ix = None;
         self.agent_run_prompt(prompt, window, cx);
     }
 
@@ -630,19 +690,32 @@ impl DartIde {
             String::new()
         };
         let was_resumed = resume_id.is_some();
+        // Attachments belong to this one message; show them in the transcript.
+        let attachments = std::mem::take(&mut self.agent.attachments);
+        let shown_prompt = if attachments.is_empty() {
+            prompt.clone()
+        } else {
+            let names: Vec<String> =
+                attachments.iter().map(|a| format!("`{}`", a.label())).collect();
+            format!("{prompt}\n\n_Attached:_ {}", names.join(", "))
+        };
+        self.agent.attach_open = false;
         self.agent.items.push(AgentItem::Message {
             is_user: true,
-            text: prompt.clone(),
+            text: shown_prompt,
         });
         self.agent.scroll.scroll_to_bottom();
+        let include_active_file = self.agent.include_active_file;
+        let include_problems = self.agent.include_problems;
 
         let harness = self.agent.harness;
         let (model_id, _) = self.agent.active_model();
         let model_id = model_id.to_string();
-        let mode = MODES[self.agent.mode_ix % MODES.len()];
+        let mode = AGENT_MODES[self.agent.mode_ix % AGENT_MODES.len()].id;
         let root = self.root.clone();
         let active_file = self
             .active_editor()
+            .filter(|_| include_active_file)
             .and_then(|ed| ed.read(cx).buffer().path().map(Path::to_path_buf))
             .and_then(|p| p.strip_prefix(&self.root).ok().map(Path::to_path_buf))
             .map(|p| p.to_string_lossy().to_string());
@@ -650,13 +723,14 @@ impl DartIde {
         let open_tabs: Vec<String> = self
             .tabs
             .iter()
+            .filter(|_| include_active_file)
             .filter_map(|t| t.path.as_ref())
             .filter_map(|p| p.strip_prefix(&self.root).ok())
             .map(|p| p.to_string_lossy().to_string())
             .collect();
 
         let mut diag_lines: Vec<String> = Vec::new();
-        for tab in &self.tabs {
+        for tab in self.tabs.iter().filter(|_| include_problems) {
             let Some(path) = tab.path.as_ref() else {
                 continue;
             };
@@ -713,13 +787,20 @@ impl DartIde {
             ctx_header.push_str(&diag_lines.join("\n  "));
         }
 
-        let full_prompt = if prior_transcript.is_empty() {
-            format!("{ctx_header}\n\n[User Request]\n{prompt}")
-        } else {
-            format!(
-                "{ctx_header}\n\n[Conversation so far]\n{prior_transcript}\n\n[User Request]\n{prompt}"
-            )
-        };
+        // Order: environment, mode rule, attachments, earlier turns, the request.
+        let mut sections = vec![ctx_header];
+        if let Some(rule) = mode.instruction() {
+            sections.push(rule.to_string());
+        }
+        let attached = attachment_prompt(&self.root, &attachments);
+        if !attached.is_empty() {
+            sections.push(attached.trim_end().to_string());
+        }
+        if !prior_transcript.is_empty() {
+            sections.push(format!("[Conversation so far]\n{prior_transcript}"));
+        }
+        sections.push(format!("[User Request]\n{prompt}"));
+        let full_prompt = sections.join("\n\n");
 
         let Some(bin_path) = harness.resolve_binary() else {
             self.agent.items.push(AgentItem::Message {
@@ -779,12 +860,7 @@ impl DartIde {
                     if model_id != "default" {
                         cmd.args(["--model", &model_id]);
                     }
-                    let perm = match mode {
-                        "Plan" => "plan",
-                        "Auto-Edit" => "bypassPermissions",
-                        _ => "acceptEdits",
-                    };
-                    cmd.args(["--permission-mode", perm, &full_prompt]);
+                    cmd.args(["--permission-mode", mode.claude_permission(), &full_prompt]);
                 }
                 AgentHarness::OpenCode => {
                     cmd.args(["run", "--format", "json"]);
@@ -799,6 +875,8 @@ impl DartIde {
                         cmd.arg("resume");
                     }
                     cmd.args(["--json", "--skip-git-repo-check"]);
+                    cmd.args(["-c", &format!("sandbox_mode=\"{}\"", mode.codex_sandbox())]);
+                    cmd.args(["-c", &format!("approval_policy=\"{}\"", mode.codex_approval())]);
                     if !model_id.is_empty() && model_id != "default" {
                         cmd.args(["-c", &format!("model=\"{model_id}\"")]);
                     }
@@ -983,10 +1061,7 @@ impl DartIde {
         let card_bg = cx.theme().muted;
         let border = cx.theme().border;
         let list_hover = cx.theme().list_hover;
-        let mode_label = MODES[self.agent.mode_ix % MODES.len()];
         let harness = self.agent.harness;
-        let (_model_id, model_display) = self.agent.active_model();
-        let model_label = model_display.to_string();
         let is_running = self.agent.running_pid.is_some();
         let bin_resolved = harness.resolve_binary();
         let active_rel_file = self
@@ -1075,12 +1150,7 @@ impl DartIde {
                                     .icon(Icon::new(IconName::Plus).xsmall().text_color(muted))
                                     .tooltip("New agent thread")
                                     .on_click(cx.listener(|this, _e, _w, cx| {
-                                        this.stop_agent_run(cx);
-                                        this.agent.tasks.clear();
-                                        this.agent.items.clear();
-                                        this.agent.ai_touched_paths.clear();
-                                        this.agent.session_id = None;
-                                        cx.notify();
+                                        this.agent_new_thread(cx);
                                     })),
                             ),
                     )
@@ -1772,347 +1842,8 @@ impl DartIde {
                         }),
                 )
             })
-            // 30. Composer (`Message agent…`, Tool selector, Model selector, Mode selector, Send / Stop button)
-            .child(
-                v_flex()
-                    .w_auto()
-                    .flex_shrink_0()
-                    .mx(px(tokens::SPACE_4))
-                    .mb(px(tokens::SPACE_4))
-                    .p(px(tokens::SPACE_3))
-                    .gap(px(tokens::SPACE_3))
-                    .rounded(px(tokens::RADIUS_CARD))
-                    .bg(cx.theme().input)
-                    .border_1()
-                    .border_color(border)
-                    .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
-                        if event.keystroke.key.as_str() == "enter"
-                            && !event.keystroke.modifiers.shift
-                        {
-                            this.agent_send_message(window, cx);
-                            cx.stop_propagation();
-                        }
-                    }))
-                    .child(
-                        div()
-                            .w_full()
-                            .child(Input::new(&self.agent.input).appearance(false).small()),
-                    )
-                    .child(
-                        h_flex()
-                            .w_full()
-                            .items_center()
-                            .justify_between()
-                            .gap(px(tokens::SPACE_2))
-                            .child(
-                                h_flex()
-                                    .min_w(px(0.))
-                                    .items_center()
-                                    .gap(px(4.))
-                                    // 1. Borderless Coding Tool trigger (`Claude Code` / `OpenCode` / `Codex`)
-                                    .child(
-                                        h_flex()
-                                            .id("agent-tool-select")
-                                            .h(px(22.))
-                                            .px(px(6.))
-                                            .items_center()
-                                            .gap(px(4.))
-                                            .rounded(px(tokens::RADIUS_SM))
-                                            .when(self.agent.tool_picker_open, |s| {
-                                                s.bg(list_hover)
-                                            })
-                                            .cursor_pointer()
-                                            .hover(move |s| s.bg(list_hover))
-                                            .text_size(px(tokens::UI_SM))
-                                            .child(
-                                                div()
-                                                    .font_medium()
-                                                    .text_color(if self.agent.tool_picker_open {
-                                                        primary
-                                                    } else {
-                                                        fg
-                                                    })
-                                                    .child(harness.short_label()),
-                                            )
-                                            .child(
-                                                Icon::new(IconName::ChevronDown)
-                                                    .with_size(px(9.5))
-                                                    .text_color(muted),
-                                            )
-                                            .on_click(cx.listener(|this, _e, _w, cx| {
-                                                this.agent.tool_picker_open =
-                                                    !this.agent.tool_picker_open;
-                                                this.agent.model_picker_open = false;
-                                                cx.notify();
-                                            })),
-                                    )
-                                    .child(
-                                        div()
-                                            .text_size(px(tokens::UI_XS))
-                                            .text_color(muted.opacity(0.55))
-                                            .child("\u{00b7}"),
-                                    )
-                                    // 2. Borderless Model trigger with human-readable label (`Gemini 4 Argon ▾`)
-                                    .child(
-                                        h_flex()
-                                            .id("agent-model-select")
-                                            .h(px(22.))
-                                            .px(px(6.))
-                                            .items_center()
-                                            .gap(px(4.))
-                                            .rounded(px(tokens::RADIUS_SM))
-                                            .when(self.agent.model_picker_open, |s| {
-                                                s.bg(list_hover)
-                                            })
-                                            .cursor_pointer()
-                                            .hover(move |s| s.bg(list_hover))
-                                            .text_size(px(tokens::UI_SM))
-                                            .child(
-                                                div()
-                                                    .max_w(px(130.))
-                                                    .truncate()
-                                                    .font_medium()
-                                                    .text_color(if self.agent.model_picker_open {
-                                                        primary
-                                                    } else {
-                                                        fg
-                                                    })
-                                                    .child(model_label),
-                                            )
-                                            .child(
-                                                Icon::new(IconName::ChevronDown)
-                                                    .with_size(px(9.5))
-                                                    .text_color(muted),
-                                            )
-                                            .on_click(cx.listener(|this, _e, _w, cx| {
-                                                this.agent.model_picker_open =
-                                                    !this.agent.model_picker_open;
-                                                this.agent.tool_picker_open = false;
-                                                cx.notify();
-                                            })),
-                                    )
-                                    .child(
-                                        div()
-                                            .text_size(px(tokens::UI_XS))
-                                            .text_color(muted.opacity(0.55))
-                                            .child("\u{00b7}"),
-                                    )
-                                    // 3. Borderless Mode trigger (`Default` / `Plan` / `Auto-Edit`)
-                                    .child(
-                                        h_flex()
-                                            .id("agent-mode-select")
-                                            .h(px(22.))
-                                            .px(px(6.))
-                                            .items_center()
-                                            .rounded(px(tokens::RADIUS_SM))
-                                            .cursor_pointer()
-                                            .hover(move |s| s.bg(list_hover).text_color(fg))
-                                            .text_size(px(tokens::UI_SM))
-                                            .text_color(muted)
-                                            .child(mode_label)
-                                            .on_click(cx.listener(|this, _e, _w, cx| {
-                                                this.agent.mode_ix =
-                                                    (this.agent.mode_ix + 1) % MODES.len();
-                                                cx.notify();
-                                            })),
-                                    ),
-                            )
-                            // Solid orange Send circle button (or Stop button when running)
-                            .child(if is_running {
-                                div()
-                                    .id("agent-stop-btn")
-                                    .size(px(26.))
-                                    .flex_shrink_0()
-                                    .rounded(px(tokens::RADIUS_PILL))
-                                    .bg(red.opacity(0.2))
-                                    .border_1()
-                                    .border_color(red)
-                                    .flex()
-                                    .items_center()
-                                    .justify_center()
-                                    .cursor_pointer()
-                                    .child(Icon::new(IconName::X).with_size(px(12.)).text_color(red))
-                                    .on_click(cx.listener(|this, _e, _w, cx| {
-                                        this.stop_agent_run(cx);
-                                    }))
-                            } else {
-                                div()
-                                    .id("agent-send-btn")
-                                    .size(px(26.))
-                                    .flex_shrink_0()
-                                    .rounded(px(tokens::RADIUS_PILL))
-                                    .bg(primary)
-                                    .flex()
-                                    .items_center()
-                                    .justify_center()
-                                    .cursor_pointer()
-                                    .hover(|s| s.opacity(0.9))
-                                    .child(
-                                        Icon::new(IconName::ArrowUp)
-                                            .with_size(px(12.5))
-                                            .text_color(cx.theme().primary_foreground),
-                                    )
-                                    .on_click(cx.listener(|this, _e, window, cx| {
-                                        this.agent_send_message(window, cx);
-                                    }))
-                            }),
-                    ),
-            )
-            // Popover 1: Coding Tooling Picker (`Claude Code`, `OpenCode`, `Codex`)
-            .when(self.agent.tool_picker_open, |el| {
-                el.child(
-                    v_flex()
-                        .id("agent-tool-popover")
-                        .occlude()
-                        .absolute()
-                        .bottom(px(86.))
-                        .left(px(tokens::SPACE_4))
-                        .w(px(220.))
-                        .p(px(tokens::SPACE_2))
-                        .gap(px(tokens::SPACE_1))
-                        .rounded(px(tokens::RADIUS_CARD))
-                        .bg(cx.theme().popover)
-                        .border_1()
-                        .border_color(border)
-                        .shadow_xl()
-                        .child(
-                            div()
-                                .px(px(tokens::SPACE_2))
-                                .py(px(2.))
-                                .text_size(px(tokens::UI_XS))
-                                .font_medium()
-                                .text_color(muted)
-                                .child("CODING TOOLING"),
-                        )
-                        .children(AgentHarness::ALL.iter().copied().enumerate().map(
-                            |(ix, tool)| {
-                                let is_sel = tool == harness;
-                                let installed = tool.resolve_binary().is_some();
-                                h_flex()
-                                    .id(("agent-tool-opt", ix))
-                                    .w_full()
-                                    .h(px(28.))
-                                    .px(px(tokens::SPACE_3))
-                                    .items_center()
-                                    .justify_between()
-                                    .rounded(px(tokens::RADIUS_SM))
-                                    .cursor_pointer()
-                                    .when(is_sel, |s| s.bg(tokens::accent_dim()))
-                                    .when(!is_sel, |s| s.hover(move |h| h.bg(list_hover)))
-                                    .child(
-                                        h_flex()
-                                            .items_center()
-                                            .gap(px(tokens::SPACE_2))
-                                            .child(
-                                                div()
-                                                    .size(px(6.))
-                                                    .rounded(px(3.))
-                                                    .bg(if installed { green } else { muted }),
-                                            )
-                                            .child(
-                                                div()
-                                                    .text_size(px(tokens::UI_SM))
-                                                    .font_medium()
-                                                    .text_color(fg)
-                                                    .child(tool.label()),
-                                            ),
-                                    )
-                                    .child(
-                                        div()
-                                            .font_family(cx.theme().mono_font_family.clone())
-                                            .text_size(px(tokens::UI_XS))
-                                            .text_color(if installed { green } else { muted })
-                                            .child(if installed { "ready" } else { "not found" }),
-                                    )
-                                    .on_click(cx.listener(move |this, _e, _w, cx| {
-                                        this.agent.set_harness(tool);
-                                        cx.notify();
-                                    }))
-                            },
-                        )),
-                )
-            })
-            // Popover 2: Model Picker under the selected Coding Tool
-            .when(self.agent.model_picker_open, |el| {
-                let current_ix = self.agent.model_ix;
-                el.child(
-                    v_flex()
-                        .id("agent-model-popover")
-                        .occlude()
-                        .absolute()
-                        .bottom(px(86.))
-                        .left(px(tokens::SPACE_4))
-                        .right(px(tokens::SPACE_4))
-                        .p(px(tokens::SPACE_2))
-                        .gap(px(tokens::SPACE_1))
-                        .rounded(px(tokens::RADIUS_CARD))
-                        .bg(cx.theme().popover)
-                        .border_1()
-                        .border_color(border)
-                        .shadow_xl()
-                        .child(
-                            div()
-                                .px(px(tokens::SPACE_2))
-                                .py(px(2.))
-                                .text_size(px(tokens::UI_XS))
-                                .font_medium()
-                                .text_color(muted)
-                                .child(format!("{} MODELS", harness.label().to_uppercase())),
-                        )
-                        .children(self.agent.models.iter().enumerate().map(|(ix, m)| {
-                            let is_sel = ix == current_ix;
-                            h_flex()
-                                .id(("agent-model-opt", ix))
-                                .w_full()
-                                .h(px(28.))
-                                .px(px(tokens::SPACE_3))
-                                .items_center()
-                                .justify_between()
-                                .gap(px(tokens::SPACE_2))
-                                .rounded(px(tokens::RADIUS_SM))
-                                .cursor_pointer()
-                                .when(is_sel, |s| s.bg(tokens::accent_dim()))
-                                .when(!is_sel, |s| s.hover(move |h| h.bg(list_hover)))
-                                .child(
-                                    h_flex()
-                                        .min_w(px(0.))
-                                        .items_center()
-                                        .gap(px(tokens::SPACE_2))
-                                        .child(
-                                            div()
-                                                .w(px(12.))
-                                                .when(is_sel, |c| {
-                                                    c.child(
-                                                        Icon::new(IconName::Check)
-                                                            .xsmall()
-                                                            .text_color(primary),
-                                                    )
-                                                }),
-                                        )
-                                        .child(
-                                            div()
-                                                .truncate()
-                                                .text_size(px(tokens::UI_SM))
-                                                .text_color(fg)
-                                                .child(m.label.clone()),
-                                        ),
-                                )
-                                .child(
-                                    div()
-                                        .flex_shrink_0()
-                                        .font_family(cx.theme().mono_font_family.clone())
-                                        .text_size(px(tokens::UI_XS))
-                                        .text_color(muted)
-                                        .child(m.id.clone()),
-                                )
-                                .on_click(cx.listener(move |this, _e, _w, cx| {
-                                    this.agent.model_ix = ix;
-                                    this.agent.model_picker_open = false;
-                                    cx.notify();
-                                }))
-                        })),
-                )
-            })
+            // 30. Composer: mode switch, context chips, input, tool / model pickers
+            .child(self.render_agent_composer(cx))
             .into_any_element()
     }
 }
@@ -2203,6 +1934,19 @@ mod tests {
         assert!(near_bottom(-500.0, 500.0, 40.0), "exactly at the end");
         assert!(near_bottom(-470.0, 500.0, 40.0), "within the slack");
         assert!(!near_bottom(-200.0, 500.0, 40.0), "scrolled up to read");
+    }
+
+    #[core::prelude::v1::test]
+    fn model_search_matches_every_word_over_label_and_id() {
+        let models = AgentHarness::ClaudeCode.models();
+        let hit = |q: &str| -> Vec<&str> {
+            filter_models(&models, q).into_iter().map(|ix| models[ix].id.as_str()).collect()
+        };
+        assert!(hit("sonnet 4.5").contains(&"claude-sonnet-4-5"), "the model that was missing from the picker");
+        assert!(hit("SONNET").len() >= 3, "aliases and dated ids all match");
+        assert_eq!(hit("haiku 5.5"), vec!["claude-haiku-5-5"]);
+        assert_eq!(hit("").len(), models.len(), "empty query lists everything");
+        assert!(hit("no-such-model").is_empty());
     }
 
     #[core::prelude::v1::test]

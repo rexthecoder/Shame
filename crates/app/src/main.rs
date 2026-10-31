@@ -8,6 +8,8 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+mod agent_composer;
+mod agent_ctx;
 mod chrome;
 mod diff_view;
 mod editor;
@@ -803,6 +805,36 @@ impl DartIde {
             },
         );
         this._subscriptions.push(search_changes);
+        // Agent composer: typing `@` opens the file picker; searching resets the highlighted row.
+        let mention_changes = cx.subscribe_in(
+            &this.agent.input,
+            window,
+            |this, state, event: &gpui_kit::component::input::InputEvent, window, cx| {
+                if !matches!(event, gpui_kit::component::input::InputEvent::Change) {
+                    return;
+                }
+                let text = state.read(cx).value().to_string();
+                if agent_ctx::mention_trigger(&text) {
+                    let cleaned = text[..text.len() - 1].to_string();
+                    state.update(cx, |s, cx| s.set_value(cleaned, window, cx));
+                    this.open_attach_picker(window, cx);
+                }
+            },
+        );
+        this._subscriptions.push(mention_changes);
+        for search in [this.agent.attach_search.clone(), this.agent.model_search.clone()] {
+            let sub = cx.subscribe(
+                &search,
+                |this, _state, event: &gpui_kit::component::input::InputEvent, cx| {
+                    if matches!(event, gpui_kit::component::input::InputEvent::Change) {
+                        this.agent.attach_selected = 0;
+                        this.agent.model_selected = 0;
+                        cx.notify();
+                    }
+                },
+            );
+            this._subscriptions.push(sub);
+        }
         this
     }
 
@@ -914,6 +946,12 @@ impl DartIde {
             if handled.is_some() {
                 return;
             }
+        }
+
+        // ⌘L: send the selection (or the whole file) to the agent chat.
+        if primary_mod && !keystroke.modifiers.shift && keystroke.key.as_str() == "l" {
+            self.attach_editor_context(window, cx);
+            return;
         }
 
         if primary_mod && !keystroke.modifiers.shift && keystroke.key.as_str() == "t" {

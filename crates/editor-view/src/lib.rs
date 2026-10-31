@@ -430,6 +430,30 @@ impl EditorView {
         (line as u32 + 1, column as u32 + 1)
     }
 
+    /// 1-indexed inclusive line range of the primary selection, if non-empty.
+    /// Cheap (no text copied), so UI can show it every frame.
+    pub fn selection_line_range(&self) -> Option<(usize, usize)> {
+        let sel = self.buffer.selections().primary();
+        if sel.is_empty() {
+            return None;
+        }
+        let range = sel.range();
+        let start_line = self.buffer.byte_to_line(range.start) + 1;
+        let mut end_line = self.buffer.byte_to_line(range.end) + 1;
+        // A selection that ends exactly at the start of a line doesn't include it.
+        if end_line > start_line && self.buffer.line_to_byte(end_line - 1) == range.end {
+            end_line -= 1;
+        }
+        Some((start_line, end_line))
+    }
+
+    /// The primary selection as `(start_line, end_line, text)` (1-indexed,
+    /// inclusive), for attaching to an AI message.
+    pub fn selection_for_context(&self) -> Option<(usize, usize, String)> {
+        let (start_line, end_line) = self.selection_line_range()?;
+        Some((start_line, end_line, self.buffer.slice(self.buffer.selections().primary().range())))
+    }
+
     /// Replace the buffer with the contents of `path`, discarding undo
     /// history and resetting the cursor to the start of the file.
     pub fn open_file(&mut self, path: impl AsRef<Path>, cx: &mut Context<Self>) -> io::Result<()> {
