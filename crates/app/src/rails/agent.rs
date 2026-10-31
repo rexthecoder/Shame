@@ -250,13 +250,6 @@ pub(crate) enum AgentItem {
     },
 }
 
-#[derive(Clone)]
-pub(crate) struct AgentPendingChange {
-    pub(crate) label: String,
-    pub(crate) path: String,
-    pub(crate) added: u32,
-}
-
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum StreamFragment {
     Tool(AgentToolCall),
@@ -443,6 +436,7 @@ fn tool_call_from_name_and_input(
 pub(crate) enum AgentStreamEvent {
     Started { pid: u32 },
     Fragment(StreamFragment),
+    StderrLine(String),
     Finished { error: Option<String> },
 }
 
@@ -456,7 +450,6 @@ pub(crate) struct AgentState {
     pub(crate) running_pid: Option<u32>,
     pub(crate) tasks: Vec<AgentTask>,
     pub(crate) items: Vec<AgentItem>,
-    pub(crate) pending: Vec<AgentPendingChange>,
     pub(crate) input: Entity<InputState>,
     pub(crate) scroll: ScrollHandle,
 }
@@ -474,7 +467,7 @@ impl AgentState {
             AgentHarness::Codex
         };
         let models = default_harness.models();
-        let mut state = Self {
+        Self {
             harness: default_harness,
             models,
             model_ix: 0,
@@ -484,12 +477,9 @@ impl AgentState {
             running_pid: None,
             tasks: Vec::new(),
             items: Vec::new(),
-            pending: Vec::new(),
             input,
             scroll: ScrollHandle::new(),
-        };
-        state.seed_reference_conversation();
-        state
+        }
     }
 
     pub(crate) fn set_harness(&mut self, harness: AgentHarness) {
@@ -504,65 +494,6 @@ impl AgentState {
             .get(self.model_ix)
             .map(|m| (m.id.as_str(), m.label.as_str()))
             .unwrap_or(("default", "Default"))
-    }
-
-    pub(crate) fn seed_reference_conversation(&mut self) {
-        self.tasks = vec![
-            AgentTask {
-                label: "Add movePane to PaneController".to_string(),
-                done: true,
-            },
-            AgentTask {
-                label: "Cover movePane with tests".to_string(),
-                done: true,
-            },
-            AgentTask {
-                label: "Run the tests".to_string(),
-                done: true,
-            },
-        ];
-        self.items = vec![
-            AgentItem::ToolGroup {
-                id: 0,
-                header: "Agent used a tool".to_string(),
-                collapsed: false,
-                calls: vec![AgentToolCall {
-                    kind: AgentToolKind::File,
-                    label: "Read pane_controller.dart".to_string(),
-                    target_path: Some("lib/src/pane_controller.dart".to_string()),
-                }],
-            },
-            AgentItem::Message {
-                is_user: false,
-                text: "`PaneController` keeps its panes in `_entries`. I'll add `movePane(id, toIndex)` next to `addPane`, clamping the index the same way, then cover it with a test.".to_string(),
-            },
-            AgentItem::ToolGroup {
-                id: 1,
-                header: "Agent used 3 tools".to_string(),
-                collapsed: false,
-                calls: vec![AgentToolCall {
-                    kind: AgentToolKind::Terminal,
-                    label: "flutter test test/move_pane_test.dart".to_string(),
-                    target_path: None,
-                }],
-            },
-            AgentItem::Message {
-                is_user: false,
-                text: "Done. `movePane` reorders a pane and notifies listeners once; sizes and visibility move with it. Both new tests pass.".to_string(),
-            },
-        ];
-        self.pending = vec![
-            AgentPendingChange {
-                label: "Edit pane_controller.dart".to_string(),
-                path: "lib/src/pane_controller.dart".to_string(),
-                added: 18,
-            },
-            AgentPendingChange {
-                label: "Create move_pane_test.dart".to_string(),
-                path: "test/move_pane_test.dart".to_string(),
-                added: 34,
-            },
-        ];
     }
 }
 
@@ -631,6 +562,22 @@ impl DartIde {
         self.agent
             .input
             .update(cx, |s, cx| s.set_value("", window, cx));
+        self.agent_run_prompt(prompt, window, cx);
+    }
+
+    pub(crate) fn agent_run_prompt(
+        &mut self,
+        prompt: String,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.agent.running_pid.is_some() {
+            return;
+        }
+        let prompt = prompt.trim().to_string();
+        if prompt.is_empty() {
+            return;
+        }
         self.agent.tool_picker_open = false;
         self.agent.model_picker_open = false;
         self.agent.items.push(AgentItem::Message {
@@ -685,7 +632,13 @@ impl DartIde {
         let (tx, rx) = async_channel::unbounded::<AgentStreamEvent>();
         std::thread::spawn(move || {
             let mut cmd = Command::new(&bin_path);
+            let home = std::env::var("HOME").unwrap_or_default();
+            let current_path = std::env::var("PATH").unwrap_or_default();
+            let enriched_path = format!(
+                "{home}/.local/bin:{home}/.bun/bin:{home}/.opencode/bin:{home}/.cargo/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:{current_path}"
+            );
             cmd.current_dir(&root)
+                .env("PATH", enriched_path)
                 .stdin(Stdio::null())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped());
@@ -731,6 +684,20 @@ impl DartIde {
 
             let _ = tx.send_blocking(AgentStreamEvent::Started { pid: child.id() });
 
+            let stderr_handle = child.stderr.take().map(|stderr| {
+                let tx_err = tx.clone();
+                std::thread::spawn(move || {
+                    let reader = BufReader::new(stderr);
+                    for line in reader.lines().map_while(Result::ok) {
+                        let trimmed = line.trim();
+                        if !trimmed.is_empty() {
+                            let _ = tx_err
+                                .send_blocking(AgentStreamEvent::StderrLine(trimmed.to_string()));
+                        }
+                    }
+                })
+            });
+
             if let Some(stdout) = child.stdout.take() {
                 let reader = BufReader::new(stdout);
                 for line in reader.lines().map_while(Result::ok) {
@@ -738,6 +705,9 @@ impl DartIde {
                         let _ = tx.send_blocking(AgentStreamEvent::Fragment(frag));
                     }
                 }
+            }
+            if let Some(h) = stderr_handle {
+                let _ = h.join();
             }
             let status = child.wait();
             let err_msg = match status {
@@ -750,12 +720,16 @@ impl DartIde {
 
         cx.spawn(async move |weak, cx| {
             let mut streamed_text = String::new();
+            let mut stderr_lines: Vec<String> = Vec::new();
             while let Ok(evt) = rx.recv().await {
                 let alive = weak
                     .update(cx, |this, cx| {
                         match evt {
                             AgentStreamEvent::Started { pid } => {
                                 this.agent.running_pid = Some(pid);
+                            }
+                            AgentStreamEvent::StderrLine(line) => {
+                                stderr_lines.push(line);
                             }
                             AgentStreamEvent::Fragment(frag) => match frag {
                                 StreamFragment::Tool(call) => {
@@ -803,11 +777,16 @@ impl DartIde {
                                     };
                                 }
                                 if streamed_text.trim().is_empty() {
-                                    if let Some(err) = error {
+                                    let fallback = if !stderr_lines.is_empty() {
+                                        Some(stderr_lines.join(" "))
+                                    } else {
+                                        error
+                                    };
+                                    if let Some(msg) = fallback {
                                         if let Some(AgentItem::Message { text, .. }) =
                                             this.agent.items.get_mut(msg_ix)
                                         {
-                                            *text = err;
+                                            *text = msg;
                                         }
                                     }
                                 }
@@ -841,16 +820,21 @@ impl DartIde {
         let (model_id, model_display) = self.agent.active_model();
         let model_short = model_id.rsplit('/').next().unwrap_or(model_display).to_string();
         let is_running = self.agent.running_pid.is_some();
+        let bin_resolved = harness.resolve_binary();
+        let active_rel_file = self
+            .active_editor()
+            .and_then(|ed| ed.read(cx).buffer().path().map(Path::to_path_buf))
+            .and_then(|p| p.strip_prefix(&self.root).ok().map(Path::to_path_buf))
+            .map(|p| p.to_string_lossy().to_string());
 
-        // Live pending changes: prefer real unstaged git changes when in a dirty repo,
-        // falling back to the seeded pending changes list.
+        // Live unstaged git changes from the workspace repository
         let real_unstaged: Vec<core_workspace::ChangedFile> = self
             .git
             .status
             .as_ref()
             .map(|s| s.unstaged.clone())
             .unwrap_or_default();
-        let use_real_git = !real_unstaged.is_empty();
+        let has_real_git = !real_unstaged.is_empty();
 
         v_flex()
             .relative()
@@ -926,7 +910,7 @@ impl DartIde {
                             })),
                     ),
             )
-            // 24. AgentHeader (shows active tool + model badge + reset)
+            // 24. AgentHeader (shows active tool + model badge + clear button)
             .child(
                 h_flex()
                     .w_full()
@@ -971,10 +955,11 @@ impl DartIde {
                                     .with_size(px(12.))
                                     .text_color(muted),
                             )
-                            .tooltip("Reset to demo conversation")
+                            .tooltip("Clear conversation")
                             .on_click(cx.listener(|this, _e, _w, cx| {
                                 this.stop_agent_run(cx);
-                                this.agent.seed_reference_conversation();
+                                this.agent.tasks.clear();
+                                this.agent.items.clear();
                                 cx.notify();
                             })),
                     ),
@@ -990,6 +975,175 @@ impl DartIde {
                     .track_scroll(&self.agent.scroll)
                     .p(px(tokens::SPACE_4))
                     .gap(px(tokens::SPACE_4))
+                    // Live empty state when no messages have been sent yet
+                    .when(self.agent.items.is_empty() && self.agent.tasks.is_empty(), |el| {
+                        let cli_ready = bin_resolved.is_some();
+                        let cli_status = match &bin_resolved {
+                            Some(p) => p.to_string_lossy().to_string(),
+                            None => format!("{} CLI not found in PATH", harness.short_label()),
+                        };
+                        let active_ctx = active_rel_file.clone().unwrap_or_else(|| {
+                            self.root
+                                .file_name()
+                                .and_then(|n| n.to_str())
+                                .unwrap_or("workspace")
+                                .to_string()
+                        });
+                        let starters: [(&str, &str); 3] = [
+                            (
+                                "Explain the active file",
+                                "Concise overview of the active file's responsibilities and key types.",
+                            ),
+                            (
+                                "Review uncommitted git changes",
+                                "Inspect git status/diff in this workspace and flag bugs or improvements.",
+                            ),
+                            (
+                                "Find & fix issues in this project",
+                                "Check for compiler/analyzer errors or failing tests and fix them.",
+                            ),
+                        ];
+
+                        el.child(
+                            v_flex()
+                                .w_full()
+                                .p(px(tokens::SPACE_4))
+                                .gap(px(tokens::SPACE_3))
+                                .rounded(px(tokens::RADIUS_CARD))
+                                .bg(card_bg)
+                                .border_1()
+                                .border_color(border)
+                                .child(
+                                    h_flex()
+                                        .w_full()
+                                        .items_center()
+                                        .justify_between()
+                                        .gap(px(tokens::SPACE_2))
+                                        .child(
+                                            h_flex()
+                                                .items_center()
+                                                .gap(px(tokens::SPACE_2))
+                                                .child(
+                                                    Icon::new(IconName::Bot)
+                                                        .small()
+                                                        .text_color(primary),
+                                                )
+                                                .child(
+                                                    div()
+                                                        .text_size(px(tokens::UI))
+                                                        .font_medium()
+                                                        .text_color(fg)
+                                                        .child(harness.label()),
+                                                ),
+                                        )
+                                        .child(
+                                            h_flex()
+                                                .items_center()
+                                                .gap(px(tokens::SPACE_1))
+                                                .px(px(6.))
+                                                .py(px(2.))
+                                                .rounded(px(tokens::RADIUS_PILL))
+                                                .bg(if cli_ready {
+                                                    green.opacity(0.15)
+                                                } else {
+                                                    red.opacity(0.15)
+                                                })
+                                                .child(
+                                                    div()
+                                                        .size(px(6.))
+                                                        .rounded(px(3.))
+                                                        .bg(if cli_ready { green } else { red }),
+                                                )
+                                                .child(
+                                                    div()
+                                                        .text_size(px(tokens::UI_XS))
+                                                        .text_color(if cli_ready {
+                                                            green
+                                                        } else {
+                                                            red
+                                                        })
+                                                        .child(if cli_ready {
+                                                            "CLI Ready"
+                                                        } else {
+                                                            "Missing CLI"
+                                                        }),
+                                                ),
+                                        ),
+                                )
+                                .child(
+                                    div()
+                                        .truncate()
+                                        .font_family(cx.theme().mono_font_family.clone())
+                                        .text_size(px(tokens::UI_XS))
+                                        .text_color(muted)
+                                        .child(cli_status),
+                                )
+                                .child(
+                                    h_flex()
+                                        .items_center()
+                                        .gap(px(tokens::SPACE_2))
+                                        .px(px(tokens::SPACE_2))
+                                        .py(px(4.))
+                                        .rounded(px(tokens::RADIUS_SM))
+                                        .bg(cx.theme().background)
+                                        .border_1()
+                                        .border_color(border)
+                                        .child(
+                                            Icon::new(IconName::FileCode)
+                                                .with_size(px(12.))
+                                                .text_color(primary),
+                                        )
+                                        .child(
+                                            div()
+                                                .truncate()
+                                                .text_size(px(tokens::UI_XS))
+                                                .text_color(fg)
+                                                .child(format!("Context: {active_ctx}")),
+                                        ),
+                                )
+                                .child(div().w_full().h(px(1.)).bg(border.opacity(0.6)))
+                                .children(starters.into_iter().enumerate().map(
+                                    |(ix, (title, prompt_text))| {
+                                        let prompt_owned = prompt_text.to_string();
+                                        h_flex()
+                                            .id(("agent-starter", ix))
+                                            .w_full()
+                                            .px(px(tokens::SPACE_3))
+                                            .py(px(6.))
+                                            .items_center()
+                                            .justify_between()
+                                            .gap(px(tokens::SPACE_2))
+                                            .rounded(px(tokens::RADIUS_SM))
+                                            .bg(cx.theme().background)
+                                            .border_1()
+                                            .border_color(border)
+                                            .cursor_pointer()
+                                            .hover(move |s| {
+                                                s.bg(list_hover).border_color(primary.opacity(0.45))
+                                            })
+                                            .child(
+                                                div()
+                                                    .truncate()
+                                                    .text_size(px(tokens::UI_SM))
+                                                    .text_color(fg)
+                                                    .child(title),
+                                            )
+                                            .child(
+                                                Icon::new(IconName::ArrowRight)
+                                                    .with_size(px(11.))
+                                                    .text_color(muted),
+                                            )
+                                            .on_click(cx.listener(move |this, _e, window, cx| {
+                                                this.agent_run_prompt(
+                                                    prompt_owned.clone(),
+                                                    window,
+                                                    cx,
+                                                );
+                                            }))
+                                    },
+                                )),
+                        )
+                    })
                     // 25. TaskChecklist card
                     .when(!self.agent.tasks.is_empty(), |el| {
                         el.child(
@@ -1193,13 +1347,9 @@ impl DartIde {
                         }
                     })),
             )
-            // 29. PendingChanges card (reflects real unstaged git files when dirty, or seeded pending items)
-            .when(use_real_git || !self.agent.pending.is_empty(), |el| {
-                let count = if use_real_git {
-                    real_unstaged.len()
-                } else {
-                    self.agent.pending.len()
-                };
+            // 29. PendingChanges card (strictly reflects real unstaged git files in the workspace)
+            .when(has_real_git, |el| {
+                let count = real_unstaged.len();
                 el.child(
                     v_flex()
                         .w_auto()
@@ -1262,14 +1412,7 @@ impl DartIde {
                                                 )
                                                 .on_click(cx.listener(
                                                     move |this, _e, window, cx| {
-                                                        if use_real_git {
-                                                            this.git_discard_all_clicked(
-                                                                window, cx,
-                                                            );
-                                                        } else {
-                                                            this.agent.pending.clear();
-                                                            cx.notify();
-                                                        }
+                                                        this.git_discard_all_clicked(window, cx);
                                                     },
                                                 )),
                                         )
@@ -1291,217 +1434,105 @@ impl DartIde {
                                                 )
                                                 .on_click(cx.listener(
                                                     move |this, _e, window, cx| {
-                                                        if use_real_git {
-                                                            this.git_stage_all(window, cx);
-                                                        } else {
-                                                            this.agent.pending.clear();
-                                                            cx.notify();
-                                                        }
+                                                        this.git_stage_all(window, cx);
                                                     },
                                                 )),
                                         ),
                                 ),
                         )
                         .child(div().w_full().h(px(1.)).bg(border.opacity(0.6)))
-                        .when(use_real_git, |list| {
-                            list.children(real_unstaged.into_iter().take(6).enumerate().map(
-                                |(ix, file)| {
-                                    let name = Path::new(&file.path)
-                                        .file_name()
-                                        .and_then(|n| n.to_str())
-                                        .unwrap_or(&file.path)
-                                        .to_string();
-                                    let diff_file = file.clone();
-                                    let stage_file = file.clone();
-                                    let discard_file = file.clone();
-                                    h_flex()
-                                        .id(("agent-git-pending-row", ix))
-                                        .w_full()
-                                        .h(px(30.))
-                                        .px(px(tokens::SPACE_2))
-                                        .items_center()
-                                        .justify_between()
-                                        .gap(px(tokens::SPACE_2))
-                                        .rounded(px(tokens::RADIUS_PANEL))
-                                        .cursor_pointer()
-                                        .hover(move |s| s.bg(list_hover))
-                                        .child(
-                                            h_flex()
-                                                .flex_1()
-                                                .min_w(px(0.))
-                                                .items_center()
-                                                .gap(px(tokens::SPACE_2))
-                                                .child(crate::rails::files::render_file_icon(&name))
-                                                .child(
-                                                    div()
-                                                        .truncate()
-                                                        .text_size(px(12.))
-                                                        .text_color(fg)
-                                                        .child(name),
-                                                ),
-                                        )
-                                        .child(
-                                            h_flex()
-                                                .flex_shrink_0()
-                                                .items_center()
-                                                .gap(px(tokens::SPACE_3))
-                                                .child(
-                                                    div()
-                                                        .id(("agent-git-reject", ix))
-                                                        .cursor_pointer()
-                                                        .text_color(red)
-                                                        .child(
-                                                            Icon::new(IconName::X)
-                                                                .with_size(px(11.)),
-                                                        )
-                                                        .on_mouse_down(
-                                                            MouseButton::Left,
-                                                            |_, _, cx| cx.stop_propagation(),
-                                                        )
-                                                        .on_click(cx.listener(
-                                                            move |this, _e, window, cx| {
-                                                                this.git_discard_clicked(
-                                                                    discard_file.clone(),
-                                                                    window,
-                                                                    cx,
-                                                                );
-                                                            },
-                                                        )),
-                                                )
-                                                .child(
-                                                    div()
-                                                        .id(("agent-git-accept", ix))
-                                                        .cursor_pointer()
-                                                        .text_color(primary)
-                                                        .child(
-                                                            Icon::new(IconName::Check)
-                                                                .with_size(px(11.)),
-                                                        )
-                                                        .on_mouse_down(
-                                                            MouseButton::Left,
-                                                            |_, _, cx| cx.stop_propagation(),
-                                                        )
-                                                        .on_click(cx.listener(
-                                                            move |this, _e, window, cx| {
-                                                                this.git_stage(
-                                                                    std::slice::from_ref(
-                                                                        &stage_file,
-                                                                    ),
-                                                                    window,
-                                                                    cx,
-                                                                );
-                                                            },
-                                                        )),
-                                                ),
-                                        )
-                                        .on_click(cx.listener(move |this, _e, _w, cx| {
-                                            this.open_git_diff(diff_file.clone(), false, cx);
-                                        }))
-                                },
-                            ))
-                        })
-                        .when(!use_real_git, |list| {
-                            list.children(self.agent.pending.iter().enumerate().map(
-                                |(ix, item)| {
-                                    let rel_path = item.path.clone();
-                                    h_flex()
-                                        .id(("agent-pending-row", ix))
-                                        .w_full()
-                                        .h(px(30.))
-                                        .px(px(tokens::SPACE_2))
-                                        .items_center()
-                                        .justify_between()
-                                        .gap(px(tokens::SPACE_2))
-                                        .rounded(px(tokens::RADIUS_PANEL))
-                                        .cursor_pointer()
-                                        .hover(move |s| s.bg(list_hover))
-                                        .child(
-                                            h_flex()
-                                                .flex_1()
-                                                .min_w(px(0.))
-                                                .items_center()
-                                                .gap(px(tokens::SPACE_2))
-                                                .child(
-                                                    Icon::new(IconName::FileCode)
-                                                        .with_size(px(13.))
-                                                        .text_color(muted),
-                                                )
-                                                .child(
-                                                    div()
-                                                        .truncate()
-                                                        .text_size(px(12.))
-                                                        .text_color(fg)
-                                                        .child(item.label.clone()),
-                                                ),
-                                        )
-                                        .child(
-                                            h_flex()
-                                                .flex_shrink_0()
-                                                .items_center()
-                                                .gap(px(tokens::SPACE_3))
-                                                .child(
-                                                    div()
-                                                        .font_family(
-                                                            cx.theme().mono_font_family.clone(),
-                                                        )
-                                                        .text_size(px(tokens::UI_SM))
-                                                        .text_color(green)
-                                                        .child(format!("+{}", item.added)),
-                                                )
-                                                .child(
-                                                    div()
-                                                        .id(("agent-reject-row", ix))
-                                                        .cursor_pointer()
-                                                        .text_color(red)
-                                                        .child(
-                                                            Icon::new(IconName::X)
-                                                                .with_size(px(11.)),
-                                                        )
-                                                        .on_mouse_down(
-                                                            MouseButton::Left,
-                                                            |_, _, cx| cx.stop_propagation(),
-                                                        )
-                                                        .on_click(cx.listener(
-                                                            move |this, _e, _w, cx| {
-                                                                if ix < this.agent.pending.len() {
-                                                                    this.agent.pending.remove(ix);
-                                                                    cx.notify();
-                                                                }
-                                                            },
-                                                        )),
-                                                )
-                                                .child(
-                                                    div()
-                                                        .id(("agent-accept-row", ix))
-                                                        .cursor_pointer()
-                                                        .text_color(primary)
-                                                        .child(
-                                                            Icon::new(IconName::Check)
-                                                                .with_size(px(11.)),
-                                                        )
-                                                        .on_mouse_down(
-                                                            MouseButton::Left,
-                                                            |_, _, cx| cx.stop_propagation(),
-                                                        )
-                                                        .on_click(cx.listener(
-                                                            move |this, _e, _w, cx| {
-                                                                if ix < this.agent.pending.len() {
-                                                                    this.agent.pending.remove(ix);
-                                                                    cx.notify();
-                                                                }
-                                                            },
-                                                        )),
-                                                ),
-                                        )
-                                        .on_click(cx.listener(move |this, _e, window, cx| {
-                                            let full = this.root.join(&rel_path);
-                                            if full.exists() {
-                                                this.open_path(full, window, cx);
-                                            }
-                                        }))
-                                },
-                            ))
-                        }),
+                        .children(real_unstaged.into_iter().take(6).enumerate().map(
+                            |(ix, file)| {
+                                let name = Path::new(&file.path)
+                                    .file_name()
+                                    .and_then(|n| n.to_str())
+                                    .unwrap_or(&file.path)
+                                    .to_string();
+                                let diff_file = file.clone();
+                                let stage_file = file.clone();
+                                let discard_file = file.clone();
+                                h_flex()
+                                    .id(("agent-git-pending-row", ix))
+                                    .w_full()
+                                    .h(px(30.))
+                                    .px(px(tokens::SPACE_2))
+                                    .items_center()
+                                    .justify_between()
+                                    .gap(px(tokens::SPACE_2))
+                                    .rounded(px(tokens::RADIUS_PANEL))
+                                    .cursor_pointer()
+                                    .hover(move |s| s.bg(list_hover))
+                                    .child(
+                                        h_flex()
+                                            .flex_1()
+                                            .min_w(px(0.))
+                                            .items_center()
+                                            .gap(px(tokens::SPACE_2))
+                                            .child(crate::rails::files::render_file_icon(&name))
+                                            .child(
+                                                div()
+                                                    .truncate()
+                                                    .text_size(px(12.))
+                                                    .text_color(fg)
+                                                    .child(name),
+                                            ),
+                                    )
+                                    .child(
+                                        h_flex()
+                                            .flex_shrink_0()
+                                            .items_center()
+                                            .gap(px(tokens::SPACE_3))
+                                            .child(
+                                                div()
+                                                    .id(("agent-git-reject", ix))
+                                                    .cursor_pointer()
+                                                    .text_color(red)
+                                                    .child(
+                                                        Icon::new(IconName::X).with_size(px(11.)),
+                                                    )
+                                                    .on_mouse_down(
+                                                        MouseButton::Left,
+                                                        |_, _, cx| cx.stop_propagation(),
+                                                    )
+                                                    .on_click(cx.listener(
+                                                        move |this, _e, window, cx| {
+                                                            this.git_discard_clicked(
+                                                                discard_file.clone(),
+                                                                window,
+                                                                cx,
+                                                            );
+                                                        },
+                                                    )),
+                                            )
+                                            .child(
+                                                div()
+                                                    .id(("agent-git-accept", ix))
+                                                    .cursor_pointer()
+                                                    .text_color(primary)
+                                                    .child(
+                                                        Icon::new(IconName::Check)
+                                                            .with_size(px(11.)),
+                                                    )
+                                                    .on_mouse_down(
+                                                        MouseButton::Left,
+                                                        |_, _, cx| cx.stop_propagation(),
+                                                    )
+                                                    .on_click(cx.listener(
+                                                        move |this, _e, window, cx| {
+                                                            this.git_stage(
+                                                                std::slice::from_ref(&stage_file),
+                                                                window,
+                                                                cx,
+                                                            );
+                                                        },
+                                                    )),
+                                            ),
+                                    )
+                                    .on_click(cx.listener(move |this, _e, _w, cx| {
+                                        this.open_git_diff(diff_file.clone(), false, cx);
+                                    }))
+                            },
+                        )),
                 )
             })
             // 30. Composer (`Message agent…`, Tool selector, Model selector, Mode selector, Send / Stop button)

@@ -5,6 +5,7 @@ use gpui_kit::component::{
     ActiveTheme as _, Icon, IconName, Sizable as _,
     button::{Button, ButtonVariants as _},
     h_flex,
+    input::Input,
     tree::TreeItem,
     v_flex,
 };
@@ -348,13 +349,17 @@ impl DartIde {
                                             .xsmall()
                                             .text_color(muted),
                                     )
-                                    .tooltip("New file")
+                                    .tooltip("New File on Disk\u{2026}")
                                     .on_click(cx.listener(|this, _event, window, cx| {
-                                        this.new_scratch_tab(window, cx);
+                                        this.open_file_tree_prompt(
+                                            crate::FileTreeOp::NewFile,
+                                            window,
+                                            cx,
+                                        );
                                     })),
                             )
                             .child(
-                                Button::new("open-folder")
+                                Button::new("rail-new-folder")
                                     .ghost()
                                     .small()
                                     .icon(
@@ -362,9 +367,13 @@ impl DartIde {
                                             .xsmall()
                                             .text_color(muted),
                                     )
-                                    .tooltip("Open Folder\u{2026} (cmd/ctrl+O)")
+                                    .tooltip("New Folder on Disk\u{2026}")
                                     .on_click(cx.listener(|this, _event, window, cx| {
-                                        this.open_folder(window, cx);
+                                        this.open_file_tree_prompt(
+                                            crate::FileTreeOp::NewFolder,
+                                            window,
+                                            cx,
+                                        );
                                     })),
                             )
                             .child(
@@ -414,6 +423,59 @@ impl DartIde {
                             ),
                     ),
             )
+            .when(self.file_tree_op.is_some(), |el| {
+                let label = match &self.file_tree_op {
+                    Some(crate::FileTreeOp::NewFile) => "New file:",
+                    Some(crate::FileTreeOp::NewFolder) => "New folder:",
+                    Some(crate::FileTreeOp::Rename(_)) => "Rename to:",
+                    None => "",
+                };
+                el.child(
+                    v_flex()
+                        .w_auto()
+                        .mx(px(tokens::SPACE_3))
+                        .mb(px(tokens::SPACE_2))
+                        .p(px(tokens::SPACE_2))
+                        .gap(px(tokens::SPACE_1))
+                        .rounded(px(tokens::RADIUS_SM))
+                        .bg(cx.theme().background)
+                        .border_1()
+                        .border_color(cx.theme().primary.opacity(0.6))
+                        .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
+                            let key = event.keystroke.key.as_str();
+                            if key == "escape" {
+                                this.file_tree_op = None;
+                                cx.stop_propagation();
+                                cx.notify();
+                            } else if key == "enter" {
+                                this.submit_file_tree_prompt(window, cx);
+                                cx.stop_propagation();
+                            }
+                        }))
+                        .child(
+                            h_flex()
+                                .items_center()
+                                .justify_between()
+                                .child(
+                                    div()
+                                        .text_size(px(tokens::UI_XS))
+                                        .text_color(cx.theme().primary)
+                                        .child(label),
+                                )
+                                .child(
+                                    div()
+                                        .text_size(px(tokens::UI_XS))
+                                        .text_color(muted)
+                                        .child("\u{21b5} save \u{00b7} esc"),
+                                ),
+                        )
+                        .child(
+                            Input::new(&self.file_tree_input)
+                                .appearance(false)
+                                .xsmall(),
+                        ),
+                )
+            })
             .child(
                 div()
                     .flex_1()
@@ -440,11 +502,15 @@ impl DartIde {
                                 }
                                 let dirty_folders = std::rc::Rc::new(dirty_folders);
                                 let git_status = std::rc::Rc::new(self.git_status.clone());
+                                let confirm_del = self.git.confirm_discard.clone();
                                 move |ix, entry, _entry_state, _window, cx| {
                                     let item = entry.item();
                                     let item_path = PathBuf::from(item.id.as_str());
                                     let is_folder = entry.is_folder();
                                     let depth = entry.depth();
+                                    let row_group = format!("tree-row-grp-{ix}");
+                                    let del_key = format!("tree-del:{}", item.id);
+                                    let del_armed = confirm_del.as_deref() == Some(del_key.as_str());
                                     let icon_el: AnyElement = if !is_folder {
                                         render_file_icon(&item.label).into_any_element()
                                     } else {
@@ -498,6 +564,7 @@ impl DartIde {
                                         .child(
                                             h_flex()
                                                 .id(("tree-row", ix))
+                                                .group(row_group.clone())
                                                 .relative()
                                                 .w_full()
                                                 .h(px(26.))
@@ -558,6 +625,83 @@ impl DartIde {
                                                         .text_size(px(tokens::UI))
                                                         .child(item.label.clone()),
                                                 )
+                                                .child({
+                                                    let view_ren = view.clone();
+                                                    let view_del = view.clone();
+                                                    let ren_path = item_path.clone();
+                                                    let del_path = item_path.clone();
+                                                    h_flex()
+                                                        .items_center()
+                                                        .gap(px(4.))
+                                                        .when(!del_armed, |r| {
+                                                            r.invisible()
+                                                                .group_hover(row_group.clone(), |s| {
+                                                                    s.visible()
+                                                                })
+                                                        })
+                                                        .child(
+                                                            div()
+                                                                .id(("tree-rename", ix))
+                                                                .text_color(cx.theme().muted_foreground)
+                                                                .hover(move |s| s.text_color(fg))
+                                                                .child(
+                                                                    Icon::new(
+                                                                        gpui_kit::assets::IconName::PenTool,
+                                                                    )
+                                                                    .with_size(px(11.)),
+                                                                )
+                                                                .on_mouse_down(
+                                                                    MouseButton::Left,
+                                                                    |_, _, cx| cx.stop_propagation(),
+                                                                )
+                                                                .on_click(move |_e, window, cx| {
+                                                                    cx.stop_propagation();
+                                                                    let p = ren_path.clone();
+                                                                    view_ren.update(cx, |this, cx| {
+                                                                        this.open_file_tree_prompt(
+                                                                            crate::FileTreeOp::Rename(p),
+                                                                            window,
+                                                                            cx,
+                                                                        );
+                                                                    });
+                                                                }),
+                                                        )
+                                                        .child(
+                                                            div()
+                                                                .id(("tree-delete", ix))
+                                                                .text_size(px(9.5))
+                                                                .text_color(if del_armed {
+                                                                    cx.theme().danger
+                                                                } else {
+                                                                    cx.theme().muted_foreground
+                                                                })
+                                                                .hover(|s| {
+                                                                    s.text_color(cx.theme().danger)
+                                                                })
+                                                                .child(if del_armed {
+                                                                    div().child("Del?").into_any_element()
+                                                                } else {
+                                                                    Icon::new(
+                                                                        gpui_kit::assets::IconName::X,
+                                                                    )
+                                                                    .with_size(px(11.))
+                                                                    .into_any_element()
+                                                                })
+                                                                .on_mouse_down(
+                                                                    MouseButton::Left,
+                                                                    |_, _, cx| cx.stop_propagation(),
+                                                                )
+                                                                .on_click(move |_e, _window, cx| {
+                                                                    cx.stop_propagation();
+                                                                    let p = del_path.clone();
+                                                                    view_del.update(cx, |this, cx| {
+                                                                        this.delete_tree_path_clicked(
+                                                                            p, cx,
+                                                                        );
+                                                                    });
+                                                                }),
+                                                        )
+                                                })
                                                 .when_some(badge, |el, letter| {
                                                     el.child(status_badge(letter, cx))
                                                 })

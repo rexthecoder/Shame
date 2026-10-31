@@ -150,6 +150,12 @@ pub struct EditorView {
     breakpoints: std::collections::BTreeSet<u32>,
     /// 1-indexed line where the debugger is currently paused, if any.
     active_debug_line: Option<u32>,
+    /// Multi-line `{ ... }` fold candidates computed from `syntax_tree`.
+    fold_ranges: Vec<core_syntax::FoldRange>,
+    /// 0-indexed `start_line`s of blocks currently folded by the user.
+    folded_starts: std::collections::HashSet<usize>,
+    /// Display-row -> 0-indexed buffer line mapping when one or more blocks are folded.
+    visible_lines: Vec<usize>,
     /// Whether a `save()` triggered an LSP format request that should re-flush once applied.
     pub(crate) save_after_format: bool,
 }
@@ -168,6 +174,10 @@ impl EditorView {
             String::new()
         };
         let syntax_tree = parse_syntax.then(|| SyntaxTree::parse(&synced_text));
+        let fold_ranges = syntax_tree
+            .as_ref()
+            .map(|t| t.fold_ranges())
+            .unwrap_or_default();
         let closing_labels = if parse_syntax {
             language.closing_labels(&synced_text)
         } else {
@@ -198,6 +208,9 @@ impl EditorView {
             test_code_lenses: Vec::new(),
             breakpoints: std::collections::BTreeSet::new(),
             active_debug_line: None,
+            fold_ranges,
+            folded_starts: std::collections::HashSet::new(),
+            visible_lines: Vec::new(),
             save_after_format: false,
         };
         this.maybe_start_lsp(cx);
@@ -248,12 +261,52 @@ impl EditorView {
                 self.syntax_tree = Some(SyntaxTree::parse(&text));
             }
             self.closing_labels = self.language.closing_labels(&text);
+            self.fold_ranges = self
+                .syntax_tree
+                .as_ref()
+                .map(|t| t.fold_ranges())
+                .unwrap_or_default();
             self.sync_lsp_text(&text);
             self.synced_text = text;
         } else {
             self.syntax_tree = None;
             self.closing_labels.clear();
+            self.fold_ranges.clear();
             self.synced_text.clear();
+        }
+        if !self.folded_starts.is_empty() {
+            self.rebuild_visible_lines();
+        }
+    }
+
+    pub fn toggle_fold(&mut self, start_line: usize, cx: &mut Context<Self>) {
+        if !self.folded_starts.remove(&start_line) {
+            self.folded_starts.insert(start_line);
+        }
+        self.rebuild_visible_lines();
+        cx.notify();
+    }
+
+    fn rebuild_visible_lines(&mut self) {
+        self.visible_lines.clear();
+        if self.folded_starts.is_empty() {
+            return;
+        }
+        let total = self.buffer.line_count().max(1);
+        let mut line = 0usize;
+        while line < total {
+            self.visible_lines.push(line);
+            if self.folded_starts.contains(&line) {
+                if let Some(f) = self
+                    .fold_ranges
+                    .iter()
+                    .find(|r| r.start_line == line && r.end_line > line)
+                {
+                    line = f.end_line + 1;
+                    continue;
+                }
+            }
+            line += 1;
         }
     }
 
@@ -1393,28 +1446,70 @@ impl EditorView {
                     .child(div().child(line_1.to_string())),
             )
             .child(
-                div()
+                h_flex()
                     .w(px(GUTTER_WIDTH - 40.))
-                    .flex()
+                    .h_full()
                     .items_center()
                     .justify_center()
+                    .gap(px(2.))
                     .when(is_active_line, |el| {
                         let view = cx.entity();
-                        el.cursor_pointer()
-                            .child(
-                                gpui_kit::component::Icon::new(
-                                    gpui_kit::assets::IconName::Lightbulb,
+                        el.child(
+                            div()
+                                .cursor_pointer()
+                                .child(
+                                    gpui_kit::component::Icon::new(
+                                        gpui_kit::assets::IconName::Lightbulb,
+                                    )
+                                    .with_size(px(11.))
+                                    .text_color(cx.theme().warning),
                                 )
-                                .xsmall()
-                                .text_color(cx.theme().warning),
+                                .on_mouse_down(MouseButton::Left, move |_event, window, cx| {
+                                    cx.stop_propagation();
+                                    view.update(cx, |this, cx| {
+                                        window.focus(&this.focus_handle, cx);
+                                        this.request_code_actions(cx);
+                                    });
+                                }),
+                        )
+                    })
+                    .when_some(
+                        self.fold_ranges
+                            .iter()
+                            .find(|r| r.start_line == index && r.end_line > index)
+                            .copied(),
+                        |el, _| {
+                            let is_folded = self.folded_starts.contains(&index);
+                            let view = cx.entity();
+                            el.child(
+                                div()
+                                    .id(("fold-chevron", index))
+                                    .cursor_pointer()
+                                    .text_color(if is_folded {
+                                        cx.theme().primary
+                                    } else {
+                                        cx.theme().muted_foreground.opacity(0.75)
+                                    })
+                                    .child(
+                                        gpui_kit::component::Icon::new(if is_folded {
+                                            gpui_kit::assets::IconName::ChevronRight
+                                        } else {
+                                            gpui_kit::assets::IconName::ChevronDown
+                                        })
+                                        .with_size(px(11.)),
+                                    )
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        move |_event, _window, cx| {
+                                            cx.stop_propagation();
+                                            view.update(cx, |this, cx| {
+                                                this.toggle_fold(index, cx);
+                                            });
+                                        },
+                                    ),
                             )
-                            .on_mouse_down(MouseButton::Left, move |_event, window, cx| {
-                                view.update(cx, |this, cx| {
-                                    window.focus(&this.focus_handle, cx);
-                                    this.request_code_actions(cx);
-                                });
-                            })
-                    }),
+                        },
+                    ),
             );
 
         // A thin bar flush against the window's left edge for a line
@@ -1560,11 +1655,24 @@ impl EditorView {
         let line_shared: SharedString = display_text.to_string().into();
         let line_len = line_shared.len();
         let leading_spaces = display_text.as_bytes().iter().take_while(|&&b| b == b' ').count();
-        let closing_label_shared: Option<SharedString> = self
-            .closing_labels
-            .get(&index)
-            .filter(|_| !display_text.contains("//"))
-            .map(|s| SharedString::from(s.clone()));
+        let folded_count = self
+            .folded_starts
+            .contains(&index)
+            .then(|| {
+                self.fold_ranges
+                    .iter()
+                    .find(|r| r.start_line == index)
+                    .map(|r| r.end_line.saturating_sub(r.start_line))
+            })
+            .flatten();
+        let closing_label_shared: Option<SharedString> = if let Some(n) = folded_count {
+            Some(SharedString::from(format!("\u{22ef} {n} lines folded }}}}")) )
+        } else {
+            self.closing_labels
+                .get(&index)
+                .filter(|_| !display_text.contains("//"))
+                .map(|s| SharedString::from(s.clone()))
+        };
         let closing_font = {
             let mut f = font(mono_family.clone());
             f.style = FontStyle::Italic;
@@ -2455,7 +2563,11 @@ impl Render for EditorView {
                 })
         });
 
-        let line_count = self.buffer.line_count().max(1);
+        let line_count = if self.folded_starts.is_empty() {
+            self.buffer.line_count().max(1)
+        } else {
+            self.visible_lines.len().max(1)
+        };
         let list = uniform_list(
             "editor-lines",
             line_count,
@@ -2463,8 +2575,16 @@ impl Render for EditorView {
                 if visible_range.is_empty() {
                     return Vec::new();
                 }
-                let start_line = visible_range.start;
-                let end_line = visible_range.end.min(this.buffer.line_count());
+                let map_line = |disp_ix: usize| -> usize {
+                    if this.folded_starts.is_empty() {
+                        disp_ix
+                    } else {
+                        this.visible_lines.get(disp_ix).copied().unwrap_or(disp_ix)
+                    }
+                };
+                let start_line = map_line(visible_range.start);
+                let end_line = (map_line(visible_range.end.saturating_sub(1)) + 1)
+                    .min(this.buffer.line_count());
                 let start_byte = this.buffer.line_to_byte(start_line);
                 let end_byte = if end_line < this.buffer.line_count() {
                     this.buffer.line_to_byte(end_line)
@@ -2483,7 +2603,12 @@ impl Render for EditorView {
                     .unwrap_or_default();
 
                 visible_range
-                    .map(|ix| {
+                    .map(|disp_ix| {
+                        let ix = if this.folded_starts.is_empty() {
+                            disp_ix
+                        } else {
+                            this.visible_lines.get(disp_ix).copied().unwrap_or(disp_ix)
+                        };
                         let line = if this.buffer.is_empty() && ix == 0 {
                             String::new()
                         } else if ix < this.buffer.line_count() {

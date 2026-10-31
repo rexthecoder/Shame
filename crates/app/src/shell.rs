@@ -652,7 +652,7 @@ impl DartIde {
                 .child(markdown(source).scrollable(true).selectable(true))
         };
 
-        let editor_body = match (active_editor, active_md_mode) {
+        let primary_body = match (active_editor, active_md_mode) {
             _ if self.diff.is_some() => self.render_diff_view(cx),
             _ if active_image.is_some() => {
                 self.render_image_viewer(self.active_tab, active_image.as_ref().unwrap(), cx)
@@ -678,6 +678,72 @@ impl DartIde {
                     .into_any_element()
             }
             (None, _) => self.render_empty_editor(view, cx).into_any_element(),
+        };
+
+        let editor_body = if let (None, Some(right_ix)) = (&self.diff, self.split_tab) {
+            if let Some(right_tab) = self.tabs.get(right_ix) {
+                let right_title = right_tab.title();
+                let right_pane: AnyElement = if let Some(img) = &right_tab.image {
+                    self.render_image_viewer(right_ix, img, cx)
+                } else {
+                    right_tab.editor.clone().into_any_element()
+                };
+                let muted = cx.theme().muted_foreground;
+                let fg = cx.theme().foreground;
+                let right_card = v_flex()
+                    .size_full()
+                    .min_w(px(0.))
+                    .min_h(px(0.))
+                    .border_l_1()
+                    .border_color(cx.theme().border)
+                    .child(
+                        h_flex()
+                            .w_full()
+                            .h(px(28.))
+                            .px(px(tokens::SPACE_4))
+                            .items_center()
+                            .justify_between()
+                            .bg(cx.theme().tab_bar)
+                            .border_b_1()
+                            .border_color(cx.theme().border)
+                            .child(
+                                h_flex()
+                                    .items_center()
+                                    .gap(px(tokens::SPACE_2))
+                                    .child(crate::rails::files::render_file_icon(&right_title))
+                                    .child(
+                                        div()
+                                            .text_size(px(tokens::UI_SM))
+                                            .text_color(fg)
+                                            .child(right_title),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .id("close-split-pane")
+                                    .cursor_pointer()
+                                    .text_color(muted)
+                                    .hover(move |s| s.text_color(fg))
+                                    .child(
+                                        Icon::new(gpui_kit::assets::IconName::X).with_size(px(11.)),
+                                    )
+                                    .on_click(cx.listener(|this, _e, _w, cx| {
+                                        this.split_tab = None;
+                                        cx.notify();
+                                    })),
+                            ),
+                    )
+                    .child(div().flex_1().w_full().min_h(px(0.)).child(right_pane));
+
+                h_resizable("editor-split-panes")
+                    .child(resizable_panel().child(primary_body))
+                    .child(resizable_panel().child(right_card))
+                    .into_any_element()
+            } else {
+                primary_body
+            }
+        } else {
+            primary_body
         };
 
         let editor_card = v_flex()

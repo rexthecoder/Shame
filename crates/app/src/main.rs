@@ -75,6 +75,13 @@ fn hash_paths(paths: &[PathBuf]) -> u64 {
     h.finish()
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum FileTreeOp {
+    NewFile,
+    NewFolder,
+    Rename(PathBuf),
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum MarkdownMode {
     Code,
@@ -266,9 +273,12 @@ pub struct DartIde {
     pub(crate) dap_stack_summary: Option<String>,
     pub(crate) dap_variables: Vec<(String, String)>,
     pub(crate) show_hidden: bool,
+    pub(crate) file_tree_op: Option<FileTreeOp>,
+    pub(crate) file_tree_input: Entity<InputState>,
     pub(crate) tree_state: Entity<TreeState>,
     pub(crate) tabs: Vec<Tab>,
     pub(crate) active_tab: usize,
+    pub(crate) split_tab: Option<usize>,
     pub(crate) tab_scroll: ScrollHandle,
     pub(crate) tab_overflow_open: bool,
     pub(crate) all_files: Vec<PathBuf>,
@@ -332,6 +342,9 @@ impl DartIde {
         let project_search_input = cx.new(|cx| {
             InputState::new(window, cx).placeholder("Search across files...")
         });
+        let file_tree_input = cx.new(|cx| {
+            InputState::new(window, cx).placeholder("path/to/file.dart\u{2026}")
+        });
         let agent = rails::agent::AgentState::new(window, cx);
 
         // Filled in by the first `refresh_git` (off the UI thread) right after construction.
@@ -386,9 +399,12 @@ impl DartIde {
             dap_stack_summary: None,
             dap_variables: Vec::new(),
             show_hidden,
+            file_tree_op: None,
+            file_tree_input,
             tree_state,
             tabs: Vec::new(),
             active_tab: 0,
+            split_tab: None,
             tab_scroll: ScrollHandle::new(),
             tab_overflow_open: false,
             all_files_hash: hash_paths(&all_files),
@@ -1659,12 +1675,132 @@ impl DartIde {
         self.tabs.remove(ix);
         if self.tabs.is_empty() {
             self.active_tab = 0;
+            self.split_tab = None;
         } else if self.active_tab > ix {
             self.active_tab -= 1;
         } else {
             self.active_tab = self.active_tab.min(self.tabs.len() - 1);
         }
+        if let Some(sp) = self.split_tab {
+            if sp == ix || self.tabs.is_empty() {
+                self.split_tab = None;
+            } else if sp > ix {
+                self.split_tab = Some(sp - 1);
+            }
+        }
         self.notify_tab_change(cx);
+    }
+
+    pub(crate) fn toggle_split_editor(&mut self, cx: &mut Context<Self>) {
+        if self.split_tab.is_some() {
+            self.split_tab = None;
+        } else if !self.tabs.is_empty() {
+            let right_ix = if self.tabs.len() > 1 {
+                (self.active_tab + 1) % self.tabs.len()
+            } else {
+                self.active_tab
+            };
+            self.split_tab = Some(right_ix);
+        }
+        cx.notify();
+    }
+
+    pub(crate) fn open_file_tree_prompt(
+        &mut self,
+        op: FileTreeOp,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let initial = match &op {
+            FileTreeOp::Rename(path) => path
+                .strip_prefix(&self.root)
+                .unwrap_or(path)
+                .to_string_lossy()
+                .to_string(),
+            _ => String::new(),
+        };
+        self.file_tree_op = Some(op);
+        self.file_tree_input.update(cx, |s, cx| {
+            s.set_value(initial, window, cx);
+            s.focus(window, cx);
+        });
+        cx.notify();
+    }
+
+    pub(crate) fn submit_file_tree_prompt(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(op) = self.file_tree_op.take() else {
+            return;
+        };
+        let raw = self.file_tree_input.read(cx).value().trim().to_string();
+        if raw.is_empty() {
+            cx.notify();
+            return;
+        }
+        let target = self.root.join(&raw);
+        match op {
+            FileTreeOp::NewFile => {
+                if let Some(parent) = target.parent() {
+                    let _ = std::fs::create_dir_all(parent);
+                }
+                if !target.exists() {
+                    let _ = std::fs::write(&target, "");
+                }
+                self.rebuild_file_tree(cx);
+                self.open_path(target, window, cx);
+            }
+            FileTreeOp::NewFolder => {
+                let _ = std::fs::create_dir_all(&target);
+                self.rebuild_file_tree(cx);
+            }
+            FileTreeOp::Rename(old_path) => {
+                if let Some(parent) = target.parent() {
+                    let _ = std::fs::create_dir_all(parent);
+                }
+                if std::fs::rename(&old_path, &target).is_ok() {
+                    self.rebuild_file_tree(cx);
+                }
+            }
+        }
+        self.refresh_git(cx);
+        cx.notify();
+    }
+
+    pub(crate) fn delete_tree_path_clicked(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        let key = format!("tree-del:{}", path.to_string_lossy());
+        if self.git.confirm_discard.as_deref() == Some(key.as_str()) {
+            self.git.confirm_discard = None;
+            if path.is_dir() {
+                let _ = std::fs::remove_dir_all(&path);
+            } else {
+                let _ = std::fs::remove_file(&path);
+            }
+            if let Some(ix) = self
+                .tabs
+                .iter()
+                .position(|t| t.path.as_ref() == Some(&path))
+            {
+                self.close_tab(ix, cx);
+            }
+            self.rebuild_file_tree(cx);
+            self.refresh_git(cx);
+            cx.notify();
+            return;
+        }
+        self.arm_confirm(key, cx);
+    }
+
+    fn rebuild_file_tree(&mut self, cx: &mut Context<Self>) {
+        let items = build_tree_items(&self.root, self.show_hidden);
+        let files = flatten_files(&self.root);
+        self.all_files_hash = hash_paths(&files);
+        self.all_files = files;
+        self.tree_state.update(cx, |state, cx| {
+            state.set_items(items, cx);
+        });
     }
 
     fn notify_tab_change(&mut self, cx: &mut Context<Self>) {
@@ -3049,7 +3185,6 @@ impl DartIde {
         let fg = cx.theme().foreground;
         let muted = cx.theme().muted_foreground;
         let green = cx.theme().green;
-        let info = cx.theme().info;
         let primary = cx.theme().primary;
         let list_hover = cx.theme().list_hover;
         let selected_id = self.selected_device.as_ref().map(|d| d.id.clone());

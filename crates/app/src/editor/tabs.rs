@@ -174,9 +174,16 @@ impl DartIde {
                                     .icon(
                                         Icon::new(gpui_kit::assets::IconName::Columns2)
                                             .xsmall()
-                                            .text_color(muted),
+                                            .text_color(if self.split_tab.is_some() {
+                                                primary
+                                            } else {
+                                                muted
+                                            }),
                                     )
-                                    .tooltip("Split editor right"),
+                                    .tooltip("Split editor right")
+                                    .on_click(cx.listener(|this, _event, _window, cx| {
+                                        this.toggle_split_editor(cx);
+                                    })),
                             )
                             .child(
                                 Button::new("new-tab")
