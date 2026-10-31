@@ -429,11 +429,6 @@ impl DartIde {
                 self.finish_inspect(result.clone(), window, cx);
                 return;
             }
-            if self.widgets.request == Some(*id) {
-                self.widgets.request = None;
-                self.finish_widget_tree(result.clone(), cx);
-                return;
-            }
         }
         match output {
             core_flutter::DaemonOutput::Event { event, params } => match event.as_str() {
@@ -473,7 +468,6 @@ impl DartIde {
                         "\x1b[32m\u{2713} Flutter app running \u{2014} Save (\u{2318}S) or click \u{26a1} to Hot Reload\x1b[0m",
                     );
                     self.refresh_simulator_screenshot(cx);
-                    self.refresh_widget_tree_if_visible(cx);
                     cx.notify();
                 }
                 "app.log" => {
@@ -497,14 +491,6 @@ impl DartIde {
                 _ => {}
             },
             core_flutter::DaemonOutput::Response { result, .. } => {
-                // A reload or restart just finished: the widget tree may have changed.
-                let was_reloading = self
-                    .flutter_status
-                    .as_deref()
-                    .is_some_and(|s| s.starts_with("Hot reloading") || s.starts_with("Restarting"));
-                if was_reloading {
-                    self.refresh_widget_tree_if_visible(cx);
-                }
                 if let Ok(val) = result {
                     if let Some(msg) = val.get("message").and_then(|v| v.as_str()) {
                         if !msg.is_empty() {

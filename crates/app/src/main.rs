@@ -30,7 +30,6 @@ mod prompts;
 mod settings_ui;
 mod tab_ops;
 mod test_runner;
-mod widgets;
 mod workspace;
 mod shell;
 mod simulator;
@@ -280,7 +279,6 @@ pub(crate) struct IdeCommand {
 }
 
 const IDE_COMMANDS: &[IdeCommand] = &[
-    IdeCommand { id: "widgets-open", title: "Flutter: Show Widget Tree", shortcut: "", flutter_only: true },
     IdeCommand { id: "test-all", title: "Test: Run All Tests", shortcut: "", flutter_only: true },
     IdeCommand { id: "test-file", title: "Test: Run Tests in Current File", shortcut: "", flutter_only: true },
     IdeCommand { id: "test-rerun-failed", title: "Test: Re-run Failed Tests", shortcut: "", flutter_only: true },
@@ -535,7 +533,6 @@ pub struct DartIde {
     pub(crate) history: Option<(Entity<EditorView>, Vec<core_workspace::Snapshot>)>,
     pub(crate) autosave: file_state::AutosaveMode,
     pub(crate) test_run: Option<test_runner::TestRunState>,
-    pub(crate) widgets: widgets::WidgetTreeState,
     pub(crate) save_options: editor_view::SaveOptions,
     /// Per editor: the revision last seen and when it last changed (autosave timing).
     pub(crate) edit_marks: HashMap<EntityId, (u64, std::time::Instant)>,
@@ -753,7 +750,6 @@ impl DartIde {
             history: None,
             autosave: file_state::AutosaveMode::Off,
             test_run: None,
-            widgets: widgets::WidgetTreeState::default(),
             save_options: editor_view::SaveOptions::default(),
             edit_marks: HashMap::new(),
             file_notices: HashMap::new(),

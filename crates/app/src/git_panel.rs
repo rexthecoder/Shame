@@ -20,8 +20,6 @@ pub(crate) enum SidebarTab {
     Files,
     Search,
     Git,
-    /// The running Flutter app's widget tree.
-    Widgets,
 }
 
 /// One line under the commit box: what just happened.
@@ -207,9 +205,6 @@ impl DartIde {
         self.sidebar_tab = tab;
         if tab == SidebarTab::Git {
             self.refresh_git(cx);
-        }
-        if tab == SidebarTab::Widgets {
-            self.refresh_widget_tree(cx);
         }
         cx.notify();
     }

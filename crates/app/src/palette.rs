@@ -276,10 +276,6 @@ impl DartIde {
         cx: &mut Context<Self>,
     ) {
         match id {
-            "widgets-open" => {
-                self.sidebar_open = true;
-                self.set_sidebar_tab(git_panel::SidebarTab::Widgets, cx);
-            }
             "test-all" => self.start_test_run(crate::test_runner::TestTarget::All, None, None, cx),
             "test-file" => self.run_tests_in_active_file(cx),
             "test-rerun-failed" => self.rerun_failed_tests(cx),

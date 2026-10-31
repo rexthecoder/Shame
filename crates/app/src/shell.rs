@@ -1089,9 +1089,6 @@ impl DartIde {
                         crate::git_panel::SidebarTab::Git => {
                             self.render_git_rail(cx).into_any_element()
                         }
-                        crate::git_panel::SidebarTab::Widgets => {
-                            self.render_widgets_rail(cx).into_any_element()
-                        }
                     }),
             );
         }

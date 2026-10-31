@@ -82,13 +82,15 @@ impl DartIde {
                 } else {
                     muted
                 }))
-                .child(
-                    div()
-                        .text_size(px(tokens::UI_SM))
-                        .font_medium()
-                        .text_color(if active { cx.theme().foreground } else { muted })
-                        .child(label),
-                )
+                .when(active, |el| {
+                    el.child(
+                        div()
+                            .text_size(px(tokens::UI_SM))
+                            .font_medium()
+                            .text_color(cx.theme().foreground)
+                            .child(label),
+                    )
+                })
                 .on_click(
                     cx.listener(move |this, _event, _window, cx| this.set_sidebar_tab(which, cx)),
                 )
@@ -103,7 +105,6 @@ impl DartIde {
             .h(px(tokens::TABSTRIP_H))
             .flex_shrink_0()
             .items_center()
-            .justify_between()
             .px(px(tokens::SPACE_4))
             .border_b_1()
             .border_color(cx.theme().border)
@@ -148,27 +149,6 @@ impl DartIde {
                             },
                         ),
                     )
-                    .when(self.is_flutter_or_dart_workspace() || self.can_inspect(), |row| {
-                        row.child(tab(
-                            "sidebar-tab-widgets",
-                            if self.sidebar_tab == SidebarTab::Widgets { "Widgets" } else { "" },
-                            IconName::ListTree,
-                            SidebarTab::Widgets,
-                            cx,
-                        ))
-                    })
-            )
-            .child(
-                div()
-                    .id("close-rail")
-                    .cursor_pointer()
-                    .text_color(muted)
-                    .hover(|s| s.text_color(cx.theme().foreground))
-                    .child(Icon::new(IconName::X).xsmall())
-                    .on_click(cx.listener(|this, _event, _window, cx| {
-                        this.sidebar_open = false;
-                        cx.notify();
-                    })),
             )
     }
 

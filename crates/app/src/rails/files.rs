@@ -345,44 +345,11 @@ impl DartIde {
                                     .text_color(muted)
                                     .child(root_name),
                             )
-                            .child(
-                                Button::new("rail-filter")
-                                    .ghost()
-                                    .small()
-                                    .icon(
-                                        Icon::new(gpui_kit::assets::IconName::Search)
-                                            .xsmall()
-                                            .text_color(muted),
-                                    )
-                                    .tooltip("Go to file (cmd/ctrl+P)")
-                                    .on_click(cx.listener(|this, _event, window, cx| {
-                                        this.palette_open = true;
-                                        this.palette_selected = 0;
-                                        this.palette_input.update(cx, |state, cx| {
-                                            state.focus(window, cx);
-                                        });
-                                        cx.notify();
-                                    })),
-                            ),
                     )
                     .child(
                         h_flex()
                             .items_center()
                             .gap(px(tokens::SPACE_1))
-                            .child(
-                                Button::new("open-folder")
-                                    .ghost()
-                                    .small()
-                                    .icon(
-                                        Icon::new(gpui_kit::assets::IconName::FolderOpen)
-                                            .xsmall()
-                                            .text_color(cx.theme().primary),
-                                    )
-                                    .tooltip("Open Folder\u{2026} (\u{2318}O)")
-                                    .on_click(cx.listener(|this, _event, window, cx| {
-                                        this.open_folder(window, cx);
-                                    })),
-                            )
                             .child(
                                 Button::new("rail-new-file")
                                     .ghost()

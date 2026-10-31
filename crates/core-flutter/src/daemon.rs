@@ -211,30 +211,6 @@ impl FlutterDaemon {
         )
     }
 
-    /// Ask for the app's widget tree (only the widgets the project created); parse the reply
-    /// with [`crate::parse_widget_tree`]. The project is registered first so its widgets count as local.
-    pub fn inspector_request_tree(&self, app_id: &str, project_dir: &Path) -> io::Result<i64> {
-        self.call_service_extension(
-            app_id,
-            "ext.flutter.inspector.addPubRootDirectories",
-            serde_json::json!({"arg0": crate::inspector::path_to_file_uri(project_dir)}),
-        )?;
-        self.call_service_extension(
-            app_id,
-            "ext.flutter.inspector.getRootWidgetSummaryTree",
-            serde_json::json!({"objectGroup": "shame"}),
-        )
-    }
-
-    /// Highlight this widget (by the inspector's `valueId`) in the running app.
-    pub fn inspector_select(&self, app_id: &str, value_id: &str) -> io::Result<i64> {
-        self.call_service_extension(
-            app_id,
-            "ext.flutter.inspector.setSelectionById",
-            serde_json::json!({"arg": value_id, "objectGroup": "shame"}),
-        )
-    }
-
     pub fn stop(&self, app_id: &str) -> io::Result<i64> {
         self.request("app.stop", serde_json::json!({"appId": app_id}))
     }
