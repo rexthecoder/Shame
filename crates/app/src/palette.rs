@@ -250,6 +250,18 @@ impl DartIde {
                     });
                 }
             }
+            "organize-imports" => {
+                if let Some(ed) = self.active_editor().cloned() {
+                    ed.update(cx, |editor, _cx| {
+                        editor.request_organize_imports();
+                    });
+                }
+            }
+            "find-references" => {
+                if let Some(ed) = self.active_editor().cloned() {
+                    ed.update(cx, |editor, _cx| editor.request_references());
+                }
+            }
             "goto-symbol" => self.open_symbol_outline(window, cx),
             "goto-line" => self.open_go_to_line(window, cx),
             "new-file" => self.new_scratch_tab(window, cx),

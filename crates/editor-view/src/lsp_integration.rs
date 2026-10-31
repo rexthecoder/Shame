@@ -43,7 +43,7 @@ use gpui_kit::Context;
 use smol::Timer;
 use lsp_types::{
     ApplyWorkspaceEditParams, ClientCapabilities, CodeAction, CodeActionClientCapabilities,
-    CodeActionContext, CodeActionLiteralSupport, CodeActionOrCommand, CodeActionParams, Command,
+    CodeActionContext, CodeActionKind, CodeActionLiteralSupport, CodeActionOrCommand, CodeActionParams, Command,
     CompletionClientCapabilities, CompletionItem, CompletionItemCapability, CompletionItemKind,
     CompletionParams, CompletionResponse, CompletionTextEdit, Diagnostic, DiagnosticSeverity,
     DidChangeTextDocumentParams, DidOpenTextDocumentParams, DocumentChangeOperation,
@@ -322,6 +322,7 @@ pub(crate) struct LspState {
     pending_completion_id: Option<i64>,
     pending_references_id: Option<i64>,
     pending_signature_id: Option<i64>,
+    pending_organize_id: Option<i64>,
 }
 
 impl EditorView {
@@ -384,6 +385,7 @@ impl EditorView {
             pending_completion_id: None,
             pending_references_id: None,
             pending_signature_id: None,
+            pending_organize_id: None,
         });
     }
 
@@ -658,6 +660,40 @@ impl EditorView {
         }
     }
 
+    /// Ask the server to organize (sort and prune) imports via a
+    /// `source.organizeImports` code action; the first action returned is
+    /// applied when the reply arrives. Returns whether a request was sent.
+    pub fn request_organize_imports(&mut self) -> bool {
+        let end = self.buffer.byte_to_line(self.buffer.len_bytes()) as u32;
+        let Some(lsp) = &mut self.lsp else {
+            return false;
+        };
+        if !lsp.ready {
+            return false;
+        }
+        let params = CodeActionParams {
+            text_document: TextDocumentIdentifier { uri: lsp.uri.clone() },
+            range: Range {
+                start: Position { line: 0, character: 0 },
+                end: Position { line: end, character: 0 },
+            },
+            context: CodeActionContext {
+                diagnostics: Vec::new(),
+                only: Some(vec![CodeActionKind::SOURCE_ORGANIZE_IMPORTS]),
+                trigger_kind: None,
+            },
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+        };
+        match lsp.client.request("textDocument/codeAction", serde_json::to_value(params).unwrap_or_default()) {
+            Ok(id) => {
+                lsp.pending_organize_id = Some(id);
+                true
+            }
+            Err(_) => false,
+        }
+    }
+
     /// Delegate to the buffer's `LanguageAdapter::builtin_code_actions` for
     /// language-specific AST/text code assists on `line`.
     pub(crate) fn builtin_language_code_actions(&self, line: u32) -> Vec<CodeActionOrCommand> {
@@ -898,6 +934,17 @@ impl EditorView {
                     self.set_cursor(offset, cx);
                 } else if let Some(path) = uri_to_path(&target_uri) {
                     cx.emit(EditorEvent::OpenAt { path, line, column });
+                }
+            }
+            ServerMessage::Response { id, result } if lsp.pending_organize_id == Some(id) => {
+                lsp.pending_organize_id = None;
+                let first = result
+                    .ok()
+                    .and_then(|v| serde_json::from_value::<Option<Vec<CodeActionOrCommand>>>(v).ok())
+                    .flatten()
+                    .and_then(|actions| actions.into_iter().next());
+                if let Some(action) = first {
+                    self.apply_code_action(action, cx);
                 }
             }
             ServerMessage::Response { id, result } if lsp.pending_references_id == Some(id) => {

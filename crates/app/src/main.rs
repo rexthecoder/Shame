@@ -299,6 +299,8 @@ const IDE_COMMANDS: &[IdeCommand] = &[
     IdeCommand { id: "toggle-web-preview", title: "View: Toggle Web Preview Rail", shortcut: "", flutter_only: false },
     IdeCommand { id: "toggle-agent", title: "View: Toggle Agent Rail", shortcut: "", flutter_only: false },
     IdeCommand { id: "format-doc", title: "Editor: Format Document", shortcut: "\u{21e7}\u{2318}F", flutter_only: false },
+    IdeCommand { id: "organize-imports", title: "Editor: Organize Imports", shortcut: "", flutter_only: false },
+    IdeCommand { id: "find-references", title: "Editor: Find References", shortcut: "\u{21e7}F12", flutter_only: false },
     IdeCommand { id: "goto-symbol", title: "Editor: Go to Symbol in File\u{2026}", shortcut: "\u{21e7}\u{2318}O", flutter_only: false },
     IdeCommand { id: "goto-line", title: "Editor: Go to Line\u{2026}", shortcut: "\u{2318}G", flutter_only: false },
     IdeCommand { id: "new-file", title: "File: New Scratch File", shortcut: "\u{2318}N", flutter_only: false },
