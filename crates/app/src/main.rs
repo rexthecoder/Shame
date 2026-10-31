@@ -90,75 +90,94 @@ fn flatten_files_bounded(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) {
     }
 }
 
-fn last_workspace_config_path() -> Option<PathBuf> {
+#[derive(Default)]
+struct WorkspaceStore {
+    current: Option<PathBuf>,
+    recents: Vec<PathBuf>,
+}
+
+fn workspace_store_path() -> Option<PathBuf> {
     let home = std::env::var("HOME").ok()?;
-    Some(Path::new(&home).join(".config/shame/last_workspace"))
+    Some(Path::new(&home).join(".config/shame/workspaces.json"))
 }
 
-fn persist_last_workspace(root: &Path) {
-    if root == Path::new("/")
-        || root.starts_with("/Applications")
-        || root.starts_with("/System")
-    {
+fn load_workspace_store() -> WorkspaceStore {
+    let Some(path) = workspace_store_path() else {
+        return WorkspaceStore::default();
+    };
+    let Ok(bytes) = std::fs::read(path) else {
+        return WorkspaceStore::default();
+    };
+    let Ok(val) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+        return WorkspaceStore::default();
+    };
+    let current = val
+        .get("current")
+        .and_then(|v| v.as_str())
+        .map(PathBuf::from)
+        .filter(|p| p.is_dir() && p != Path::new("/"));
+    let recents = val
+        .get("recents")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(PathBuf::from))
+                .filter(|p| p.is_dir() && p != Path::new("/"))
+                .collect()
+        })
+        .unwrap_or_default();
+    WorkspaceStore { current, recents }
+}
+
+fn save_workspace_store(current: Option<&Path>, recents: &[PathBuf]) {
+    let Some(path) = workspace_store_path() else {
         return;
+    };
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
     }
-    if let Some(cfg) = last_workspace_config_path() {
-        if let Some(parent) = cfg.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-        let _ = std::fs::write(cfg, root.to_string_lossy().as_bytes());
+    let recents_strs: Vec<String> = recents
+        .iter()
+        .map(|p| p.to_string_lossy().to_string())
+        .collect();
+    let val = serde_json::json!({
+        "current": current.map(|p| p.to_string_lossy().to_string()),
+        "recents": recents_strs,
+    });
+    if let Ok(json) = serde_json::to_vec_pretty(&val) {
+        let _ = std::fs::write(path, json);
     }
 }
 
-/// When launched as a macOS `.app` bundle from Finder / Dock / Spotlight, LaunchServices
-/// sets the process `current_dir` to `/`. Detect that and restore the user's last workspace
-/// (or a sensible project folder under `$HOME`) instead of scanning `/`.
-fn resolve_initial_workspace_root() -> PathBuf {
+/// Resolve the startup workspace state:
+/// - If a directory path was explicitly passed on the CLI (`shame /path/to/project`), open it.
+/// - Otherwise, restore `store.current` if the user had a folder open in their last session.
+/// - If `store.current` is `None` (first launch or after closing a folder), start in the
+///   Welcome / No-Folder Empty State (`has_workspace = false`) with `store.recents` ready to click.
+fn resolve_initial_workspace() -> (bool, PathBuf, Vec<PathBuf>) {
+    let mut store = load_workspace_store();
+
     if let Some(arg_path) = std::env::args().nth(1).filter(|a| !a.starts_with('-')) {
-        let p = PathBuf::from(arg_path);
-        if p.is_dir() {
-            persist_last_workspace(&p);
-            return p;
-        }
-    }
-
-    if let Ok(cwd) = std::env::current_dir() {
-        if cwd != Path::new("/")
-            && !cwd.starts_with("/Applications")
-            && !cwd.starts_with("/System")
-        {
-            persist_last_workspace(&cwd);
-            return cwd;
-        }
-    }
-
-    if let Some(cfg) = last_workspace_config_path()
-        && let Ok(saved) = std::fs::read_to_string(cfg)
-    {
-        let p = PathBuf::from(saved.trim());
+        let p = std::fs::canonicalize(&arg_path).unwrap_or_else(|_| PathBuf::from(arg_path));
         if p.is_dir() && p != Path::new("/") {
+            store.recents.retain(|r| r != &p);
+            store.recents.insert(0, p.clone());
+            store.recents.truncate(10);
+            save_workspace_store(Some(&p), &store.recents);
             let _ = std::env::set_current_dir(&p);
-            return p;
+            return (true, p, store.recents);
         }
     }
 
-    if let Ok(home) = std::env::var("HOME") {
-        let shame_proj = Path::new(&home).join("Desktop/Projects/shame");
-        if shame_proj.is_dir() {
-            let _ = std::env::set_current_dir(&shame_proj);
-            return shame_proj;
-        }
-        let projects = Path::new(&home).join("Desktop/Projects");
-        if projects.is_dir() {
-            let _ = std::env::set_current_dir(&projects);
-            return projects;
-        }
-        let home_path = PathBuf::from(home);
-        let _ = std::env::set_current_dir(&home_path);
-        return home_path;
+    if let Some(cur) = store.current.clone() {
+        let _ = std::env::set_current_dir(&cur);
+        return (true, cur, store.recents);
     }
 
-    PathBuf::from(".")
+    let fallback = std::env::var("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("."));
+    (false, fallback, store.recents)
 }
 
 fn hash_paths(paths: &[PathBuf]) -> u64 {
@@ -207,6 +226,31 @@ pub(crate) enum DockTab {
     DebugConsole,
 }
 
+actions!(
+    shame_menus,
+    [
+        AboutShame,
+        OpenSettings,
+        QuitShame,
+        MenuOpenFolder,
+        MenuCloseFolder,
+        MenuNewFile,
+        MenuSaveFile,
+        MenuCloseTab,
+        MenuGoToFile,
+        MenuCommandPalette,
+        MenuFindInFile,
+        MenuFindInProject,
+        MenuFormatDoc,
+        MenuToggleSidebar,
+        MenuToggleTerminal,
+        MenuToggleProblems,
+        MenuToggleAgent,
+        MenuToggleWebPreview,
+        MenuSplitEditor,
+    ]
+);
+
 #[derive(Clone, Copy)]
 pub(crate) struct IdeCommand {
     pub(crate) id: &'static str,
@@ -234,6 +278,7 @@ const IDE_COMMANDS: &[IdeCommand] = &[
     IdeCommand { id: "debug-dap", title: "Debug: Start Dart DAP Debugger", shortcut: "", flutter_only: true },
     IdeCommand { id: "toggle-sim", title: "Simulator: Attach / Detach iOS Simulator", shortcut: "", flutter_only: true },
     IdeCommand { id: "open-git", title: "Git: Open Git Panel", shortcut: "\u{2318}\u{21e7}G", flutter_only: false },
+    IdeCommand { id: "git-switch-branch", title: "Git: Switch / Create Branch\u{2026}", shortcut: "", flutter_only: false },
     IdeCommand { id: "git-stage-all", title: "Git: Stage All Changes", shortcut: "", flutter_only: false },
     IdeCommand { id: "git-unstage-all", title: "Git: Unstage All Changes", shortcut: "", flutter_only: false },
     IdeCommand { id: "git-stash", title: "Git: Stash Uncommitted Changes", shortcut: "", flutter_only: false },
@@ -249,6 +294,9 @@ const IDE_COMMANDS: &[IdeCommand] = &[
     IdeCommand { id: "goto-line", title: "Editor: Go to Line\u{2026}", shortcut: "\u{2318}G", flutter_only: false },
     IdeCommand { id: "new-file", title: "File: New Scratch File", shortcut: "\u{2318}N", flutter_only: false },
     IdeCommand { id: "open-folder", title: "File: Open Folder\u{2026}", shortcut: "\u{2318}O", flutter_only: false },
+    IdeCommand { id: "close-folder", title: "File: Close Folder", shortcut: "", flutter_only: false },
+    IdeCommand { id: "open-settings", title: "Preferences: Open Settings", shortcut: "\u{2318},", flutter_only: false },
+    IdeCommand { id: "about-shame", title: "Help: About Shame", shortcut: "", flutter_only: false },
 ];
 
 #[derive(Clone)]
@@ -370,6 +418,8 @@ impl Tab {
 }
 
 pub struct DartIde {
+    pub(crate) has_workspace: bool,
+    pub(crate) recent_workspaces: Vec<PathBuf>,
     pub(crate) root: PathBuf,
     pub(crate) git_branch: Option<String>,
     /// Cached `git status` for the tree's row badges.
@@ -444,6 +494,9 @@ pub struct DartIde {
     pub(crate) perf_overlay_on: bool,
     pub(crate) debug_paint_on: bool,
     pub(crate) slow_animations_on: bool,
+    pub(crate) settings_open: bool,
+    pub(crate) about_open: bool,
+    pub(crate) light_theme: bool,
     pub(crate) add_package_open: bool,
     pub(crate) add_package_input: Entity<InputState>,
     _subscriptions: Vec<Subscription>,
@@ -451,10 +504,18 @@ pub struct DartIde {
 
 impl DartIde {
     fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let root = resolve_initial_workspace_root();
+        let (has_workspace, root, recent_workspaces) = resolve_initial_workspace();
         let show_hidden = true;
-        let items = build_tree_items(&root, show_hidden);
-        let all_files = flatten_files(&root);
+        let items = if has_workspace {
+            build_tree_items(&root, show_hidden)
+        } else {
+            Vec::new()
+        };
+        let all_files = if has_workspace {
+            flatten_files(&root)
+        } else {
+            Vec::new()
+        };
 
         let tree_state = cx.new(|cx| TreeState::new(cx).items(items));
         let palette_input = cx.new(|cx| {
@@ -488,7 +549,8 @@ impl DartIde {
         let git_branch = None;
         let git_status = HashMap::new();
         let (terminal_tx, terminal_rx) = async_channel::unbounded();
-        let initial_terminal = editor::dock::TerminalSession::new(0, root.clone(), true);
+        let initial_terminal =
+            editor::dock::TerminalSession::new(0, root.clone(), has_workspace);
         let terminal_focus = cx.focus_handle();
 
         cx.spawn(async move |weak, cx| {
@@ -512,11 +574,13 @@ impl DartIde {
         };
 
         let mut this = Self {
+            has_workspace,
+            recent_workspaces,
             root,
             git_branch,
             git_status,
-            sidebar_open: true,
-            terminal_open: true,
+            sidebar_open: has_workspace,
+            terminal_open: has_workspace,
             terminal_maximized: false,
             dock_tab: DockTab::Terminal,
             debug_lines: Vec::new(),
@@ -584,17 +648,22 @@ impl DartIde {
             perf_overlay_on: false,
             debug_paint_on: false,
             slow_animations_on: false,
+            settings_open: false,
+            about_open: false,
+            light_theme: false,
             add_package_open: false,
             add_package_input,
             _subscriptions: Vec::new(),
         };
 
-        this.reload_launch_configs(cx);
-        if this.is_flutter_or_dart_workspace() {
-            this.refresh_devices(cx);
+        if this.has_workspace {
+            this.reload_launch_configs(cx);
+            if this.is_flutter_or_dart_workspace() {
+                this.refresh_devices(cx);
+            }
+            this.refresh_git(cx);
         }
         this.start_git_refresh_loop(cx);
-        this.refresh_git(cx);
         // The Commit button depends on whether the message box is empty.
         cx.observe(&this.git.message, |_, _, cx| cx.notify()).detach();
         cx.observe(&this.git.branch_input, |_, _, cx| cx.notify())
@@ -663,7 +732,7 @@ impl DartIde {
     /// Background check: if files were added, renamed, or deleted on disk outside the editor,
     /// refresh `all_files` and `tree_state` automatically without cloning `all_files` on the UI thread.
     pub(crate) fn sync_workspace_files_if_changed(&mut self, cx: &mut Context<Self>) {
-        if self.syncing_files {
+        if !self.has_workspace || self.syncing_files {
             return;
         }
         self.syncing_files = true;
@@ -702,8 +771,8 @@ impl DartIde {
     /// Non-Dart/Flutter projects hide the Flutter target picker, Simulator button, and
     /// Flutter-only palette commands.
     pub(crate) fn is_flutter_or_dart_workspace(&self) -> bool {
-        self.root.join("pubspec.yaml").is_file()
-            || !self.launch_configs.is_empty()
+        (self.has_workspace
+            && (self.root.join("pubspec.yaml").is_file() || !self.launch_configs.is_empty()))
             || self.tabs.iter().any(|t| {
                 t.path
                     .as_ref()
@@ -850,6 +919,7 @@ impl DartIde {
                 self.sidebar_open = true;
                 self.set_sidebar_tab(git_panel::SidebarTab::Git, cx);
             }
+            "git-switch-branch" => self.git_open_branch_switcher(window, cx),
             "git-stage-all" => self.git_stage_all(window, cx),
             "git-unstage-all" => self.git_unstage_all(window, cx),
             "git-stash" => self.git_stash_save(window, cx),
@@ -883,6 +953,13 @@ impl DartIde {
             "goto-line" => self.open_go_to_line(window, cx),
             "new-file" => self.new_scratch_tab(window, cx),
             "open-folder" => self.open_folder(window, cx),
+            "close-folder" => self.close_workspace(cx),
+            "open-settings" => {
+                self.settings_open = true;
+            }
+            "about-shame" => {
+                self.about_open = true;
+            }
             _ => {}
         }
         cx.notify();
@@ -1130,15 +1207,24 @@ impl DartIde {
         .detach();
     }
 
-    fn set_root(&mut self, root: PathBuf, cx: &mut Context<Self>) {
-        persist_last_workspace(&root);
+    pub(crate) fn set_root(&mut self, root: PathBuf, cx: &mut Context<Self>) {
+        let root = std::fs::canonicalize(&root).unwrap_or(root);
         let _ = std::env::set_current_dir(&root);
+        self.has_workspace = true;
+        self.sidebar_open = true;
+        self.terminal_open = true;
+        self.recent_workspaces.retain(|r| r != &root);
+        self.recent_workspaces.insert(0, root.clone());
+        self.recent_workspaces.truncate(10);
+        save_workspace_store(Some(&root), &self.recent_workspaces);
+
         // Stop any running Flutter daemon from the previous project
         self.stop_flutter_run(cx);
 
         // Close tabs and overlays from the previous project workspace
         self.tabs.clear();
         self.active_tab = 0;
+        self.split_tab = None;
         self.tab_overflow_open = false;
         self.device_picker_open = false;
         self.launch_picker_open = false;
@@ -1167,6 +1253,7 @@ impl DartIde {
 
         let items = build_tree_items(&root, self.show_hidden);
         self.all_files = flatten_files(&root);
+        self.all_files_hash = hash_paths(&self.all_files);
         self.tree_state.update(cx, |state, cx| {
             state.set_items(items, cx);
         });
@@ -1179,12 +1266,52 @@ impl DartIde {
         self.diff = None;
         self.refresh_git(cx);
         self.reload_launch_configs(cx);
+        if self.is_flutter_or_dart_workspace() {
+            self.refresh_devices(cx);
+        }
+        cx.notify();
+    }
+
+    pub(crate) fn close_workspace(&mut self, cx: &mut Context<Self>) {
+        self.stop_flutter_run(cx);
+        self.stop_dap_debug(cx);
+        self.has_workspace = false;
+        self.sidebar_open = false;
+        self.terminal_open = false;
+        self.tabs.clear();
+        self.active_tab = 0;
+        self.split_tab = None;
+        self.diff = None;
+        self.all_files.clear();
+        self.all_files_hash = 0;
+        self.git.status = None;
+        self.git_branch = None;
+        self.git_status.clear();
+        self.launch_configs.clear();
+        self.test_launch_templates.clear();
+        self.tree_state.update(cx, |state, cx| {
+            state.set_items(Vec::new(), cx);
+        });
+        save_workspace_store(None, &self.recent_workspaces);
+        cx.notify();
+    }
+
+    pub(crate) fn remove_recent_workspace(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        self.recent_workspaces.retain(|p| p != &path);
+        let cur = self.has_workspace.then_some(self.root.as_path());
+        save_workspace_store(cur, &self.recent_workspaces);
         cx.notify();
     }
 
     fn on_key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         let keystroke = &event.keystroke;
         let primary_mod = keystroke.modifiers.platform || keystroke.modifiers.control;
+
+        if primary_mod && keystroke.key.as_str() == "," {
+            self.settings_open = !self.settings_open;
+            cx.notify();
+            return;
+        }
 
         if primary_mod && keystroke.key.as_str() == "o" {
             self.open_folder(window, cx);
@@ -2064,8 +2191,36 @@ impl DartIde {
     pub(crate) fn refresh_devices(&mut self, cx: &mut Context<Self>) {
         let (tx, rx) = async_channel::bounded(1);
         std::thread::spawn(move || {
-            let devices = core_flutter::list_devices().unwrap_or_default();
             let sims = core_flutter::list_ios_simulators().unwrap_or_default();
+            let mut devices = core_flutter::list_devices().unwrap_or_default();
+            // Always ensure booted iOS simulators from `xcrun simctl` appear as active targets
+            // even if `flutter devices` was slow or unavailable in GUI PATH.
+            for sim in sims.iter().filter(|s| s.is_booted()) {
+                if !devices
+                    .iter()
+                    .any(|d| d.id.eq_ignore_ascii_case(&sim.udid) || d.name == sim.name)
+                {
+                    devices.insert(
+                        0,
+                        core_flutter::Device {
+                            id: sim.udid.clone(),
+                            name: sim.name.clone(),
+                            target_platform: "ios".to_string(),
+                            emulator: true,
+                            is_supported: true,
+                        },
+                    );
+                }
+            }
+            if !devices.iter().any(|d| d.id == "macos") {
+                devices.push(core_flutter::Device {
+                    id: "macos".to_string(),
+                    name: "macOS".to_string(),
+                    target_platform: "darwin".to_string(),
+                    emulator: false,
+                    is_supported: true,
+                });
+            }
             let _ = tx.send_blocking((devices, sims));
         });
 
@@ -2077,14 +2232,16 @@ impl DartIde {
                 if !devices.is_empty() {
                     this.devices = devices;
                     let current_valid = this.selected_device.as_ref().is_some_and(|sel| {
-                        this.devices.iter().any(|d| d.id == sel.id)
+                        this.devices
+                            .iter()
+                            .any(|d| d.id.eq_ignore_ascii_case(&sel.id))
                     });
                     if !current_valid {
                         // Prefer a booted iOS Simulator if one is running, otherwise macOS or first device
                         let preferred = this
                             .devices
                             .iter()
-                            .find(|d| d.target_platform.contains("ios") && d.emulator)
+                            .find(|d| d.is_ios())
                             .or_else(|| this.devices.iter().find(|d| d.id == "macos"))
                             .or_else(|| this.devices.first())
                             .cloned();
@@ -3486,17 +3643,45 @@ impl DartIde {
         let sim_attached = self.sim.attached;
         let sims_expanded = self.sim_list_expanded;
 
+        // Build active targets: `self.devices` + any booted (or currently selected) iOS simulator
+        // from `self.ios_simulators`, so booted iPhones always appear under `TARGET`.
+        let mut active_targets: Vec<core_flutter::Device> = self.devices.clone();
+        for sim in &self.ios_simulators {
+            let is_selected_sim = selected_id
+                .as_deref()
+                .is_some_and(|id| id.eq_ignore_ascii_case(&sim.udid));
+            if (sim.is_booted() || is_selected_sim)
+                && !active_targets
+                    .iter()
+                    .any(|d| d.id.eq_ignore_ascii_case(&sim.udid) || d.name == sim.name)
+            {
+                active_targets.insert(
+                    0,
+                    core_flutter::Device {
+                        id: sim.udid.clone(),
+                        name: sim.name.clone(),
+                        target_platform: "ios".to_string(),
+                        emulator: true,
+                        is_supported: true,
+                    },
+                );
+            }
+        }
+
         // Deduplicate unbooted iOS simulators by model name (keeping the first/latest runtime)
-        // and exclude any simulator already shown in `self.devices` (by UDID or name).
+        // and exclude any simulator already shown in `active_targets`.
         let mut seen_names = std::collections::HashSet::new();
-        for d in &self.devices {
+        for d in &active_targets {
             seen_names.insert(d.name.clone());
         }
         let extra_sims: Vec<_> = self
             .ios_simulators
             .iter()
             .filter(|sim| {
-                !self.devices.iter().any(|d| d.id == sim.udid)
+                !sim.is_booted()
+                    && !active_targets
+                        .iter()
+                        .any(|d| d.id.eq_ignore_ascii_case(&sim.udid))
                     && seen_names.insert(sim.name.clone())
             })
             .take(6)
@@ -3570,9 +3755,11 @@ impl DartIde {
                                         })
                                 }),
                         )
-                        .children(self.devices.iter().enumerate().map(|(ix, dev)| {
-                            let is_sel = selected_id.as_deref() == Some(dev.id.as_str());
-                            let icon = if dev.target_platform.contains("ios")
+                        .children(active_targets.into_iter().enumerate().map(|(ix, dev)| {
+                            let is_sel = selected_id
+                                .as_deref()
+                                .is_some_and(|id| id.eq_ignore_ascii_case(&dev.id));
+                            let icon = if dev.is_ios()
                                 || dev.target_platform.contains("android")
                             {
                                 gpui_kit::assets::IconName::Smartphone
@@ -3864,6 +4051,497 @@ impl DartIde {
                 )
         )
     }
+
+    fn render_settings_modal(
+        &self,
+        view: &Entity<Self>,
+        cx: &mut Context<Self>,
+    ) -> Option<Stateful<Div>> {
+        if !self.settings_open {
+            return None;
+        }
+        let fg = cx.theme().foreground;
+        let muted = cx.theme().muted_foreground;
+        let primary = cx.theme().primary;
+        let green = cx.theme().green;
+        let border = cx.theme().border;
+        let list_hover = cx.theme().list_hover;
+        let show_hidden = self.show_hidden;
+        let light_theme = self.light_theme;
+        let current_harness = self.agent.harness;
+        let current_mode_ix = self.agent.mode_ix;
+
+        Some(
+            div()
+                .id("settings-backdrop")
+                .absolute()
+                .inset_0()
+                .flex()
+                .justify_center()
+                .pt(px(72.))
+                .bg(rgba(0x00000066))
+                .on_mouse_down(MouseButton::Left, {
+                    let view = view.clone();
+                    move |_e, _w, cx| {
+                        view.update(cx, |this, cx| {
+                            this.settings_open = false;
+                            cx.notify();
+                        });
+                    }
+                })
+                .child(
+                    v_flex()
+                        .id("settings-card")
+                        .w(px(500.))
+                        .p(px(tokens::SPACE_5))
+                        .gap(px(tokens::SPACE_4))
+                        .bg(cx.theme().popover)
+                        .border_1()
+                        .border_color(border)
+                        .rounded(px(tokens::RADIUS_CARD))
+                        .shadow_xl()
+                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                        .child(
+                            h_flex()
+                                .w_full()
+                                .items_center()
+                                .justify_between()
+                                .child(
+                                    h_flex()
+                                        .items_center()
+                                        .gap(px(tokens::SPACE_2))
+                                        .child(
+                                            gpui_kit::component::Icon::new(
+                                                gpui_kit::assets::IconName::Settings,
+                                            )
+                                            .small()
+                                            .text_color(primary),
+                                        )
+                                        .child(
+                                            div()
+                                                .text_size(px(14.))
+                                                .font_semibold()
+                                                .text_color(fg)
+                                                .child("Shame Settings & Preferences"),
+                                        ),
+                                )
+                                .child(
+                                    div()
+                                        .id("close-settings-btn")
+                                        .cursor_pointer()
+                                        .text_color(muted)
+                                        .hover(move |s| s.text_color(fg))
+                                        .child(
+                                            gpui_kit::component::Icon::new(
+                                                gpui_kit::assets::IconName::X,
+                                            )
+                                            .small(),
+                                        )
+                                        .on_click({
+                                            let view = view.clone();
+                                            move |_e, _w, cx| {
+                                                view.update(cx, |this, cx| {
+                                                    this.settings_open = false;
+                                                    cx.notify();
+                                                });
+                                            }
+                                        }),
+                                ),
+                        )
+                        .child(div().h(px(1.)).w_full().bg(border))
+                        // 1. Workspace Folder row
+                        .child(
+                            h_flex()
+                                .w_full()
+                                .items_center()
+                                .justify_between()
+                                .child(
+                                    v_flex()
+                                        .gap(px(2.))
+                                        .child(
+                                            div()
+                                                .text_size(px(tokens::UI))
+                                                .font_medium()
+                                                .text_color(fg)
+                                                .child("Workspace Folder"),
+                                        )
+                                        .child(
+                                            div()
+                                                .font_family("SF Mono")
+                                                .text_size(px(tokens::UI_XS))
+                                                .text_color(muted)
+                                                .child(if self.has_workspace {
+                                                    self.root.to_string_lossy().to_string()
+                                                } else {
+                                                    "No folder currently open".to_string()
+                                                }),
+                                        ),
+                                )
+                                .child(
+                                    h_flex()
+                                        .id("settings-open-folder")
+                                        .h(px(26.))
+                                        .px(px(tokens::SPACE_3))
+                                        .items_center()
+                                        .gap(px(tokens::SPACE_2))
+                                        .rounded(px(tokens::RADIUS_SM))
+                                        .bg(primary.opacity(0.16))
+                                        .border_1()
+                                        .border_color(primary.opacity(0.45))
+                                        .cursor_pointer()
+                                        .hover(move |s| s.bg(primary.opacity(0.26)))
+                                        .text_size(px(tokens::UI_SM))
+                                        .font_medium()
+                                        .text_color(primary)
+                                        .child("Open Folder\u{2026}")
+                                        .on_click({
+                                            let view = view.clone();
+                                            move |_e, window, cx| {
+                                                view.update(cx, |this, cx| {
+                                                    this.settings_open = false;
+                                                    this.open_folder(window, cx);
+                                                });
+                                            }
+                                        }),
+                                ),
+                        )
+                        // 2. Theme Mode (Dark / Light)
+                        .child(
+                            h_flex()
+                                .w_full()
+                                .items_center()
+                                .justify_between()
+                                .child(
+                                    v_flex()
+                                        .gap(px(2.))
+                                        .child(
+                                            div()
+                                                .text_size(px(tokens::UI))
+                                                .font_medium()
+                                                .text_color(fg)
+                                                .child("Appearance Theme"),
+                                        )
+                                        .child(
+                                            div()
+                                                .text_size(px(tokens::UI_XS))
+                                                .text_color(muted)
+                                                .child("Switch between Shame Dark and Light themes"),
+                                        ),
+                                )
+                                .child(
+                                    h_flex()
+                                        .id("settings-theme-toggle")
+                                        .h(px(26.))
+                                        .px(px(tokens::SPACE_3))
+                                        .items_center()
+                                        .rounded(px(tokens::RADIUS_SM))
+                                        .bg(cx.theme().background)
+                                        .border_1()
+                                        .border_color(border)
+                                        .cursor_pointer()
+                                        .hover(move |s| s.bg(list_hover))
+                                        .text_size(px(tokens::UI_SM))
+                                        .text_color(fg)
+                                        .child(if light_theme { "Light" } else { "Dark" })
+                                        .on_click({
+                                            let view = view.clone();
+                                            move |_e, window, cx| {
+                                                view.update(cx, |this, cx| {
+                                                    this.light_theme = !this.light_theme;
+                                                    if this.light_theme {
+                                                        gpui_kit::component::Theme::change(
+                                                            gpui_kit::component::ThemeMode::Light,
+                                                            Some(window),
+                                                            cx,
+                                                        );
+                                                    } else {
+                                                        gpui_kit::component::Theme::change(
+                                                            gpui_kit::component::ThemeMode::Dark,
+                                                            Some(window),
+                                                            cx,
+                                                        );
+                                                        crate::theme::apply(cx);
+                                                    }
+                                                    cx.notify();
+                                                });
+                                            }
+                                        }),
+                                ),
+                        )
+                        // 3. Show Hidden Dotfiles
+                        .child(
+                            h_flex()
+                                .w_full()
+                                .items_center()
+                                .justify_between()
+                                .child(
+                                    v_flex()
+                                        .gap(px(2.))
+                                        .child(
+                                            div()
+                                                .text_size(px(tokens::UI))
+                                                .font_medium()
+                                                .text_color(fg)
+                                                .child("Show Hidden Dotfiles"),
+                                        )
+                                        .child(
+                                            div()
+                                                .text_size(px(tokens::UI_XS))
+                                                .text_color(muted)
+                                                .child("Show .gitignore, .env, and .vscode in File Explorer"),
+                                        ),
+                                )
+                                .child(
+                                    h_flex()
+                                        .id("settings-dotfiles-toggle")
+                                        .h(px(26.))
+                                        .px(px(tokens::SPACE_3))
+                                        .items_center()
+                                        .rounded(px(tokens::RADIUS_SM))
+                                        .bg(cx.theme().background)
+                                        .border_1()
+                                        .border_color(border)
+                                        .cursor_pointer()
+                                        .hover(move |s| s.bg(list_hover))
+                                        .text_size(px(tokens::UI_SM))
+                                        .text_color(if show_hidden { green } else { muted })
+                                        .child(if show_hidden { "Shown" } else { "Hidden" })
+                                        .on_click({
+                                            let view = view.clone();
+                                            move |_e, _w, cx| {
+                                                view.update(cx, |this, cx| {
+                                                    this.show_hidden = !this.show_hidden;
+                                                    if this.has_workspace {
+                                                        this.rebuild_file_tree(cx);
+                                                    }
+                                                    cx.notify();
+                                                });
+                                            }
+                                        }),
+                                ),
+                        )
+                        // 4. Default AI Coding Tool
+                        .child(
+                            h_flex()
+                                .w_full()
+                                .items_center()
+                                .justify_between()
+                                .child(
+                                    v_flex()
+                                        .gap(px(2.))
+                                        .child(
+                                            div()
+                                                .text_size(px(tokens::UI))
+                                                .font_medium()
+                                                .text_color(fg)
+                                                .child("AI Agent Harness"),
+                                        )
+                                        .child(
+                                            div()
+                                                .text_size(px(tokens::UI_XS))
+                                                .text_color(muted)
+                                                .child("CLI coding tool used by the Agent rail"),
+                                        ),
+                                )
+                                .child(
+                                    h_flex()
+                                        .items_center()
+                                        .gap(px(4.))
+                                        .children(
+                                            rails::agent::AgentHarness::ALL
+                                                .iter()
+                                                .copied()
+                                                .enumerate()
+                                                .map(|(ix, tool)| {
+                                                    let is_sel = tool == current_harness;
+                                                    let view = view.clone();
+                                                    div()
+                                                        .id(("settings-harness", ix))
+                                                        .px(px(8.))
+                                                        .py(px(3.))
+                                                        .rounded(px(tokens::RADIUS_SM))
+                                                        .bg(if is_sel {
+                                                            primary.opacity(0.18)
+                                                        } else {
+                                                            cx.theme().background
+                                                        })
+                                                        .border_1()
+                                                        .border_color(if is_sel {
+                                                            primary
+                                                        } else {
+                                                            border
+                                                        })
+                                                        .cursor_pointer()
+                                                        .text_size(px(tokens::UI_XS))
+                                                        .text_color(if is_sel {
+                                                            primary
+                                                        } else {
+                                                            muted
+                                                        })
+                                                        .child(tool.short_label())
+                                                        .on_click(move |_e, _w, cx| {
+                                                            view.update(cx, |this, cx| {
+                                                                this.agent.set_harness(tool);
+                                                                cx.notify();
+                                                            });
+                                                        })
+                                                }),
+                                        ),
+                                ),
+                        )
+                        // 5. Default Agent Mode
+                        .child(
+                            h_flex()
+                                .w_full()
+                                .items_center()
+                                .justify_between()
+                                .child(
+                                    v_flex()
+                                        .gap(px(2.))
+                                        .child(
+                                            div()
+                                                .text_size(px(tokens::UI))
+                                                .font_medium()
+                                                .text_color(fg)
+                                                .child("AI Permission Mode"),
+                                        )
+                                        .child(
+                                            div()
+                                                .text_size(px(tokens::UI_XS))
+                                                .text_color(muted)
+                                                .child("Default, Plan-only, or Auto-Edit permissions"),
+                                        ),
+                                )
+                                .child(
+                                    h_flex()
+                                        .items_center()
+                                        .gap(px(4.))
+                                        .children(
+                                            ["Default", "Plan", "Auto-Edit"]
+                                                .into_iter()
+                                                .enumerate()
+                                                .map(|(ix, lbl)| {
+                                                    let is_sel = ix == current_mode_ix;
+                                                    let view = view.clone();
+                                                    div()
+                                                        .id(("settings-mode", ix))
+                                                        .px(px(8.))
+                                                        .py(px(3.))
+                                                        .rounded(px(tokens::RADIUS_SM))
+                                                        .bg(if is_sel {
+                                                            primary.opacity(0.18)
+                                                        } else {
+                                                            cx.theme().background
+                                                        })
+                                                        .border_1()
+                                                        .border_color(if is_sel {
+                                                            primary
+                                                        } else {
+                                                            border
+                                                        })
+                                                        .cursor_pointer()
+                                                        .text_size(px(tokens::UI_XS))
+                                                        .text_color(if is_sel {
+                                                            primary
+                                                        } else {
+                                                            muted
+                                                        })
+                                                        .child(lbl)
+                                                        .on_click(move |_e, _w, cx| {
+                                                            view.update(cx, |this, cx| {
+                                                                this.agent.mode_ix = ix;
+                                                                cx.notify();
+                                                            });
+                                                        })
+                                                }),
+                                        ),
+                                ),
+                        ),
+                ),
+        )
+    }
+
+    fn render_about_modal(
+        &self,
+        view: &Entity<Self>,
+        cx: &mut Context<Self>,
+    ) -> Option<Stateful<Div>> {
+        if !self.about_open {
+            return None;
+        }
+        let fg = cx.theme().foreground;
+        let muted = cx.theme().muted_foreground;
+        let primary = cx.theme().primary;
+        let border = cx.theme().border;
+
+        Some(
+            div()
+                .id("about-backdrop")
+                .absolute()
+                .inset_0()
+                .flex()
+                .justify_center()
+                .pt(px(110.))
+                .bg(rgba(0x00000066))
+                .on_mouse_down(MouseButton::Left, {
+                    let view = view.clone();
+                    move |_e, _w, cx| {
+                        view.update(cx, |this, cx| {
+                            this.about_open = false;
+                            cx.notify();
+                        });
+                    }
+                })
+                .child(
+                    v_flex()
+                        .id("about-card")
+                        .w(px(360.))
+                        .p(px(tokens::SPACE_5))
+                        .gap(px(tokens::SPACE_3))
+                        .items_center()
+                        .bg(cx.theme().popover)
+                        .border_1()
+                        .border_color(border)
+                        .rounded(px(tokens::RADIUS_CARD))
+                        .shadow_xl()
+                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                        .child(
+                            div()
+                                .px(px(10.))
+                                .py(px(4.))
+                                .rounded(px(8.))
+                                .bg(primary.opacity(0.18))
+                                .border_1()
+                                .border_color(primary.opacity(0.45))
+                                .font_family("SF Mono")
+                                .font_semibold()
+                                .text_size(px(18.))
+                                .text_color(primary)
+                                .child("//>"),
+                        )
+                        .child(
+                            div()
+                                .text_size(px(16.))
+                                .font_semibold()
+                                .text_color(fg)
+                                .child("Shame IDE"),
+                        )
+                        .child(
+                            div()
+                                .font_family("SF Mono")
+                                .text_size(px(tokens::UI_XS))
+                                .text_color(muted)
+                                .child("Version 0.1.0 \u{00b7} Native GPUI macOS IDE"),
+                        )
+                        .child(
+                            div()
+                                .text_size(px(tokens::UI_SM))
+                                .text_color(muted)
+                                .child("21 languages \u{00b7} Flutter & iOS Simulator \u{00b7} Multi-Harness AI Agent"),
+                        ),
+                ),
+        )
+    }
 }
 
 impl Render for DartIde {
@@ -3875,11 +4553,102 @@ impl Render for DartIde {
             .relative()
             .key_context("DartIde")
             .on_key_down(cx.listener(Self::on_key_down))
+            .on_action(cx.listener(|this, _: &AboutShame, _w, cx| {
+                this.about_open = true;
+                cx.notify();
+            }))
+            .on_action(cx.listener(|this, _: &OpenSettings, _w, cx| {
+                this.settings_open = !this.settings_open;
+                cx.notify();
+            }))
+            .on_action(|_: &QuitShame, _w, cx| {
+                cx.quit();
+            })
+            .on_action(cx.listener(|this, _: &MenuOpenFolder, window, cx| {
+                this.open_folder(window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &MenuCloseFolder, _w, cx| {
+                this.close_workspace(cx);
+            }))
+            .on_action(cx.listener(|this, _: &MenuNewFile, window, cx| {
+                this.new_scratch_tab(window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &MenuSaveFile, _w, cx| {
+                if let Some(ed) = this.active_editor().cloned() {
+                    ed.update(cx, |editor, cx| editor.save(cx));
+                }
+            }))
+            .on_action(cx.listener(|this, _: &MenuCloseTab, _w, cx| {
+                if !this.tabs.is_empty() {
+                    this.close_tab(this.active_tab, cx);
+                }
+            }))
+            .on_action(cx.listener(|this, _: &MenuGoToFile, window, cx| {
+                this.palette_open = true;
+                this.palette_selected = 0;
+                this.palette_input
+                    .update(cx, |s, cx| {
+                        s.set_value("", window, cx);
+                        s.focus(window, cx);
+                    });
+                cx.notify();
+            }))
+            .on_action(cx.listener(|this, _: &MenuCommandPalette, window, cx| {
+                this.palette_open = true;
+                this.palette_selected = 0;
+                this.palette_input
+                    .update(cx, |s, cx| {
+                        s.set_value("> ", window, cx);
+                        s.focus(window, cx);
+                    });
+                cx.notify();
+            }))
+            .on_action(cx.listener(|this, _: &MenuFindInFile, window, cx| {
+                this.find_open = true;
+                this.find_input.update(cx, |s, cx| s.focus(window, cx));
+                cx.notify();
+            }))
+            .on_action(cx.listener(|this, _: &MenuFindInProject, window, cx| {
+                this.execute_ide_command("project-search", window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &MenuFormatDoc, window, cx| {
+                this.execute_ide_command("format-doc", window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &MenuToggleSidebar, _w, cx| {
+                this.sidebar_open = !this.sidebar_open;
+                cx.notify();
+            }))
+            .on_action(cx.listener(|this, _: &MenuToggleTerminal, _w, cx| {
+                this.terminal_open = !this.terminal_open;
+                cx.notify();
+            }))
+            .on_action(cx.listener(|this, _: &MenuToggleProblems, window, cx| {
+                this.execute_ide_command("toggle-problems", window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &MenuToggleAgent, _w, cx| {
+                this.agent_open = !this.agent_open;
+                cx.notify();
+            }))
+            .on_action(cx.listener(|this, _: &MenuToggleWebPreview, window, cx| {
+                this.toggle_web_preview(window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &MenuSplitEditor, _w, cx| {
+                this.toggle_split_editor(cx);
+            }))
             .bg(cx.theme().background)
             .text_color(cx.theme().foreground)
             .child(self.render_titlebar(window, cx))
             .child(self.render_shell(&view, window, cx))
             .child(self.render_status_bar(cx))
+            .when_some(self.render_branch_switcher_modal(&view, cx), |el, modal| {
+                el.child(modal)
+            })
+            .when_some(self.render_settings_modal(&view, cx), |el, modal| {
+                el.child(modal)
+            })
+            .when_some(self.render_about_modal(&view, cx), |el, modal| {
+                el.child(modal)
+            })
             .when_some(self.render_launch_picker_popover(&view, cx), |el, pop| {
                 el.child(pop)
             })
@@ -3910,6 +4679,82 @@ fn main() {
         gpui_kit::component::Theme::change(gpui_kit::component::ThemeMode::Dark, None, cx);
         theme::apply(cx);
 
+        cx.bind_keys([
+            KeyBinding::new("cmd-,", OpenSettings, None),
+            KeyBinding::new("cmd-q", QuitShame, None),
+            KeyBinding::new("cmd-o", MenuOpenFolder, None),
+            KeyBinding::new("cmd-n", MenuNewFile, None),
+            KeyBinding::new("cmd-s", MenuSaveFile, None),
+            KeyBinding::new("cmd-w", MenuCloseTab, None),
+        ]);
+
+        cx.set_menus(vec![
+            Menu {
+                name: "Shame".into(),
+                items: vec![
+                    MenuItem::action("About Shame", AboutShame),
+                    MenuItem::separator(),
+                    MenuItem::action("Settings\u{2026}", OpenSettings),
+                    MenuItem::separator(),
+                    MenuItem::os_submenu("Services", SystemMenuType::Services),
+                    MenuItem::separator(),
+                    MenuItem::action("Quit Shame", QuitShame),
+                ],
+                disabled: false,
+            },
+            Menu {
+                name: "File".into(),
+                items: vec![
+                    MenuItem::action("New Scratch File", MenuNewFile),
+                    MenuItem::action("Open Folder\u{2026}", MenuOpenFolder),
+                    MenuItem::separator(),
+                    MenuItem::action("Save", MenuSaveFile),
+                    MenuItem::action("Close Tab", MenuCloseTab),
+                    MenuItem::action("Close Folder", MenuCloseFolder),
+                ],
+                disabled: false,
+            },
+            Menu {
+                name: "Edit".into(),
+                items: vec![
+                    MenuItem::action("Find in File\u{2026}", MenuFindInFile),
+                    MenuItem::action("Find in Project\u{2026}", MenuFindInProject),
+                    MenuItem::separator(),
+                    MenuItem::action("Format Document", MenuFormatDoc),
+                ],
+                disabled: false,
+            },
+            Menu {
+                name: "View".into(),
+                items: vec![
+                    MenuItem::action("Command Palette\u{2026}", MenuCommandPalette),
+                    MenuItem::action("Go to File\u{2026}", MenuGoToFile),
+                    MenuItem::separator(),
+                    MenuItem::action("Toggle Left Sidebar", MenuToggleSidebar),
+                    MenuItem::action("Toggle Terminal Dock", MenuToggleTerminal),
+                    MenuItem::action("Toggle Problems Panel", MenuToggleProblems),
+                    MenuItem::action("Toggle AI Agent Rail", MenuToggleAgent),
+                    MenuItem::action("Toggle Web Preview Rail", MenuToggleWebPreview),
+                    MenuItem::separator(),
+                    MenuItem::action("Split Editor Right", MenuSplitEditor),
+                ],
+                disabled: false,
+            },
+            Menu {
+                name: "Help".into(),
+                items: vec![MenuItem::action("About Shame", AboutShame)],
+                disabled: false,
+            },
+        ]);
+
+        cx.set_dock_menu(vec![
+            MenuItem::action("Open Folder\u{2026}", MenuOpenFolder),
+            MenuItem::action("New Scratch File", MenuNewFile),
+            MenuItem::separator(),
+            MenuItem::action("Settings\u{2026}", OpenSettings),
+            MenuItem::action("About Shame", AboutShame),
+        ]);
+
         let bounds = Bounds::centered(None, size(px(1600.), px(1000.)), cx);
 
         let window_options = WindowOptions {
@@ -3926,5 +4771,6 @@ fn main() {
             cx.new(|cx| DartIde::new(window, cx))
         })
         .expect("Failed to open window");
+        cx.activate(true);
     });
 }

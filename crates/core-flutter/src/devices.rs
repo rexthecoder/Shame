@@ -43,12 +43,38 @@ impl IosSimulator {
     }
 }
 
+fn resolve_flutter_bin() -> String {
+    if let Ok(home) = std::env::var("HOME") {
+        let candidates = [
+            format!("{home}/fvm/default/bin/flutter"),
+            format!("{home}/development/flutter/bin/flutter"),
+            format!("{home}/flutter/bin/flutter"),
+            "/opt/homebrew/bin/flutter".to_string(),
+            "/usr/local/bin/flutter".to_string(),
+        ];
+        for c in candidates {
+            if Path::new(&c).is_file() {
+                return c;
+            }
+        }
+    }
+    "flutter".to_string()
+}
+
 /// Run `flutter devices --machine` and parse its output. Unlike the
 /// streaming daemon protocol (`FlutterDaemon`), this is a one-shot
 /// command: it prints a single (pretty-printed, multi-line) JSON array
 /// and exits, so we just wait for it and parse the whole thing.
 pub fn list_devices() -> io::Result<Vec<Device>> {
-    let output = Command::new("flutter").args(["devices", "--machine"]).output()?;
+    let home = std::env::var("HOME").unwrap_or_default();
+    let cur_path = std::env::var("PATH").unwrap_or_default();
+    let enriched_path = format!(
+        "{home}/fvm/default/bin:{home}/development/flutter/bin:{home}/flutter/bin:{home}/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:{cur_path}"
+    );
+    let output = Command::new(resolve_flutter_bin())
+        .args(["devices", "--machine"])
+        .env("PATH", enriched_path)
+        .output()?;
     if !output.status.success() {
         return Err(io::Error::new(
             io::ErrorKind::Other,

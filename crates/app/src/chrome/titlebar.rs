@@ -30,12 +30,15 @@ impl DartIde {
     ) -> impl IntoElement {
         let traffic_light_inset = if window.is_fullscreen() { px(12.) } else { px(78.) };
 
-        let root_name = self
-            .root
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("/")
-            .to_string();
+        let root_name = if self.has_workspace {
+            self.root
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("workspace")
+                .to_string()
+        } else {
+            "Shame \u{00b7} Open Folder\u{2026}".to_string()
+        };
 
         let fg = cx.theme().foreground;
         let muted = cx.theme().muted_foreground;
@@ -58,12 +61,6 @@ impl DartIde {
                     .flex_1()
                     .items_center()
                     .gap_1()
-                    .child(icon_button(
-                        "menu",
-                        gpui_kit::assets::IconName::Menu,
-                        Some(muted),
-                        "Application menu",
-                    ))
                     .child(
                         Button::new("layout-sidebar")
                             .ghost()
@@ -76,7 +73,7 @@ impl DartIde {
                                 })
                                 .text_color(if self.sidebar_open { fg } else { muted }),
                             )
-                            .tooltip("Toggle sidebar (cmd/ctrl+B)")
+                            .tooltip("Toggle sidebar (\u{2318}B)")
                             .on_click(cx.listener(|this, _event, _window, cx| {
                                 this.sidebar_open = !this.sidebar_open;
                                 cx.notify();
@@ -90,7 +87,7 @@ impl DartIde {
                                 Icon::new(gpui_kit::assets::IconName::PanelBottom)
                                     .text_color(if self.terminal_open { fg } else { muted }),
                             )
-                            .tooltip("Toggle terminal dock (cmd/ctrl+J)")
+                            .tooltip("Toggle terminal dock (\u{2318}J)")
                             .on_click(cx.listener(|this, _event, _window, cx| {
                                 this.terminal_open = !this.terminal_open;
                                 cx.notify();
@@ -109,13 +106,7 @@ impl DartIde {
                                 this.agent_open = !this.agent_open;
                                 cx.notify();
                             })),
-                    )
-                    .child(icon_button(
-                        "add-person",
-                        gpui_kit::assets::IconName::UserPlus,
-                        Some(muted),
-                        "Invite collaborator",
-                    )),
+                    ),
             )
             .child(
                 h_flex()
@@ -183,19 +174,41 @@ impl DartIde {
                                 .on_mouse_down(MouseButton::Left, |_, _, cx| {
                                     cx.stop_propagation();
                                 })
+                                .on_click(cx.listener(|this, _event, window, cx| {
+                                    cx.stop_propagation();
+                                    this.git_open_branch_switcher(window, cx);
+                                })),
+                        )
+                    })
+                    .when(self.has_workspace, |el| {
+                        el.child(
+                            div()
+                                .id("titlebar-close-folder")
+                                .cursor_pointer()
+                                .text_color(muted)
+                                .hover(move |s| s.text_color(fg))
+                                .child(
+                                    Icon::new(gpui_kit::assets::IconName::X).with_size(px(10.5)),
+                                )
+                                .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                                    cx.stop_propagation();
+                                })
                                 .on_click(cx.listener(|this, _event, _window, cx| {
                                     cx.stop_propagation();
-                                    this.sidebar_open = true;
-                                    this.set_sidebar_tab(crate::git_panel::SidebarTab::Git, cx);
+                                    this.close_workspace(cx);
                                 })),
                         )
                     })
                     .on_click(cx.listener(|this, _event, window, cx| {
-                        this.palette_open = true;
-                        this.palette_selected = 0;
-                        this.palette_input
-                            .update(cx, |state, cx| state.focus(window, cx));
-                        cx.notify();
+                        if this.has_workspace {
+                            this.palette_open = true;
+                            this.palette_selected = 0;
+                            this.palette_input
+                                .update(cx, |state, cx| state.focus(window, cx));
+                            cx.notify();
+                        } else {
+                            this.open_folder(window, cx);
+                        }
                     })),
             )
             .child(
@@ -478,12 +491,22 @@ impl DartIde {
                                 cx.notify();
                             })),
                     )
-                    .child(icon_button(
-                        "settings",
-                        gpui_kit::assets::IconName::Settings,
-                        Some(muted),
-                        "Settings",
-                    )),
+                    .child(
+                        icon_button(
+                            "settings",
+                            gpui_kit::assets::IconName::Settings,
+                            Some(if self.settings_open {
+                                cx.theme().primary
+                            } else {
+                                muted
+                            }),
+                            "Settings & Preferences (\u{2318},)",
+                        )
+                        .on_click(cx.listener(|this, _event, _window, cx| {
+                            this.settings_open = !this.settings_open;
+                            cx.notify();
+                        })),
+                    ),
             )
     }
 }

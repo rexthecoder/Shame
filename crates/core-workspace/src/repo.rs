@@ -575,9 +575,10 @@ pub fn push(root: &Path, status: &RepoStatus) -> Result<String, String> {
     Ok("Pushed".to_string())
 }
 
-/// Local branches, most recently committed first.
+/// Local branches (most recently committed first), followed by remote branches (`origin/...`)
+/// that do not yet have a local tracking branch of the same name.
 pub fn branches(root: &Path) -> Vec<BranchInfo> {
-    git(
+    let mut list: Vec<BranchInfo> = git(
         root,
         &[
             "for-each-ref",
@@ -596,11 +597,46 @@ pub fn branches(root: &Path) -> Vec<BranchInfo> {
             })
             .collect()
     })
-    .unwrap_or_default()
+    .unwrap_or_default();
+
+    if let Ok(remotes_out) = git(
+        root,
+        &[
+            "for-each-ref",
+            "--sort=-committerdate",
+            "--format=%(refname:short)",
+            "refs/remotes/origin",
+        ],
+        None,
+    ) {
+        for r in remotes_out.lines().map(str::trim) {
+            if r.is_empty() || r == "origin" || r.ends_with("/HEAD") {
+                continue;
+            }
+            let short = r.strip_prefix("origin/").unwrap_or(r);
+            if !list.iter().any(|b| b.name == short || b.name == r) {
+                list.push(BranchInfo {
+                    name: r.to_string(),
+                    current: false,
+                });
+            }
+        }
+    }
+    list
 }
 
 pub fn checkout(root: &Path, branch: &str) -> Result<(), String> {
-    git(root, &["switch", branch], None).map(|_| ())
+    if let Some(short) = branch.strip_prefix("origin/") {
+        git(root, &["switch", "--track", branch], None)
+            .or_else(|_| git(root, &["switch", short], None))
+            .map(|_| ())
+    } else {
+        git(root, &["switch", branch], None).map(|_| ())
+    }
+}
+
+pub fn delete_branch(root: &Path, branch: &str) -> Result<String, String> {
+    git(root, &["branch", "-D", branch], None).map(|_| format!("Deleted branch {branch}"))
 }
 
 pub fn create_branch(root: &Path, name: &str) -> Result<(), String> {

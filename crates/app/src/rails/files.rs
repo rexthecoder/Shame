@@ -363,6 +363,20 @@ impl DartIde {
                             .items_center()
                             .gap(px(tokens::SPACE_1))
                             .child(
+                                Button::new("open-folder")
+                                    .ghost()
+                                    .small()
+                                    .icon(
+                                        Icon::new(gpui_kit::assets::IconName::FolderOpen)
+                                            .xsmall()
+                                            .text_color(cx.theme().primary),
+                                    )
+                                    .tooltip("Open Folder\u{2026} (\u{2318}O)")
+                                    .on_click(cx.listener(|this, _event, window, cx| {
+                                        this.open_folder(window, cx);
+                                    })),
+                            )
+                            .child(
                                 Button::new("rail-new-file")
                                     .ghost()
                                     .small()

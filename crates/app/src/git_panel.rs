@@ -39,6 +39,7 @@ pub(crate) struct GitState {
     pub(crate) branch_input: Entity<InputState>,
     pub(crate) branches: Vec<BranchInfo>,
     pub(crate) branches_open: bool,
+    pub(crate) branch_selected: usize,
     pub(crate) amend: bool,
     pub(crate) staged_collapsed: bool,
     pub(crate) changes_collapsed: bool,
@@ -78,6 +79,7 @@ impl GitState {
                 .new(|cx| InputState::new(window, cx).placeholder("Filter or create branch…")),
             branches: Vec::new(),
             branches_open: false,
+            branch_selected: 0,
             amend: false,
             staged_collapsed: false,
             changes_collapsed: false,
@@ -622,14 +624,68 @@ impl DartIde {
         });
     }
 
-    pub(crate) fn git_toggle_branches(&mut self, cx: &mut Context<Self>) {
+    pub(crate) fn git_toggle_branches(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.git.branches_open = !self.git.branches_open;
         if self.git.branches_open {
             if let Some(root) = self.git.status.as_ref().map(|s| s.root.clone()) {
                 self.git.branches = core_workspace::branches(&root);
             }
+            self.git.branch_selected = 0;
+            self.git.branch_input.update(cx, |s, cx| {
+                s.set_value("", window, cx);
+                s.focus(window, cx);
+            });
         }
         cx.notify();
+    }
+
+    pub(crate) fn git_open_branch_switcher(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.git.branches_open = true;
+        let root = self
+            .git
+            .status
+            .as_ref()
+            .map(|s| s.root.clone())
+            .unwrap_or_else(|| self.root.clone());
+        self.git.branches = core_workspace::branches(&root);
+        self.git.branch_selected = 0;
+        self.git.branch_input.update(cx, |s, cx| {
+            s.set_value("", window, cx);
+            s.focus(window, cx);
+        });
+        cx.notify();
+    }
+
+    pub(crate) fn git_delete_branch_clicked(
+        &mut self,
+        name: String,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) {
+        let key = format!("branch-del:{name}");
+        if self.git.confirm_discard.as_deref() == Some(key.as_str()) {
+            self.git.confirm_discard = None;
+            let branch_name = name.clone();
+            self.git_run(
+                window,
+                Some("Deleting branch\u{2026}"),
+                false,
+                cx,
+                move |root, _| core_workspace::delete_branch(root, &branch_name),
+            );
+            self.git.branches.retain(|b| b.name != name);
+            cx.notify();
+            return;
+        }
+        self.arm_confirm(key, cx);
     }
 
     pub(crate) fn git_checkout(&mut self, name: String, window: &Window, cx: &mut Context<Self>) {

@@ -368,9 +368,6 @@ impl DartIde {
             .w_full()
             .min_h(px(0.))
             .child(self.render_git_branch_bar(status, cx))
-            .when(self.git.branches_open, |el| {
-                el.child(self.render_git_branch_list(cx))
-            })
             .when(!status.is_clean() || self.git.amend, |el| {
                 el.child(self.render_git_commit_box(status, cx))
             })
@@ -381,7 +378,10 @@ impl DartIde {
     fn render_git_branch_bar(&self, status: &RepoStatus, cx: &mut Context<Self>) -> Div {
         let muted = cx.theme().muted_foreground;
         let fg = cx.theme().foreground;
+        let primary = cx.theme().primary;
+        let border = cx.theme().border;
         let busy = self.git.busy.is_some();
+        let is_open = self.git.branches_open;
         let name = status
             .branch
             .clone()
@@ -391,30 +391,36 @@ impl DartIde {
             status.upstream.is_none() && status.head.is_some() && status.branch.is_some();
         h_flex()
             .w_full()
-            .h(px(30.))
+            .h(px(34.))
             .flex_shrink_0()
             .items_center()
             .justify_between()
             .gap(px(tokens::SPACE_2))
             .px(px(tokens::SPACE_4))
             .border_b_1()
-            .border_color(cx.theme().border.opacity(0.6))
+            .border_color(border.opacity(0.6))
             .child(
                 h_flex()
                     .id("git-branch-toggle")
                     .min_w(px(0.))
                     .items_center()
                     .gap(px(tokens::SPACE_2))
-                    .h(px(22.))
+                    .h(px(24.))
                     .px(px(tokens::SPACE_2))
-                    .ml(px(-tokens::SPACE_2))
                     .rounded(px(tokens::RADIUS_SM))
+                    .bg(if is_open {
+                        tokens::accent_dim()
+                    } else {
+                        cx.theme().background
+                    })
+                    .border_1()
+                    .border_color(if is_open { primary } else { border })
                     .cursor_pointer()
                     .hover(|s| s.bg(cx.theme().list_hover))
                     .child(
                         Icon::new(IconName::GitBranch)
                             .xsmall()
-                            .text_color(cx.theme().green),
+                            .text_color(if is_open { primary } else { cx.theme().green }),
                     )
                     .child(
                         div()
@@ -425,9 +431,9 @@ impl DartIde {
                             .child(name),
                     )
                     .child(Icon::new(IconName::ChevronDown).xsmall().text_color(muted))
-                    .on_click(
-                        cx.listener(|this, _event, _window, cx| this.git_toggle_branches(cx)),
-                    ),
+                    .on_click(cx.listener(|this, _event, window, cx| {
+                        this.git_toggle_branches(window, cx)
+                    })),
             )
             .child(
                 // Only what applies: fetch always; pull when behind; push when ahead; publish
@@ -523,9 +529,25 @@ impl DartIde {
             )
     }
 
-    fn render_git_branch_list(&self, cx: &mut Context<Self>) -> Div {
+    pub(crate) fn render_branch_switcher_modal(
+        &self,
+        view: &Entity<Self>,
+        cx: &mut Context<Self>,
+    ) -> Option<Stateful<Div>> {
+        if !self.git.branches_open {
+            return None;
+        }
         let muted = cx.theme().muted_foreground;
-        let query = self.git.branch_input.read(cx).value().trim().to_lowercase();
+        let fg = cx.theme().foreground;
+        let primary = cx.theme().primary;
+        let green = cx.theme().green;
+        let red = cx.theme().red;
+        let info = cx.theme().info;
+        let border = cx.theme().border;
+        let list_hover = cx.theme().list_hover;
+
+        let raw_query = self.git.branch_input.read(cx).value().trim().to_string();
+        let query = raw_query.to_lowercase();
         let filtered: Vec<_> = self
             .git
             .branches
@@ -533,100 +555,343 @@ impl DartIde {
             .filter(|b| query.is_empty() || b.name.to_lowercase().contains(&query))
             .cloned()
             .collect();
-        let exact_match = self
+        let exact_exists = self
             .git
             .branches
             .iter()
-            .find(|b| b.name.eq_ignore_ascii_case(&query) && !b.current)
-            .map(|b| b.name.clone());
+            .any(|b| b.name.eq_ignore_ascii_case(&raw_query));
+        let sel_ix = self
+            .git
+            .branch_selected
+            .min(filtered.len().saturating_sub(1));
+        let selected_branch_name = filtered.get(sel_ix).map(|b| b.name.clone());
+        let filtered_count = filtered.len();
+        let has_query = !raw_query.is_empty();
+        let confirm_del = self.git.confirm_discard.clone();
 
-        v_flex()
-            .w_auto()
-            .flex_shrink_0()
-            .max_h(px(220.))
-            .mx(px(tokens::SPACE_4))
-            .mb(px(tokens::SPACE_3))
-            .p(px(tokens::SPACE_2))
-            .gap(px(tokens::SPACE_1))
-            .rounded(px(tokens::RADIUS_PANEL))
-            .border_1()
-            .border_color(cx.theme().border)
-            .bg(cx.theme().background)
-            .on_key_down(cx.listener(move |this, event: &KeyDownEvent, window, cx| {
-                let key = event.keystroke.key.as_str();
-                if key == "escape" {
-                    this.git.branches_open = false;
-                    cx.stop_propagation();
-                    cx.notify();
-                } else if key == "enter" {
-                    if let Some(existing) = exact_match.clone() {
-                        this.git
-                            .branch_input
-                            .update(cx, |s, cx| s.set_value("", window, cx));
-                        this.git_checkout(existing, window, cx);
-                    } else {
-                        this.git_create_branch(window, cx);
+        Some(
+            div()
+                .id("branch-switcher-backdrop")
+                .absolute()
+                .inset_0()
+                .flex()
+                .justify_center()
+                .pt(px(84.))
+                .bg(rgba(0x00000066))
+                .on_mouse_down(MouseButton::Left, {
+                    let view = view.clone();
+                    move |_e, _w, cx| {
+                        view.update(cx, |this, cx| {
+                            this.git.branches_open = false;
+                            cx.notify();
+                        });
                     }
-                    cx.stop_propagation();
-                }
-            }))
-            .child(
-                h_flex()
-                    .items_center()
-                    .gap(px(tokens::SPACE_2))
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w(px(0.))
-                            .child(Input::new(&self.git.branch_input).small()),
-                    )
-                    .child(
-                        Button::new("git-create-branch")
-                            .small()
-                            .disabled(query.is_empty())
-                            .label("Create")
-                            .on_click(cx.listener(|this, _event, window, cx| {
-                                this.git_create_branch(window, cx)
-                            })),
-                    ),
-            )
-            .child(
-                v_flex()
-                    .id("git-branch-scroll")
-                    .overflow_y_scroll()
-                    .children(filtered.into_iter().enumerate().map(|(ix, branch)| {
-                        let name = branch.name.clone();
-                        let current = branch.current;
-                        h_flex()
-                            .id(("git-branch", ix))
-                            .h(px(24.))
-                            .px(px(tokens::SPACE_3))
-                            .items_center()
-                            .gap(px(tokens::SPACE_2))
-                            .rounded(px(tokens::RADIUS_SM))
-                            .cursor_pointer()
-                            .hover(|s| s.bg(cx.theme().list_hover))
-                            .text_size(px(tokens::UI_SM))
-                            .text_color(if current {
-                                cx.theme().foreground
-                            } else {
-                                muted
-                            })
-                            .child(div().w(px(12.)).when(current, |el| {
-                                el.child(
-                                    Icon::new(IconName::Check)
-                                        .xsmall()
-                                        .text_color(cx.theme().green),
+                })
+                .child(
+                    v_flex()
+                        .id("branch-switcher-card")
+                        .w(px(480.))
+                        .max_h(px(400.))
+                        .bg(cx.theme().popover)
+                        .border_1()
+                        .border_color(border)
+                        .rounded(px(tokens::RADIUS_CARD))
+                        .shadow_xl()
+                        .overflow_hidden()
+                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                        .on_key_down(cx.listener(move |this, event: &KeyDownEvent, window, cx| {
+                            let key = event.keystroke.key.as_str();
+                            match key {
+                                "escape" => {
+                                    this.git.branches_open = false;
+                                    cx.stop_propagation();
+                                    cx.notify();
+                                }
+                                "down" => {
+                                    if filtered_count > 0 {
+                                        this.git.branch_selected =
+                                            (this.git.branch_selected + 1) % filtered_count;
+                                        cx.stop_propagation();
+                                        cx.notify();
+                                    }
+                                }
+                                "up" => {
+                                    if filtered_count > 0 {
+                                        this.git.branch_selected = if this.git.branch_selected == 0
+                                        {
+                                            filtered_count - 1
+                                        } else {
+                                            this.git.branch_selected - 1
+                                        };
+                                        cx.stop_propagation();
+                                        cx.notify();
+                                    }
+                                }
+                                "enter" => {
+                                    if let Some(ref b_name) = selected_branch_name {
+                                        this.git
+                                            .branch_input
+                                            .update(cx, |s, cx| s.set_value("", window, cx));
+                                        this.git_checkout(b_name.clone(), window, cx);
+                                    } else if has_query {
+                                        this.git_create_branch(window, cx);
+                                    }
+                                    cx.stop_propagation();
+                                }
+                                _ => {}
+                            }
+                        }))
+                        // Search / Create Input Header
+                        .child(
+                            h_flex()
+                                .h(px(38.))
+                                .px_3()
+                                .gap_2()
+                                .items_center()
+                                .border_b_1()
+                                .border_color(border)
+                                .child(
+                                    Icon::new(IconName::GitBranch)
+                                        .with_size(px(13.))
+                                        .text_color(green),
                                 )
-                            }))
-                            .child(div().truncate().child(branch.name))
-                            .when(!current, |el| {
-                                el.on_click(cx.listener(move |this, _event, window, cx| {
-                                    this.git_checkout(name.clone(), window, cx)
-                                }))
-                            })
-                    })),
-            )
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .min_w(px(0.))
+                                        .child(
+                                            Input::new(&self.git.branch_input)
+                                                .appearance(false)
+                                                .small(),
+                                        ),
+                                ),
+                        )
+                        // Scrollable Body
+                        .child(
+                            v_flex()
+                                .id("git-branch-scroll")
+                                .p_1p5()
+                                .gap(px(tokens::SPACE_1))
+                                .overflow_y_scroll()
+                                // Prominent "+ Create & switch to branch '<query>'" row when typing a new name
+                                .when(!raw_query.is_empty() && !exact_exists, |el| {
+                                    let new_name = raw_query.clone();
+                                    el.child(
+                                        h_flex()
+                                            .id("git-create-branch")
+                                            .w_full()
+                                            .h(px(30.))
+                                            .px_3()
+                                            .items_center()
+                                            .justify_between()
+                                            .gap(px(tokens::SPACE_2))
+                                            .rounded(px(tokens::RADIUS_SM))
+                                            .bg(primary.opacity(0.14))
+                                            .border_1()
+                                            .border_color(primary.opacity(0.35))
+                                            .cursor_pointer()
+                                            .hover(move |s| s.bg(primary.opacity(0.24)))
+                                            .text_size(px(tokens::UI))
+                                            .text_color(primary)
+                                            .child(
+                                                h_flex()
+                                                    .min_w(px(0.))
+                                                    .items_center()
+                                                    .gap(px(tokens::SPACE_2))
+                                                    .child(Icon::new(IconName::Plus).with_size(px(12.)))
+                                                    .child(
+                                                        div()
+                                                            .truncate()
+                                                            .font_medium()
+                                                            .child(format!(
+                                                                "Create & switch to branch \"{new_name}\""
+                                                            )),
+                                                    ),
+                                            )
+                                            .child(
+                                                div()
+                                                    .font_family(cx.theme().mono_font_family.clone())
+                                                    .text_size(px(tokens::UI_XS))
+                                                    .child("\u{21b5}"),
+                                            )
+                                            .on_click(cx.listener(|this, _event, window, cx| {
+                                                this.git_create_branch(window, cx)
+                                            })),
+                                    )
+                                })
+                                .children(filtered.into_iter().enumerate().map(|(ix, branch)| {
+                                    let name = branch.name.clone();
+                                    let del_name = branch.name.clone();
+                                    let current = branch.current;
+                                    let is_remote = name.starts_with("origin/");
+                                    let is_selected = ix == sel_ix;
+                                    let del_key = format!("branch-del:{name}");
+                                    let del_armed =
+                                        confirm_del.as_deref() == Some(del_key.as_str());
+                                    let row_group = format!("git-branch-grp-{ix}");
+
+                                    h_flex()
+                                        .id(("git-branch", ix))
+                                        .group(row_group.clone())
+                                        .relative()
+                                        .w_full()
+                                        .h(px(30.))
+                                        .px_3()
+                                        .items_center()
+                                        .justify_between()
+                                        .gap(px(tokens::SPACE_2))
+                                        .rounded(px(tokens::RADIUS_SM))
+                                        .border_1()
+                                        .border_color(gpui_kit::transparent_black())
+                                        .cursor_pointer()
+                                        .when(is_selected, |s| {
+                                            s.bg(rgba(0xea7a3c16))
+                                                .border_color(rgba(0xea7a3c36))
+                                                .child(
+                                                    div()
+                                                        .absolute()
+                                                        .left(px(2.))
+                                                        .top(px(6.))
+                                                        .bottom(px(6.))
+                                                        .w(px(2.5))
+                                                        .rounded(px(2.))
+                                                        .bg(primary),
+                                                )
+                                        })
+                                        .when(!is_selected, |s| s.hover(move |h| h.bg(list_hover)))
+                                        .text_size(px(tokens::UI))
+                                        .text_color(if current { fg } else { muted })
+                                        .child(
+                                            h_flex()
+                                                .flex_1()
+                                                .min_w(px(0.))
+                                                .items_center()
+                                                .gap(px(tokens::SPACE_2))
+                                                .child(
+                                                    Icon::new(if current {
+                                                        IconName::Check
+                                                    } else {
+                                                        IconName::GitBranch
+                                                    })
+                                                    .xsmall()
+                                                    .text_color(if current {
+                                                        green
+                                                    } else if is_remote {
+                                                        info
+                                                    } else {
+                                                        muted
+                                                    }),
+                                                )
+                                                .child(
+                                                    div()
+                                                        .truncate()
+                                                        .when(current, |d| d.font_medium())
+                                                        .child(branch.name),
+                                                ),
+                                        )
+                                        .child(
+                                            h_flex()
+                                                .flex_shrink_0()
+                                                .items_center()
+                                                .gap(px(tokens::SPACE_2))
+                                                .when(is_remote, |r| {
+                                                    r.child(
+                                                        div()
+                                                            .px(px(5.))
+                                                            .py(px(1.))
+                                                            .rounded(px(3.))
+                                                            .bg(info.opacity(0.15))
+                                                            .font_family(
+                                                                cx.theme().mono_font_family.clone(),
+                                                            )
+                                                            .text_size(px(9.5))
+                                                            .text_color(info)
+                                                            .child("remote"),
+                                                    )
+                                                })
+                                                .when(current, |r| {
+                                                    r.child(
+                                                        div()
+                                                            .px(px(5.))
+                                                            .py(px(1.))
+                                                            .rounded(px(3.))
+                                                            .bg(green.opacity(0.15))
+                                                            .font_family(
+                                                                cx.theme().mono_font_family.clone(),
+                                                            )
+                                                            .text_size(px(9.5))
+                                                            .text_color(green)
+                                                            .child("current"),
+                                                    )
+                                                })
+                                                .when(!current && !is_remote, |r| {
+                                                    r.child(
+                                                        div()
+                                                            .id(("git-del-branch", ix))
+                                                            .when(!del_armed, |d| {
+                                                                d.invisible().group_hover(
+                                                                    row_group.clone(),
+                                                                    |s| s.visible(),
+                                                                )
+                                                            })
+                                                            .text_size(px(9.5))
+                                                            .text_color(if del_armed {
+                                                                red
+                                                            } else {
+                                                                muted
+                                                            })
+                                                            .hover(move |s| s.text_color(red))
+                                                            .child(if del_armed {
+                                                                div()
+                                                                    .child("Del?")
+                                                                    .into_any_element()
+                                                            } else {
+                                                                Icon::new(IconName::X)
+                                                                    .with_size(px(11.))
+                                                                    .into_any_element()
+                                                            })
+                                                            .on_mouse_down(
+                                                                MouseButton::Left,
+                                                                |_, _, cx| cx.stop_propagation(),
+                                                            )
+                                                            .on_click(cx.listener(
+                                                                move |this, _e, window, cx| {
+                                                                    cx.stop_propagation();
+                                                                    this.git_delete_branch_clicked(
+                                                                        del_name.clone(),
+                                                                        window,
+                                                                        cx,
+                                                                    );
+                                                                },
+                                                            )),
+                                                    )
+                                                }),
+                                        )
+                                        .when(!current, |el| {
+                                            el.on_click(cx.listener(
+                                                move |this, _event, window, cx| {
+                                                    this.git_checkout(name.clone(), window, cx)
+                                                },
+                                            ))
+                                        })
+                                })),
+                        )
+                        // Footer Hints
+                        .child(
+                            h_flex()
+                                .px_3()
+                                .py_1p5()
+                                .gap_3()
+                                .border_t_1()
+                                .border_color(border)
+                                .text_size(px(tokens::UI_XS))
+                                .text_color(muted)
+                                .child("\u{2191}\u{2193} Navigate")
+                                .child("\u{21b5} Switch / Create")
+                                .child("Esc Dismiss"),
+                        ),
+                ),
+        )
     }
 
     /// Option A commit composer: clean input box with inline `☐ Amend` and `✦ Auto-fill` row,
@@ -1706,9 +1971,16 @@ impl DartIde {
                                         .child("\u{2191}"),
                                 )
                             })
-                            .child(
+                            .child({
+                                let copy_hash = commit.hash.clone();
                                 div()
+                                    .id(("git-copy-sha", ix))
                                     .flex_shrink_0()
+                                    .px(px(4.))
+                                    .rounded(px(3.))
+                                    .bg(cx.theme().background)
+                                    .border_1()
+                                    .border_color(cx.theme().border)
                                     .font_family(cx.theme().mono_font_family.clone())
                                     .text_size(px(tokens::UI_XS))
                                     .text_color(if unpushed {
@@ -1716,8 +1988,23 @@ impl DartIde {
                                     } else {
                                         cx.theme().info
                                     })
-                                    .child(commit.hash.clone()),
-                            )
+                                    .hover(|s| s.border_color(cx.theme().primary))
+                                    .child(commit.hash.clone())
+                                    .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                                        cx.stop_propagation();
+                                    })
+                                    .on_click(cx.listener(move |this, _e, _w, cx| {
+                                        cx.stop_propagation();
+                                        cx.write_to_clipboard(ClipboardItem::new_string(
+                                            copy_hash.clone(),
+                                        ));
+                                        this.git.notice = Some(crate::git_panel::GitNotice {
+                                            text: format!("Copied commit {copy_hash}"),
+                                            is_error: false,
+                                        });
+                                        cx.notify();
+                                    }))
+                            })
                             .child(
                                 div()
                                     .flex_1()

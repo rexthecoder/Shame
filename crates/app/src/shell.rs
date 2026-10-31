@@ -1,3 +1,4 @@
+use gpui_kit::base::StyledExt as _;
 use gpui_kit::component::{
     ActiveTheme as _, Icon, Sizable as _,
     h_flex,
@@ -207,16 +208,30 @@ impl DartIde {
     ) -> impl IntoElement {
         let muted = cx.theme().muted_foreground;
         let fg = cx.theme().foreground;
+        let primary = cx.theme().primary;
+        let border = cx.theme().border;
+        let home_prefix = std::env::var("HOME").ok();
 
-        let quick_files: Vec<_> = self
-            .all_files
+        let quick_files: Vec<_> = if self.has_workspace {
+            self.all_files
+                .iter()
+                .filter(|p| {
+                    p.extension()
+                        .and_then(|e| e.to_str())
+                        .is_some_and(|ext| matches!(ext, "dart" | "rs" | "toml" | "md" | "ts" | "py"))
+                })
+                .take(4)
+                .cloned()
+                .collect()
+        } else {
+            Vec::new()
+        };
+
+        let recent_folders: Vec<std::path::PathBuf> = self
+            .recent_workspaces
             .iter()
-            .filter(|p| {
-                p.extension()
-                    .and_then(|e| e.to_str())
-                    .is_some_and(|ext| matches!(ext, "dart" | "rs" | "toml" | "md"))
-            })
-            .take(4)
+            .filter(|p| !self.has_workspace || *p != &self.root)
+            .take(5)
             .cloned()
             .collect();
 
@@ -225,18 +240,68 @@ impl DartIde {
             .items_center()
             .justify_center()
             .gap(px(tokens::SPACE_5))
+            // Brand / Welcome Header
             .child(
                 v_flex()
-                    .w(px(280.))
+                    .items_center()
+                    .gap(px(4.))
+                    .child(
+                        h_flex()
+                            .items_center()
+                            .gap(px(tokens::SPACE_2))
+                            .child(
+                                div()
+                                    .px(px(6.))
+                                    .py(px(2.))
+                                    .rounded(px(5.))
+                                    .bg(primary.opacity(0.18))
+                                    .border_1()
+                                    .border_color(primary.opacity(0.45))
+                                    .font_family("SF Mono")
+                                    .font_semibold()
+                                    .text_size(px(12.))
+                                    .text_color(primary)
+                                    .child("//>"),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(16.))
+                                    .font_semibold()
+                                    .text_color(fg)
+                                    .child("Shame"),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(tokens::UI_SM))
+                            .text_color(muted)
+                            .child(if self.has_workspace {
+                                format!(
+                                    "Workspace: {}",
+                                    self.root
+                                        .file_name()
+                                        .and_then(|n| n.to_str())
+                                        .unwrap_or("project")
+                                )
+                            } else {
+                                "No folder open \u{2014} open a project folder or restore a recent workspace"
+                                    .to_string()
+                            }),
+                    ),
+            )
+            // Primary Actions Card
+            .child(
+                v_flex()
+                    .w(px(340.))
                     .p(px(tokens::SPACE_3))
                     .gap(px(tokens::SPACE_1))
                     .rounded(px(tokens::RADIUS_CARD))
                     .bg(cx.theme().sidebar)
                     .border_1()
-                    .border_color(cx.theme().border)
+                    .border_color(border)
                     .child(
                         h_flex()
-                            .id("empty-go-file")
+                            .id("empty-open-folder")
                             .w_full()
                             .h(px(30.))
                             .px(px(tokens::SPACE_4))
@@ -250,23 +315,54 @@ impl DartIde {
                                     .items_center()
                                     .gap(px(tokens::SPACE_3))
                                     .text_size(px(tokens::UI))
-                                    .text_color(muted)
+                                    .text_color(fg)
                                     .child(
-                                        Icon::new(gpui_kit::assets::IconName::Search)
+                                        Icon::new(gpui_kit::assets::IconName::FolderPlus)
                                             .xsmall()
-                                            .text_color(cx.theme().primary),
+                                            .text_color(primary),
                                     )
-                                    .child("Go to File\u{2026}"),
+                                    .child("Open Folder\u{2026}"),
                             )
-                            .child(keycap("\u{2318}P", cx))
+                            .child(keycap("\u{2318}O", cx))
                             .on_click(cx.listener(|this, _event, window, cx| {
-                                this.palette_open = true;
-                                this.palette_selected = 0;
-                                this.palette_input
-                                    .update(cx, |state, cx| state.focus(window, cx));
-                                cx.notify();
+                                this.open_folder(window, cx);
                             })),
                     )
+                    .when(self.has_workspace, |el| {
+                        el.child(
+                            h_flex()
+                                .id("empty-go-file")
+                                .w_full()
+                                .h(px(30.))
+                                .px(px(tokens::SPACE_4))
+                                .rounded(px(tokens::RADIUS_SM))
+                                .items_center()
+                                .justify_between()
+                                .cursor_pointer()
+                                .hover(move |s| s.bg(rgba(0xffffff08)).text_color(fg))
+                                .child(
+                                    h_flex()
+                                        .items_center()
+                                        .gap(px(tokens::SPACE_3))
+                                        .text_size(px(tokens::UI))
+                                        .text_color(muted)
+                                        .child(
+                                            Icon::new(gpui_kit::assets::IconName::Search)
+                                                .xsmall()
+                                                .text_color(muted),
+                                        )
+                                        .child("Go to File\u{2026}"),
+                                )
+                                .child(keycap("\u{2318}P", cx))
+                                .on_click(cx.listener(|this, _event, window, cx| {
+                                    this.palette_open = true;
+                                    this.palette_selected = 0;
+                                    this.palette_input
+                                        .update(cx, |state, cx| state.focus(window, cx));
+                                    cx.notify();
+                                })),
+                        )
+                    })
                     .child(
                         h_flex()
                             .id("empty-new-file")
@@ -296,66 +392,144 @@ impl DartIde {
                                 this.new_scratch_tab(window, cx);
                             })),
                     )
-                    .child(
-                        h_flex()
-                            .id("empty-open-folder")
-                            .w_full()
-                            .h(px(30.))
-                            .px(px(tokens::SPACE_4))
-                            .rounded(px(tokens::RADIUS_SM))
-                            .items_center()
-                            .justify_between()
-                            .cursor_pointer()
-                            .hover(move |s| s.bg(rgba(0xffffff08)).text_color(fg))
-                            .child(
-                                h_flex()
-                                    .items_center()
-                                    .gap(px(tokens::SPACE_3))
-                                    .text_size(px(tokens::UI))
-                                    .text_color(muted)
-                                    .child(
-                                        Icon::new(gpui_kit::assets::IconName::FolderPlus)
-                                            .xsmall()
-                                            .text_color(muted),
-                                    )
-                                    .child("Open Folder\u{2026}"),
-                            )
-                            .child(keycap("\u{2318}O", cx))
-                            .on_click(cx.listener(|this, _event, window, cx| {
-                                this.open_folder(window, cx);
-                            })),
-                    )
-                    .child(
-                        h_flex()
-                            .id("empty-toggle-files")
-                            .w_full()
-                            .h(px(30.))
-                            .px(px(tokens::SPACE_4))
-                            .rounded(px(tokens::RADIUS_SM))
-                            .items_center()
-                            .justify_between()
-                            .cursor_pointer()
-                            .hover(move |s| s.bg(rgba(0xffffff08)).text_color(fg))
-                            .child(
-                                h_flex()
-                                    .items_center()
-                                    .gap(px(tokens::SPACE_3))
-                                    .text_size(px(tokens::UI))
-                                    .text_color(muted)
-                                    .child(
-                                        Icon::new(gpui_kit::assets::IconName::PanelLeft)
-                                            .xsmall()
-                                            .text_color(muted),
-                                    )
-                                    .child("Toggle Files Panel"),
-                            )
-                            .child(keycap("\u{2318}B", cx))
-                            .on_click(cx.listener(|this, _event, _window, cx| {
-                                this.sidebar_open = !this.sidebar_open;
-                                cx.notify();
-                            })),
-                    ),
+                    .when(self.has_workspace, |el| {
+                        el.child(
+                            h_flex()
+                                .id("empty-close-folder")
+                                .w_full()
+                                .h(px(30.))
+                                .px(px(tokens::SPACE_4))
+                                .rounded(px(tokens::RADIUS_SM))
+                                .items_center()
+                                .justify_between()
+                                .cursor_pointer()
+                                .hover(move |s| s.bg(rgba(0xffffff08)).text_color(fg))
+                                .child(
+                                    h_flex()
+                                        .items_center()
+                                        .gap(px(tokens::SPACE_3))
+                                        .text_size(px(tokens::UI))
+                                        .text_color(muted)
+                                        .child(
+                                            Icon::new(gpui_kit::assets::IconName::X)
+                                                .xsmall()
+                                                .text_color(muted),
+                                        )
+                                        .child("Close Folder"),
+                                )
+                                .on_click(cx.listener(|this, _event, _window, cx| {
+                                    this.close_workspace(cx);
+                                })),
+                        )
+                    }),
             )
+            // Recent Folders Card (Folder Restoration)
+            .when(!recent_folders.is_empty(), |el| {
+                el.child(
+                    v_flex()
+                        .w(px(340.))
+                        .p(px(tokens::SPACE_3))
+                        .gap(px(tokens::SPACE_1))
+                        .rounded(px(tokens::RADIUS_CARD))
+                        .bg(cx.theme().sidebar)
+                        .border_1()
+                        .border_color(border)
+                        .child(
+                            div()
+                                .px(px(tokens::SPACE_3))
+                                .py(px(2.))
+                                .text_size(px(tokens::UI_XS))
+                                .font_medium()
+                                .text_color(muted)
+                                .child("RECENT PROJECTS"),
+                        )
+                        .children(recent_folders.into_iter().enumerate().map(|(ix, path)| {
+                            let name = path
+                                .file_name()
+                                .and_then(|n| n.to_str())
+                                .unwrap_or("folder")
+                                .to_string();
+                            let full_str = path.to_string_lossy().to_string();
+                            let short_dir = match &home_prefix {
+                                Some(h) if full_str.starts_with(h) => {
+                                    format!("~{}", &full_str[h.len()..])
+                                }
+                                _ => full_str,
+                            };
+                            let open_p = path.clone();
+                            let rm_p = path.clone();
+                            let view_open = view.clone();
+                            let view_rm = view.clone();
+                            h_flex()
+                                .id(("recent-folder-row", ix))
+                                .w_full()
+                                .h(px(30.))
+                                .px(px(tokens::SPACE_3))
+                                .rounded(px(tokens::RADIUS_SM))
+                                .items_center()
+                                .justify_between()
+                                .gap(px(tokens::SPACE_2))
+                                .cursor_pointer()
+                                .hover(move |s| s.bg(rgba(0xffffff08)))
+                                .child(
+                                    h_flex()
+                                        .flex_1()
+                                        .min_w(px(0.))
+                                        .items_center()
+                                        .gap(px(tokens::SPACE_2))
+                                        .child(
+                                            Icon::new(gpui_kit::assets::IconName::Folder)
+                                                .xsmall()
+                                                .text_color(primary),
+                                        )
+                                        .child(
+                                            div()
+                                                .font_medium()
+                                                .text_size(px(tokens::UI_SM))
+                                                .text_color(fg)
+                                                .child(name),
+                                        )
+                                        .child(
+                                            div()
+                                                .flex_1()
+                                                .min_w(px(0.))
+                                                .truncate()
+                                                .font_family("SF Mono")
+                                                .text_size(px(tokens::UI_XS))
+                                                .text_color(muted)
+                                                .child(short_dir),
+                                        ),
+                                )
+                                .child(
+                                    div()
+                                        .id(("rm-recent-folder", ix))
+                                        .cursor_pointer()
+                                        .text_color(muted)
+                                        .hover(move |s| s.text_color(fg))
+                                        .child(
+                                            Icon::new(gpui_kit::assets::IconName::X)
+                                                .with_size(px(10.5)),
+                                        )
+                                        .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                                            cx.stop_propagation();
+                                        })
+                                        .on_click(move |_e, _w, cx| {
+                                            cx.stop_propagation();
+                                            let p = rm_p.clone();
+                                            view_rm.update(cx, |this, cx| {
+                                                this.remove_recent_workspace(p, cx);
+                                            });
+                                        }),
+                                )
+                                .on_click(move |_e, _w, cx| {
+                                    let p = open_p.clone();
+                                    view_open.update(cx, |this, cx| {
+                                        this.set_root(p, cx);
+                                    });
+                                })
+                        })),
+                )
+            })
             .when(!quick_files.is_empty(), |el| {
                 el.child(
                     h_flex()
