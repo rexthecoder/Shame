@@ -115,11 +115,15 @@ pub trait LanguageAdapter: Send + Sync {
 pub fn language_for_path(path: Option<&Path>) -> Arc<dyn LanguageAdapter> {
     static REGISTRY: OnceLock<Vec<Arc<dyn LanguageAdapter>>> = OnceLock::new();
     let adapters = REGISTRY.get_or_init(|| {
-        vec![
+        let mut list: Vec<Arc<dyn LanguageAdapter>> = vec![
             Arc::new(DartLanguageAdapter),
             Arc::new(RustLanguageAdapter),
             Arc::new(TypeScriptLanguageAdapter),
-        ]
+        ];
+        for spec in BUILTIN_SIMPLE_LANGUAGES {
+            list.push(Arc::new(SimpleLanguageAdapter(spec)));
+        }
+        list
     });
 
     if let Some(p) = path {
@@ -134,6 +138,327 @@ pub fn language_for_path(path: Option<&Path>) -> Arc<dyn LanguageAdapter> {
         .get_or_init(|| Arc::new(GenericLanguageAdapter))
         .clone()
 }
+
+pub struct SimpleLanguageSpec {
+    pub language_id: &'static str,
+    pub extensions: &'static [&'static str],
+    pub exact_names: &'static [&'static str],
+    pub root_markers: &'static [&'static str],
+    pub lsp_bin: &'static str,
+    pub lsp_args: &'static [&'static str],
+    pub keywords: &'static [&'static str],
+}
+
+pub struct SimpleLanguageAdapter(pub &'static SimpleLanguageSpec);
+
+impl LanguageAdapter for SimpleLanguageAdapter {
+    fn language_id(&self) -> &'static str {
+        self.0.language_id
+    }
+
+    fn matches_path(&self, path: &Path) -> bool {
+        if let Some(ext) = path.extension().and_then(|e| e.to_str())
+            && self
+                .0
+                .extensions
+                .iter()
+                .any(|cand| cand.eq_ignore_ascii_case(ext))
+        {
+            return true;
+        }
+        if let Some(name) = path.file_name().and_then(|n| n.to_str())
+            && self.0.exact_names.contains(&name)
+        {
+            return true;
+        }
+        false
+    }
+
+    fn root_markers(&self) -> &'static [&'static str] {
+        self.0.root_markers
+    }
+
+    fn lsp_command(&self, _project_root: Option<&Path>) -> Option<(String, Vec<String>)> {
+        if self.0.lsp_bin.is_empty() {
+            None
+        } else {
+            Some((
+                self.0.lsp_bin.to_string(),
+                self.0.lsp_args.iter().map(|s| (*s).to_string()).collect(),
+            ))
+        }
+    }
+
+    fn keywords(&self) -> &'static [&'static str] {
+        self.0.keywords
+    }
+}
+
+static BUILTIN_SIMPLE_LANGUAGES: &[SimpleLanguageSpec] = &[
+    SimpleLanguageSpec {
+        language_id: "python",
+        extensions: &["py", "pyi"],
+        exact_names: &[],
+        root_markers: &["pyproject.toml", "setup.py", "requirements.txt"],
+        lsp_bin: "pyright-langserver",
+        lsp_args: &["--stdio"],
+        keywords: &[
+            "and", "as", "assert", "async", "await", "break", "class", "continue", "def", "del",
+            "elif", "else", "except", "False", "finally", "for", "from", "global", "if", "import",
+            "in", "is", "lambda", "None", "nonlocal", "not", "or", "pass", "raise", "return",
+            "self", "True", "try", "while", "with", "yield",
+        ],
+    },
+    SimpleLanguageSpec {
+        language_id: "go",
+        extensions: &["go"],
+        exact_names: &[],
+        root_markers: &["go.mod", "go.work"],
+        lsp_bin: "gopls",
+        lsp_args: &[],
+        keywords: &[
+            "break", "case", "chan", "const", "continue", "default", "defer", "else",
+            "fallthrough", "for", "func", "go", "goto", "if", "import", "interface", "map",
+            "package", "range", "return", "select", "struct", "switch", "type", "var", "error",
+            "string", "int", "bool", "nil", "true", "false",
+        ],
+    },
+    SimpleLanguageSpec {
+        language_id: "swift",
+        extensions: &["swift"],
+        exact_names: &["Package.swift"],
+        root_markers: &["Package.swift", "Podfile", "Runner.xcodeproj"],
+        lsp_bin: "sourcekit-lsp",
+        lsp_args: &[],
+        keywords: &[
+            "actor", "as", "async", "await", "break", "case", "catch", "class", "continue",
+            "default", "defer", "do", "else", "enum", "extension", "fallthrough", "false",
+            "fileprivate", "for", "func", "guard", "if", "import", "in", "init", "inout",
+            "internal", "is", "let", "nil", "open", "operator", "private", "protocol", "public",
+            "repeat", "rethrows", "return", "self", "Self", "some", "static", "struct", "subscript",
+            "super", "switch", "throw", "throws", "true", "try", "typealias", "var", "where",
+            "while",
+        ],
+    },
+    SimpleLanguageSpec {
+        language_id: "kotlin",
+        extensions: &["kt", "kts"],
+        exact_names: &[],
+        root_markers: &["build.gradle.kts", "build.gradle", "settings.gradle.kts", "settings.gradle"],
+        lsp_bin: "kotlin-language-server",
+        lsp_args: &[],
+        keywords: &[
+            "abstract", "actual", "annotation", "as", "break", "by", "catch", "class", "companion",
+            "const", "constructor", "continue", "coroutine", "crossinline", "data", "do", "else",
+            "enum", "expect", "external", "false", "final", "finally", "for", "fun", "if",
+            "import", "in", "infix", "init", "inline", "inner", "interface", "internal", "is",
+            "lateinit", "noinline", "null", "object", "open", "operator", "out", "override",
+            "package", "private", "protected", "public", "reified", "return", "sealed", "super",
+            "suspend", "tailrec", "this", "throw", "true", "try", "typealias", "val", "var",
+            "vararg", "when", "where", "while",
+        ],
+    },
+    SimpleLanguageSpec {
+        language_id: "cpp",
+        extensions: &["c", "h", "cc", "cpp", "cxx", "hpp", "hh", "m", "mm"],
+        exact_names: &[],
+        root_markers: &["CMakeLists.txt", "compile_commands.json", "Makefile"],
+        lsp_bin: "clangd",
+        lsp_args: &[],
+        keywords: &[
+            "alignas", "alignof", "auto", "bool", "break", "case", "catch", "char", "class",
+            "const", "constexpr", "continue", "default", "delete", "do", "double", "else", "enum",
+            "explicit", "extern", "false", "final", "float", "for", "friend", "goto", "if",
+            "inline", "int", "long", "mutable", "namespace", "new", "noexcept", "nullptr",
+            "operator", "override", "private", "protected", "public", "return", "short", "signed",
+            "sizeof", "static", "static_cast", "struct", "switch", "template", "this", "throw",
+            "true", "try", "typedef", "typename", "union", "unsigned", "using", "virtual", "void",
+            "volatile", "while",
+        ],
+    },
+    SimpleLanguageSpec {
+        language_id: "java",
+        extensions: &["java"],
+        exact_names: &[],
+        root_markers: &["pom.xml", "build.gradle", "build.gradle.kts"],
+        lsp_bin: "jdtls",
+        lsp_args: &[],
+        keywords: &[
+            "abstract", "assert", "boolean", "break", "byte", "case", "catch", "char", "class",
+            "continue", "default", "do", "double", "else", "enum", "extends", "false", "final",
+            "finally", "float", "for", "if", "implements", "import", "instanceof", "int",
+            "interface", "long", "native", "new", "null", "package", "private", "protected",
+            "public", "record", "return", "short", "static", "super", "switch", "synchronized",
+            "this", "throw", "throws", "transient", "true", "try", "var", "void", "volatile",
+            "while",
+        ],
+    },
+    SimpleLanguageSpec {
+        language_id: "ruby",
+        extensions: &["rb", "gemspec", "rake"],
+        exact_names: &["Gemfile", "Podfile", "Fastfile", "Rakefile"],
+        root_markers: &["Gemfile", "Podfile"],
+        lsp_bin: "ruby-lsp",
+        lsp_args: &[],
+        keywords: &[
+            "alias", "and", "begin", "break", "case", "class", "def", "defined?", "do", "else",
+            "elsif", "end", "ensure", "false", "for", "if", "in", "module", "next", "nil", "not",
+            "or", "redo", "rescue", "retry", "return", "self", "super", "then", "true", "undef",
+            "unless", "until", "when", "while", "yield", "require", "include",
+        ],
+    },
+    SimpleLanguageSpec {
+        language_id: "zig",
+        extensions: &["zig"],
+        exact_names: &[],
+        root_markers: &["build.zig", "build.zig.zon"],
+        lsp_bin: "zls",
+        lsp_args: &[],
+        keywords: &[
+            "addrspace", "align", "allowzero", "and", "anyframe", "anytype", "asm", "async",
+            "await", "break", "callconv", "catch", "comptime", "const", "continue", "defer",
+            "else", "enum", "errdefer", "error", "export", "extern", "false", "fn", "for", "if",
+            "inline", "noalias", "nosuspend", "null", "opaque", "or", "orelse", "packed", "pub",
+            "resume", "return", "struct", "suspend", "switch", "test", "threadlocal", "true",
+            "try", "undefined", "union", "unreachable", "var", "volatile", "while",
+        ],
+    },
+    SimpleLanguageSpec {
+        language_id: "csharp",
+        extensions: &["cs"],
+        exact_names: &[],
+        root_markers: &[".sln", ".csproj"],
+        lsp_bin: "csharp-ls",
+        lsp_args: &[],
+        keywords: &[
+            "abstract", "as", "async", "await", "base", "bool", "break", "byte", "case", "catch",
+            "char", "checked", "class", "const", "continue", "decimal", "default", "delegate",
+            "do", "double", "else", "enum", "event", "explicit", "extern", "false", "finally",
+            "fixed", "float", "for", "foreach", "goto", "if", "implicit", "in", "int", "interface",
+            "internal", "is", "lock", "long", "namespace", "new", "null", "object", "operator",
+            "out", "override", "params", "private", "protected", "public", "readonly", "record",
+            "ref", "return", "sealed", "short", "sizeof", "static", "string", "struct", "switch",
+            "this", "throw", "true", "try", "typeof", "uint", "ulong", "unchecked", "unsafe",
+            "ushort", "using", "var", "virtual", "void", "volatile", "while", "yield",
+        ],
+    },
+    SimpleLanguageSpec {
+        language_id: "php",
+        extensions: &["php"],
+        exact_names: &[],
+        root_markers: &["composer.json"],
+        lsp_bin: "intelephense",
+        lsp_args: &["--stdio"],
+        keywords: &[
+            "abstract", "array", "as", "break", "callable", "case", "catch", "class", "clone",
+            "const", "continue", "declare", "default", "do", "echo", "else", "elseif", "empty",
+            "enum", "extends", "false", "final", "finally", "fn", "for", "foreach", "function",
+            "global", "if", "implements", "include", "instanceof", "interface", "isset", "list",
+            "match", "namespace", "new", "null", "private", "protected", "public", "readonly",
+            "require", "return", "self", "static", "switch", "throw", "trait", "true", "try",
+            "unset", "use", "var", "while", "yield",
+        ],
+    },
+    SimpleLanguageSpec {
+        language_id: "lua",
+        extensions: &["lua"],
+        exact_names: &[],
+        root_markers: &[".luarc.json", ".git"],
+        lsp_bin: "lua-language-server",
+        lsp_args: &[],
+        keywords: &[
+            "and", "break", "do", "else", "elseif", "end", "false", "for", "function", "goto",
+            "if", "in", "local", "nil", "not", "or", "repeat", "return", "then", "true", "until",
+            "while",
+        ],
+    },
+    SimpleLanguageSpec {
+        language_id: "html",
+        extensions: &["html", "htm"],
+        exact_names: &[],
+        root_markers: &["package.json", "index.html"],
+        lsp_bin: "vscode-html-language-server",
+        lsp_args: &["--stdio"],
+        keywords: &["div", "span", "section", "header", "footer", "main", "button", "input", "form"],
+    },
+    SimpleLanguageSpec {
+        language_id: "css",
+        extensions: &["css", "scss", "less"],
+        exact_names: &[],
+        root_markers: &["package.json"],
+        lsp_bin: "vscode-css-language-server",
+        lsp_args: &["--stdio"],
+        keywords: &[
+            "display", "flex", "grid", "position", "color", "background", "border", "padding",
+            "margin", "width", "height", "font-size", "font-weight", "align-items",
+            "justify-content",
+        ],
+    },
+    SimpleLanguageSpec {
+        language_id: "json",
+        extensions: &["json", "jsonc", "arb"],
+        exact_names: &[],
+        root_markers: &["package.json", "pubspec.yaml"],
+        lsp_bin: "vscode-json-language-server",
+        lsp_args: &["--stdio"],
+        keywords: &["true", "false", "null"],
+    },
+    SimpleLanguageSpec {
+        language_id: "yaml",
+        extensions: &["yaml", "yml"],
+        exact_names: &[],
+        root_markers: &["pubspec.yaml", ".git"],
+        lsp_bin: "yaml-language-server",
+        lsp_args: &["--stdio"],
+        keywords: &["true", "false", "null", "dependencies", "dev_dependencies", "flutter", "environment"],
+    },
+    SimpleLanguageSpec {
+        language_id: "toml",
+        extensions: &["toml"],
+        exact_names: &["Cargo.lock"],
+        root_markers: &["Cargo.toml", "pyproject.toml"],
+        lsp_bin: "taplo",
+        lsp_args: &["lsp", "stdio"],
+        keywords: &["package", "dependencies", "workspace", "features", "profile", "true", "false"],
+    },
+    SimpleLanguageSpec {
+        language_id: "shellscript",
+        extensions: &["sh", "bash", "zsh"],
+        exact_names: &[".zshrc", ".bashrc", ".bash_profile"],
+        root_markers: &[".git"],
+        lsp_bin: "bash-language-server",
+        lsp_args: &["start"],
+        keywords: &[
+            "if", "then", "else", "elif", "fi", "case", "esac", "for", "select", "while", "until",
+            "do", "done", "in", "function", "time", "export", "local", "readonly", "return", "exit",
+            "echo", "printf", "set",
+        ],
+    },
+    SimpleLanguageSpec {
+        language_id: "sql",
+        extensions: &["sql"],
+        exact_names: &[],
+        root_markers: &[".git"],
+        lsp_bin: "sql-language-server",
+        lsp_args: &["up", "--method", "stdio"],
+        keywords: &[
+            "SELECT", "FROM", "WHERE", "INSERT", "INTO", "VALUES", "UPDATE", "SET", "DELETE",
+            "CREATE", "TABLE", "ALTER", "DROP", "INDEX", "VIEW", "JOIN", "INNER", "LEFT", "RIGHT",
+            "ON", "GROUP", "BY", "ORDER", "HAVING", "LIMIT", "OFFSET", "AS", "AND", "OR", "NOT",
+            "NULL", "PRIMARY", "KEY", "FOREIGN", "REFERENCES", "UNIQUE", "DEFAULT", "BEGIN",
+            "COMMIT", "ROLLBACK",
+        ],
+    },
+    SimpleLanguageSpec {
+        language_id: "markdown",
+        extensions: &["md", "mdx", "markdown"],
+        exact_names: &["README", "CHANGELOG"],
+        root_markers: &[".git"],
+        lsp_bin: "marksman",
+        lsp_args: &["server"],
+        keywords: &[],
+    },
+];
 
 // ============================================================================
 // 1. Generic Fallback Language Adapter

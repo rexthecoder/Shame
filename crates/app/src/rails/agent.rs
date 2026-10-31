@@ -450,6 +450,7 @@ pub(crate) struct AgentState {
     pub(crate) running_pid: Option<u32>,
     pub(crate) tasks: Vec<AgentTask>,
     pub(crate) items: Vec<AgentItem>,
+    pub(crate) ai_touched_paths: Vec<String>,
     pub(crate) input: Entity<InputState>,
     pub(crate) scroll: ScrollHandle,
 }
@@ -477,8 +478,24 @@ impl AgentState {
             running_pid: None,
             tasks: Vec::new(),
             items: Vec::new(),
+            ai_touched_paths: Vec::new(),
             input,
             scroll: ScrollHandle::new(),
+        }
+    }
+
+    pub(crate) fn record_ai_touched_path(&mut self, root: &Path, raw_path: &str) {
+        let p = Path::new(raw_path);
+        let rel = if p.is_absolute() {
+            p.strip_prefix(root)
+                .unwrap_or(p)
+                .to_string_lossy()
+                .to_string()
+        } else {
+            raw_path.trim_start_matches("./").to_string()
+        };
+        if !rel.is_empty() && !self.ai_touched_paths.iter().any(|existing| existing == &rel) {
+            self.ai_touched_paths.push(rel);
         }
     }
 
@@ -629,6 +646,13 @@ impl DartIde {
         });
         cx.notify();
 
+        let pre_run_unstaged: std::collections::HashSet<String> = self
+            .git
+            .status
+            .as_ref()
+            .map(|s| s.unstaged.iter().map(|f| f.path.clone()).collect())
+            .unwrap_or_default();
+
         let (tx, rx) = async_channel::unbounded::<AgentStreamEvent>();
         std::thread::spawn(move || {
             let mut cmd = Command::new(&bin_path);
@@ -733,6 +757,13 @@ impl DartIde {
                             }
                             AgentStreamEvent::Fragment(frag) => match frag {
                                 StreamFragment::Tool(call) => {
+                                    if (call.label.starts_with("Edit ")
+                                        || call.label.starts_with("Write "))
+                                        && let Some(ref target_path) = call.target_path
+                                    {
+                                        this.agent
+                                            .record_ai_touched_path(&this.root, target_path);
+                                    }
                                     if let Some(AgentItem::ToolGroup { header, calls, .. }) =
                                         this.agent.items.get_mut(group_id)
                                     {
@@ -790,6 +821,14 @@ impl DartIde {
                                         }
                                     }
                                 }
+                                if let Some(post_status) = core_workspace::repo_status(&this.root) {
+                                    for f in &post_status.unstaged {
+                                        if !pre_run_unstaged.contains(&f.path) {
+                                            this.agent
+                                                .record_ai_touched_path(&this.root, &f.path);
+                                        }
+                                    }
+                                }
                                 this.refresh_git(cx);
                                 this.sync_workspace_files_if_changed(cx);
                             }
@@ -827,14 +866,26 @@ impl DartIde {
             .and_then(|p| p.strip_prefix(&self.root).ok().map(Path::to_path_buf))
             .map(|p| p.to_string_lossy().to_string());
 
-        // Live unstaged git changes from the workspace repository
-        let real_unstaged: Vec<core_workspace::ChangedFile> = self
+        // Only show files that the AI agent itself modified/created during its runs,
+        // never the user's own pre-existing uncommitted files.
+        let ai_unstaged: Vec<core_workspace::ChangedFile> = self
             .git
             .status
             .as_ref()
-            .map(|s| s.unstaged.clone())
+            .map(|s| {
+                s.unstaged
+                    .iter()
+                    .filter(|f| {
+                        self.agent
+                            .ai_touched_paths
+                            .iter()
+                            .any(|ai_p| ai_p == &f.path)
+                    })
+                    .cloned()
+                    .collect()
+            })
             .unwrap_or_default();
-        let has_real_git = !real_unstaged.is_empty();
+        let has_ai_changes = !ai_unstaged.is_empty();
 
         v_flex()
             .relative()
@@ -894,6 +945,7 @@ impl DartIde {
                                         this.stop_agent_run(cx);
                                         this.agent.tasks.clear();
                                         this.agent.items.clear();
+                                        this.agent.ai_touched_paths.clear();
                                         cx.notify();
                                     })),
                             ),
@@ -1293,9 +1345,10 @@ impl DartIde {
                         }
                     })),
             )
-            // 29. PendingChanges card (strictly reflects real unstaged git files in the workspace)
-            .when(has_real_git, |el| {
-                let count = real_unstaged.len();
+            // 29. PendingChanges card (strictly reflects files modified/created by the AI agent)
+            .when(has_ai_changes, |el| {
+                let count = ai_unstaged.len();
+                let all_ai_files = ai_unstaged.clone();
                 el.child(
                     v_flex()
                         .w_auto()
@@ -1329,7 +1382,7 @@ impl DartIde {
                                                 .font_medium()
                                                 .text_color(fg)
                                                 .child(format!(
-                                                    "{count} Pending Change{}",
+                                                    "{count} AI Change{}",
                                                     if count == 1 { "" } else { "s" }
                                                 )),
                                         ),
@@ -1356,11 +1409,20 @@ impl DartIde {
                                                         .with_size(px(11.))
                                                         .text_color(red),
                                                 )
-                                                .on_click(cx.listener(
+                                                .on_click(cx.listener({
+                                                    let to_revert = all_ai_files.clone();
                                                     move |this, _e, window, cx| {
-                                                        this.git_discard_all_clicked(window, cx);
-                                                    },
-                                                )),
+                                                        for f in &to_revert {
+                                                            this.git_discard_clicked(
+                                                                f.clone(),
+                                                                window,
+                                                                cx,
+                                                            );
+                                                        }
+                                                        this.agent.ai_touched_paths.clear();
+                                                        cx.notify();
+                                                    }
+                                                })),
                                         )
                                         .child(
                                             div()
@@ -1379,15 +1441,16 @@ impl DartIde {
                                                         .text_color(cx.theme().primary_foreground),
                                                 )
                                                 .on_click(cx.listener(
-                                                    move |this, _e, window, cx| {
-                                                        this.git_stage_all(window, cx);
+                                                    move |this, _e, _window, cx| {
+                                                        this.agent.ai_touched_paths.clear();
+                                                        cx.notify();
                                                     },
                                                 )),
                                         ),
                                 ),
                         )
                         .child(div().w_full().h(px(1.)).bg(border.opacity(0.6)))
-                        .children(real_unstaged.into_iter().take(6).enumerate().map(
+                        .children(ai_unstaged.into_iter().take(6).enumerate().map(
                             |(ix, file)| {
                                 let name = Path::new(&file.path)
                                     .file_name()
@@ -1395,7 +1458,7 @@ impl DartIde {
                                     .unwrap_or(&file.path)
                                     .to_string();
                                 let diff_file = file.clone();
-                                let stage_file = file.clone();
+                                let accept_path = file.path.clone();
                                 let discard_file = file.clone();
                                 h_flex()
                                     .id(("agent-git-pending-row", ix))
@@ -1442,11 +1505,15 @@ impl DartIde {
                                                     )
                                                     .on_click(cx.listener(
                                                         move |this, _e, window, cx| {
+                                                            this.agent
+                                                                .ai_touched_paths
+                                                                .retain(|p| p != &discard_file.path);
                                                             this.git_discard_clicked(
                                                                 discard_file.clone(),
                                                                 window,
                                                                 cx,
                                                             );
+                                                            cx.notify();
                                                         },
                                                     )),
                                             )
@@ -1464,12 +1531,11 @@ impl DartIde {
                                                         |_, _, cx| cx.stop_propagation(),
                                                     )
                                                     .on_click(cx.listener(
-                                                        move |this, _e, window, cx| {
-                                                            this.git_stage(
-                                                                std::slice::from_ref(&stage_file),
-                                                                window,
-                                                                cx,
-                                                            );
+                                                        move |this, _e, _window, cx| {
+                                                            this.agent
+                                                                .ai_touched_paths
+                                                                .retain(|p| p != &accept_path);
+                                                            cx.notify();
                                                         },
                                                     )),
                                             ),
