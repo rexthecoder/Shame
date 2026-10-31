@@ -49,8 +49,9 @@ use lsp_types::{
     DidChangeTextDocumentParams, DidOpenTextDocumentParams, DocumentChangeOperation,
     DocumentChanges, DocumentFormattingParams, ExecuteCommandParams, FormattingOptions,
     GotoDefinitionParams, GotoDefinitionResponse, Hover, HoverContents, HoverParams,
-    InitializeParams, LanguageString, Location, MarkedString, OneOf, Position,
-    PublishDiagnosticsParams, Range, RenameParams, TextDocumentClientCapabilities,
+    InitializeParams, LanguageString, Location, MarkedString, OneOf, ParameterLabel, Position,
+    PublishDiagnosticsParams, Range, ReferenceContext, ReferenceParams, RenameParams,
+    SignatureHelp, SignatureHelpParams, SignatureInformation, TextDocumentClientCapabilities,
     TextDocumentContentChangeEvent, TextDocumentIdentifier, TextDocumentItem,
     TextDocumentPositionParams, TextEdit, Uri, VersionedTextDocumentIdentifier,
     WorkspaceClientCapabilities, WorkspaceEdit, WorkspaceEditClientCapabilities, WorkspaceFolder,
@@ -319,6 +320,8 @@ pub(crate) struct LspState {
     pending_rename_id: Option<i64>,
     pending_code_action_id: Option<i64>,
     pending_completion_id: Option<i64>,
+    pending_references_id: Option<i64>,
+    pending_signature_id: Option<i64>,
 }
 
 impl EditorView {
@@ -379,6 +382,8 @@ impl EditorView {
             pending_rename_id: None,
             pending_code_action_id: None,
             pending_completion_id: None,
+            pending_references_id: None,
+            pending_signature_id: None,
         });
     }
 
@@ -505,6 +510,69 @@ impl EditorView {
             lsp.client.request("textDocument/definition", serde_json::to_value(params).unwrap_or_default())
         {
             lsp.pending_definition_id = Some(id);
+        }
+    }
+
+    /// Send `textDocument/references` for the symbol at the cursor. The
+    /// reply arrives as `EditorEvent::ShowReferences`. No-op without a
+    /// ready server.
+    pub fn request_references(&mut self) {
+        let head = self.buffer.selections().primary().head;
+        let line = self.buffer.byte_to_line(head) as u32;
+        let column = (head - self.buffer.line_to_byte(line as usize)) as u32;
+        let Some(lsp) = &mut self.lsp else {
+            return;
+        };
+        if !lsp.ready {
+            return;
+        }
+        let params = ReferenceParams {
+            text_document_position: TextDocumentPositionParams {
+                text_document: TextDocumentIdentifier { uri: lsp.uri.clone() },
+                position: Position { line, character: column },
+            },
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+            context: ReferenceContext { include_declaration: true },
+        };
+        if let Ok(id) =
+            lsp.client.request("textDocument/references", serde_json::to_value(params).unwrap_or_default())
+        {
+            lsp.pending_references_id = Some(id);
+        }
+    }
+
+    /// Send `textDocument/signatureHelp` for the cursor, typically right
+    /// after `(` or `,` is typed. No-op without a ready server.
+    pub(crate) fn request_signature_help(&mut self) {
+        let head = self.buffer.selections().primary().head;
+        let line = self.buffer.byte_to_line(head) as u32;
+        let column = (head - self.buffer.line_to_byte(line as usize)) as u32;
+        let Some(lsp) = &mut self.lsp else {
+            return;
+        };
+        if !lsp.ready {
+            return;
+        }
+        let params = SignatureHelpParams {
+            text_document_position_params: TextDocumentPositionParams {
+                text_document: TextDocumentIdentifier { uri: lsp.uri.clone() },
+                position: Position { line, character: column },
+            },
+            work_done_progress_params: Default::default(),
+            context: None,
+        };
+        if let Ok(id) =
+            lsp.client.request("textDocument/signatureHelp", serde_json::to_value(params).unwrap_or_default())
+        {
+            lsp.pending_signature_id = Some(id);
+        }
+    }
+
+    /// Dismiss the signature-help popup (e.g. on `)` or Escape).
+    pub(crate) fn clear_signature_help(&mut self, cx: &mut Context<Self>) {
+        if self.signature_help.take().is_some() {
+            cx.notify();
         }
     }
 
@@ -832,6 +900,31 @@ impl EditorView {
                     cx.emit(EditorEvent::OpenAt { path, line, column });
                 }
             }
+            ServerMessage::Response { id, result } if lsp.pending_references_id == Some(id) => {
+                lsp.pending_references_id = None;
+                let locations = result
+                    .ok()
+                    .and_then(|v| serde_json::from_value::<Option<Vec<Location>>>(v).ok())
+                    .flatten()
+                    .unwrap_or_default();
+                if !locations.is_empty() {
+                    cx.emit(EditorEvent::ShowReferences { locations });
+                }
+            }
+            ServerMessage::Response { id, result } if lsp.pending_signature_id == Some(id) => {
+                lsp.pending_signature_id = None;
+                let help = result
+                    .ok()
+                    .and_then(|v| serde_json::from_value::<Option<SignatureHelp>>(v).ok())
+                    .flatten();
+                let head = self.buffer.selections().primary().head;
+                let line = self.buffer.byte_to_line(head);
+                let column = head - self.buffer.line_to_byte(line);
+                self.signature_help = help
+                    .and_then(|h| signature_view(&h))
+                    .map(|(label, active)| SignatureView { line, column, label, active });
+                cx.notify();
+            }
             ServerMessage::Response { id, result } if lsp.pending_format_id == Some(id) => {
                 lsp.pending_format_id = None;
                 let save_after = std::mem::take(&mut self.save_after_format);
@@ -986,6 +1079,48 @@ impl EditorView {
             }
         }
         by_line
+    }
+}
+
+/// A shown signature-help popup: the active signature's label, with the
+/// byte range of the active parameter inside it (if the server named one).
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct SignatureView {
+    pub line: usize,
+    pub column: usize,
+    pub label: String,
+    pub active: Option<std::ops::Range<usize>>,
+}
+
+/// Pick the active signature out of a `SignatureHelp` reply and locate its
+/// active parameter. `None` if the server returned no signatures.
+pub(crate) fn signature_view(help: &SignatureHelp) -> Option<(String, Option<std::ops::Range<usize>>)> {
+    let sig = help
+        .signatures
+        .get(help.active_signature.unwrap_or(0) as usize)
+        .or_else(|| help.signatures.first())?;
+    let active_param = sig.active_parameter.or(help.active_parameter);
+    Some((sig.label.clone(), active_parameter_range(sig, active_param)))
+}
+
+fn active_parameter_range(sig: &SignatureInformation, active: Option<u32>) -> Option<std::ops::Range<usize>> {
+    let param = sig.parameters.as_ref()?.get(active? as usize)?;
+    match &param.label {
+        // Offsets are UTF-16 code units; map them to byte offsets in the label.
+        ParameterLabel::LabelOffsets([start, end]) => {
+            let to_byte = |units: u32| -> usize {
+                let mut seen = 0u32;
+                for (byte, ch) in sig.label.char_indices() {
+                    if seen >= units {
+                        return byte;
+                    }
+                    seen += ch.len_utf16() as u32;
+                }
+                sig.label.len()
+            };
+            Some(to_byte(*start)..to_byte(*end))
+        }
+        ParameterLabel::Simple(text) => sig.label.find(text.as_str()).map(|at| at..at + text.len()),
     }
 }
 
@@ -1325,5 +1460,53 @@ mod tests {
             serde_json::from_value(message["params"].clone()).expect("should deserialize");
         let changes = params.edit.changes.expect("expected a changes map");
         assert_eq!(changes.len(), 1);
+    }
+
+    #[test]
+    fn signature_view_marks_the_active_parameter_by_offsets() {
+        let help: SignatureHelp = serde_json::from_value(serde_json::json!({
+            "signatures": [{
+                "label": "greet(String name, int times)",
+                "parameters": [
+                    {"label": [6, 17]},
+                    {"label": [19, 28]}
+                ]
+            }],
+            "activeSignature": 0,
+            "activeParameter": 1
+        }))
+        .unwrap();
+        let (label, active) = signature_view(&help).unwrap();
+        assert_eq!(&label[active.unwrap()], "int times");
+    }
+
+    #[test]
+    fn signature_view_marks_the_active_parameter_by_name() {
+        let help: SignatureHelp = serde_json::from_value(serde_json::json!({
+            "signatures": [{
+                "label": "greet(String name, int times)",
+                "parameters": [{"label": "String name"}, {"label": "int times"}],
+                "activeParameter": 0
+            }]
+        }))
+        .unwrap();
+        let (label, active) = signature_view(&help).unwrap();
+        assert_eq!(&label[active.unwrap()], "String name");
+    }
+
+    #[test]
+    fn signature_view_is_none_without_signatures() {
+        let help: SignatureHelp =
+            serde_json::from_value(serde_json::json!({"signatures": []})).unwrap();
+        assert!(signature_view(&help).is_none());
+    }
+
+    #[test]
+    fn deserializes_a_references_response() {
+        let value = serde_json::json!([
+            {"uri": "file:///a.dart", "range": {"start": {"line": 1, "character": 2}, "end": {"line": 1, "character": 7}}}
+        ]);
+        let locations: Option<Vec<Location>> = serde_json::from_value(value).unwrap();
+        assert_eq!(locations.unwrap()[0].range.start.line, 1);
     }
 }

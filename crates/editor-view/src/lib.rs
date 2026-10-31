@@ -86,6 +86,7 @@ pub enum EditorEvent {
     OpenAt { path: PathBuf, line: u32, column: u32 },
     RequestRename { line: u32, column: u32 },
     ShowCodeActions { actions: Vec<lsp_types::CodeActionOrCommand> },
+    ShowReferences { locations: Vec<lsp_types::Location> },
     ExternalFileEdits { path: PathBuf, edits: Vec<lsp_types::TextEdit> },
     BreakpointsChanged { path: PathBuf, lines: Vec<u32> },
     Saved { path: PathBuf },
@@ -135,6 +136,7 @@ pub struct EditorView {
     hover_point: Option<(usize, usize)>,
     hover_sequence: u64,
     hover_result: Option<(usize, String)>,
+    signature_help: Option<lsp_integration::SignatureView>,
     /// Active in-file search query (`⌘F`) and all case-insensitive byte ranges
     /// matching it across the buffer.
     search_query: String,
@@ -205,6 +207,7 @@ impl EditorView {
             hover_point: None,
             hover_sequence: 0,
             hover_result: None,
+            signature_help: None,
             search_query: String::new(),
             search_matches: Vec::new(),
             active_search_match: 0,
@@ -909,6 +912,7 @@ impl EditorView {
                     self.ensure_cursor_visible();
                     if text == "(" {
                         self.trigger_completions(true, cx);
+                        self.request_signature_help();
                     }
                     return;
                 }
@@ -916,6 +920,12 @@ impl EditorView {
         }
 
         self.insert_at_cursor(text, cx);
+
+        match text {
+            "(" | "," => self.request_signature_help(),
+            ")" => self.clear_signature_help(cx),
+            _ => {}
+        }
 
         let is_trigger = text == "."
             || text == ":"
@@ -1350,6 +1360,9 @@ impl EditorView {
                 _ => {}
             }
         }
+        if keystroke.key == "escape" {
+            self.clear_signature_help(cx);
+        }
 
         if primary_mod {
             match keystroke.key.as_str() {
@@ -1387,6 +1400,7 @@ impl EditorView {
         let extend = keystroke.modifiers.shift;
         match keystroke.key.as_str() {
             "f2" => self.start_rename(cx),
+            "f12" if keystroke.modifiers.shift => self.request_references(),
             "backspace" => self.backspace(cx),
             "delete" => self.delete_forward(cx),
             "enter" => self.insert_newline(cx),
@@ -2238,6 +2252,24 @@ impl EditorView {
                         },
                     )
                     .when_some(
+                        self.signature_help.as_ref().filter(|sig| sig.line == index),
+                        |el, sig| {
+                            let left_offset = px((sig.column as f32 * 7.5).min(280.));
+                            let card = Self::render_signature_card(sig, &mono_family, cx);
+                            el.child(
+                                deferred(
+                                    div()
+                                        .occlude()
+                                        .absolute()
+                                        .bottom(px(LINE_HEIGHT + 2.))
+                                        .left(left_offset)
+                                        .child(card),
+                                )
+                                .with_priority(12),
+                            )
+                        },
+                    )
+                    .when_some(
                         self.hover_to_render()
                             .filter(|(line, _)| *line == index && self.completions.is_empty()),
                         |el, (_, text)| {
@@ -2263,6 +2295,42 @@ impl EditorView {
                         },
                     ),
             )
+    }
+
+    /// A one-line popover showing the active signature, with the current
+    /// parameter in bold accent color.
+    fn render_signature_card(
+        sig: &lsp_integration::SignatureView,
+        mono_family: &SharedString,
+        cx: &Context<Self>,
+    ) -> Div {
+        let (before, active, after) = match &sig.active {
+            Some(r) if r.end <= sig.label.len() && sig.label.is_char_boundary(r.start) && sig.label.is_char_boundary(r.end) => (
+                sig.label[..r.start].to_string(),
+                sig.label[r.clone()].to_string(),
+                sig.label[r.end..].to_string(),
+            ),
+            _ => (sig.label.clone(), String::new(), String::new()),
+        };
+        h_flex()
+            .px_2()
+            .py_1()
+            .bg(cx.theme().popover)
+            .border_1()
+            .border_color(cx.theme().border)
+            .rounded(px(4.))
+            .shadow_md()
+            .font_family(mono_family.clone())
+            .text_size(px(12.))
+            .text_color(cx.theme().muted_foreground)
+            .child(before)
+            .child(
+                div()
+                    .font_weight(FontWeight::BOLD)
+                    .text_color(cx.theme().foreground)
+                    .child(active),
+            )
+            .child(after)
     }
 
     /// Format an LSP markdown hover payload (` ```dart ... ``` `, `Type: ...`,
