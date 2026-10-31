@@ -453,21 +453,29 @@ impl DartIde {
                 return;
             }
         }
+        if action == HunkAction::Accept {
+            // Accepting keeps the agent's edit (staged below) and releases the
+            // pending hold on the file, so it stops showing up in AI Changes.
+            self.agent.ai_touched_paths
+                .retain(|p| p != &state.file.path);
+        }
         let (file, rows) = (state.file.clone(), state.diff.rows.clone());
         let (label, done) = match action {
             HunkAction::Stage => ("Staging hunk\u{2026}", "Staged hunk"),
             HunkAction::Unstage => ("Unstaging hunk\u{2026}", "Unstaged hunk"),
             HunkAction::Revert => ("Reverting hunk\u{2026}", "Reverted hunk"),
+            HunkAction::Accept => ("Accepting hunk\u{2026}", "Accepted hunk"),
         };
         self.git_run(window, Some(label), false, cx, move |root, _| {
-            match action {
+            let result = match action {
                 HunkAction::Stage => core_workspace::stage_hunk(root, &file, &rows, block_range),
                 HunkAction::Unstage => {
                     core_workspace::unstage_hunk(root, &file, &rows, block_range)
                 }
                 HunkAction::Revert => core_workspace::revert_hunk(root, &file, &rows, block_range),
-            }
-            .map(|_| done.to_string())
+                HunkAction::Accept => core_workspace::stage_hunk(root, &file, &rows, block_range),
+            };
+            result.map(|_| done.to_string())
         });
     }
 
@@ -809,7 +817,14 @@ impl DartIde {
                         };
                         let armed = this.git.confirm_discard.clone();
                         range
-                            .map(|ix| render_diff_item(state, ix, armed.as_deref(), window, cx))
+                            .map(|ix| {
+                                let accept = this
+                                    .agent
+                                    .ai_touched_paths
+                                    .iter()
+                                    .any(|p| *p == state.file.path);
+                                render_diff_item(state, ix, armed.as_deref(), accept, window, cx)
+                            })
                             .collect()
                     }),
                 )
@@ -968,6 +983,10 @@ pub(crate) enum HunkAction {
     Stage,
     Unstage,
     Revert,
+    /// Keep the agent's change for this hunk: stage it into the index (so the
+    /// edit stops being "pending" for the AI reviewer) and release the hold on
+    /// the file. Used by the AI diff review flow.
+    Accept,
 }
 
 fn diff_message(text: &'static str, color: Hsla) -> Div {
@@ -986,6 +1005,7 @@ fn render_diff_item(
     state: &DiffState,
     ix: usize,
     armed: Option<&str>,
+    accept: bool,
     _window: &mut Window,
     cx: &mut Context<DartIde>,
 ) -> AnyElement {
@@ -1035,7 +1055,7 @@ fn render_diff_item(
                 .get(&row_ix)
                 .copied()
                 .filter(|_| state.commit.is_none() && state.file.kind != ChangeKind::Untracked)
-                .map(|block| hunk_chips(state, block, armed, cx));
+                .map(|block| hunk_chips(state, block, armed, accept, cx));
             diff_unified_row(
                 row.left.as_ref().map(|c| c.line),
                 None,
@@ -1082,7 +1102,7 @@ fn render_diff_item(
                 .get(&row_ix)
                 .copied()
                 .filter(|_| state.commit.is_none() && state.file.kind != ChangeKind::Untracked)
-                .map(|block| hunk_chips(state, block, armed, cx));
+                .map(|block| hunk_chips(state, block, armed, accept, cx));
             if state.unified {
                 let (tint, spans, text) = match row.kind {
                     RowKind::Removed => (
@@ -1151,23 +1171,34 @@ fn hunk_chips(
     state: &DiffState,
     block: usize,
     armed: Option<&str>,
+    accept: bool,
     cx: &mut Context<DartIde>,
 ) -> Div {
     let revert_armed = armed == Some(format!("hunk:{}:{block}", state.file.path).as_str());
     let chip = |id: &'static str,
                 label: &'static str,
                 danger: bool,
+                positive: bool,
                 action: HunkAction,
                 cx: &mut Context<DartIde>| {
         let theme = cx.theme();
-        let (red, fg, border, bg, muted, font) = (
+        let (red, green, fg, border, bg, muted, font) = (
             theme.red,
+            theme.green,
             theme.foreground,
             theme.border,
             theme.background,
             theme.muted_foreground,
             theme.font_family.clone(),
         );
+        let (chip_border, chip_bg) = if danger {
+            (red.opacity(0.5), red.opacity(0.18))
+        } else if positive {
+            (green.opacity(0.5), green.opacity(0.18))
+        } else {
+            (border, bg)
+        };
+        let chip_text = if danger { red } else if positive { green } else { muted };
         div()
             .id((id, block))
             .px(px(7.))
@@ -1176,12 +1207,12 @@ fn hunk_chips(
             .items_center()
             .rounded(px(4.))
             .border_1()
-            .border_color(if danger { red.opacity(0.5) } else { border })
-            .bg(if danger { red.opacity(0.18) } else { bg })
+            .border_color(chip_border)
+            .bg(chip_bg)
             .cursor_pointer()
             .text_size(px(tokens::UI_XS))
             .font_family(font)
-            .text_color(if danger { red } else { muted })
+            .text_color(chip_text)
             .hover(move |s| s.text_color(fg))
             .child(label)
             .on_click(cx.listener(move |this, _e, window, cx| {
@@ -1198,14 +1229,29 @@ fn hunk_chips(
                 "hunk-unstage",
                 "Unstage hunk",
                 false,
+                false,
                 HunkAction::Unstage,
                 cx,
             ))
         })
         .when(!state.staged, |el| {
-            el.child(chip(
+            // AI-touched diffs get an "Accept hunk" chip that keeps the agent's
+            // edit (staging it) instead of leaving it pending for review.
+            let mut row = el;
+            if accept {
+                row = row.child(chip(
+                    "hunk-accept",
+                    "Accept hunk",
+                    false,
+                    true,
+                    HunkAction::Accept,
+                    cx,
+                ));
+            }
+            row.child(chip(
                 "hunk-stage",
                 "Stage hunk",
+                false,
                 false,
                 HunkAction::Stage,
                 cx,
@@ -1214,6 +1260,7 @@ fn hunk_chips(
                 "hunk-revert",
                 if revert_armed { "Revert?" } else { "Revert" },
                 revert_armed,
+                false,
                 HunkAction::Revert,
                 cx,
             ))
