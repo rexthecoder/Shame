@@ -817,8 +817,8 @@ impl DartIde {
         let list_hover = cx.theme().list_hover;
         let mode_label = MODES[self.agent.mode_ix % MODES.len()];
         let harness = self.agent.harness;
-        let (model_id, model_display) = self.agent.active_model();
-        let model_short = model_id.rsplit('/').next().unwrap_or(model_display).to_string();
+        let (_model_id, model_display) = self.agent.active_model();
+        let model_label = model_display.to_string();
         let is_running = self.agent.running_pid.is_some();
         let bin_resolved = harness.resolve_binary();
         let active_rel_file = self
@@ -906,60 +906,6 @@ impl DartIde {
                             .tooltip("Close Agent panel")
                             .on_click(cx.listener(|this, _event, _window, cx| {
                                 this.agent_open = false;
-                                cx.notify();
-                            })),
-                    ),
-            )
-            // 24. AgentHeader (shows active tool + model badge + clear button)
-            .child(
-                h_flex()
-                    .w_full()
-                    .h(px(30.))
-                    .flex_shrink_0()
-                    .px(px(tokens::SPACE_4))
-                    .items_center()
-                    .justify_between()
-                    .border_b_1()
-                    .border_color(border.opacity(0.6))
-                    .child(
-                        h_flex()
-                            .min_w(px(0.))
-                            .items_center()
-                            .gap(px(tokens::SPACE_2))
-                            .child(
-                                div()
-                                    .px(px(6.))
-                                    .py(px(1.))
-                                    .rounded(px(4.))
-                                    .bg(primary.opacity(0.15))
-                                    .text_size(px(tokens::UI_XS))
-                                    .font_medium()
-                                    .text_color(primary)
-                                    .child(harness.short_label()),
-                            )
-                            .child(
-                                div()
-                                    .truncate()
-                                    .font_family(cx.theme().mono_font_family.clone())
-                                    .text_size(px(tokens::UI_XS))
-                                    .text_color(muted)
-                                    .child(model_display.to_string()),
-                            ),
-                    )
-                    .child(
-                        Button::new("agent-clear-chat")
-                            .ghost()
-                            .xsmall()
-                            .icon(
-                                Icon::new(IconName::RotateCcwClock)
-                                    .with_size(px(12.))
-                                    .text_color(muted),
-                            )
-                            .tooltip("Clear conversation")
-                            .on_click(cx.listener(|this, _e, _w, cx| {
-                                this.stop_agent_run(cx);
-                                this.agent.tasks.clear();
-                                this.agent.items.clear();
                                 cx.notify();
                             })),
                     ),
@@ -1569,37 +1515,32 @@ impl DartIde {
                             .gap(px(tokens::SPACE_2))
                             .child(
                                 h_flex()
-                                    .flex_wrap()
+                                    .min_w(px(0.))
                                     .items_center()
-                                    .gap(px(tokens::SPACE_2))
-                                    // 1. Coding Tooling selector (`Claude Code` / `OpenCode` / `Codex`)
+                                    .gap(px(4.))
+                                    // 1. Borderless Coding Tool trigger (`Claude Code` / `OpenCode` / `Codex`)
                                     .child(
                                         h_flex()
                                             .id("agent-tool-select")
                                             .h(px(22.))
-                                            .px(px(tokens::SPACE_2))
+                                            .px(px(6.))
                                             .items_center()
-                                            .gap(px(tokens::SPACE_1))
+                                            .gap(px(4.))
                                             .rounded(px(tokens::RADIUS_SM))
-                                            .bg(cx.theme().background)
-                                            .border_1()
-                                            .border_color(if self.agent.tool_picker_open {
-                                                primary
-                                            } else {
-                                                border
+                                            .when(self.agent.tool_picker_open, |s| {
+                                                s.bg(list_hover)
                                             })
                                             .cursor_pointer()
                                             .hover(move |s| s.bg(list_hover))
-                                            .text_size(px(tokens::UI_XS))
-                                            .child(
-                                                Icon::new(IconName::Bot)
-                                                    .with_size(px(11.))
-                                                    .text_color(primary),
-                                            )
+                                            .text_size(px(tokens::UI_SM))
                                             .child(
                                                 div()
                                                     .font_medium()
-                                                    .text_color(fg)
+                                                    .text_color(if self.agent.tool_picker_open {
+                                                        primary
+                                                    } else {
+                                                        fg
+                                                    })
                                                     .child(harness.short_label()),
                                             )
                                             .child(
@@ -1614,32 +1555,38 @@ impl DartIde {
                                                 cx.notify();
                                             })),
                                     )
-                                    // 2. Per-tool Model selector
+                                    .child(
+                                        div()
+                                            .text_size(px(tokens::UI_XS))
+                                            .text_color(muted.opacity(0.55))
+                                            .child("\u{00b7}"),
+                                    )
+                                    // 2. Borderless Model trigger with human-readable label (`Gemini 4 Argon ▾`)
                                     .child(
                                         h_flex()
                                             .id("agent-model-select")
                                             .h(px(22.))
-                                            .px(px(tokens::SPACE_2))
+                                            .px(px(6.))
                                             .items_center()
-                                            .gap(px(tokens::SPACE_1))
+                                            .gap(px(4.))
                                             .rounded(px(tokens::RADIUS_SM))
-                                            .bg(cx.theme().background)
-                                            .border_1()
-                                            .border_color(if self.agent.model_picker_open {
-                                                primary
-                                            } else {
-                                                border
+                                            .when(self.agent.model_picker_open, |s| {
+                                                s.bg(list_hover)
                                             })
                                             .cursor_pointer()
                                             .hover(move |s| s.bg(list_hover))
-                                            .font_family(cx.theme().mono_font_family.clone())
-                                            .text_size(px(tokens::UI_XS))
+                                            .text_size(px(tokens::UI_SM))
                                             .child(
                                                 div()
-                                                    .max_w(px(110.))
+                                                    .max_w(px(130.))
                                                     .truncate()
-                                                    .text_color(fg)
-                                                    .child(model_short),
+                                                    .font_medium()
+                                                    .text_color(if self.agent.model_picker_open {
+                                                        primary
+                                                    } else {
+                                                        fg
+                                                    })
+                                                    .child(model_label),
                                             )
                                             .child(
                                                 Icon::new(IconName::ChevronDown)
@@ -1653,18 +1600,23 @@ impl DartIde {
                                                 cx.notify();
                                             })),
                                     )
-                                    // 3. Mode selector (`Default` / `Plan` / `Auto-Edit`)
+                                    .child(
+                                        div()
+                                            .text_size(px(tokens::UI_XS))
+                                            .text_color(muted.opacity(0.55))
+                                            .child("\u{00b7}"),
+                                    )
+                                    // 3. Borderless Mode trigger (`Default` / `Plan` / `Auto-Edit`)
                                     .child(
                                         h_flex()
                                             .id("agent-mode-select")
                                             .h(px(22.))
-                                            .px(px(tokens::SPACE_2))
+                                            .px(px(6.))
                                             .items_center()
-                                            .gap(px(tokens::SPACE_1))
                                             .rounded(px(tokens::RADIUS_SM))
                                             .cursor_pointer()
-                                            .hover(move |s| s.bg(list_hover))
-                                            .text_size(px(tokens::UI_XS))
+                                            .hover(move |s| s.bg(list_hover).text_color(fg))
+                                            .text_size(px(tokens::UI_SM))
                                             .text_color(muted)
                                             .child(mode_label)
                                             .on_click(cx.listener(|this, _e, _w, cx| {
@@ -1674,11 +1626,12 @@ impl DartIde {
                                             })),
                                     ),
                             )
-                            // Send or Stop circle button
+                            // Solid orange Send circle button (or Stop button when running)
                             .child(if is_running {
                                 div()
                                     .id("agent-stop-btn")
                                     .size(px(26.))
+                                    .flex_shrink_0()
                                     .rounded(px(tokens::RADIUS_PILL))
                                     .bg(red.opacity(0.2))
                                     .border_1()
@@ -1695,19 +1648,18 @@ impl DartIde {
                                 div()
                                     .id("agent-send-btn")
                                     .size(px(26.))
+                                    .flex_shrink_0()
                                     .rounded(px(tokens::RADIUS_PILL))
-                                    .bg(primary.opacity(0.18))
-                                    .border_1()
-                                    .border_color(primary.opacity(0.55))
+                                    .bg(primary)
                                     .flex()
                                     .items_center()
                                     .justify_center()
                                     .cursor_pointer()
-                                    .hover(|s| s.bg(primary.opacity(0.3)))
+                                    .hover(|s| s.opacity(0.9))
                                     .child(
-                                        Icon::new(IconName::ArrowRight)
+                                        Icon::new(IconName::ArrowUp)
                                             .with_size(px(12.5))
-                                            .text_color(primary),
+                                            .text_color(cx.theme().primary_foreground),
                                     )
                                     .on_click(cx.listener(|this, _e, window, cx| {
                                         this.agent_send_message(window, cx);
