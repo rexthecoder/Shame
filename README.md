@@ -52,6 +52,8 @@ cargo run -p app
 | ⇧⌘F | Find in project |
 | ⌘T | Go to symbol in workspace |
 | ⌘L | Add selection (or file) to the agent chat |
+| `@` in the agent input | Mention a file, folder, symbol, `@problems`, `@diff` or `@terminal` |
+| Enter while the agent runs | Queue the message to send when it finishes |
 | ⌘D | Select next occurrence (multi-cursor) |
 | ⌥⌘↑ / ⌥⌘↓ | Add cursor above / below |
 | ⇧F12 | Find references |

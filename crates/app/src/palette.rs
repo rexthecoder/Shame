@@ -105,6 +105,29 @@ impl DartIde {
 
     /// Open the palette in `#` mode and (re)index the workspace's
     /// declarations on a background thread.
+    /// Index the workspace's declarations in the background once (for `@symbol`
+    /// mentions); does nothing if already indexed or in progress.
+    pub(crate) fn ensure_symbol_index(&mut self, cx: &mut Context<Self>) {
+        if !self.workspace_symbols.is_empty() || self.symbols_indexing {
+            return;
+        }
+        self.symbols_indexing = true;
+        let root = self.root.clone();
+        let (tx, rx) = async_channel::bounded(1);
+        std::thread::spawn(move || {
+            let _ = tx.send_blocking(core_workspace::index_workspace_symbols(&root));
+        });
+        cx.spawn(async move |weak, cx| {
+            let Ok(symbols) = rx.recv().await else { return };
+            let _ = weak.update(cx, |this, cx| {
+                this.workspace_symbols = symbols;
+                this.symbols_indexing = false;
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
     pub(crate) fn open_workspace_symbols(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.palette_open = true;
         self.palette_selected = 0;

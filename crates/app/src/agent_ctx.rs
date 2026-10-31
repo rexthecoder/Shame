@@ -86,6 +86,45 @@ pub(crate) enum Attachment {
     /// An image on disk (absolute path): pasted, dropped or chosen. The agent
     /// is pointed at the file rather than sent pixels.
     Image { path: String },
+    /// A folder: the agent gets a listing and reads what it needs.
+    Folder { rel: String },
+    /// A declaration, sent with the lines that follow it (`line` is 1-indexed).
+    Symbol { name: String, rel: String, line: usize },
+    /// Live IDE state, resolved when the message is sent.
+    Context(ContextKind),
+}
+
+/// IDE state a mention can pull in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ContextKind {
+    /// Current errors and warnings in open files.
+    Problems,
+    /// Uncommitted changes (`git diff HEAD`).
+    GitDiff,
+    /// Recent terminal output.
+    Terminal,
+}
+
+impl ContextKind {
+    pub(crate) const ALL: [ContextKind; 3] =
+        [ContextKind::Problems, ContextKind::GitDiff, ContextKind::Terminal];
+
+    pub(crate) fn name(self) -> &'static str {
+        match self {
+            ContextKind::Problems => "problems",
+            ContextKind::GitDiff => "diff",
+            ContextKind::Terminal => "terminal",
+        }
+    }
+
+    /// One-line description shown in the picker.
+    pub(crate) fn description(self) -> &'static str {
+        match self {
+            ContextKind::Problems => "errors and warnings in open files",
+            ContextKind::GitDiff => "your uncommitted changes",
+            ContextKind::Terminal => "recent terminal output",
+        }
+    }
 }
 
 impl Attachment {
@@ -100,6 +139,12 @@ impl Attachment {
         match self {
             Attachment::File { rel } => name(rel),
             Attachment::Image { path } => name(path),
+            Attachment::Folder { rel } => {
+                let trimmed = rel.trim_end_matches('/');
+                format!("{}/", name(trimmed))
+            }
+            Attachment::Symbol { name, .. } => name.clone(),
+            Attachment::Context(kind) => kind.name().to_string(),
             Attachment::Selection { rel, start_line, end_line, .. } if start_line == end_line => {
                 format!("{}:{start_line}", name(rel))
             }
@@ -143,6 +188,44 @@ pub(crate) fn add_attachment(list: &mut Vec<Attachment>, new: Attachment) {
     }
 }
 
+/// Entries listed for a mentioned folder.
+const MAX_FOLDER_ENTRIES: usize = 80;
+/// Lines sent after a mentioned symbol's declaration.
+const SYMBOL_CONTEXT_LINES: usize = 40;
+
+/// Folders never worth listing.
+const SKIPPED_DIRS: &[&str] = &[".git", "target", "build", "node_modules", ".dart_tool", "Pods"];
+
+/// Files under `dir` (paths relative to it), breadth-first so shallow files
+/// come first, at most `limit` of them, skipping build output and dotfiles.
+pub(crate) fn folder_listing(dir: &Path, limit: usize) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut queue = std::collections::VecDeque::from([(dir.to_path_buf(), 0usize)]);
+    while let Some((current, depth)) = queue.pop_front() {
+        let Ok(entries) = std::fs::read_dir(&current) else { continue };
+        let mut entries: Vec<_> = entries.flatten().collect();
+        entries.sort_by_key(|e| e.file_name());
+        for entry in entries {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name.starts_with('.') || SKIPPED_DIRS.contains(&name.as_str()) {
+                continue;
+            }
+            let path = entry.path();
+            if path.is_dir() {
+                if depth < 3 {
+                    queue.push_back((path, depth + 1));
+                }
+            } else if let Ok(rel) = path.strip_prefix(dir) {
+                out.push(rel.to_string_lossy().to_string());
+                if out.len() >= limit {
+                    return out;
+                }
+            }
+        }
+    }
+    out
+}
+
 /// Largest file inlined into the prompt; bigger ones are sent as a path only
 /// (the agent can read them itself).
 const MAX_INLINE_BYTES: usize = 24 * 1024;
@@ -179,6 +262,26 @@ fn clip(text: &str, max: usize) -> (&str, bool) {
         end -= 1;
     }
     (&text[..end], true)
+}
+
+/// `text` cut to at most `max` bytes (on a char boundary), and whether it was cut.
+pub(crate) fn clip_text(text: &str, max: usize) -> (&str, bool) {
+    clip(text, max)
+}
+
+/// The last `max_lines` lines of a terminal session as plain text: commands as
+/// `$ command`, output without colors.
+pub(crate) fn terminal_text(lines: &[crate::editor::dock::TerminalLine], max_lines: usize) -> String {
+    use crate::editor::dock::TerminalLine;
+    let skip = lines.len().saturating_sub(max_lines);
+    lines[skip..]
+        .iter()
+        .map(|line| match line {
+            TerminalLine::Command { command, .. } => format!("$ {command}"),
+            TerminalLine::Output { spans, .. } => spans.iter().map(|s| s.text.as_str()).collect(),
+        })
+        .collect::<Vec<String>>()
+        .join("\n")
 }
 
 /// The "[Attached context]" block for the prompt: file contents and selected
@@ -221,6 +324,34 @@ pub(crate) fn attachment_prompt(root: &Path, attachments: &[Attachment]) -> Stri
             Attachment::Image { path } => out.push_str(&format!(
                 "Image `{path}` is attached: open it with your file-reading tool to look at it.\n"
             )),
+            Attachment::Folder { rel } => {
+                let listing = folder_listing(&root.join(rel), MAX_FOLDER_ENTRIES);
+                out.push_str(&format!(
+                    "Folder `{rel}` contains (read what you need):\n{}\n",
+                    if listing.is_empty() { "(empty)".to_string() } else { listing.join("\n") }
+                ));
+            }
+            Attachment::Symbol { name, rel, line } => {
+                let snippet = std::fs::read_to_string(root.join(rel))
+                    .ok()
+                    .map(|text| {
+                        text.lines()
+                            .skip(line.saturating_sub(1))
+                            .take(SYMBOL_CONTEXT_LINES)
+                            .collect::<Vec<_>>()
+                            .join("\n")
+                    })
+                    .unwrap_or_default();
+                let (snippet, _) = clip(&snippet, MAX_INLINE_BYTES.min(budget));
+                budget -= snippet.len();
+                out.push_str(&format!(
+                    "Symbol `{name}` defined at `{rel}` line {line}:\n```{}\n{}\n```\n",
+                    fence_lang(rel),
+                    snippet.trim_end_matches('\n')
+                ));
+            }
+            // Resolved from live IDE state when the message is sent.
+            Attachment::Context(_) => {}
             Attachment::Selection { rel, start_line, end_line, text } => {
                 let (text, cut) = clip(text, MAX_INLINE_BYTES.min(budget));
                 budget -= text.len();
@@ -284,6 +415,60 @@ pub(crate) fn active_mention(
         return None;
     }
     Some(range)
+}
+
+/// A message typed while the agent was still busy, with the context that was
+/// attached to it at the time.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct QueuedPrompt {
+    pub prompt: String,
+    pub shelf: Vec<Attachment>,
+    pub mentions: Vec<Attachment>,
+}
+
+/// How a finished turn is summarized under its reply: `12s · $0.082`.
+pub(crate) fn format_turn_stats(duration_ms: u64, cost_usd: Option<f64>) -> String {
+    let secs = duration_ms as f64 / 1000.0;
+    let time = if duration_ms < 1000 {
+        "<1s".to_string()
+    } else if secs < 10.0 {
+        format!("{secs:.1}s")
+    } else if secs < 60.0 {
+        format!("{}s", secs.round() as u64)
+    } else {
+        let total = secs.round() as u64;
+        format!("{}m {:02}s", total / 60, total % 60)
+    };
+    match cost_usd.filter(|c| *c > 0.0) {
+        Some(c) if c < 1.0 => format!("{time} \u{b7} ${c:.3}"),
+        Some(c) => format!("{time} \u{b7} ${c:.2}"),
+        None => time,
+    }
+}
+
+/// Escape text for use inside an AppleScript string literal.
+pub(crate) fn applescript_escape(text: &str) -> String {
+    text.chars()
+        .filter(|c| !c.is_control())
+        .collect::<String>()
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+}
+
+/// A one-line preview of a reply for a notification: whitespace collapsed,
+/// markdown fences and backticks dropped, cut to `max` characters.
+pub(crate) fn notification_body(reply: &str, max: usize) -> String {
+    let flat: String = reply
+        .replace("```", " ")
+        .replace('`', "")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    if flat.chars().count() <= max {
+        return flat;
+    }
+    let cut: String = flat.chars().take(max).collect();
+    format!("{}\u{2026}", cut.trim_end())
 }
 
 /// Step through prompt history: `Up` goes to older prompts, `Down` to newer
@@ -399,6 +584,59 @@ mod tests {
     }
 
     #[core::prelude::v1::test]
+    fn folders_and_symbols_resolve_from_disk() {
+        let dir = std::env::temp_dir().join(format!("agent-ctx-mention-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("lib/src")).unwrap();
+        std::fs::create_dir_all(dir.join("lib/build")).unwrap();
+        std::fs::write(dir.join("lib/a.dart"), "class A {}\nclass Widget {\n  int x;\n}\n").unwrap();
+        std::fs::write(dir.join("lib/src/b.dart"), "b").unwrap();
+        std::fs::write(dir.join("lib/build/skip.dart"), "x").unwrap();
+        std::fs::write(dir.join("lib/.hidden"), "x").unwrap();
+
+        let listing = folder_listing(&dir.join("lib"), 10);
+        assert_eq!(listing, vec!["a.dart", "src/b.dart"], "shallow first; build output and dotfiles skipped");
+        assert_eq!(folder_listing(&dir.join("lib"), 1).len(), 1, "limit applies");
+
+        let prompt = attachment_prompt(
+            &dir,
+            &[
+                Attachment::Folder { rel: "lib".into() },
+                Attachment::Symbol { name: "Widget".into(), rel: "lib/a.dart".into(), line: 2 },
+                Attachment::Context(ContextKind::Problems),
+            ],
+        );
+        assert!(prompt.contains("Folder `lib` contains"));
+        assert!(prompt.contains("src/b.dart"));
+        assert!(prompt.contains("Symbol `Widget` defined at `lib/a.dart` line 2:\n```dart\nclass Widget {\n  int x;\n}\n```"));
+        assert!(!prompt.contains("problems"), "live context is resolved elsewhere");
+        assert_eq!(Attachment::Folder { rel: "lib/src".into() }.label(), "src/");
+        assert_eq!(Attachment::Context(ContextKind::GitDiff).label(), "diff");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[core::prelude::v1::test]
+    fn terminal_text_keeps_recent_lines_as_plain_text() {
+        use crate::editor::dock::{AnsiColor, AnsiSpan, TerminalLine};
+        let out = |text: &str| TerminalLine::Output {
+            spans: vec![
+                AnsiSpan { text: text.to_string(), color: AnsiColor::Default, bold: false },
+                AnsiSpan { text: "!".to_string(), color: AnsiColor::Default, bold: true },
+            ],
+            file_link: None,
+        };
+        let lines = vec![
+            out("old"),
+            TerminalLine::Command { user_host: "u@h".into(), dir: "~".into(), command: "cargo test".into() },
+            out("ok"),
+        ];
+        assert_eq!(terminal_text(&lines, 2), "$ cargo test\nok!");
+        assert_eq!(terminal_text(&lines, 10), "old!\n$ cargo test\nok!");
+        assert_eq!(terminal_text(&[], 5), "");
+        assert_eq!(clip_text("héllo", 2), ("h", true), "cuts on a char boundary");
+    }
+
+    #[core::prelude::v1::test]
     fn slash_commands_parse_only_whole_known_words() {
         assert_eq!(parse_slash_command("/clear"), Some(SlashCommand::NewThread));
         assert_eq!(parse_slash_command(" /Plan "), Some(SlashCommand::SetMode(ModeId::Plan)));
@@ -432,6 +670,25 @@ mod tests {
         // A different, new mention right after is still found.
         let text = "see @main.dart @te";
         assert_eq!(active_mention(text, text.len(), &[4..14]), Some(15..18));
+    }
+
+    #[core::prelude::v1::test]
+    fn turn_stats_read_naturally() {
+        assert_eq!(format_turn_stats(400, None), "<1s");
+        assert_eq!(format_turn_stats(4_200, None), "4.2s");
+        assert_eq!(format_turn_stats(12_400, Some(0.0824)), "12s \u{b7} $0.082");
+        assert_eq!(format_turn_stats(65_000, Some(1.5)), "1m 05s \u{b7} $1.50");
+        assert_eq!(format_turn_stats(90_000, Some(0.0)), "1m 30s", "zero cost is not shown");
+    }
+
+    #[core::prelude::v1::test]
+    fn notification_text_is_safe_and_short() {
+        assert_eq!(applescript_escape(r#"say "hi" \ there"#), r#"say \"hi\" \\ there"#);
+        assert_eq!(applescript_escape("line\nbreak"), "linebreak");
+        assert_eq!(notification_body("Done.\n\n```dart\nvoid main() {}\n```\nAll `tests` pass.", 200), "Done. dart void main() {} All tests pass.");
+        let long = "word ".repeat(40);
+        let body = notification_body(&long, 30);
+        assert!(body.chars().count() <= 31 && body.ends_with('\u{2026}'), "{body}");
     }
 
     #[core::prelude::v1::test]

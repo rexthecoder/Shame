@@ -16,8 +16,8 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 use crate::agent_ctx::{
-    AGENT_MODES, Attachment, ModeId, SlashCommand, active_mention, add_attachment, classify_path,
-    history_step,
+    AGENT_MODES, Attachment, ContextKind, ModeId, SlashCommand, active_mention, add_attachment,
+    classify_path, history_step,
 };
 use crate::rails::agent::{AgentHarness, ModelOption, filter_models};
 use crate::{DartIde, tokens};
@@ -120,8 +120,112 @@ pub(crate) fn attachment_sub(attachment: &Attachment) -> String {
         Attachment::Selection { start_line, end_line, .. } => {
             format!("lines {start_line}\u{2013}{end_line}")
         }
-        Attachment::Image { .. } => String::new(),
+        Attachment::Image { .. } | Attachment::Folder { .. } | Attachment::Context(_) => String::new(),
+        Attachment::Symbol { rel, line, .. } => format!("{rel}:{line}"),
     }
+}
+
+/// A small text glyph for live-context mentions (no file icon applies).
+fn context_glyph(name: &str, color: Hsla) -> Div {
+    let glyph = match name {
+        "problems" => "\u{26a0}",
+        "diff" => "\u{b1}",
+        "terminal" => ">_",
+        _ => "\u{2022}",
+    };
+    div()
+        .flex_shrink_0()
+        .size(px(16.))
+        .rounded(px(4.))
+        .bg(color.opacity(0.15))
+        .flex()
+        .items_center()
+        .justify_center()
+        .text_size(px(9.5))
+        .font_semibold()
+        .text_color(color)
+        .child(glyph)
+}
+
+/// One row of the mention picker.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum Candidate {
+    Context(ContextKind),
+    File(String),
+    Folder(String),
+    Symbol { name: String, rel: String, line: usize },
+}
+
+impl Candidate {
+    pub(crate) fn into_attachment(self) -> Attachment {
+        match self {
+            Candidate::Context(kind) => Attachment::Context(kind),
+            Candidate::File(rel) => Attachment::File { rel },
+            Candidate::Folder(rel) => Attachment::Folder { rel },
+            Candidate::Symbol { name, rel, line } => Attachment::Symbol { name, rel, line },
+        }
+    }
+}
+
+/// Folders (workspace-relative, no trailing slash) whose own name contains
+/// `query`, shallowest first.
+fn matching_folders(all: &[String], query: &str, limit: usize) -> Vec<String> {
+    let q = query.to_lowercase();
+    let mut dirs: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for path in all {
+        let mut parts: Vec<&str> = path.split('/').collect();
+        parts.pop(); // the file name
+        for end in 1..=parts.len() {
+            dirs.insert(parts[..end].join("/"));
+        }
+    }
+    let mut hits: Vec<String> = dirs
+        .into_iter()
+        .filter(|d| d.rsplit('/').next().unwrap_or(d).to_lowercase().contains(&q))
+        .collect();
+    hits.sort_by_key(|d| (d.matches('/').count(), d.clone()));
+    hits.truncate(limit);
+    hits
+}
+
+/// Everything `@query` can offer, best first: live IDE context, files, folders,
+/// then symbols. With no query it is the context kinds plus the open files.
+pub(crate) fn mention_candidates(
+    all_files: &[String],
+    open_tabs: &[String],
+    symbols: &[(String, String, usize)],
+    query: &str,
+    limit: usize,
+) -> Vec<Candidate> {
+    let q = query.trim().to_lowercase();
+    let mut out: Vec<Candidate> = ContextKind::ALL
+        .into_iter()
+        .filter(|k| q.is_empty() || k.name().contains(&q))
+        .map(Candidate::Context)
+        .collect();
+    let file_budget = if q.is_empty() { limit } else { 6 };
+    out.extend(
+        attach_matches(all_files, open_tabs, query, file_budget)
+            .into_iter()
+            .map(Candidate::File),
+    );
+    if !q.is_empty() {
+        out.extend(matching_folders(all_files, &q, 3).into_iter().map(Candidate::Folder));
+        if q.chars().count() >= 2 {
+            let mut hits: Vec<&(String, String, usize)> = symbols
+                .iter()
+                .filter(|(name, _, _)| name.to_lowercase().contains(&q))
+                .collect();
+            hits.sort_by_key(|(name, _, _)| !name.to_lowercase().starts_with(&q));
+            out.extend(hits.into_iter().take(4).map(|(name, rel, line)| Candidate::Symbol {
+                name: name.clone(),
+                rel: rel.clone(),
+                line: *line,
+            }));
+        }
+    }
+    out.truncate(limit);
+    out
 }
 
 impl DartIde {
@@ -172,7 +276,7 @@ impl DartIde {
         }
     }
 
-    fn attach_candidates(&self, cx: &App) -> Vec<String> {
+    fn attach_candidates(&self, cx: &App) -> Vec<Candidate> {
         let query = self.attach_query(cx);
         let all: Vec<String> = self.all_files.iter().map(|p| self.rel_path(p)).collect();
         let open: Vec<String> = self
@@ -181,12 +285,18 @@ impl DartIde {
             .filter_map(|t| t.path.as_deref())
             .map(|p| self.rel_path(p))
             .collect();
-        attach_matches(&all, &open, &query, MAX_ATTACH_ROWS)
+        let symbols: Vec<(String, String, usize)> = self
+            .workspace_symbols
+            .iter()
+            .map(|sym| (sym.name.clone(), self.rel_path(&sym.path), sym.line as usize + 1))
+            .collect();
+        mention_candidates(&all, &open, &symbols, &query, MAX_ATTACH_ROWS)
     }
 
     pub(crate) fn open_attach_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.agent.mention_range = None;
         self.agent.attach_open = true;
+        self.ensure_symbol_index(cx);
         self.agent.tool_picker_open = false;
         self.agent.model_picker_open = false;
         self.agent.attach_selected = 0;
@@ -289,6 +399,7 @@ impl DartIde {
                 }
                 self.agent.last_mention_query = query;
                 self.agent.mention_range = Some(range);
+                self.ensure_symbol_index(cx);
                 self.agent.attach_open = true;
                 self.agent.tool_picker_open = false;
                 self.agent.model_picker_open = false;
@@ -311,7 +422,15 @@ impl DartIde {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let id = format!("mention-{}", self.agent.next_mention);
+        // The id carries the kind (`mention-3:folder`) so the pill can pick its icon.
+        let kind = match &attachment {
+            Attachment::File { .. } | Attachment::Image { .. } => "file",
+            Attachment::Selection { .. } => "selection",
+            Attachment::Folder { .. } => "folder",
+            Attachment::Symbol { .. } => "symbol",
+            Attachment::Context(kind) => kind.name(),
+        };
+        let id = format!("mention-{}:{kind}", self.agent.next_mention);
         self.agent.next_mention += 1;
         let label = attachment.label();
         let token = InlineToken::new(id.clone(), format!("@{label}")).with_label(label);
@@ -335,7 +454,8 @@ impl DartIde {
         let (rel, line) = match attachment {
             Attachment::File { rel } => (rel, None),
             Attachment::Selection { rel, start_line, .. } => (rel, Some(start_line as u32 - 1)),
-            Attachment::Image { .. } => return,
+            Attachment::Symbol { rel, line, .. } => (rel, Some(line as u32 - 1)),
+            Attachment::Image { .. } | Attachment::Folder { .. } | Attachment::Context(_) => return,
         };
         self.open_path(self.root.join(rel), window, cx);
         if let (Some(line), Some(editor)) = (line, self.active_editor().cloned()) {
@@ -403,8 +523,8 @@ impl DartIde {
     fn accept_picker_selection(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.agent.attach_open {
             let candidates = self.attach_candidates(cx);
-            if let Some(rel) = candidates.get(self.agent.attach_selected).cloned() {
-                self.insert_mention(Attachment::File { rel }, window, cx);
+            if let Some(candidate) = candidates.get(self.agent.attach_selected).cloned() {
+                self.insert_mention(candidate.into_attachment(), window, cx);
             }
         } else if self.agent.model_picker_open {
             let (matches, custom) = self.model_candidates(cx);
@@ -515,10 +635,6 @@ impl DartIde {
         let is_running = self.agent.running_pid.is_some();
 
         // --- context chips ---
-        let active_name = self
-            .active_editor()
-            .and_then(|ed| ed.read(cx).buffer().path().map(Path::to_path_buf))
-            .and_then(|p| p.file_name().and_then(|n| n.to_str()).map(str::to_string));
         let problem_count: usize = self
             .tabs
             .iter()
@@ -542,20 +658,6 @@ impl DartIde {
                 .hover(move |s| s.bg(list_hover).text_color(fg))
         };
         let mut header_chips: Vec<AnyElement> = Vec::new();
-        if let Some(name) = active_name {
-            let on = self.agent.include_active_file;
-            header_chips.push(
-                ghost("agent-ctx-active".into())
-                    .when(!on, |c| c.opacity(0.45))
-                    .child(crate::rails::files::render_file_icon(&name))
-                    .child(div().max_w(px(110.)).truncate().when(!on, |d| d.line_through()).child(name))
-                    .on_click(cx.listener(|this, _e, _w, cx| {
-                        this.agent.include_active_file = !this.agent.include_active_file;
-                        cx.notify();
-                    }))
-                    .into_any_element(),
-            );
-        }
         if problem_count > 0 {
             let on = self.agent.include_problems;
             header_chips.push(
@@ -805,6 +907,41 @@ impl DartIde {
                 this.agent_composer_key(event, window, cx);
             }))
             .when_some(self.render_agent_picker(cx), |col, panel| col.child(panel))
+            .when(!self.agent.queue.is_empty(), |col| {
+                let count = self.agent.queue.len();
+                let first = crate::agent_ctx::notification_body(&self.agent.queue[0].prompt, 48);
+                col.child(
+                    h_flex()
+                        .w_full()
+                        .px(px(tokens::SPACE_2))
+                        .gap(px(tokens::SPACE_2))
+                        .items_center()
+                        .justify_between()
+                        .text_size(px(tokens::UI_XS))
+                        .text_color(muted)
+                        .child(
+                            div()
+                                .min_w(px(0.))
+                                .truncate()
+                                .child(format!(
+                                    "Queued{} \u{b7} {first}",
+                                    if count > 1 { format!(" ({count})") } else { String::new() }
+                                )),
+                        )
+                        .child(
+                            div()
+                                .id("agent-queue-clear")
+                                .flex_shrink_0()
+                                .cursor_pointer()
+                                .hover(move |s| s.text_color(fg))
+                                .child("Clear")
+                                .on_click(cx.listener(|this, _e, _w, cx| {
+                                    this.agent.queue.clear();
+                                    cx.notify();
+                                })),
+                        ),
+                )
+            })
             .child(
                 v_flex()
                     .w_full()
@@ -880,7 +1017,19 @@ impl DartIde {
                                                 .text_size(px(tokens::UI_SM))
                                                 .line_height(px((line - 4.).max(16.)))
                                                 .text_color(cx.theme().foreground)
-                                                .child(crate::rails::files::render_file_icon_sized(&name, 12.))
+                                                .child(match ctx.token().id().rsplit(':').next().unwrap_or("") {
+                                                    kind @ ("problems" | "diff" | "terminal") => {
+                                                        context_glyph(kind, primary).into_any_element()
+                                                    }
+                                                    "folder" => Icon::new(IconName::Folder)
+                                                        .with_size(px(12.))
+                                                        .text_color(muted)
+                                                        .into_any_element(),
+                                                    "symbol" => crate::rails::files::render_file_icon_sized("symbol.dart", 12.)
+                                                        .into_any_element(),
+                                                    _ => crate::rails::files::render_file_icon_sized(&name, 12.)
+                                                        .into_any_element(),
+                                                })
                                                 .child(label),
                                         )
                                 })
@@ -1103,27 +1252,51 @@ impl DartIde {
                                         .child("No matching files"),
                                 )
                             })
-                            .children(candidates.into_iter().enumerate().map(|(ix, rel)| {
-                                let name = PathBuf::from(&rel)
-                                    .file_name()
-                                    .and_then(|n| n.to_str())
-                                    .unwrap_or(&rel)
-                                    .to_string();
-                                let dir = rel.strip_suffix(&name).unwrap_or("").trim_end_matches('/').to_string();
-                                let rel_for_click = rel.clone();
+                            .children(candidates.into_iter().enumerate().map(|(ix, candidate)| {
+                                // (icon, label, muted right-hand text)
+                                let (icon, label, sub): (AnyElement, String, String) = match &candidate {
+                                    Candidate::Context(kind) => (
+                                        context_glyph(kind.name(), primary).into_any_element(),
+                                        kind.name().to_string(),
+                                        kind.description().to_string(),
+                                    ),
+                                    Candidate::File(rel) => {
+                                        let name = PathBuf::from(rel)
+                                            .file_name()
+                                            .and_then(|n| n.to_str())
+                                            .unwrap_or(rel)
+                                            .to_string();
+                                        let dir = rel.strip_suffix(&name).unwrap_or("").trim_end_matches('/').to_string();
+                                        (
+                                            crate::rails::files::render_file_icon(&name).into_any_element(),
+                                            name,
+                                            dir,
+                                        )
+                                    }
+                                    Candidate::Folder(rel) => (
+                                        Icon::new(IconName::Folder).with_size(px(14.)).text_color(muted).into_any_element(),
+                                        format!("{}/", rel.rsplit('/').next().unwrap_or(rel)),
+                                        rel.clone(),
+                                    ),
+                                    Candidate::Symbol { name, rel, line } => (
+                                        crate::rails::files::render_file_icon("symbol.dart").into_any_element(),
+                                        name.clone(),
+                                        format!("{rel}:{line}"),
+                                    ),
+                                };
                                 row(("agent-attach-opt", ix).into(), ix == selected)
                                     .child(
                                         h_flex()
                                             .min_w(px(0.))
                                             .items_center()
                                             .gap(px(tokens::SPACE_2))
-                                            .child(crate::rails::files::render_file_icon(&name))
+                                            .child(icon)
                                             .child(
                                                 div()
                                                     .truncate()
                                                     .text_size(px(tokens::UI_SM))
                                                     .text_color(fg)
-                                                    .child(name),
+                                                    .child(label),
                                             ),
                                     )
                                     .child(
@@ -1133,14 +1306,10 @@ impl DartIde {
                                             .truncate()
                                             .text_size(px(tokens::UI_XS))
                                             .text_color(muted)
-                                            .child(dir),
+                                            .child(sub),
                                     )
                                     .on_click(cx.listener(move |this, _e, window, cx| {
-                                        this.insert_mention(
-                                            Attachment::File { rel: rel_for_click.clone() },
-                                            window,
-                                            cx,
-                                        );
+                                        this.insert_mention(candidate.clone().into_attachment(), window, cx);
                                     }))
                             })),
                     ),
@@ -1152,8 +1321,8 @@ impl DartIde {
 
 #[cfg(test)]
 mod tests {
-    use super::{attach_matches, attachment_sub};
-    use crate::agent_ctx::Attachment;
+    use super::{Candidate, attach_matches, attachment_sub, mention_candidates};
+    use crate::agent_ctx::{Attachment, ContextKind};
 
     #[core::prelude::v1::test]
     fn tile_subtitles_place_the_file_or_selection() {
@@ -1172,6 +1341,48 @@ mod tests {
             .into_iter()
             .map(String::from)
             .collect()
+    }
+
+    fn symbols() -> Vec<(String, String, usize)> {
+        vec![
+            ("UserModel".into(), "lib/src/user_model.dart".into(), 3),
+            ("MainApp".into(), "lib/main.dart".into(), 7),
+        ]
+    }
+
+    #[core::prelude::v1::test]
+    fn empty_query_offers_live_context_then_open_files() {
+        let tabs = vec!["README.md".to_string()];
+        let c = mention_candidates(&files(), &tabs, &symbols(), "", 6);
+        assert_eq!(&c[..3], &[
+            Candidate::Context(ContextKind::Problems),
+            Candidate::Context(ContextKind::GitDiff),
+            Candidate::Context(ContextKind::Terminal),
+        ]);
+        assert_eq!(c[3], Candidate::File("README.md".into()), "open tabs lead the files");
+        assert_eq!(c.len(), 6);
+    }
+
+    #[core::prelude::v1::test]
+    fn typing_narrows_across_context_files_folders_and_symbols() {
+        let c = mention_candidates(&files(), &[], &symbols(), "prob", 12);
+        assert_eq!(c, vec![Candidate::Context(ContextKind::Problems)]);
+
+        let c = mention_candidates(&files(), &[], &symbols(), "src", 12);
+        assert!(c.contains(&Candidate::File("lib/src/user_model.dart".into())));
+        assert!(c.contains(&Candidate::Folder("lib/src".into())), "{c:?}");
+
+        let c = mention_candidates(&files(), &[], &symbols(), "user", 12);
+        assert!(c.contains(&Candidate::Symbol { name: "UserModel".into(), rel: "lib/src/user_model.dart".into(), line: 3 }));
+        // Files rank before symbols.
+        let first_symbol = c.iter().position(|x| matches!(x, Candidate::Symbol { .. })).unwrap();
+        let first_file = c.iter().position(|x| matches!(x, Candidate::File(_))).unwrap();
+        assert!(first_file < first_symbol);
+
+        // One character is too vague for symbols.
+        assert!(!mention_candidates(&files(), &[], &symbols(), "u", 12)
+            .iter()
+            .any(|x| matches!(x, Candidate::Symbol { .. })));
     }
 
     #[core::prelude::v1::test]

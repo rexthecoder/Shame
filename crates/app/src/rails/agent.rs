@@ -20,7 +20,8 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 use crate::agent_ctx::{
-    AGENT_MODES, Attachment, ModeId, attachment_prompt, parse_slash_command,
+    AGENT_MODES, Attachment, ModeId, QueuedPrompt, applescript_escape, attachment_prompt,
+    notification_body, parse_slash_command,
 };
 use crate::{DartIde, tokens};
 
@@ -271,13 +272,15 @@ pub(crate) enum AgentItem {
     },
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq)]
 pub(crate) enum StreamFragment {
     Tool(AgentToolCall),
     TextDelta(String),
     ReplaceText(String),
     /// The CLI's id for this conversation, used to resume it on the next message.
     SessionId(String),
+    /// What the CLI reported about the finished turn (Claude Code only).
+    Stats { cost_usd: Option<f64>, duration_ms: Option<u64> },
 }
 
 /// Parse one line of output (either `claude --output-format stream-json`, `opencode run --format json`,
@@ -339,6 +342,14 @@ pub(crate) fn parse_agent_stream_line(raw: &str) -> Vec<StreamFragment> {
         }
         // Claude Code final result summary
         "result" => {
+            let cost_usd = val
+                .get("total_cost_usd")
+                .or_else(|| val.get("cost_usd"))
+                .and_then(|v| v.as_f64());
+            let duration_ms = val.get("duration_ms").and_then(|v| v.as_u64());
+            if cost_usd.is_some() || duration_ms.is_some() {
+                out.push(StreamFragment::Stats { cost_usd, duration_ms });
+            }
             if let Some(res) = val.get("result").and_then(|v| v.as_str()) {
                 if !res.trim().is_empty() {
                     out.push(StreamFragment::ReplaceText(res.to_string()));
@@ -474,6 +485,13 @@ pub(crate) enum AgentStreamEvent {
     Finished { error: Option<String> },
 }
 
+/// How long a turn took, and what it cost when the CLI says so.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct TurnStats {
+    pub(crate) duration_ms: u64,
+    pub(crate) cost_usd: Option<f64>,
+}
+
 pub(crate) struct AgentState {
     pub(crate) harness: AgentHarness,
     pub(crate) models: Vec<ModelOption>,
@@ -500,9 +518,11 @@ pub(crate) struct AgentState {
     pub(crate) pending_mentions: Vec<Attachment>,
     /// While an `@query` is being typed: its byte range in the input.
     pub(crate) mention_range: Option<std::ops::Range<usize>>,
+    /// Time and cost of each finished turn, by the index of its reply.
+    pub(crate) turn_stats: std::collections::HashMap<usize, TurnStats>,
+    /// Messages typed while the agent was busy; sent one by one when it finishes.
+    pub(crate) queue: Vec<QueuedPrompt>,
     pub(crate) last_mention_query: String,
-    /// Send the active file and open tabs as context.
-    pub(crate) include_active_file: bool,
     /// Send current editor diagnostics as context.
     pub(crate) include_problems: bool,
     pub(crate) attach_open: bool,
@@ -554,8 +574,9 @@ impl AgentState {
             next_mention: 0,
             pending_mentions: Vec::new(),
             mention_range: None,
+            turn_stats: std::collections::HashMap::new(),
+            queue: Vec::new(),
             last_mention_query: String::new(),
-            include_active_file: true,
             include_problems: true,
             attach_open: false,
             attach_search,
@@ -645,8 +666,25 @@ pub(crate) fn conversation_transcript(
     turns.join("\n\n")
 }
 
+/// A macOS notification, fire and forget.
+fn notify_desktop(title: &str, body: &str) {
+    let script = format!(
+        "display notification \"{}\" with title \"{}\"",
+        applescript_escape(body),
+        applescript_escape(title)
+    );
+    let _ = Command::new("osascript")
+        .args(["-e", &script])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn();
+}
+
 impl DartIde {
     pub(crate) fn stop_agent_run(&mut self, cx: &mut Context<Self>) {
+        // Stopping means "stop", not "go on to the next queued message".
+        self.agent.queue.clear();
         if let Some(pid) = self.agent.running_pid.take() {
             let _ = Command::new("kill")
                 .args(["-TERM", &pid.to_string()])
@@ -656,9 +694,6 @@ impl DartIde {
     }
 
     pub(crate) fn agent_send_message(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.agent.running_pid.is_some() {
-            return;
-        }
         let prompt = self.agent.input.read(cx).value().trim().to_string();
         if prompt.is_empty() {
             return;
@@ -684,16 +719,100 @@ impl DartIde {
             self.agent.history.push(prompt.clone());
         }
         self.agent.history_ix = None;
+        if self.agent.running_pid.is_some() {
+            // Busy: keep the message (with its attachments) for when the run ends.
+            let shelf = std::mem::take(&mut self.agent.attachments);
+            self.agent.queue.push(QueuedPrompt { prompt, shelf, mentions: mentioned });
+            cx.notify();
+            return;
+        }
         self.agent.pending_mentions = mentioned;
-        self.agent_run_prompt(prompt, window, cx);
+        self.agent_run_prompt(prompt, cx);
     }
 
-    pub(crate) fn agent_run_prompt(
-        &mut self,
-        prompt: String,
-        _window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    /// Send the next queued message, if any.
+    fn run_next_queued(&mut self, cx: &mut Context<Self>) {
+        if self.agent.running_pid.is_some() || self.agent.queue.is_empty() {
+            return;
+        }
+        let next = self.agent.queue.remove(0);
+        self.agent.attachments = next.shelf;
+        self.agent.pending_mentions = next.mentions;
+        self.agent_run_prompt(next.prompt, cx);
+    }
+
+    /// The text for one live-context mention, ending in a newline.
+    fn context_block(&self, kind: crate::agent_ctx::ContextKind, cx: &App) -> String {
+        use crate::agent_ctx::ContextKind;
+        match kind {
+            ContextKind::Problems => {
+                let mut lines: Vec<String> = Vec::new();
+                for tab in &self.tabs {
+                    let Some(path) = tab.path.as_ref() else { continue };
+                    let rel = path.strip_prefix(&self.root).unwrap_or(path).to_string_lossy();
+                    for d in tab.editor.read(cx).diagnostics() {
+                        let sev = match d.severity {
+                            Some(core_lsp::lsp_types::DiagnosticSeverity::ERROR) => "ERROR",
+                            Some(core_lsp::lsp_types::DiagnosticSeverity::WARNING) => "WARN",
+                            _ => "INFO",
+                        };
+                        let msg = d.message.lines().next().unwrap_or(&d.message).trim();
+                        lines.push(format!(
+                            "{sev} {rel}:{}:{}: {msg}",
+                            d.range.start.line + 1,
+                            d.range.start.character + 1
+                        ));
+                        if lines.len() >= 60 {
+                            break;
+                        }
+                    }
+                }
+                if lines.is_empty() {
+                    "Problems: none reported in the open files.\n".to_string()
+                } else {
+                    format!("Problems in open files:\n{}\n", lines.join("\n"))
+                }
+            }
+            ContextKind::GitDiff => {
+                let out = Command::new("git")
+                    .args(["diff", "HEAD", "--no-color"])
+                    .current_dir(&self.root)
+                    .stdin(Stdio::null())
+                    .output()
+                    .ok()
+                    .filter(|o| o.status.success())
+                    .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+                    .unwrap_or_default();
+                if out.trim().is_empty() {
+                    return "Uncommitted changes: none.\n".to_string();
+                }
+                let (shown, cut) = crate::agent_ctx::clip_text(&out, 64 * 1024);
+                format!(
+                    "Uncommitted changes (`git diff HEAD`{}):\n```diff\n{}\n```\n",
+                    if cut { ", truncated" } else { "" },
+                    shown.trim_end()
+                )
+            }
+            ContextKind::Terminal => {
+                let text = self
+                    .terminals
+                    .get(self.active_terminal)
+                    .map(|t| crate::agent_ctx::terminal_text(&t.lines, 120))
+                    .unwrap_or_default();
+                if text.trim().is_empty() {
+                    return "Terminal: no output yet.\n".to_string();
+                }
+                let (shown, cut) = crate::agent_ctx::clip_text(&text, 24 * 1024);
+                format!(
+                    "Recent terminal output{}:\n```\n{}\n```\n",
+                    if cut { " (truncated)" } else { "" },
+                    shown.trim_end()
+                )
+            }
+        }
+    }
+
+    pub(crate) fn agent_run_prompt(&mut self, prompt: String, cx: &mut Context<Self>) {
         if self.agent.running_pid.is_some() {
             return;
         }
@@ -731,7 +850,6 @@ impl DartIde {
             text: shown_prompt,
         });
         self.agent.scroll.scroll_to_bottom();
-        let include_active_file = self.agent.include_active_file;
         let include_problems = self.agent.include_problems;
 
         let harness = self.agent.harness;
@@ -741,7 +859,6 @@ impl DartIde {
         let root = self.root.clone();
         let active_file = self
             .active_editor()
-            .filter(|_| include_active_file)
             .and_then(|ed| ed.read(cx).buffer().path().map(Path::to_path_buf))
             .and_then(|p| p.strip_prefix(&self.root).ok().map(Path::to_path_buf))
             .map(|p| p.to_string_lossy().to_string());
@@ -749,7 +866,6 @@ impl DartIde {
         let open_tabs: Vec<String> = self
             .tabs
             .iter()
-            .filter(|_| include_active_file)
             .filter_map(|t| t.path.as_ref())
             .filter_map(|p| p.strip_prefix(&self.root).ok())
             .map(|p| p.to_string_lossy().to_string())
@@ -820,7 +936,13 @@ impl DartIde {
         }
         let everything: Vec<Attachment> =
             attachments.iter().chain(mentions.iter()).cloned().collect();
-        let attached = attachment_prompt(&self.root, &everything);
+        let mut attached = attachment_prompt(&self.root, &everything);
+        // Live IDE state (`@problems`, `@diff`, `@terminal`) is read now, at send time.
+        for attachment in &everything {
+            if let Attachment::Context(kind) = attachment {
+                attached.push_str(&self.context_block(*kind, cx));
+            }
+        }
         if !attached.is_empty() {
             sections.push(attached.trim_end().to_string());
         }
@@ -961,9 +1083,11 @@ impl DartIde {
             let _ = tx.send_blocking(AgentStreamEvent::Finished { error: err_msg });
         });
 
+        let started_at = std::time::Instant::now();
         cx.spawn(async move |weak, cx| {
             let mut streamed_text = String::new();
             let mut stderr_lines: Vec<String> = Vec::new();
+            let mut reported_cost: Option<f64> = None;
             while let Ok(evt) = rx.recv().await {
                 let alive = weak
                     .update(cx, |this, cx| {
@@ -980,6 +1104,9 @@ impl DartIde {
                                     if this.agent.harness == harness {
                                         this.agent.session_id = Some(id);
                                     }
+                                }
+                                StreamFragment::Stats { cost_usd, .. } => {
+                                    reported_cost = cost_usd.or(reported_cost);
                                 }
                                 StreamFragment::Tool(call) => {
                                     if (call.label.starts_with("Edit ")
@@ -1019,6 +1146,24 @@ impl DartIde {
                             },
                             AgentStreamEvent::Finished { error } => {
                                 this.agent.running_pid = None;
+                                let elapsed = started_at.elapsed();
+                                this.agent.turn_stats.insert(
+                                    msg_ix,
+                                    TurnStats {
+                                        duration_ms: elapsed.as_millis() as u64,
+                                        cost_usd: reported_cost,
+                                    },
+                                );
+                                // A long run finishing while you're in another app is worth a nudge.
+                                if elapsed.as_secs() >= 10 && cx.active_window().is_none() {
+                                    let body = if streamed_text.trim().is_empty() {
+                                        "The agent finished.".to_string()
+                                    } else {
+                                        notification_body(&streamed_text, 110)
+                                    };
+                                    notify_desktop("Shame", &body);
+                                }
+                                let failed = error.is_some();
                                 if error.is_some() && was_resumed {
                                     // The session may be gone; start fresh next time.
                                     this.agent.session_id = None;
@@ -1062,6 +1207,11 @@ impl DartIde {
                                 this.sync_workspace_files_if_changed(cx);
                                 if this.web_preview_open {
                                     this.refresh_web_preview(cx);
+                                }
+                                if failed {
+                                    this.agent.queue.clear();
+                                } else {
+                                    this.run_next_queued(cx);
                                 }
                             }
                         }
@@ -1391,12 +1541,8 @@ impl DartIde {
                                                     .with_size(px(11.))
                                                     .text_color(muted),
                                             )
-                                            .on_click(cx.listener(move |this, _e, window, cx| {
-                                                this.agent_run_prompt(
-                                                    prompt_owned.clone(),
-                                                    window,
-                                                    cx,
-                                                );
+                                            .on_click(cx.listener(move |this, _e, _window, cx| {
+                                                this.agent_run_prompt(prompt_owned.clone(), cx);
                                             }))
                                     },
                                 )),
@@ -1590,6 +1736,12 @@ impl DartIde {
                                     && item_ix + 1 == self.agent.items.len();
                                 let can_copy = !*is_user && !streaming && !text.trim().is_empty();
                                 let to_copy = text.clone();
+                                let stats_text = (!*is_user && !streaming)
+                                    .then(|| self.agent.turn_stats.get(&item_ix))
+                                    .flatten()
+                                    .map(|st| {
+                                        crate::agent_ctx::format_turn_stats(st.duration_ms, st.cost_usd)
+                                    });
                                 v_flex()
                                     .w_full()
                                     .px(px(tokens::SPACE_5))
@@ -1617,7 +1769,17 @@ impl DartIde {
                                     })
                                     .when(can_copy, |el| {
                                         el.child(
-                                            h_flex().w_full().justify_end().child(
+                                            h_flex()
+                                                .w_full()
+                                                .items_center()
+                                                .justify_between()
+                                                .child(
+                                                    div()
+                                                        .text_size(px(tokens::UI_XS))
+                                                        .text_color(muted.opacity(0.8))
+                                                        .child(stats_text.unwrap_or_default()),
+                                                )
+                                                .child(
                                                 div()
                                                     .id(("agent-copy-reply", item_ix))
                                                     .px(px(6.))
@@ -1924,6 +2086,16 @@ mod tests {
             vec![
                 StreamFragment::SessionId("abc-123".into()),
                 StreamFragment::ReplaceText("Done.".into()),
+            ]
+        );
+
+        let with_cost = r#"{"type":"result","result":"Ok.","session_id":"s","total_cost_usd":0.0824,"duration_ms":12400}"#;
+        assert_eq!(
+            parse_agent_stream_line(with_cost),
+            vec![
+                StreamFragment::SessionId("s".into()),
+                StreamFragment::Stats { cost_usd: Some(0.0824), duration_ms: Some(12400) },
+                StreamFragment::ReplaceText("Ok.".into()),
             ]
         );
 
