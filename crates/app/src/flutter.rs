@@ -686,6 +686,7 @@ impl DartIde {
         Some(
             div()
                 .id("launch-picker-backdrop")
+                .occlude()
                 .absolute()
                 .inset_0()
                 .on_mouse_down(MouseButton::Left, {
@@ -1060,6 +1061,7 @@ impl DartIde {
         Some(
             div()
                 .id("device-picker-backdrop")
+                .occlude()
                 .absolute()
                 .inset_0()
                 .on_mouse_down(MouseButton::Left, {

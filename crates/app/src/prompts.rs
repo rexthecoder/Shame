@@ -8,6 +8,7 @@ impl DartIde {
 
         Some(
             div()
+                .occlude()
                 .absolute()
                 .inset_0()
                 .flex()
@@ -75,6 +76,7 @@ impl DartIde {
 
         Some(
             div()
+                .occlude()
                 .absolute()
                 .inset_0()
                 .flex()
@@ -202,6 +204,7 @@ impl DartIde {
 
         Some(
             div()
+                .occlude()
                 .absolute()
                 .inset_0()
                 .flex()
@@ -333,6 +336,7 @@ impl DartIde {
 
         Some(
             div()
+                .occlude()
                 .absolute()
                 .inset_0()
                 .flex()

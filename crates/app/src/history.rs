@@ -54,6 +54,7 @@ impl DartIde {
 
         Some(
             div()
+                .occlude()
                 .absolute()
                 .inset_0()
                 .flex()

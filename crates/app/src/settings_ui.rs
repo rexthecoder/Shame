@@ -1,6 +1,7 @@
 //! Settings and About modals.
 
 use super::*;
+use gpui_kit::component::button::Button;
 
 impl DartIde {
     pub(crate) fn render_settings_modal(
@@ -464,6 +465,7 @@ impl DartIde {
         Some(
             div()
                 .id("settings-backdrop")
+                .occlude()
                 .absolute()
                 .inset_0()
                 .flex()
@@ -709,16 +711,39 @@ impl DartIde {
         let muted = cx.theme().muted_foreground;
         let primary = cx.theme().primary;
         let border = cx.theme().border;
+        let card_bg = cx.theme().popover;
+        let subtle = cx.theme().background;
+        let info = cx.theme().info;
+
+        let stat = |label: &'static str, value: &'static str| {
+            v_flex()
+                .flex_1()
+                .gap(px(2.))
+                .child(
+                    div()
+                        .text_size(px(tokens::UI_XS))
+                        .text_color(muted.opacity(0.75))
+                        .child(label),
+                )
+                .child(
+                    div()
+                        .text_size(px(tokens::UI_XS))
+                        .font_semibold()
+                        .text_color(fg)
+                        .child(value),
+                )
+        };
 
         Some(
             div()
                 .id("about-backdrop")
+                .occlude()
                 .absolute()
                 .inset_0()
                 .flex()
+                .items_center()
                 .justify_center()
-                .pt(px(110.))
-                .bg(rgba(0x00000066))
+                .bg(rgba(0x00000080))
                 .on_mouse_down(MouseButton::Left, {
                     let view = view.clone();
                     move |_e, _w, cx| {
@@ -731,49 +756,123 @@ impl DartIde {
                 .child(
                     v_flex()
                         .id("about-card")
-                        .w(px(360.))
-                        .p(px(tokens::SPACE_5))
-                        .gap(px(tokens::SPACE_3))
-                        .items_center()
-                        .bg(cx.theme().popover)
+                        .w(px(420.))
+                        .overflow_hidden()
+                        .bg(card_bg)
                         .border_1()
                         .border_color(border)
-                        .rounded(px(tokens::RADIUS_CARD))
+                        .rounded(px(14.))
                         .shadow_xl()
                         .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                        // Hero band
                         .child(
-                            div()
-                                .px(px(10.))
-                                .py(px(4.))
-                                .rounded(px(8.))
-                                .bg(primary.opacity(0.18))
-                                .border_1()
-                                .border_color(primary.opacity(0.45))
-                                .font_family("SF Mono")
-                                .font_semibold()
-                                .text_size(px(18.))
-                                .text_color(primary)
-                                .child("//>"),
+                            v_flex()
+                                .w_full()
+                                .items_center()
+                                .gap(px(tokens::SPACE_3))
+                                .pt(px(tokens::SPACE_6))
+                                .pb(px(tokens::SPACE_5))
+                                .px(px(tokens::SPACE_5))
+                                .bg(subtle.opacity(0.55))
+                                .child(
+                                    // Terracotta squircle mark with the `//>` glyph
+                                    div()
+                                        .w(px(64.))
+                                        .h(px(64.))
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .rounded(px(16.))
+                                        .bg(primary)
+                                        .shadow_lg()
+                                        .child(
+                                            div()
+                                                .font_family("SF Mono")
+                                                .font_bold()
+                                                .text_size(px(24.))
+                                                .text_color(cx.theme().primary_foreground)
+                                                .child("//>"),
+                                        ),
+                                )
+                                .child(
+                                    div()
+                                        .text_size(px(20.))
+                                        .font_semibold()
+                                        .text_color(fg)
+                                        .child("Shame"),
+                                )
+                                .child(
+                                    h_flex()
+                                        .items_center()
+                                        .gap(px(6.))
+                                        .child(
+                                            div()
+                                                .px(px(7.))
+                                                .py(px(2.))
+                                                .rounded(px(999.))
+                                                .bg(info.opacity(0.14))
+                                                .border_1()
+                                                .border_color(info.opacity(0.30))
+                                                .font_family("SF Mono")
+                                                .text_size(px(10.))
+                                                .text_color(info)
+                                                .child("0.1.0"),
+                                        )
+                                        .child(
+                                            div()
+                                                .text_size(px(tokens::UI_XS))
+                                                .text_color(muted)
+                                                .child("Native GPUI macOS IDE"),
+                                        ),
+                                ),
                         )
+                        // Body
                         .child(
-                            div()
-                                .text_size(px(16.))
-                                .font_semibold()
-                                .text_color(fg)
-                                .child("Shame IDE"),
-                        )
-                        .child(
-                            div()
-                                .font_family("SF Mono")
-                                .text_size(px(tokens::UI_XS))
-                                .text_color(muted)
-                                .child("Version 0.1.0 \u{00b7} Native GPUI macOS IDE"),
-                        )
-                        .child(
-                            div()
-                                .text_size(px(tokens::UI_SM))
-                                .text_color(muted)
-                                .child("21 languages \u{00b7} Flutter & iOS Simulator \u{00b7} Multi-Harness AI Agent"),
+                            v_flex()
+                                .w_full()
+                                .gap(px(tokens::SPACE_4))
+                                .p(px(tokens::SPACE_5))
+                                .child(
+                                    div()
+                                        .text_size(px(tokens::UI_SM))
+                                        .line_height(px(19.))
+                                        .text_color(muted)
+                                        .child(
+                                            "A fast, keyboard-first code editor built for Flutter and Dart, \
+                                             with an embedded simulator, a Git workflow, and a live \
+                                             multi-harness AI agent.",
+                                        ),
+                                )
+                                .child(
+                                    h_flex()
+                                        .w_full()
+                                        .gap(px(tokens::SPACE_4))
+                                        .p(px(tokens::SPACE_3))
+                                        .rounded(px(tokens::RADIUS_SM))
+                                        .bg(subtle.opacity(0.6))
+                                        .border_1()
+                                        .border_color(border.opacity(0.6))
+                                        .child(stat("Languages", "21"))
+                                        .child(stat("Harnesses", "3"))
+                                        .child(stat("Engine", "GPUI")),
+                                )
+                                .child(
+                                    h_flex()
+                                        .w_full()
+                                        .justify_end()
+                                        .gap(px(tokens::SPACE_2))
+                                        .child(
+                                            Button::new("about-close")
+                                                .small()
+                                                .label("Close")
+                                                .on_click(cx.listener(
+                                                    |this, _e, _w, cx| {
+                                                        this.about_open = false;
+                                                        cx.notify();
+                                                    },
+                                                )),
+                                        ),
+                                ),
                         ),
                 ),
         )
