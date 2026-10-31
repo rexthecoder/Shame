@@ -52,9 +52,9 @@ impl DartIde {
         Some(
             h_flex()
                 .w_full()
-                .h(px(32.))
+                .h(px(36.))
                 .px(px(tokens::SPACE_4))
-                .gap(px(tokens::SPACE_3))
+                .gap(px(tokens::SPACE_2))
                 .items_center()
                 .justify_between()
                 .bg(cx.theme().tab_bar)
@@ -82,30 +82,105 @@ impl DartIde {
                 .child(
                     h_flex()
                         .flex_1()
-                        .max_w(px(320.))
-                        .h(px(22.))
-                        .px(px(tokens::SPACE_3))
-                        .gap(px(tokens::SPACE_2))
                         .items_center()
-                        .rounded(px(tokens::RADIUS_SM))
-                        .bg(cx.theme().background)
-                        .border_1()
-                        .border_color(cx.theme().border)
+                        .gap(px(tokens::SPACE_2))
+                        // Find input
                         .child(
-                            Icon::new(gpui_kit::assets::IconName::Search)
-                                .with_size(px(12.))
-                                .text_color(muted),
-                        )
-                        .child(
-                            div()
-                                .flex_1()
-                                .min_w(px(0.))
+                            h_flex()
+                                .w(px(220.))
+                                .h(px(24.))
+                                .px(px(tokens::SPACE_3))
+                                .gap(px(tokens::SPACE_2))
+                                .items_center()
+                                .rounded(px(tokens::RADIUS_SM))
+                                .bg(cx.theme().background)
+                                .border_1()
+                                .border_color(cx.theme().border)
                                 .child(
-                                    Input::new(&self.find_input)
-                                        .appearance(false)
-                                        .xsmall(),
+                                    Icon::new(gpui_kit::assets::IconName::Search)
+                                        .with_size(px(12.))
+                                        .text_color(muted),
+                                )
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .min_w(px(0.))
+                                        .child(
+                                            Input::new(&self.find_input)
+                                                .appearance(false)
+                                                .xsmall(),
+                                        ),
                                 ),
-                        ),
+                        )
+                        // Replace input
+                        .child(
+                            h_flex()
+                                .w(px(200.))
+                                .h(px(24.))
+                                .px(px(tokens::SPACE_3))
+                                .gap(px(tokens::SPACE_2))
+                                .items_center()
+                                .rounded(px(tokens::RADIUS_SM))
+                                .bg(cx.theme().background)
+                                .border_1()
+                                .border_color(cx.theme().border)
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .min_w(px(0.))
+                                        .child(
+                                            Input::new(&self.replace_input)
+                                                .appearance(false)
+                                                .xsmall(),
+                                        ),
+                                ),
+                        )
+                        // Replace Next button
+                        .child({
+                            let editor = editor.clone();
+                            let view = view.clone();
+                            h_flex()
+                                .id("find-replace-next")
+                                .h(px(24.))
+                                .px(px(8.))
+                                .items_center()
+                                .rounded(px(tokens::RADIUS_SM))
+                                .bg(cx.theme().secondary)
+                                .border_1()
+                                .border_color(cx.theme().border)
+                                .cursor_pointer()
+                                .hover(move |s| s.bg(rgba(0xffffff0c)).text_color(fg))
+                                .text_size(px(tokens::UI_XS))
+                                .text_color(fg)
+                                .child("Replace")
+                                .on_click(move |_e, _w, cx| {
+                                    let repl = view.read(cx).replace_input.read(cx).value().to_string();
+                                    editor.update(cx, |ed, cx| ed.replace_next(&repl, cx));
+                                })
+                        })
+                        // Replace All button
+                        .child({
+                            let editor = editor.clone();
+                            let view = view.clone();
+                            h_flex()
+                                .id("find-replace-all")
+                                .h(px(24.))
+                                .px(px(8.))
+                                .items_center()
+                                .rounded(px(tokens::RADIUS_SM))
+                                .bg(cx.theme().secondary)
+                                .border_1()
+                                .border_color(cx.theme().border)
+                                .cursor_pointer()
+                                .hover(move |s| s.bg(rgba(0xffffff0c)).text_color(fg))
+                                .text_size(px(tokens::UI_XS))
+                                .text_color(fg)
+                                .child("Replace All")
+                                .on_click(move |_e, _w, cx| {
+                                    let repl = view.read(cx).replace_input.read(cx).value().to_string();
+                                    editor.update(cx, |ed, cx| ed.replace_all(&repl, cx));
+                                })
+                        }),
                 )
                 .child(
                     h_flex()

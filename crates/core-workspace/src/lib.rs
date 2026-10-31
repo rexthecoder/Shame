@@ -25,7 +25,8 @@ pub use diff::{
     intraline, parse_unified, revert_hunk, stage_hunk, unstage_hunk,
 };
 pub use git::{
-    LineChange, ahead_behind, current_branch, has_uncommitted_changes, line_changes, status_map,
+    LineChange, ahead_behind, current_branch, has_uncommitted_changes, line_blame, line_changes,
+    status_map,
 };
 pub use message::{apply_commit_type, commit_type_of, commit_types, suggest_message};
 pub use repo::{

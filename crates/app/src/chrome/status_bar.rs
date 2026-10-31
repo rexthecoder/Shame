@@ -33,7 +33,21 @@ impl DartIde {
         let fg = cx.theme().foreground;
         let view = cx.entity();
 
-        let mut breadcrumb = h_flex().items_center().gap(px(tokens::SPACE_2));
+        let view_bc = view.clone();
+        let mut breadcrumb = h_flex()
+            .id("status-breadcrumb")
+            .px_1p5()
+            .py_0p5()
+            .rounded(px(tokens::RADIUS_SM))
+            .items_center()
+            .gap(px(tokens::SPACE_2))
+            .cursor_pointer()
+            .hover(move |s| s.bg(rgba(0xffffff10)).text_color(fg))
+            .on_click(move |_e, window, cx| {
+                view_bc.update(cx, |this, cx| {
+                    this.open_symbol_outline(window, cx);
+                });
+            });
         for (ix, seg) in segments.iter().enumerate() {
             if ix > 0 {
                 breadcrumb = breadcrumb.child(

@@ -127,6 +127,7 @@ pub struct EditorView {
     synced_revision: u64,
     indent_width: usize,
     line_changes: std::collections::HashMap<u32, LineChange>,
+    line_blame: std::collections::HashMap<u32, String>,
     /// Language server state for this buffer, spawned via `language.lsp_command(...)`.
     lsp: Option<LspState>,
     /// `(line, column)` the mouse is currently hovering, for debouncing
@@ -199,6 +200,7 @@ impl EditorView {
             synced_revision,
             indent_width,
             line_changes: std::collections::HashMap::new(),
+            line_blame: std::collections::HashMap::new(),
             lsp: None,
             hover_point: None,
             hover_sequence: 0,
@@ -225,17 +227,23 @@ impl EditorView {
     fn refresh_line_changes(&mut self, cx: &mut Context<Self>) {
         let Some(path) = self.buffer.path().map(Path::to_path_buf) else {
             self.line_changes.clear();
+            self.line_blame.clear();
             return;
         };
         let (tx, rx) = async_channel::bounded(1);
         std::thread::spawn(move || {
-            let _ = tx.send_blocking(core_workspace::line_changes(&path));
+            let changes = core_workspace::line_changes(&path);
+            let blame = core_workspace::line_blame(&path);
+            let _ = tx.send_blocking((changes, blame));
         });
         cx.spawn(async move |weak, cx| {
-            let Ok(changes) = rx.recv().await else { return };
+            let Ok((changes, blame)) = rx.recv().await else {
+                return;
+            };
             let _ = weak.update(cx, |this, cx| {
-                if this.line_changes != changes {
+                if this.line_changes != changes || this.line_blame != blame {
                     this.line_changes = changes;
+                    this.line_blame = blame;
                     cx.notify();
                 }
             });
@@ -543,6 +551,140 @@ impl EditorView {
         self.scroll_handle
             .scroll_to_item(line, ScrollStrategy::Center);
         cx.notify();
+    }
+
+    pub fn replace_next(&mut self, replacement: &str, cx: &mut Context<Self>) {
+        if self.search_matches.is_empty() {
+            return;
+        }
+        let ix = self
+            .active_search_match
+            .min(self.search_matches.len().saturating_sub(1));
+        let range = self.search_matches[ix].clone();
+        self.buffer.edit(range.clone(), replacement);
+        self.sync_buffer_state();
+        if !self.search_matches.is_empty() {
+            self.active_search_match = ix.min(self.search_matches.len() - 1);
+            let next_target = self.search_matches[self.active_search_match].clone();
+            self.buffer
+                .selections_mut()
+                .set_primary(Selection::cursor(next_target.start));
+            let line = self.buffer.byte_to_line(next_target.start);
+            self.scroll_handle
+                .scroll_to_item(line, ScrollStrategy::Center);
+        }
+        cx.notify();
+    }
+
+    pub fn replace_all(&mut self, replacement: &str, cx: &mut Context<Self>) {
+        if self.search_matches.is_empty() {
+            return;
+        }
+        let ranges: Vec<Range<usize>> = self.search_matches.iter().rev().cloned().collect();
+        for range in ranges {
+            self.buffer.edit(range, replacement);
+        }
+        self.sync_buffer_state();
+        cx.notify();
+    }
+
+    /// Extract document symbols `(symbol_name, kind_badge, 0_indexed_line)` from the buffer
+    /// for the Go to Symbol in File (`⌘⇧O` / `@`) overlay.
+    pub fn document_symbols(&self) -> Vec<(String, &'static str, u32)> {
+        let text = if !self.synced_text.is_empty() {
+            std::borrow::Cow::Borrowed(self.synced_text.as_str())
+        } else {
+            std::borrow::Cow::Owned(self.buffer.text())
+        };
+        let mut out = Vec::new();
+        const PREFIXES: &[(&str, &str)] = &[
+            ("class ", "class"),
+            ("abstract class ", "class"),
+            ("sealed class ", "class"),
+            ("mixin ", "mixin"),
+            ("extension ", "ext"),
+            ("enum ", "enum"),
+            ("typedef ", "type"),
+            ("pub struct ", "struct"),
+            ("struct ", "struct"),
+            ("pub enum ", "enum"),
+            ("pub trait ", "trait"),
+            ("trait ", "trait"),
+            ("impl ", "impl"),
+            ("pub fn ", "fn"),
+            ("pub(crate) fn ", "fn"),
+            ("pub async fn ", "fn"),
+            ("async fn ", "fn"),
+            ("fn ", "fn"),
+            ("func ", "func"),
+            ("def ", "def"),
+            ("async def ", "def"),
+            ("export interface ", "iface"),
+            ("interface ", "iface"),
+            ("export type ", "type"),
+            ("export function ", "fn"),
+            ("export async function ", "fn"),
+            ("function ", "fn"),
+            ("export class ", "class"),
+        ];
+
+        for (line_ix, raw_line) in text.lines().enumerate() {
+            let trimmed = raw_line.trim_start();
+            if trimmed.is_empty() || trimmed.starts_with("//") || trimmed.starts_with('#') {
+                continue;
+            }
+            let mut matched = false;
+            for (prefix, kind) in PREFIXES {
+                if let Some(rest) = trimmed.strip_prefix(prefix) {
+                    let sym: String = rest
+                        .trim_start()
+                        .chars()
+                        .take_while(|c| {
+                            c.is_alphanumeric() || *c == '_' || *c == '<' || *c == '>' || *c == ' '
+                        })
+                        .collect();
+                    let sym = sym
+                        .split_whitespace()
+                        .next()
+                        .unwrap_or("")
+                        .trim_matches(|c: char| !c.is_alphanumeric() && c != '_');
+                    if !sym.is_empty() {
+                        out.push((sym.to_string(), *kind, line_ix as u32));
+                        matched = true;
+                        break;
+                    }
+                }
+            }
+            if matched {
+                continue;
+            }
+            // Dart / C-family method signature heuristic (`Widget build(`, `Future<void> load(`, `void main(`)
+            if let Some(open_paren) = trimmed.find('(')
+                && (trimmed.ends_with('{') || trimmed.ends_with(") =>") || trimmed.contains(") async"))
+                && !trimmed.starts_with("if ")
+                && !trimmed.starts_with("for ")
+                && !trimmed.starts_with("while ")
+                && !trimmed.starts_with("switch ")
+                && !trimmed.starts_with("return ")
+            {
+                let before_paren = trimmed[..open_paren].trim();
+                let mut words = before_paren.split_whitespace().rev();
+                if let Some(name_tok) = words.next()
+                    && words.next().is_some()
+                {
+                    let clean = name_tok.trim_matches(|c: char| !c.is_alphanumeric() && c != '_');
+                    if !clean.is_empty()
+                        && clean
+                            .bytes()
+                            .next()
+                            .is_some_and(|b| b.is_ascii_lowercase() || b == b'_')
+                    {
+                        out.push((clean.to_string(), "method", line_ix as u32));
+                    }
+                }
+            }
+        }
+        out
     }
 
     fn recompute_search_matches(&mut self) {
@@ -1688,11 +1830,18 @@ impl EditorView {
             .flatten();
         let closing_label_shared: Option<SharedString> = if let Some(n) = folded_count {
             Some(SharedString::from(format!("\u{22ef} {n} lines folded }}}}")) )
+        } else if let Some(lbl) = self
+            .closing_labels
+            .get(&index)
+            .filter(|_| !display_text.contains("//"))
+        {
+            Some(SharedString::from(lbl.clone()))
+        } else if is_active_line && !display_text.trim().is_empty() {
+            self.line_blame
+                .get(&(index as u32))
+                .map(|b| SharedString::from(b.clone()))
         } else {
-            self.closing_labels
-                .get(&index)
-                .filter(|_| !display_text.contains("//"))
-                .map(|s| SharedString::from(s.clone()))
+            None
         };
         let closing_font = {
             let mut f = font(mono_family.clone());

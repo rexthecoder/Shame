@@ -80,6 +80,80 @@ pub fn line_changes(file: &Path) -> HashMap<u32, LineChange> {
     changes
 }
 
+/// Per-line `git blame` summary for `file` keyed by 0-indexed line number:
+/// e.g. `"Busha · Add split editor panes (a1b2c3d)"`.
+pub fn line_blame(file: &Path) -> HashMap<u32, String> {
+    let mut blame = HashMap::new();
+    let Some(dir) = file.parent() else {
+        return blame;
+    };
+    let Ok(output) = Command::new("git")
+        .args(["blame", "--porcelain", "--"])
+        .arg(file)
+        .current_dir(dir)
+        .output()
+    else {
+        return blame;
+    };
+    if !output.status.success() {
+        return blame;
+    }
+
+    let text = String::from_utf8_lossy(&output.stdout);
+    let mut cur_sha = String::new();
+    let mut authors: HashMap<String, String> = HashMap::new();
+    let mut summaries: HashMap<String, String> = HashMap::new();
+    let mut spans: Vec<(u32, u32, String)> = Vec::new();
+
+    for raw in text.lines() {
+        if raw.starts_with('\t') {
+            continue;
+        }
+        let mut parts = raw.split_whitespace();
+        if let (Some(first), Some(_orig), Some(final_l)) =
+            (parts.next(), parts.next(), parts.next())
+            && first.len() == 40
+            && first.bytes().all(|b| b.is_ascii_hexdigit())
+            && let Ok(fl) = final_l.parse::<u32>()
+        {
+            cur_sha = first.to_string();
+            let count = parts.next().and_then(|c| c.parse().ok()).unwrap_or(1);
+            spans.push((fl, count, cur_sha.clone()));
+            continue;
+        }
+        if let Some(author) = raw.strip_prefix("author ") {
+            if !cur_sha.is_empty() {
+                authors.insert(cur_sha.clone(), author.trim().to_string());
+            }
+        } else if let Some(summary) = raw.strip_prefix("summary ") {
+            if !cur_sha.is_empty() {
+                summaries.insert(cur_sha.clone(), summary.trim().to_string());
+            }
+        }
+    }
+
+    for (start_1, count, sha) in spans {
+        if sha.starts_with("00000000") {
+            continue;
+        }
+        let author = authors.get(&sha).map(String::as_str).unwrap_or("Unknown");
+        let summary = summaries.get(&sha).map(String::as_str).unwrap_or("");
+        let short_sha = &sha[..7.min(sha.len())];
+        let label = if summary.is_empty() {
+            format!("  \u{2014} {author} ({short_sha})")
+        } else {
+            format!("  \u{2014} {author} \u{00b7} {summary} ({short_sha})")
+        };
+        for l1 in start_1..(start_1 + count) {
+            if l1 > 0 {
+                blame.insert(l1 - 1, label.clone());
+            }
+        }
+    }
+
+    blame
+}
+
 /// Parses a unified-diff hunk header's body (the text after `"@@ "`, up
 /// to and including the closing `"@@"` — any trailing function context
 /// is ignored) into `(old_line_count, new_start_line, new_line_count)`.

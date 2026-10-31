@@ -291,6 +291,7 @@ const IDE_COMMANDS: &[IdeCommand] = &[
     IdeCommand { id: "toggle-web-preview", title: "View: Toggle Web Preview Rail", shortcut: "", flutter_only: false },
     IdeCommand { id: "toggle-agent", title: "View: Toggle Agent Rail", shortcut: "", flutter_only: false },
     IdeCommand { id: "format-doc", title: "Editor: Format Document", shortcut: "\u{21e7}\u{2318}F", flutter_only: false },
+    IdeCommand { id: "goto-symbol", title: "Editor: Go to Symbol in File\u{2026}", shortcut: "\u{21e7}\u{2318}O", flutter_only: false },
     IdeCommand { id: "goto-line", title: "Editor: Go to Line\u{2026}", shortcut: "\u{2318}G", flutter_only: false },
     IdeCommand { id: "new-file", title: "File: New Scratch File", shortcut: "\u{2318}N", flutter_only: false },
     IdeCommand { id: "open-folder", title: "File: Open Folder\u{2026}", shortcut: "\u{2318}O", flutter_only: false },
@@ -467,6 +468,7 @@ pub struct DartIde {
     pub(crate) palette_selected: usize,
     pub(crate) find_open: bool,
     pub(crate) find_input: Entity<InputState>,
+    pub(crate) replace_input: Entity<InputState>,
     pub(crate) go_to_line_open: bool,
     pub(crate) go_to_line_input: Entity<InputState>,
     pub(crate) rename_target: Option<(Entity<EditorView>, u32, u32)>,
@@ -525,7 +527,9 @@ impl DartIde {
                 .placeholder("Go to file, or type > for commands\u{2026}")
         });
         let find_input =
-            cx.new(|cx| InputState::new(window, cx).placeholder("Find in file..."));
+            cx.new(|cx| InputState::new(window, cx).placeholder("Find in file\u{2026}"));
+        let replace_input =
+            cx.new(|cx| InputState::new(window, cx).placeholder("Replace with\u{2026}"));
         let go_to_line_input = cx.new(|cx| {
             InputState::new(window, cx).placeholder("Line[:Column] (e.g. 42 or 42:8)...")
         });
@@ -627,6 +631,7 @@ impl DartIde {
             palette_selected: 0,
             find_open: false,
             find_input,
+            replace_input,
             go_to_line_open: false,
             go_to_line_input,
             rename_target: None,
@@ -664,11 +669,14 @@ impl DartIde {
         };
 
         if this.has_workspace {
+            this.restore_session_state(window, cx);
             this.reload_launch_configs(cx);
             if this.is_flutter_or_dart_workspace() {
                 this.refresh_devices(cx);
             }
             this.refresh_git(cx);
+        } else {
+            this.restore_preferences_only(window, cx);
         }
         this.start_git_refresh_loop(cx);
         // The Commit button depends on whether the message box is empty.
@@ -799,6 +807,46 @@ impl DartIde {
             .starts_with('>')
     }
 
+    fn palette_is_symbol_mode(&self, cx: &Context<Self>) -> bool {
+        self.palette_input
+            .read(cx)
+            .value()
+            .trim_start()
+            .starts_with('@')
+    }
+
+    fn palette_symbol_matches(&self, cx: &Context<Self>) -> Vec<(String, &'static str, u32)> {
+        let Some(ed) = self.active_editor() else {
+            return Vec::new();
+        };
+        let raw = self.palette_input.read(cx).value().to_string();
+        let query = raw
+            .trim_start()
+            .strip_prefix('@')
+            .unwrap_or(&raw)
+            .trim()
+            .to_lowercase();
+        ed.read(cx)
+            .document_symbols()
+            .into_iter()
+            .filter(|(name, _, _)| query.is_empty() || contains_ascii_ci(name, &query))
+            .take(40)
+            .collect()
+    }
+
+    pub(crate) fn open_symbol_outline(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.active_editor().is_none() {
+            return;
+        }
+        self.palette_open = true;
+        self.palette_selected = 0;
+        self.palette_input.update(cx, |s, cx| {
+            s.set_value("@ ", window, cx);
+            s.focus(window, cx);
+        });
+        cx.notify();
+    }
+
     fn palette_command_matches(&self, cx: &Context<Self>) -> Vec<IdeCommand> {
         let raw = self.palette_input.read(cx).value().to_string();
         let query = raw
@@ -832,6 +880,21 @@ impl DartIde {
     }
 
     fn open_palette_selection(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.palette_is_symbol_mode(cx) {
+            let syms = self.palette_symbol_matches(cx);
+            if let Some((_, _, line_0)) = syms.get(self.palette_selected).cloned() {
+                self.palette_open = false;
+                if let Some(ed) = self.active_editor().cloned() {
+                    ed.update(cx, |editor, cx| {
+                        editor.set_cursor_to_position(line_0, 0, cx);
+                    });
+                    let fh = ed.read(cx).focus_handle(cx);
+                    window.focus(&fh, cx);
+                }
+                cx.notify();
+            }
+            return;
+        }
         if self.palette_is_command_mode(cx) {
             let cmds = self.palette_command_matches(cx);
             if let Some(cmd) = cmds.get(self.palette_selected).copied() {
@@ -959,6 +1022,7 @@ impl DartIde {
                     });
                 }
             }
+            "goto-symbol" => self.open_symbol_outline(window, cx),
             "goto-line" => self.open_go_to_line(window, cx),
             "new-file" => self.new_scratch_tab(window, cx),
             "open-folder" => self.open_folder(window, cx),
@@ -1322,6 +1386,11 @@ impl DartIde {
             return;
         }
 
+        if primary_mod && keystroke.modifiers.shift && keystroke.key.as_str() == "o" {
+            self.open_symbol_outline(window, cx);
+            return;
+        }
+
         if primary_mod && keystroke.key.as_str() == "o" {
             self.open_folder(window, cx);
             return;
@@ -1446,7 +1515,9 @@ impl DartIde {
                     cx.notify();
                 }
                 "down" => {
-                    let count = if self.palette_is_command_mode(cx) {
+                    let count = if self.palette_is_symbol_mode(cx) {
+                        self.palette_symbol_matches(cx).len()
+                    } else if self.palette_is_command_mode(cx) {
                         self.palette_command_matches(cx).len()
                     } else {
                         self.palette_matches(cx).len()
@@ -1471,25 +1542,115 @@ impl DartIde {
             return None;
         }
 
-        let is_cmd_mode = self.palette_is_command_mode(cx);
+        let is_sym_mode = self.palette_is_symbol_mode(cx);
+        let is_cmd_mode = !is_sym_mode && self.palette_is_command_mode(cx);
+        let sym_matches = if is_sym_mode {
+            self.palette_symbol_matches(cx)
+        } else {
+            Vec::new()
+        };
         let cmd_matches = if is_cmd_mode {
             self.palette_command_matches(cx)
         } else {
             Vec::new()
         };
-        let matches = if is_cmd_mode {
+        let matches = if is_sym_mode || is_cmd_mode {
             Vec::new()
         } else {
             self.palette_matches(cx)
         };
-        let total_items = if is_cmd_mode {
+        let total_items = if is_sym_mode {
+            sym_matches.len()
+        } else if is_cmd_mode {
             cmd_matches.len()
         } else {
             matches.len()
         };
         let selected = self.palette_selected.min(total_items.saturating_sub(1));
 
-        let rows: Vec<AnyElement> = if is_cmd_mode {
+        let rows: Vec<AnyElement> = if is_sym_mode {
+            sym_matches
+                .into_iter()
+                .enumerate()
+                .map(|(ix, (sym_name, kind_lbl, line_0))| {
+                    let is_selected = ix == selected;
+                    let view = view.clone();
+                    h_flex()
+                        .id(("palette-sym", ix))
+                        .relative()
+                        .w_full()
+                        .h(px(34.))
+                        .items_center()
+                        .justify_between()
+                        .px(px(14.))
+                        .rounded(px(tokens::RADIUS_SM))
+                        .border_1()
+                        .border_color(gpui_kit::transparent_black())
+                        .cursor_pointer()
+                        .when(is_selected, |el| {
+                            el.bg(rgba(0xea7a3c16))
+                                .border_color(rgba(0xea7a3c36))
+                                .child(
+                                    div()
+                                        .absolute()
+                                        .left(px(2.))
+                                        .top(px(6.))
+                                        .bottom(px(6.))
+                                        .w(px(2.5))
+                                        .rounded(px(2.))
+                                        .bg(cx.theme().primary),
+                                )
+                        })
+                        .when(!is_selected, |el| el.hover(|s| s.bg(rgba(0xffffff08))))
+                        .child(
+                            h_flex()
+                                .items_center()
+                                .gap_2()
+                                .min_w(px(0.))
+                                .child(
+                                    div()
+                                        .px_1p5()
+                                        .py_0p5()
+                                        .rounded(px(4.))
+                                        .bg(cx.theme().info.opacity(0.16))
+                                        .font_family("SF Mono")
+                                        .text_size(px(10.))
+                                        .text_color(cx.theme().info)
+                                        .child(kind_lbl),
+                                )
+                                .child(
+                                    div()
+                                        .truncate()
+                                        .font_family("SF Mono")
+                                        .text_size(px(tokens::UI))
+                                        .text_color(cx.theme().foreground)
+                                        .child(sym_name),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .font_family("SF Mono")
+                                .text_size(px(tokens::UI_XS))
+                                .text_color(cx.theme().muted_foreground)
+                                .child(format!(":{}", line_0 + 1)),
+                        )
+                        .on_click(move |_event, window, cx| {
+                            view.update(cx, |this, cx| {
+                                this.palette_open = false;
+                                if let Some(ed) = this.active_editor().cloned() {
+                                    ed.update(cx, |editor, cx| {
+                                        editor.set_cursor_to_position(line_0, 0, cx);
+                                    });
+                                    let fh = ed.read(cx).focus_handle(cx);
+                                    window.focus(&fh, cx);
+                                }
+                                cx.notify();
+                            });
+                        })
+                        .into_any_element()
+                })
+                .collect()
+        } else if is_cmd_mode {
             cmd_matches
                 .into_iter()
                 .enumerate()
@@ -1965,6 +2126,7 @@ impl DartIde {
             let focus_handle = editor.read(cx).focus_handle(cx);
             window.focus(&focus_handle, cx);
         }
+        self.save_session_state();
         cx.notify();
     }
 
@@ -1988,6 +2150,7 @@ impl DartIde {
             let focus_handle = editor.read(cx).focus_handle(cx);
             window.focus(&focus_handle, cx);
         }
+        self.save_session_state();
         cx.notify();
     }
 
@@ -2162,7 +2325,147 @@ impl DartIde {
     }
 
     fn notify_tab_change(&mut self, cx: &mut Context<Self>) {
+        self.save_session_state();
         cx.notify();
+    }
+
+    pub(crate) fn save_session_state(&self) {
+        let Ok(home) = std::env::var("HOME") else {
+            return;
+        };
+        let path = Path::new(&home).join(".config/shame/session.json");
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let open_tabs: Vec<String> = self
+            .tabs
+            .iter()
+            .filter_map(|t| t.path.as_ref())
+            .map(|p| p.to_string_lossy().to_string())
+            .collect();
+        let harness_str = match self.agent.harness {
+            rails::agent::AgentHarness::ClaudeCode => "claude",
+            rails::agent::AgentHarness::OpenCode => "opencode",
+            rails::agent::AgentHarness::Codex => "codex",
+        };
+        let val = serde_json::json!({
+            "workspace": self.has_workspace.then(|| self.root.to_string_lossy().to_string()),
+            "open_tabs": open_tabs,
+            "active_tab": self.active_tab,
+            "split_tab": self.split_tab,
+            "sidebar_open": self.sidebar_open,
+            "terminal_open": self.terminal_open,
+            "agent_open": self.agent_open,
+            "show_hidden": self.show_hidden,
+            "light_theme": self.light_theme,
+            "unified_diff": self.git.unified_diff,
+            "agent_harness": harness_str,
+            "agent_mode_ix": self.agent.mode_ix,
+        });
+        if let Ok(json) = serde_json::to_vec_pretty(&val) {
+            let _ = std::fs::write(path, json);
+        }
+    }
+
+    pub(crate) fn restore_preferences_only(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Ok(home) = std::env::var("HOME") else {
+            return;
+        };
+        let path = Path::new(&home).join(".config/shame/session.json");
+        let Ok(bytes) = std::fs::read(path) else {
+            return;
+        };
+        let Ok(val) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+            return;
+        };
+        self.apply_saved_preferences(&val, window, cx);
+    }
+
+    fn apply_saved_preferences(
+        &mut self,
+        val: &serde_json::Value,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(sh) = val.get("show_hidden").and_then(|v| v.as_bool()) {
+            self.show_hidden = sh;
+        }
+        if let Some(ud) = val.get("unified_diff").and_then(|v| v.as_bool()) {
+            self.git.unified_diff = ud;
+        }
+        if let Some(mode_ix) = val.get("agent_mode_ix").and_then(|v| v.as_u64()) {
+            self.agent.mode_ix = (mode_ix as usize) % 3;
+        }
+        if let Some(h) = val.get("agent_harness").and_then(|v| v.as_str()) {
+            let tool = match h {
+                "opencode" => rails::agent::AgentHarness::OpenCode,
+                "codex" => rails::agent::AgentHarness::Codex,
+                _ => rails::agent::AgentHarness::ClaudeCode,
+            };
+            self.agent.set_harness(tool);
+        }
+        if let Some(lt) = val.get("light_theme").and_then(|v| v.as_bool()) {
+            self.light_theme = lt;
+            if lt {
+                gpui_kit::component::Theme::change(
+                    gpui_kit::component::ThemeMode::Light,
+                    Some(window),
+                    cx,
+                );
+            }
+        }
+    }
+
+    pub(crate) fn restore_session_state(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Ok(home) = std::env::var("HOME") else {
+            return;
+        };
+        let path = Path::new(&home).join(".config/shame/session.json");
+        let Ok(bytes) = std::fs::read(path) else {
+            return;
+        };
+        let Ok(val) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+            return;
+        };
+        self.apply_saved_preferences(&val, window, cx);
+
+        let saved_ws = val
+            .get("workspace")
+            .and_then(|v| v.as_str())
+            .map(PathBuf::from);
+        if saved_ws.as_ref() != Some(&self.root) {
+            return;
+        }
+        if let Some(sb) = val.get("sidebar_open").and_then(|v| v.as_bool()) {
+            self.sidebar_open = sb;
+        }
+        if let Some(tb) = val.get("terminal_open").and_then(|v| v.as_bool()) {
+            self.terminal_open = tb;
+        }
+        if let Some(ab) = val.get("agent_open").and_then(|v| v.as_bool()) {
+            self.agent_open = ab;
+        }
+        if let Some(arr) = val.get("open_tabs").and_then(|v| v.as_array()) {
+            for item in arr.iter().take(12) {
+                if let Some(p_str) = item.as_str() {
+                    let p = PathBuf::from(p_str);
+                    if p.is_file() {
+                        self.open_path_with_mode(p, false, window, cx);
+                    }
+                }
+            }
+        }
+        if let Some(act) = val.get("active_tab").and_then(|v| v.as_u64())
+            && !self.tabs.is_empty()
+        {
+            self.active_tab = (act as usize).min(self.tabs.len() - 1);
+        }
+        if let Some(sp) = val.get("split_tab").and_then(|v| v.as_u64()) {
+            let sp_ix = sp as usize;
+            if sp_ix < self.tabs.len() {
+                self.split_tab = Some(sp_ix);
+            }
+        }
     }
 
     /// Push a plain or ANSI-styled line into the Debug Console (flutter run / pub / test output).
@@ -4524,6 +4827,7 @@ impl DartIde {
                     move |_e, _w, cx| {
                         view.update(cx, |this, cx| {
                             this.settings_open = false;
+                            this.save_session_state();
                             cx.notify();
                         });
                     }
