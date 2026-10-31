@@ -1124,41 +1124,43 @@ impl Render for DartIde {
             .child(self.render_shell(&view, window, cx))
             .child(self.render_status_bar(cx))
             .when_some(self.render_branch_switcher_modal(&view, cx), |el, modal| {
-                el.child(modal)
+                el.child(deferred(modal).with_priority(100))
             })
             .when_some(self.render_settings_modal(&view, cx), |el, modal| {
-                el.child(modal)
+                el.child(deferred(modal).with_priority(100))
             })
             .when_some(self.render_about_modal(&view, cx), |el, modal| {
-                el.child(modal)
+                el.child(deferred(modal).with_priority(100))
             })
             .when_some(self.render_launch_picker_popover(&view, cx), |el, pop| {
-                el.child(pop)
+                el.child(deferred(pop).with_priority(100))
             })
             .when_some(self.render_device_picker_popover(&view, cx), |el, pop| {
-                el.child(pop)
+                el.child(deferred(pop).with_priority(100))
             })
-            .when_some(self.render_palette(&view, cx), |el, palette| el.child(palette))
+            .when_some(self.render_palette(&view, cx), |el, palette| {
+                el.child(deferred(palette).with_priority(100))
+            })
             .when_some(self.render_go_to_line_prompt(&view, cx), |el, prompt| {
-                el.child(prompt)
+                el.child(deferred(prompt).with_priority(100))
             })
             .when_some(self.render_add_package_prompt(&view, cx), |el, prompt| {
-                el.child(prompt)
+                el.child(deferred(prompt).with_priority(100))
             })
             .when_some(self.render_rename_prompt(&view, cx), |el, prompt| {
-                el.child(prompt)
+                el.child(deferred(prompt).with_priority(100))
             })
             .when_some(self.render_code_actions(&view, cx), |el, picker| {
-                el.child(picker)
+                el.child(deferred(picker).with_priority(100))
             })
             .when_some(self.render_references(&view, cx), |el, picker| {
-                el.child(picker)
+                el.child(deferred(picker).with_priority(100))
             })
             .when_some(self.render_local_history(&view, cx), |el, picker| {
-                el.child(picker)
+                el.child(deferred(picker).with_priority(100))
             })
             .when_some(self.render_debug_prompt(&view, cx), |el, picker| {
-                el.child(picker)
+                el.child(deferred(picker).with_priority(100))
             })
     }
 }
