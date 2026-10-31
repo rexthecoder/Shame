@@ -590,8 +590,8 @@ impl DartIde {
                 .child(
                     v_flex()
                         .id("branch-switcher-card")
-                        .w(px(480.))
-                        .max_h(px(400.))
+                        .w(px(580.))
+                        .max_h(px(440.))
                         .bg(cx.theme().popover)
                         .border_1()
                         .border_color(border)
@@ -641,28 +641,21 @@ impl DartIde {
                                 _ => {}
                             }
                         }))
-                        // Search / Create Input Header
+                        // Spacious Zed-style Input Header (48px tall, medium input text)
                         .child(
                             h_flex()
-                                .h(px(38.))
-                                .px_3()
-                                .gap_2()
+                                .h(px(48.))
+                                .px(px(16.))
+                                .gap(px(10.))
                                 .items_center()
                                 .border_b_1()
                                 .border_color(border)
-                                .child(
-                                    Icon::new(IconName::GitBranch)
-                                        .with_size(px(13.))
-                                        .text_color(green),
-                                )
                                 .child(
                                     div()
                                         .flex_1()
                                         .min_w(px(0.))
                                         .child(
-                                            Input::new(&self.git.branch_input)
-                                                .appearance(false)
-                                                .small(),
+                                            Input::new(&self.git.branch_input).appearance(false),
                                         ),
                                 ),
                         )
