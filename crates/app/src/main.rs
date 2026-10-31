@@ -75,6 +75,20 @@ fn hash_paths(paths: &[PathBuf]) -> u64 {
     h.finish()
 }
 
+/// Zero-allocation ASCII case-insensitive substring check (`needle_lower` must be lowercase).
+fn contains_ascii_ci(haystack: &str, needle_lower: &str) -> bool {
+    if needle_lower.is_empty() {
+        return true;
+    }
+    let h = haystack.as_bytes();
+    let n = needle_lower.as_bytes();
+    if h.len() < n.len() {
+        return false;
+    }
+    h.windows(n.len())
+        .any(|w| w.iter().zip(n).all(|(a, b)| a.to_ascii_lowercase() == *b))
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum FileTreeOp {
     NewFile,
@@ -102,31 +116,42 @@ pub(crate) struct IdeCommand {
     pub(crate) id: &'static str,
     pub(crate) title: &'static str,
     pub(crate) shortcut: &'static str,
+    pub(crate) flutter_only: bool,
 }
 
 const IDE_COMMANDS: &[IdeCommand] = &[
-    IdeCommand { id: "run-flutter", title: "Flutter: Run App on Selected Device", shortcut: "" },
-    IdeCommand { id: "hot-reload", title: "Flutter: Hot Reload", shortcut: "\u{2318}S" },
-    IdeCommand { id: "hot-restart", title: "Flutter: Hot Restart", shortcut: "" },
-    IdeCommand { id: "pub-get", title: "Flutter: Run Pub Get", shortcut: "" },
-    IdeCommand { id: "add-package", title: "Flutter: Add Package (pub.dev)\u{2026}", shortcut: "" },
-    IdeCommand { id: "debug-dap", title: "Debug: Start Dart DAP Debugger", shortcut: "" },
-    IdeCommand { id: "toggle-sim", title: "Simulator: Attach / Detach iOS Simulator", shortcut: "" },
-    IdeCommand { id: "open-git", title: "Git: Open Git Panel", shortcut: "\u{2318}\u{21e7}G" },
-    IdeCommand { id: "git-stage-all", title: "Git: Stage All Changes", shortcut: "" },
-    IdeCommand { id: "git-unstage-all", title: "Git: Unstage All Changes", shortcut: "" },
-    IdeCommand { id: "git-stash", title: "Git: Stash Uncommitted Changes", shortcut: "" },
-    IdeCommand { id: "git-uncommit", title: "Git: Undo Last Commit (Keep Staged)", shortcut: "" },
-    IdeCommand { id: "diff-unified", title: "Diff: Toggle Split / Unified View", shortcut: "" },
-    IdeCommand { id: "project-search", title: "Search: Find in Project", shortcut: "\u{2318}\u{21e7}F" },
-    IdeCommand { id: "toggle-problems", title: "View: Toggle Problems Panel", shortcut: "\u{2318}\u{21e7}M" },
-    IdeCommand { id: "toggle-terminal", title: "View: Toggle Terminal Dock", shortcut: "\u{2318}J" },
-    IdeCommand { id: "toggle-sidebar", title: "View: Toggle Left Sidebar", shortcut: "\u{2318}B" },
-    IdeCommand { id: "toggle-agent", title: "View: Toggle Agent Rail", shortcut: "" },
-    IdeCommand { id: "format-doc", title: "Editor: Format Document", shortcut: "\u{21e7}\u{2318}F" },
-    IdeCommand { id: "goto-line", title: "Editor: Go to Line\u{2026}", shortcut: "\u{2318}G" },
-    IdeCommand { id: "new-file", title: "File: New Scratch File", shortcut: "\u{2318}N" },
-    IdeCommand { id: "open-folder", title: "File: Open Folder\u{2026}", shortcut: "\u{2318}O" },
+    IdeCommand { id: "run-flutter", title: "Flutter: Run App on Selected Device", shortcut: "", flutter_only: true },
+    IdeCommand { id: "hot-reload", title: "Flutter: Hot Reload", shortcut: "\u{2318}S", flutter_only: true },
+    IdeCommand { id: "hot-restart", title: "Flutter: Hot Restart", shortcut: "", flutter_only: true },
+    IdeCommand { id: "pub-get", title: "Flutter: Run Pub Get", shortcut: "", flutter_only: true },
+    IdeCommand { id: "pub-upgrade", title: "Flutter: Run Pub Upgrade", shortcut: "", flutter_only: true },
+    IdeCommand { id: "flutter-clean", title: "Flutter: Clean & Pub Get", shortcut: "", flutter_only: true },
+    IdeCommand { id: "build-runner", title: "Flutter: Run build_runner (Codegen)", shortcut: "", flutter_only: true },
+    IdeCommand { id: "build-runner-watch", title: "Flutter: Watch build_runner", shortcut: "", flutter_only: true },
+    IdeCommand { id: "gen-l10n", title: "Flutter: Generate Localizations (gen-l10n)", shortcut: "", flutter_only: true },
+    IdeCommand { id: "add-package", title: "Flutter: Add Package (pub.dev)\u{2026}", shortcut: "", flutter_only: true },
+    IdeCommand { id: "open-devtools", title: "Flutter: Open DevTools in Browser", shortcut: "", flutter_only: true },
+    IdeCommand { id: "toggle-perf-overlay", title: "Flutter: Toggle Performance Overlay", shortcut: "", flutter_only: true },
+    IdeCommand { id: "toggle-debug-paint", title: "Flutter: Toggle Debug Paint (Widget Bounds)", shortcut: "", flutter_only: true },
+    IdeCommand { id: "toggle-slow-animations", title: "Flutter: Toggle Slow Animations", shortcut: "", flutter_only: true },
+    IdeCommand { id: "flutter-doctor", title: "Flutter: Run Flutter Doctor", shortcut: "", flutter_only: true },
+    IdeCommand { id: "debug-dap", title: "Debug: Start Dart DAP Debugger", shortcut: "", flutter_only: true },
+    IdeCommand { id: "toggle-sim", title: "Simulator: Attach / Detach iOS Simulator", shortcut: "", flutter_only: true },
+    IdeCommand { id: "open-git", title: "Git: Open Git Panel", shortcut: "\u{2318}\u{21e7}G", flutter_only: false },
+    IdeCommand { id: "git-stage-all", title: "Git: Stage All Changes", shortcut: "", flutter_only: false },
+    IdeCommand { id: "git-unstage-all", title: "Git: Unstage All Changes", shortcut: "", flutter_only: false },
+    IdeCommand { id: "git-stash", title: "Git: Stash Uncommitted Changes", shortcut: "", flutter_only: false },
+    IdeCommand { id: "git-uncommit", title: "Git: Undo Last Commit (Keep Staged)", shortcut: "", flutter_only: false },
+    IdeCommand { id: "diff-unified", title: "Diff: Toggle Split / Unified View", shortcut: "", flutter_only: false },
+    IdeCommand { id: "project-search", title: "Search: Find in Project", shortcut: "\u{2318}\u{21e7}F", flutter_only: false },
+    IdeCommand { id: "toggle-problems", title: "View: Toggle Problems Panel", shortcut: "\u{2318}\u{21e7}M", flutter_only: false },
+    IdeCommand { id: "toggle-terminal", title: "View: Toggle Terminal Dock", shortcut: "\u{2318}J", flutter_only: false },
+    IdeCommand { id: "toggle-sidebar", title: "View: Toggle Left Sidebar", shortcut: "\u{2318}B", flutter_only: false },
+    IdeCommand { id: "toggle-agent", title: "View: Toggle Agent Rail", shortcut: "", flutter_only: false },
+    IdeCommand { id: "format-doc", title: "Editor: Format Document", shortcut: "\u{21e7}\u{2318}F", flutter_only: false },
+    IdeCommand { id: "goto-line", title: "Editor: Go to Line\u{2026}", shortcut: "\u{2318}G", flutter_only: false },
+    IdeCommand { id: "new-file", title: "File: New Scratch File", shortcut: "\u{2318}N", flutter_only: false },
+    IdeCommand { id: "open-folder", title: "File: Open Folder\u{2026}", shortcut: "\u{2318}O", flutter_only: false },
 ];
 
 #[derive(Clone)]
@@ -311,7 +336,11 @@ pub struct DartIde {
     pub(crate) launch_picker_open: bool,
     pub(crate) flutter_daemon: Option<std::sync::Arc<std::sync::Mutex<core_flutter::FlutterDaemon>>>,
     pub(crate) flutter_app_id: Option<String>,
+    pub(crate) flutter_ws_uri: Option<String>,
     pub(crate) flutter_status: Option<String>,
+    pub(crate) perf_overlay_on: bool,
+    pub(crate) debug_paint_on: bool,
+    pub(crate) slow_animations_on: bool,
     pub(crate) add_package_open: bool,
     pub(crate) add_package_input: Entity<InputState>,
     _subscriptions: Vec<Subscription>,
@@ -436,14 +465,20 @@ impl DartIde {
             launch_picker_open: false,
             flutter_daemon: None,
             flutter_app_id: None,
+            flutter_ws_uri: None,
             flutter_status: None,
+            perf_overlay_on: false,
+            debug_paint_on: false,
+            slow_animations_on: false,
             add_package_open: false,
             add_package_input,
             _subscriptions: Vec::new(),
         };
 
         this.reload_launch_configs(cx);
-        this.refresh_devices(cx);
+        if this.is_flutter_or_dart_workspace() {
+            this.refresh_devices(cx);
+        }
         this.start_git_refresh_loop(cx);
         this.refresh_git(cx);
         // The Commit button depends on whether the message box is empty.
@@ -548,6 +583,22 @@ impl DartIde {
         .detach();
     }
 
+    /// True when the open workspace is a Dart / Flutter project (`pubspec.yaml` at root,
+    /// `.vscode/launch.json` present, or an open `.dart` buffer).
+    /// Non-Dart/Flutter projects hide the Flutter target picker, Simulator button, and
+    /// Flutter-only palette commands.
+    pub(crate) fn is_flutter_or_dart_workspace(&self) -> bool {
+        self.root.join("pubspec.yaml").is_file()
+            || !self.launch_configs.is_empty()
+            || self.tabs.iter().any(|t| {
+                t.path
+                    .as_ref()
+                    .and_then(|p| p.extension())
+                    .and_then(|e| e.to_str())
+                    == Some("dart")
+            })
+    }
+
     fn palette_is_command_mode(&self, cx: &Context<Self>) -> bool {
         self.palette_input
             .read(cx)
@@ -564,9 +615,11 @@ impl DartIde {
             .unwrap_or(&raw)
             .trim()
             .to_lowercase();
+        let is_flutter = self.is_flutter_or_dart_workspace();
         IDE_COMMANDS
             .iter()
-            .filter(|cmd| query.is_empty() || cmd.title.to_lowercase().contains(&query))
+            .filter(|cmd| !cmd.flutter_only || is_flutter)
+            .filter(|cmd| query.is_empty() || contains_ascii_ci(cmd.title, &query))
             .copied()
             .collect()
     }
@@ -576,7 +629,10 @@ impl DartIde {
         self.all_files
             .iter()
             .filter(|path| {
-                query.is_empty() || path.to_string_lossy().to_lowercase().contains(&query)
+                query.is_empty()
+                    || path
+                        .to_str()
+                        .is_some_and(|s| contains_ascii_ci(s, &query))
             })
             .take(20)
             .cloned()
@@ -612,6 +668,61 @@ impl DartIde {
             "hot-reload" => self.trigger_hot_reload(cx),
             "hot-restart" => self.trigger_hot_restart(cx),
             "pub-get" => self.run_pub_get(cx),
+            "pub-upgrade" => {
+                self.terminal_open = true;
+                self.dock_tab = DockTab::Terminal;
+                self.execute_terminal_command("flutter pub upgrade".to_string(), cx);
+            }
+            "flutter-clean" => {
+                self.terminal_open = true;
+                self.dock_tab = DockTab::Terminal;
+                self.execute_terminal_command(
+                    "flutter clean && flutter pub get".to_string(),
+                    cx,
+                );
+            }
+            "build-runner" => {
+                self.terminal_open = true;
+                self.dock_tab = DockTab::Terminal;
+                self.execute_terminal_command(
+                    "dart run build_runner build --delete-conflicting-outputs".to_string(),
+                    cx,
+                );
+            }
+            "build-runner-watch" => {
+                self.terminal_open = true;
+                self.dock_tab = DockTab::Terminal;
+                self.execute_terminal_command(
+                    "dart run build_runner watch --delete-conflicting-outputs".to_string(),
+                    cx,
+                );
+            }
+            "gen-l10n" => {
+                self.terminal_open = true;
+                self.dock_tab = DockTab::Terminal;
+                self.execute_terminal_command("flutter gen-l10n".to_string(), cx);
+            }
+            "flutter-doctor" => {
+                self.terminal_open = true;
+                self.dock_tab = DockTab::Terminal;
+                self.execute_terminal_command("flutter doctor -v".to_string(), cx);
+            }
+            "open-devtools" => self.open_flutter_devtools(cx),
+            "toggle-perf-overlay" => self.toggle_flutter_vm_ext(
+                "ext.flutter.showPerformanceOverlay",
+                "Performance Overlay",
+                cx,
+            ),
+            "toggle-debug-paint" => self.toggle_flutter_vm_ext(
+                "ext.flutter.debugPaint",
+                "Debug Paint (Widget Bounds)",
+                cx,
+            ),
+            "toggle-slow-animations" => self.toggle_flutter_vm_ext(
+                "ext.flutter.timeDilation",
+                "Slow Animations",
+                cx,
+            ),
             "add-package" => self.open_add_package(window, cx),
             "debug-dap" => self.start_dap_debug(window, cx),
             "toggle-sim" => {
@@ -2236,6 +2347,11 @@ impl DartIde {
                     }
                     cx.notify();
                 }
+                "app.debugPort" => {
+                    if let Some(ws) = params.get("wsUri").and_then(|v| v.as_str()) {
+                        self.flutter_ws_uri = Some(ws.to_string());
+                    }
+                }
                 "app.started" => {
                     if let Some(app_id) = params.get("appId").and_then(|v| v.as_str()) {
                         self.flutter_app_id = Some(app_id.to_string());
@@ -2259,6 +2375,7 @@ impl DartIde {
                     self.sim.inspect = false;
                     self.sim.inspected = None;
                     self.flutter_app_id = None;
+                    self.flutter_ws_uri = None;
                     self.flutter_daemon = None;
                     self.flutter_status = None;
                     self.push_flutter_log("\x1b[90m\u{25a0} Flutter app stopped.\x1b[0m");
@@ -2330,10 +2447,67 @@ impl DartIde {
                 }
                 let _ = guard.kill();
             }
+            self.flutter_ws_uri = None;
             self.flutter_status = None;
             self.push_flutter_log("\x1b[90m\u{25a0} Stopped Flutter run session.\x1b[0m");
             cx.notify();
         }
+    }
+
+    pub(crate) fn open_flutter_devtools(&mut self, cx: &mut Context<Self>) {
+        self.terminal_open = true;
+        if let Some(ws) = &self.flutter_ws_uri {
+            let http = ws
+                .replacen("ws://", "http://", 1)
+                .replacen("wss://", "https://", 1);
+            let _ = std::process::Command::new("open").arg(&http).spawn();
+            self.dock_tab = DockTab::DebugConsole;
+            self.push_flutter_log(&format!(
+                "\x1b[36m\u{2713} Opened Flutter VM Service / DevTools at {http}\x1b[0m"
+            ));
+        } else {
+            self.dock_tab = DockTab::Terminal;
+            self.execute_terminal_command("dart devtools".to_string(), cx);
+        }
+        cx.notify();
+    }
+
+    pub(crate) fn toggle_flutter_vm_ext(
+        &mut self,
+        method: &str,
+        label: &str,
+        cx: &mut Context<Self>,
+    ) {
+        let (Some(daemon), Some(app_id)) = (self.flutter_daemon.clone(), self.flutter_app_id.clone())
+        else {
+            self.terminal_open = true;
+            self.dock_tab = DockTab::DebugConsole;
+            self.push_flutter_log(&format!(
+                "\x1b[33mStart a Flutter session first to toggle {label}.\x1b[0m"
+            ));
+            cx.notify();
+            return;
+        };
+        let params = match method {
+            "ext.flutter.showPerformanceOverlay" => {
+                self.perf_overlay_on = !self.perf_overlay_on;
+                serde_json::json!({ "enabled": if self.perf_overlay_on { "true" } else { "false" } })
+            }
+            "ext.flutter.debugPaint" => {
+                self.debug_paint_on = !self.debug_paint_on;
+                serde_json::json!({ "enabled": if self.debug_paint_on { "true" } else { "false" } })
+            }
+            "ext.flutter.timeDilation" => {
+                self.slow_animations_on = !self.slow_animations_on;
+                serde_json::json!({ "timeDilation": if self.slow_animations_on { "5.0" } else { "1.0" } })
+            }
+            _ => serde_json::json!({}),
+        };
+        if let Ok(guard) = daemon.lock() {
+            let _ = guard.call_service_extension(&app_id, method, params);
+            self.push_flutter_log(&format!("\x1b[36m\u{26a1} Toggled {label}\x1b[0m"));
+        }
+        cx.notify();
     }
 
     /// Apply cross-file `WorkspaceEdit` changes to an open tab or directly to disk.

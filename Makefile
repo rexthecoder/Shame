@@ -1,15 +1,27 @@
-# Dart/Flutter IDE — common tasks.
+# Dart/Flutter IDE — development & release tasks.
 #
-#   make run       foreground run (logs in this terminal)
-#   make restart   rebuild, stop the old window, relaunch in the background
-#   make test      whole workspace
-#   make check     clippy
+#   make run             foreground debug run (logs in this terminal)
+#   make restart         rebuild debug, stop old window, relaunch in background
+#   make test            run workspace test suite
+#   make check           clippy across workspace
+#   make icon            generate assets/icon.png + assets/icon.icns from assets/icon.svg
+#   make release-build   optimized LTO release binary (target/release/dart-ide)
+#   make bundle          package macOS app bundle (dist/Dart IDE.app) with icon.icns
+#   make dmg             create distributable macOS disk image (dist/Dart-IDE-0.1.0-macos.dmg)
+#   make release         full v0.1.0 release pipeline (test + release-build + bundle + dmg)
+#   make install         install dist/Dart IDE.app into /Applications
 
-CRATE := app
-BIN  := dart-ide
-LOG  := /tmp/dart-ide.log
+CRATE     := app
+BIN       := dart-ide
+APP_NAME  := Dart IDE
+BUNDLE_ID := dev.shame.dart-ide
+VERSION   := 0.1.0
+DIST_DIR  := dist
+APP_DIR   := $(DIST_DIR)/$(APP_NAME).app
+DMG_PATH  := $(DIST_DIR)/Dart-IDE-$(VERSION)-macos.dmg
+LOG       := /tmp/dart-ide.log
 
-.PHONY: build run restart stop test check fmt clean
+.PHONY: build run restart stop test check fmt clean icon release-build bundle dmg release install
 
 build:
 	cargo build -p $(CRATE)
@@ -40,3 +52,68 @@ fmt:
 
 clean:
 	cargo clean
+	rm -rf "$(DIST_DIR)"
+
+# Generate 1024x1024 PNG and multi-resolution macOS .icns from assets/icon.svg
+icon:
+	@swift -e 'import AppKit; let u = URL(fileURLWithPath: "assets/icon.svg"); let p = URL(fileURLWithPath: "assets/icon.png"); guard let img = NSImage(contentsOf: u) else { exit(1) }; let sz = NSSize(width: 1024, height: 1024); let rep = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: 1024, pixelsHigh: 1024, bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true, isPlanar: false, colorSpaceName: .deviceRGB, bytesPerRow: 0, bitsPerPixel: 0)!; rep.size = sz; NSGraphicsContext.saveGraphicsState(); NSGraphicsContext.current = NSGraphicsContext(bitmapImageRep: rep); img.draw(in: NSRect(origin: .zero, size: sz), from: .zero, operation: .copy, fraction: 1.0); NSGraphicsContext.restoreGraphicsState(); try! rep.representation(using: .png, properties: [:])!.write(to: p)'
+	@ICONSET_DIR=$$(mktemp -d)/AppIcon.iconset && mkdir -p "$$ICONSET_DIR" && \
+	for sz in 16 32 128 256 512; do \
+		sips -z $$sz $$sz assets/icon.png --out "$$ICONSET_DIR/icon_$${sz}x$${sz}.png" >/dev/null; \
+		sz2=$$((sz * 2)); \
+		sips -z $$sz2 $$sz2 assets/icon.png --out "$$ICONSET_DIR/icon_$${sz}x$${sz}@2x.png" >/dev/null; \
+	done && \
+	iconutil -c icns "$$ICONSET_DIR" -o assets/icon.icns && \
+	rm -rf "$$(dirname "$$ICONSET_DIR")"
+	@echo "✓ Generated assets/icon.png and assets/icon.icns"
+
+# Build stripped, LTO-optimized release binary
+release-build:
+	cargo build --release -p $(CRATE)
+
+# Assemble signed macOS .app bundle in dist/Dart IDE.app
+bundle: icon release-build
+	@rm -rf "$(APP_DIR)"
+	@mkdir -p "$(APP_DIR)/Contents/MacOS" "$(APP_DIR)/Contents/Resources"
+	@cp "target/release/$(BIN)" "$(APP_DIR)/Contents/MacOS/$(BIN)"
+	@cp "assets/icon.icns" "$(APP_DIR)/Contents/Resources/icon.icns"
+	@printf '%s\n' \
+		'<?xml version="1.0" encoding="UTF-8"?>' \
+		'<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">' \
+		'<plist version="1.0">' \
+		'<dict>' \
+		'  <key>CFBundleName</key><string>$(APP_NAME)</string>' \
+		'  <key>CFBundleDisplayName</key><string>$(APP_NAME)</string>' \
+		'  <key>CFBundleIdentifier</key><string>$(BUNDLE_ID)</string>' \
+		'  <key>CFBundleVersion</key><string>$(VERSION)</string>' \
+		'  <key>CFBundleShortVersionString</key><string>$(VERSION)</string>' \
+		'  <key>CFBundlePackageType</key><string>APPL</string>' \
+		'  <key>CFBundleExecutable</key><string>$(BIN)</string>' \
+		'  <key>CFBundleIconFile</key><string>icon.icns</string>' \
+		'  <key>LSMinimumSystemVersion</key><string>13.0</string>' \
+		'  <key>NSHighResolutionCapable</key><true/>' \
+		'  <key>NSSupportsAutomaticGraphicsSwitching</key><true/>' \
+		'</dict>' \
+		'</plist>' > "$(APP_DIR)/Contents/Info.plist"
+	@codesign --force --deep --sign - "$(APP_DIR)"
+	@echo "✓ Packaged $(APP_DIR)"
+
+# Create distributable .dmg archive
+dmg: bundle
+	@rm -f "$(DMG_PATH)"
+	@STAGING=$$(mktemp -d) && \
+	cp -R "$(APP_DIR)" "$$STAGING/" && \
+	ln -s /Applications "$$STAGING/Applications" && \
+	hdiutil create -volname "$(APP_NAME) $(VERSION)" -srcfolder "$$STAGING" -ov -format UDZO "$(DMG_PATH)" >/dev/null && \
+	rm -rf "$$STAGING"
+	@echo "✓ Created $(DMG_PATH)"
+
+# Full first-release pipeline
+release: test dmg
+	@ls -lh "$(DMG_PATH)"
+
+# Install into /Applications
+install: bundle
+	@rm -rf "/Applications/$(APP_NAME).app"
+	@cp -R "$(APP_DIR)" "/Applications/$(APP_NAME).app"
+	@echo "✓ Installed /Applications/$(APP_NAME).app"

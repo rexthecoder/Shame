@@ -1,0 +1,30 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" width="1024" height="1024">
+  <defs>
+    <linearGradient id="tileGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#F08A4E" />
+      <stop offset="55%" stop-color="#E37439" />
+      <stop offset="100%" stop-color="#CF5E26" />
+    </linearGradient>
+  </defs>
+
+  <!-- macOS Big Sur / Sequoia safe-area continuous squircle (824x824 centered in 1024x1024) -->
+  <rect
+    x="100"
+    y="100"
+    width="824"
+    height="824"
+    rx="186"
+    ry="186"
+    fill="url(#tileGrad)"
+  />
+
+  <!-- Concept A: Tactile Code Wing (`/>`) — stepped round-cap slash + Dart chevron wing -->
+  <g stroke="#0B0C10" stroke-width="52" stroke-linecap="round" stroke-linejoin="round" fill="none">
+    <!-- Stepped parallel slash strokes -->
+    <line x1="236" y1="652" x2="404" y2="352" />
+    <line x1="334" y1="676" x2="502" y2="376" />
+    <!-- Right '>' chevron wing with clean optical separation -->
+    <polyline points="586,366 784,512 586,658" />
+    <line x1="542" y1="472" x2="616" y2="526" />
+  </g>
+</svg>

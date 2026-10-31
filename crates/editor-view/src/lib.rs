@@ -168,16 +168,20 @@ impl EditorView {
     pub fn from_buffer(buffer: Buffer, cx: &mut Context<Self>) -> Self {
         let language = language_for_path(buffer.path());
         let parse_syntax = should_parse_syntax(&buffer);
+        let is_dart = language.language_id() == "dart" || buffer.path().is_none();
         let synced_text = if parse_syntax {
             buffer.text()
         } else {
             String::new()
         };
-        let syntax_tree = parse_syntax.then(|| SyntaxTree::parse(&synced_text));
-        let fold_ranges = syntax_tree
-            .as_ref()
-            .map(|t| t.fold_ranges())
-            .unwrap_or_default();
+        let syntax_tree = (parse_syntax && is_dart).then(|| SyntaxTree::parse(&synced_text));
+        let fold_ranges = if let Some(t) = &syntax_tree {
+            t.fold_ranges()
+        } else if parse_syntax {
+            lexical_fold_ranges(&synced_text)
+        } else {
+            Vec::new()
+        };
         let closing_labels = if parse_syntax {
             language.closing_labels(&synced_text)
         } else {
@@ -253,19 +257,25 @@ impl EditorView {
         }
         if should_parse_syntax(&self.buffer) {
             let text = self.buffer.text();
-            if let Some(tree) = &mut self.syntax_tree {
-                if let Some(edit) = diff_as_edit(&self.synced_text, &text) {
-                    tree.reparse(&text, edit);
+            let is_dart = self.language.language_id() == "dart" || self.buffer.path().is_none();
+            if is_dart {
+                if let Some(tree) = &mut self.syntax_tree {
+                    if let Some(edit) = diff_as_edit(&self.synced_text, &text) {
+                        tree.reparse(&text, edit);
+                    }
+                } else {
+                    self.syntax_tree = Some(SyntaxTree::parse(&text));
                 }
+                self.fold_ranges = self
+                    .syntax_tree
+                    .as_ref()
+                    .map(|t| t.fold_ranges())
+                    .unwrap_or_default();
             } else {
-                self.syntax_tree = Some(SyntaxTree::parse(&text));
+                self.syntax_tree = None;
+                self.fold_ranges = lexical_fold_ranges(&text);
             }
             self.closing_labels = self.language.closing_labels(&text);
-            self.fold_ranges = self
-                .syntax_tree
-                .as_ref()
-                .map(|t| t.fold_ranges())
-                .unwrap_or_default();
             self.sync_lsp_text(&text);
             self.synced_text = text;
         } else {
@@ -287,6 +297,15 @@ impl EditorView {
         cx.notify();
     }
 
+    fn fold_range_at(&self, start_line: usize) -> Option<core_syntax::FoldRange> {
+        let ix = self
+            .fold_ranges
+            .binary_search_by_key(&start_line, |r| r.start_line)
+            .ok()?;
+        let r = self.fold_ranges[ix];
+        (r.end_line > start_line).then_some(r)
+    }
+
     fn rebuild_visible_lines(&mut self) {
         self.visible_lines.clear();
         if self.folded_starts.is_empty() {
@@ -297,11 +316,7 @@ impl EditorView {
         while line < total {
             self.visible_lines.push(line);
             if self.folded_starts.contains(&line) {
-                if let Some(f) = self
-                    .fold_ranges
-                    .iter()
-                    .find(|r| r.start_line == line && r.end_line > line)
-                {
+                if let Some(f) = self.fold_range_at(line) {
                     line = f.end_line + 1;
                     continue;
                 }
@@ -375,16 +390,27 @@ impl EditorView {
         self.buffer = Buffer::open(path)?;
         self.language = language_for_path(self.buffer.path());
         let parse_syntax = should_parse_syntax(&self.buffer);
+        let is_dart = self.language.language_id() == "dart" || self.buffer.path().is_none();
         if parse_syntax {
             let text = self.buffer.text();
-            self.syntax_tree = Some(SyntaxTree::parse(&text));
+            if is_dart {
+                let tree = SyntaxTree::parse(&text);
+                self.fold_ranges = tree.fold_ranges();
+                self.syntax_tree = Some(tree);
+            } else {
+                self.syntax_tree = None;
+                self.fold_ranges = lexical_fold_ranges(&text);
+            }
             self.closing_labels = self.language.closing_labels(&text);
             self.synced_text = text;
         } else {
             self.syntax_tree = None;
             self.closing_labels.clear();
+            self.fold_ranges.clear();
             self.synced_text.clear();
         }
+        self.folded_starts.clear();
+        self.visible_lines.clear();
         self.synced_revision = self.buffer.revision();
         self.indent_width = self.buffer.detect_indent_width();
         self.line_changes.clear();
@@ -1474,10 +1500,7 @@ impl EditorView {
                         )
                     })
                     .when_some(
-                        self.fold_ranges
-                            .iter()
-                            .find(|r| r.start_line == index && r.end_line > index)
-                            .copied(),
+                        self.fold_range_at(index),
                         |el, _| {
                             let is_folded = self.folded_starts.contains(&index);
                             let view = cx.entity();
@@ -1659,9 +1682,7 @@ impl EditorView {
             .folded_starts
             .contains(&index)
             .then(|| {
-                self.fold_ranges
-                    .iter()
-                    .find(|r| r.start_line == index)
+                self.fold_range_at(index)
                     .map(|r| r.end_line.saturating_sub(r.start_line))
             })
             .flatten();
@@ -2458,6 +2479,177 @@ fn contains_ascii_ci(haystack: &str, needle_lower: &str) -> bool {
 /// as cyan, member access as a warm red, literals as green/orange, and
 /// everything structural (operators, punctuation) recedes to a dim
 /// blue-gray instead of competing with any of it.
+/// Fast single-pass `{ ... }` fold range scanner for non-Dart languages.
+/// Returns sorted, deduplicated `FoldRange` entries by `start_line`.
+fn lexical_fold_ranges(source: &str) -> Vec<core_syntax::FoldRange> {
+    let bytes = source.as_bytes();
+    let mut stack: Vec<(usize, usize)> = Vec::new();
+    let mut ranges = Vec::new();
+    let mut line = 0usize;
+    let mut i = 0usize;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b == b'\n' {
+            line += 1;
+            i += 1;
+            continue;
+        }
+        if b == b'/' && i + 1 < bytes.len() && bytes[i + 1] == b'/' {
+            while i < bytes.len() && bytes[i] != b'\n' {
+                i += 1;
+            }
+            continue;
+        }
+        if b == b'"' || b == b'\'' {
+            let quote = b;
+            i += 1;
+            while i < bytes.len() {
+                if bytes[i] == b'\\' {
+                    i += 2;
+                    continue;
+                }
+                if bytes[i] == b'\n' {
+                    line += 1;
+                }
+                if bytes[i] == quote {
+                    i += 1;
+                    break;
+                }
+                i += 1;
+            }
+            continue;
+        }
+        if b == b'{' {
+            stack.push((line, i));
+        } else if b == b'}' {
+            if let Some((start_line, start_byte)) = stack.pop() {
+                if line > start_line {
+                    ranges.push(core_syntax::FoldRange {
+                        start_line,
+                        end_line: line,
+                        start_byte,
+                        end_byte: i + 1,
+                    });
+                }
+            }
+        }
+        i += 1;
+    }
+    ranges.sort_by_key(|r| (r.start_line, std::cmp::Reverse(r.end_line)));
+    ranges.dedup_by_key(|r| r.start_line);
+    ranges
+}
+
+/// Viewport-scoped lexical syntax highlighter for all non-Dart languages
+/// (Rust, TypeScript/JS, Python, Go, Swift, Kotlin, C/C++, Java, Ruby, Zig,
+/// C#, PHP, Lua, HTML/CSS, JSON, YAML, TOML, Shell, SQL).
+fn lexical_highlights_in_range(
+    source: &str,
+    range: Range<usize>,
+    keywords: &[&str],
+) -> Vec<Highlight> {
+    let start = range.start.min(source.len());
+    let end = range.end.min(source.len()).max(start);
+    let bytes = source.as_bytes();
+    let mut out = Vec::new();
+    let mut i = start;
+
+    while i < end {
+        let b = bytes[i];
+        // Line comments: `//` or `#` (when at start of token)
+        if (b == b'/' && i + 1 < end && bytes[i + 1] == b'/')
+            || (b == b'#' && (i == start || bytes[i - 1].is_ascii_whitespace()))
+        {
+            let c_start = i;
+            while i < end && bytes[i] != b'\n' {
+                i += 1;
+            }
+            out.push(Highlight {
+                range: c_start..i,
+                kind: HighlightKind::Comment,
+            });
+            continue;
+        }
+        // Strings: `"..."` or `'...'`
+        if b == b'"' || b == b'\'' {
+            let quote = b;
+            let s_start = i;
+            i += 1;
+            while i < end && bytes[i] != b'\n' {
+                if bytes[i] == b'\\' {
+                    i = (i + 2).min(end);
+                    continue;
+                }
+                if bytes[i] == quote {
+                    i += 1;
+                    break;
+                }
+                i += 1;
+            }
+            out.push(Highlight {
+                range: s_start..i,
+                kind: HighlightKind::String,
+            });
+            continue;
+        }
+        // Attributes / decorators: `@foo` or `#[...]`
+        if b == b'@' || (b == b'#' && i + 1 < end && bytes[i + 1] == b'[') {
+            let a_start = i;
+            i += 1;
+            while i < end && (is_word_byte(bytes[i]) || bytes[i] == b'[' || bytes[i] == b']') {
+                i += 1;
+            }
+            out.push(Highlight {
+                range: a_start..i,
+                kind: HighlightKind::Attribute,
+            });
+            continue;
+        }
+        // Numbers
+        if b.is_ascii_digit() && (i == start || !is_word_byte(bytes[i - 1])) {
+            let n_start = i;
+            while i < end
+                && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'.' || bytes[i] == b'_')
+            {
+                i += 1;
+            }
+            out.push(Highlight {
+                range: n_start..i,
+                kind: HighlightKind::Number,
+            });
+            continue;
+        }
+        // Identifiers / Keywords / Types / Function calls
+        if b.is_ascii_alphabetic() || b == b'_' {
+            let w_start = i;
+            while i < end && is_word_byte(bytes[i]) {
+                i += 1;
+            }
+            let word = &source[w_start..i];
+            let kind = if keywords.contains(&word) {
+                Some(HighlightKind::Keyword)
+            } else if word.bytes().next().is_some_and(|c| c.is_ascii_uppercase()) {
+                Some(HighlightKind::Type)
+            } else if i < end && bytes[i] == b'(' {
+                Some(HighlightKind::Function)
+            } else if w_start > start && bytes[w_start - 1] == b'.' {
+                Some(HighlightKind::Property)
+            } else {
+                None
+            };
+            if let Some(k) = kind {
+                out.push(Highlight {
+                    range: w_start..i,
+                    kind: k,
+                });
+            }
+            continue;
+        }
+        i += 1;
+    }
+    out
+}
+
 pub fn highlight_color(kind: HighlightKind) -> Rgba {
     match kind {
         HighlightKind::Keyword => rgb(0xc678dd),
@@ -2592,15 +2784,19 @@ impl Render for EditorView {
                     this.buffer.len_bytes()
                 };
 
-                let highlights = this
-                    .syntax_tree
-                    .as_ref()
-                    .map(|tree| {
-                        let clamped_start = start_byte.min(this.synced_text.len());
-                        let clamped_end = end_byte.min(this.synced_text.len()).max(clamped_start);
-                        tree.highlights_in_range(&this.synced_text, clamped_start..clamped_end)
-                    })
-                    .unwrap_or_default();
+                let clamped_start = start_byte.min(this.synced_text.len());
+                let clamped_end = end_byte.min(this.synced_text.len()).max(clamped_start);
+                let highlights = if let Some(tree) = &this.syntax_tree {
+                    tree.highlights_in_range(&this.synced_text, clamped_start..clamped_end)
+                } else if !this.synced_text.is_empty() {
+                    lexical_highlights_in_range(
+                        &this.synced_text,
+                        clamped_start..clamped_end,
+                        this.language.keywords(),
+                    )
+                } else {
+                    Vec::new()
+                };
 
                 visible_range
                     .map(|disp_ix| {

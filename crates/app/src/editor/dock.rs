@@ -1013,7 +1013,56 @@ impl DartIde {
                 })
         };
 
-        let problems_body = {
+        let debug_pill = {
+            let view_select = view.clone();
+            h_flex()
+                .id("debug-console-tab")
+                .items_center()
+                .gap(px(tokens::SPACE_2))
+                .px(px(tokens::SPACE_3))
+                .h(px(28.))
+                .rounded(px(tokens::RADIUS_PANEL))
+                .border_1()
+                .border_color(if debug_active {
+                    tokens::accent_dim()
+                } else {
+                    gpui_kit::transparent_black()
+                })
+                .when(debug_active, |el| el.bg(cx.theme().tab_active).text_color(fg))
+                .when(!debug_active, |el| {
+                    el.text_color(muted)
+                        .hover(move |s| s.bg(rgba(0xffffff08)).text_color(fg))
+                })
+                .text_size(px(tokens::UI_SM))
+                .cursor_pointer()
+                .on_click(move |_event, _window, cx| {
+                    view_select.update(cx, |this, cx| {
+                        this.dock_tab = DockTab::DebugConsole;
+                        cx.notify();
+                    });
+                })
+                .child(
+                    Icon::new(gpui_kit::assets::IconName::Bug)
+                        .xsmall()
+                        .text_color(if self.flutter_daemon.is_some() { green } else { primary }),
+                )
+                .child("Debug Console")
+                .when(debug_count_err > 0, |el| {
+                    el.child(
+                        div()
+                            .px(px(5.))
+                            .rounded(px(8.))
+                            .bg(red.opacity(0.18))
+                            .text_size(px(9.5))
+                            .text_color(red)
+                            .child(debug_count_err.to_string()),
+                    )
+                })
+        };
+
+        const MAX_RENDERED_DOCK_LINES: usize = 350;
+
+        let body_element = if problems_active {
             let rows: Vec<AnyElement> = all_problems
                 .into_iter()
                 .enumerate()
@@ -1115,56 +1164,7 @@ impl DartIde {
                 })
                 .children(rows)
                 .into_any_element()
-        };
-
-        let debug_pill = {
-            let view_select = view.clone();
-            h_flex()
-                .id("debug-console-tab")
-                .items_center()
-                .gap(px(tokens::SPACE_2))
-                .px(px(tokens::SPACE_3))
-                .h(px(28.))
-                .rounded(px(tokens::RADIUS_PANEL))
-                .border_1()
-                .border_color(if debug_active {
-                    tokens::accent_dim()
-                } else {
-                    gpui_kit::transparent_black()
-                })
-                .when(debug_active, |el| el.bg(cx.theme().tab_active).text_color(fg))
-                .when(!debug_active, |el| {
-                    el.text_color(muted)
-                        .hover(move |s| s.bg(rgba(0xffffff08)).text_color(fg))
-                })
-                .text_size(px(tokens::UI_SM))
-                .cursor_pointer()
-                .on_click(move |_event, _window, cx| {
-                    view_select.update(cx, |this, cx| {
-                        this.dock_tab = DockTab::DebugConsole;
-                        cx.notify();
-                    });
-                })
-                .child(
-                    Icon::new(gpui_kit::assets::IconName::Bug)
-                        .xsmall()
-                        .text_color(if self.flutter_daemon.is_some() { green } else { primary }),
-                )
-                .child("Debug Console")
-                .when(debug_count_err > 0, |el| {
-                    el.child(
-                        div()
-                            .px(px(5.))
-                            .rounded(px(8.))
-                            .bg(red.opacity(0.18))
-                            .text_size(px(9.5))
-                            .text_color(red)
-                            .child(debug_count_err.to_string()),
-                    )
-                })
-        };
-
-        let debug_body = {
+        } else if debug_active {
             let running = self.flutter_daemon.is_some() || self.dap_client.is_some();
             let dap_paused = self.dap_paused_thread.is_some();
             let status_text = self
@@ -1190,10 +1190,15 @@ impl DartIde {
                 muted
             };
 
+            let skip_dbg = self
+                .debug_lines
+                .len()
+                .saturating_sub(MAX_RENDERED_DOCK_LINES);
             let rows: Vec<AnyElement> = self
                 .debug_lines
                 .iter()
                 .enumerate()
+                .skip(skip_dbg)
                 .filter_map(|(line_ix, line)| {
                     let TerminalLine::Output { spans, file_link } = line else {
                         return None;
@@ -1469,17 +1474,13 @@ impl DartIde {
                         .children(rows),
                 )
                 .into_any_element()
-        };
-
-        let body_element = if problems_active {
-            problems_body
-        } else if debug_active {
-            debug_body
         } else if let Some(session) = self.terminals.get(active_ix) {
+            let skip_term = session.lines.len().saturating_sub(MAX_RENDERED_DOCK_LINES);
             let line_elements: Vec<AnyElement> = session
                 .lines
                 .iter()
                 .enumerate()
+                .skip(skip_term)
                 .map(|(line_ix, line)| match line {
                     TerminalLine::Command {
                         user_host,
@@ -1633,7 +1634,13 @@ impl DartIde {
                             .gap(px(tokens::SPACE_2))
                             .children(tabs)
                             .child(problems_pill)
-                            .child(debug_pill)
+                            .when(
+                                self.is_flutter_or_dart_workspace()
+                                    || self.flutter_daemon.is_some()
+                                    || self.dap_client.is_some()
+                                    || !self.debug_lines.is_empty(),
+                                |r| r.child(debug_pill),
+                            )
                             .child(
                                 Button::new("new-terminal-tab")
                                     .ghost()
