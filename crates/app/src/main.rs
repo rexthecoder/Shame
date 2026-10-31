@@ -309,6 +309,7 @@ const IDE_COMMANDS: &[IdeCommand] = &[
     IdeCommand { id: "conflict-both", title: "Git: Accept Both Changes (Merge Conflict)", shortcut: "", flutter_only: false },
     IdeCommand { id: "organize-imports", title: "Editor: Organize Imports", shortcut: "", flutter_only: false },
     IdeCommand { id: "find-references", title: "Editor: Find References", shortcut: "\u{21e7}F12", flutter_only: false },
+    IdeCommand { id: "goto-workspace-symbol", title: "Editor: Go to Symbol in Workspace\u{2026}", shortcut: "\u{2318}T", flutter_only: false },
     IdeCommand { id: "goto-symbol", title: "Editor: Go to Symbol in File\u{2026}", shortcut: "\u{21e7}\u{2318}O", flutter_only: false },
     IdeCommand { id: "goto-line", title: "Editor: Go to Line\u{2026}", shortcut: "\u{2318}G", flutter_only: false },
     IdeCommand { id: "new-file", title: "File: New Scratch File", shortcut: "\u{2318}N", flutter_only: false },
@@ -470,7 +471,11 @@ pub struct DartIde {
     pub(crate) dap_breakpoints: HashMap<PathBuf, Vec<u32>>,
     pub(crate) dap_paused_thread: Option<i64>,
     pub(crate) dap_stack_summary: Option<String>,
-    pub(crate) dap_variables: Vec<(String, String)>,
+    pub(crate) dap_variables: Vec<debug::DapVar>,
+    pub(crate) dap_children: HashMap<i64, Vec<debug::DapVar>>,
+    pub(crate) dap_expanded: std::collections::HashSet<i64>,
+    /// In-flight child `variables` requests: request seq -> parent reference.
+    pub(crate) dap_var_pending: HashMap<i64, i64>,
     /// Conditional-breakpoint expressions, keyed by file then 1-indexed line.
     pub(crate) dap_conditions: HashMap<PathBuf, std::collections::BTreeMap<u32, String>>,
     pub(crate) dap_watches: Vec<String>,
@@ -504,6 +509,7 @@ pub struct DartIde {
     pub(crate) rename_input: Entity<InputState>,
     pub(crate) code_actions: Option<(Entity<EditorView>, Vec<lsp_types::CodeActionOrCommand>)>,
     pub(crate) references: Option<Vec<references::ReferenceItem>>,
+    pub(crate) workspace_symbols: Vec<core_workspace::WorkspaceSymbol>,
     pub(crate) history: Option<(Entity<EditorView>, Vec<core_workspace::Snapshot>)>,
     pub(crate) terminals: Vec<editor::dock::TerminalSession>,
     pub(crate) active_terminal: usize,
@@ -651,6 +657,9 @@ impl DartIde {
             dap_paused_thread: None,
             dap_stack_summary: None,
             dap_variables: Vec::new(),
+            dap_children: HashMap::new(),
+            dap_expanded: std::collections::HashSet::new(),
+            dap_var_pending: HashMap::new(),
             dap_conditions: HashMap::new(),
             dap_watches: Vec::new(),
             dap_watch_values: HashMap::new(),
@@ -682,6 +691,7 @@ impl DartIde {
             rename_input,
             code_actions: None,
             references: None,
+            workspace_symbols: Vec::new(),
             history: None,
             terminals: vec![initial_terminal],
             active_terminal: 0,
@@ -863,6 +873,11 @@ impl DartIde {
             return;
         }
 
+        if primary_mod && !keystroke.modifiers.shift && keystroke.key.as_str() == "t" {
+            self.open_workspace_symbols(window, cx);
+            return;
+        }
+
         if primary_mod && keystroke.key.as_str() == "o" {
             self.open_folder(window, cx);
             return;
@@ -987,7 +1002,9 @@ impl DartIde {
                     cx.notify();
                 }
                 "down" => {
-                    let count = if self.palette_is_symbol_mode(cx) {
+                    let count = if self.palette_is_workspace_symbol_mode(cx) {
+                        self.palette_workspace_symbol_matches(cx).len()
+                    } else if self.palette_is_symbol_mode(cx) {
                         self.palette_symbol_matches(cx).len()
                     } else if self.palette_is_command_mode(cx) {
                         self.palette_command_matches(cx).len()

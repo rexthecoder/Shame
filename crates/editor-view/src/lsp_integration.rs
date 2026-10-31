@@ -76,6 +76,8 @@ pub struct CompletionEntry {
     pub detail: Option<String>,
     pub kind: CompletionKindBadge,
     pub additional_edits: Vec<TextEdit>,
+    /// Tab stops (byte ranges within `insert_text`) from an LSP snippet.
+    pub snippet_stops: Vec<std::ops::Range<usize>>,
 }
 
 struct SharedLspInner {
@@ -1222,7 +1224,8 @@ pub(crate) fn completion_item_to_entry(item: CompletionItem) -> Option<Completio
         })
         .or(item.insert_text)
         .unwrap_or_else(|| label.clone());
-    let insert_text = strip_lsp_snippet(&raw_insert);
+    let snippet = crate::snippet::parse_snippet(&raw_insert);
+    let insert_text = snippet.text;
     if insert_text.is_empty() {
         return None;
     }
@@ -1266,6 +1269,7 @@ pub(crate) fn completion_item_to_entry(item: CompletionItem) -> Option<Completio
         detail,
         kind,
         additional_edits,
+        snippet_stops: snippet.stops,
     })
 }
 
@@ -1311,7 +1315,8 @@ pub(crate) fn parse_completion_entries_from_value(value: serde_json::Value) -> V
             .and_then(|v| v.as_str())
             .or_else(|| raw.get("insertText").and_then(|v| v.as_str()))
             .unwrap_or(label);
-        let insert_text = strip_lsp_snippet(insert_raw);
+        let snippet = crate::snippet::parse_snippet(insert_raw);
+        let insert_text = snippet.text;
         if insert_text.is_empty() {
             continue;
         }
@@ -1340,47 +1345,10 @@ pub(crate) fn parse_completion_entries_from_value(value: serde_json::Value) -> V
             detail,
             kind,
             additional_edits: Vec::new(),
+            snippet_stops: snippet.stops,
         });
     }
     entries
-}
-
-/// Strip LSP snippet placeholders (`$0`, `$1`, `${1:default}`) so inserting a
-/// completion never leaves raw `$0` syntax in the buffer.
-pub(crate) fn strip_lsp_snippet(raw: &str) -> String {
-    let mut out = String::with_capacity(raw.len());
-    let chars: Vec<char> = raw.chars().collect();
-    let mut i = 0;
-    while i < chars.len() {
-        if chars[i] == '$' && i + 1 < chars.len() {
-            if chars[i + 1].is_ascii_digit() {
-                i += 2;
-                while i < chars.len() && chars[i].is_ascii_digit() {
-                    i += 1;
-                }
-                continue;
-            } else if chars[i + 1] == '{' {
-                i += 2;
-                while i < chars.len() && chars[i].is_ascii_digit() {
-                    i += 1;
-                }
-                if i < chars.len() && chars[i] == ':' {
-                    i += 1;
-                    while i < chars.len() && chars[i] != '}' {
-                        out.push(chars[i]);
-                        i += 1;
-                    }
-                }
-                if i < chars.len() && chars[i] == '}' {
-                    i += 1;
-                }
-                continue;
-            }
-        }
-        out.push(chars[i]);
-        i += 1;
-    }
-    out
 }
 
 #[cfg(test)]

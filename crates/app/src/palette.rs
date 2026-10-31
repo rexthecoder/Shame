@@ -83,6 +83,65 @@ impl DartIde {
             .starts_with('@')
     }
 
+    pub(crate) fn palette_is_workspace_symbol_mode(&self, cx: &Context<Self>) -> bool {
+        self.palette_input
+            .read(cx)
+            .value()
+            .trim_start()
+            .starts_with('#')
+    }
+
+    pub(crate) fn palette_workspace_symbol_matches(
+        &self,
+        cx: &Context<Self>,
+    ) -> Vec<core_workspace::WorkspaceSymbol> {
+        let raw = self.palette_input.read(cx).value().to_string();
+        let query = raw.trim_start().strip_prefix('#').unwrap_or(&raw).to_string();
+        core_workspace::filter_symbols(&self.workspace_symbols, &query, 40)
+            .into_iter()
+            .cloned()
+            .collect()
+    }
+
+    /// Open the palette in `#` mode and (re)index the workspace's
+    /// declarations on a background thread.
+    pub(crate) fn open_workspace_symbols(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.palette_open = true;
+        self.palette_selected = 0;
+        self.palette_input.update(cx, |s, cx| {
+            s.set_value("# ", window, cx);
+            s.focus(window, cx);
+        });
+        let root = self.root.clone();
+        let (tx, rx) = async_channel::bounded(1);
+        std::thread::spawn(move || {
+            let _ = tx.send_blocking(core_workspace::index_workspace_symbols(&root));
+        });
+        cx.spawn(async move |weak, cx| {
+            let Ok(symbols) = rx.recv().await else { return };
+            let _ = weak.update(cx, |this, cx| {
+                this.workspace_symbols = symbols;
+                cx.notify();
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+
+    fn open_workspace_symbol_at(
+        &mut self,
+        symbol: core_workspace::WorkspaceSymbol,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.palette_open = false;
+        self.open_path(symbol.path, window, cx);
+        if let Some(ed) = self.active_editor().cloned() {
+            ed.update(cx, |editor, cx| editor.set_cursor_to_position(symbol.line, 0, cx));
+        }
+        cx.notify();
+    }
+
     pub(crate) fn palette_symbol_matches(&self, cx: &Context<Self>) -> Vec<(String, &'static str, u32)> {
         let Some(ed) = self.active_editor() else {
             return Vec::new();
@@ -148,6 +207,13 @@ impl DartIde {
     }
 
     pub(crate) fn open_palette_selection(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.palette_is_workspace_symbol_mode(cx) {
+            let syms = self.palette_workspace_symbol_matches(cx);
+            if let Some(symbol) = syms.get(self.palette_selected).cloned() {
+                self.open_workspace_symbol_at(symbol, window, cx);
+            }
+            return;
+        }
         if self.palette_is_symbol_mode(cx) {
             let syms = self.palette_symbol_matches(cx);
             if let Some((_, _, line_0)) = syms.get(self.palette_selected).cloned() {
@@ -323,6 +389,7 @@ impl DartIde {
                 }
             }
             "goto-symbol" => self.open_symbol_outline(window, cx),
+            "goto-workspace-symbol" => self.open_workspace_symbols(window, cx),
             "goto-line" => self.open_go_to_line(window, cx),
             "new-file" => self.new_scratch_tab(window, cx),
             "open-folder" => self.open_folder(window, cx),
@@ -343,8 +410,14 @@ impl DartIde {
             return None;
         }
 
-        let is_sym_mode = self.palette_is_symbol_mode(cx);
-        let is_cmd_mode = !is_sym_mode && self.palette_is_command_mode(cx);
+        let is_ws_mode = self.palette_is_workspace_symbol_mode(cx);
+        let ws_matches = if is_ws_mode {
+            self.palette_workspace_symbol_matches(cx)
+        } else {
+            Vec::new()
+        };
+        let is_sym_mode = !is_ws_mode && self.palette_is_symbol_mode(cx);
+        let is_cmd_mode = !is_ws_mode && !is_sym_mode && self.palette_is_command_mode(cx);
         let sym_matches = if is_sym_mode {
             self.palette_symbol_matches(cx)
         } else {
@@ -355,12 +428,14 @@ impl DartIde {
         } else {
             Vec::new()
         };
-        let matches = if is_sym_mode || is_cmd_mode {
+        let matches = if is_ws_mode || is_sym_mode || is_cmd_mode {
             Vec::new()
         } else {
             self.palette_matches(cx)
         };
-        let total_items = if is_sym_mode {
+        let total_items = if is_ws_mode {
+            ws_matches.len()
+        } else if is_sym_mode {
             sym_matches.len()
         } else if is_cmd_mode {
             cmd_matches.len()
@@ -369,7 +444,74 @@ impl DartIde {
         };
         let selected = self.palette_selected.min(total_items.saturating_sub(1));
 
-        let rows: Vec<AnyElement> = if is_sym_mode {
+        let rows: Vec<AnyElement> = if is_ws_mode {
+            ws_matches
+                .into_iter()
+                .enumerate()
+                .map(|(ix, symbol)| {
+                    let is_selected = ix == selected;
+                    let view = view.clone();
+                    let rel = symbol
+                        .path
+                        .strip_prefix(&self.root)
+                        .unwrap_or(&symbol.path)
+                        .display()
+                        .to_string();
+                    let (name, kind) = (symbol.name.clone(), symbol.kind);
+                    h_flex()
+                        .id(("palette-wsym", ix))
+                        .relative()
+                        .w_full()
+                        .h(px(34.))
+                        .items_center()
+                        .justify_between()
+                        .gap_2()
+                        .px(px(14.))
+                        .rounded(px(tokens::RADIUS_SM))
+                        .cursor_pointer()
+                        .when(is_selected, |el| el.bg(rgba(0xea7a3c16)))
+                        .when(!is_selected, |el| el.hover(|s| s.bg(rgba(0xffffff08))))
+                        .child(
+                            h_flex()
+                                .items_center()
+                                .gap_2()
+                                .min_w(px(0.))
+                                .child(
+                                    div()
+                                        .px_1p5()
+                                        .py_0p5()
+                                        .rounded(px(4.))
+                                        .bg(cx.theme().info.opacity(0.16))
+                                        .font_family("SF Mono")
+                                        .text_size(px(10.))
+                                        .text_color(cx.theme().info)
+                                        .child(kind),
+                                )
+                                .child(
+                                    div()
+                                        .truncate()
+                                        .font_family("SF Mono")
+                                        .text_size(px(tokens::UI))
+                                        .text_color(cx.theme().foreground)
+                                        .child(name),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .truncate()
+                                .font_family("SF Mono")
+                                .text_size(px(tokens::UI_XS))
+                                .text_color(cx.theme().muted_foreground)
+                                .child(format!("{rel}:{}", symbol.line + 1)),
+                        )
+                        .on_click(move |_event, window, cx| {
+                            let symbol = symbol.clone();
+                            view.update(cx, |this, cx| this.open_workspace_symbol_at(symbol, window, cx));
+                        })
+                        .into_any_element()
+                })
+                .collect()
+        } else if is_sym_mode {
             sym_matches
                 .into_iter()
                 .enumerate()

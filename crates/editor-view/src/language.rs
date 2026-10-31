@@ -694,6 +694,7 @@ impl LanguageAdapter for DartLanguageAdapter {
         for &(label, insert, ty) in NAMED_ARGS {
             if prefix_lower.is_empty() || label.to_lowercase().starts_with(&prefix_lower) {
                 results.push(CompletionEntry {
+                    snippet_stops: Vec::new(),
                     label: label.to_string(),
                     insert_text: insert.to_string(),
                     detail: Some(ty.to_string()),
@@ -746,6 +747,7 @@ impl LanguageAdapter for DartLanguageAdapter {
             for &(label, insert, pkg) in TYPES_AND_CONSTRUCTORS {
                 if label != prefix && label.to_lowercase().contains(&prefix_lower) {
                     results.push(CompletionEntry {
+                        snippet_stops: Vec::new(),
                         label: label.to_string(),
                         insert_text: insert.to_string(),
                         detail: Some(pkg.to_string()),

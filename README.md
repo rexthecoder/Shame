@@ -50,11 +50,13 @@ cargo run -p app
 |---|---|
 | ⌘P / ⇧⌘O / ⌘G | Quick open / go to symbol / go to line |
 | ⇧⌘F | Find in project |
+| ⌘T | Go to symbol in workspace |
 | ⌘D | Select next occurrence (multi-cursor) |
 | ⌥⌘↑ / ⌥⌘↓ | Add cursor above / below |
 | ⇧F12 | Find references |
 | F2 | Rename symbol |
 | ⌘. | Code actions |
+| Tab | Next snippet tab stop |
 
 Everything else is in the command palette.
 

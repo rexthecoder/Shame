@@ -25,6 +25,8 @@ pub mod language;
 mod conflicts;
 mod lsp_integration;
 mod multicursor;
+mod snippet;
+mod sticky;
 
 use std::io;
 use std::ops::Range;
@@ -140,6 +142,9 @@ pub struct EditorView {
     hover_sequence: u64,
     hover_result: Option<(usize, String)>,
     signature_help: Option<lsp_integration::SignatureView>,
+    /// Memoized sticky-scroll header lines, keyed by (top line, fold count, buffer revision).
+    sticky_cache: Option<((usize, usize, u64), Vec<(usize, String)>)>,
+    snippet: Option<snippet::SnippetSession>,
     /// Active in-file search query (`⌘F`) and all case-insensitive byte ranges
     /// matching it across the buffer.
     search_query: String,
@@ -211,6 +216,8 @@ impl EditorView {
             hover_sequence: 0,
             hover_result: None,
             signature_help: None,
+            sticky_cache: None,
+            snippet: None,
             search_query: String::new(),
             search_matches: Vec::new(),
             active_search_match: 0,
@@ -1074,6 +1081,7 @@ impl EditorView {
                     && seen.insert(snippet.trigger.to_string())
                 {
                     results.push(CompletionEntry {
+                        snippet_stops: Vec::new(),
                         label: snippet.trigger.to_string(),
                         insert_text: snippet.body.to_string(),
                         detail: Some(snippet.detail.to_string()),
@@ -1100,6 +1108,7 @@ impl EditorView {
                 {
                     let is_type = kw.bytes().next().is_some_and(|b| b.is_ascii_uppercase());
                     results.push(CompletionEntry {
+                        snippet_stops: Vec::new(),
                         label: kw.to_string(),
                         insert_text: kw.to_string(),
                         detail: Some(if is_type { "type" } else { "keyword" }.to_string()),
@@ -1145,6 +1154,7 @@ impl EditorView {
                             CompletionKindBadge::Variable
                         };
                         results.push(CompletionEntry {
+                            snippet_stops: Vec::new(),
                             label: word.to_string(),
                             insert_text: word.to_string(),
                             detail: None,
@@ -1200,6 +1210,57 @@ impl EditorView {
         self.completion_selected = 0;
         self.set_cursor(cursor_pos.min(self.buffer.len_bytes()), cx);
         self.ensure_cursor_visible();
+
+        // Snippet tab stops: jump to the first and queue the rest for Tab.
+        // Offsets are relative to the inserted text; account for additional
+        // edits that landed before it.
+        if !entry.snippet_stops.is_empty() {
+            let inserted_end = insert_at + entry.insert_text.len();
+            let shift = cursor_pos as isize - inserted_end as isize;
+            let stops = entry
+                .snippet_stops
+                .iter()
+                .map(|r| {
+                    let at = |o: usize| ((insert_at + o) as isize + shift).max(0) as usize;
+                    at(r.start)..at(r.end)
+                })
+                .collect();
+            self.snippet = Some(snippet::SnippetSession {
+                stops,
+                len_at_active: self.buffer.len_bytes(),
+                active: None,
+            });
+            self.advance_snippet(cx);
+        }
+    }
+
+    /// Tab inside a snippet: select the next tab stop. Returns whether one
+    /// was available (otherwise Tab falls through to indenting).
+    pub(crate) fn advance_snippet(&mut self, cx: &mut Context<Self>) -> bool {
+        let len = self.buffer.len_bytes();
+        let head = self.buffer.selections().primary().head;
+        let Some(session) = self.snippet.as_mut() else {
+            return false;
+        };
+        if !session.cursor_in_active(head, len) {
+            self.snippet = None;
+            return false;
+        }
+        let Some(stop) = session.next_stop(len) else {
+            self.snippet = None;
+            return false;
+        };
+        if session.stops.is_empty() {
+            self.snippet = None;
+        }
+        let end = stop.end.min(len);
+        let start = stop.start.min(end);
+        self.buffer
+            .selections_mut()
+            .set_primary(Selection::new(start, end));
+        self.ensure_cursor_visible();
+        cx.notify();
+        true
     }
 
     /// Toggle `// ` line comments across the current line or selected lines (`⌘/`).
@@ -1395,6 +1456,7 @@ impl EditorView {
         if keystroke.key == "escape" {
             self.clear_signature_help(cx);
             self.collapse_selections(cx);
+            self.snippet = None;
         }
 
         if primary_mod {
@@ -1441,6 +1503,9 @@ impl EditorView {
             "delete" => self.delete_forward(cx),
             "enter" => self.insert_newline(cx),
             "tab" => {
+                if self.advance_snippet(cx) {
+                    return;
+                }
                 let spaces = " ".repeat(self.indent_width);
                 self.insert_at_cursor(&spaces, cx);
             }
@@ -3110,6 +3175,41 @@ impl Render for EditorView {
         .track_scroll(&self.scroll_handle)
         .size_full();
 
+        let sticky_font = cx.theme().mono_font_family.clone();
+        // Read the scroll position now (not from the list's layout pass, which
+        // runs after this and would leave the overlay a frame behind), and only
+        // rebuild the header lines when the top line, folds or text change.
+        let top_display = {
+            // A uniform list doesn't register per-row bounds, so
+            // `ScrollHandle::logical_scroll_top` is always 0 here; derive the
+            // row from the pixel offset and the measured row height instead.
+            let state = self.scroll_handle.0.borrow();
+            let row_height = state
+                .last_item_size
+                .as_ref()
+                .map_or(LINE_HEIGHT as f64, |size| size.item.height.to_f64())
+                .max(1.0);
+            sticky::top_row(-state.base_handle.offset().y.to_f64(), row_height)
+        };
+        let top_line = if self.folded_starts.is_empty() {
+            top_display
+        } else {
+            self.visible_lines.get(top_display).copied().unwrap_or(top_display)
+        };
+        let sticky_key = (top_line, self.fold_ranges.len(), self.buffer.revision());
+        if self.sticky_cache.as_ref().map(|(k, _)| *k) != Some(sticky_key) {
+            let lines = sticky::sticky_scope_lines(&self.fold_ranges, top_line, 3)
+                .into_iter()
+                .map(|line| (line, self.buffer.line(line).trim_end().to_string()))
+                .collect();
+            self.sticky_cache = Some((sticky_key, lines));
+        }
+        let sticky_lines: Vec<(usize, String)> = self
+            .sticky_cache
+            .as_ref()
+            .map(|(_, lines)| lines.clone())
+            .unwrap_or_default();
+
         div()
             .id("editor-view")
             .key_context("Editor")
@@ -3125,6 +3225,36 @@ impl Render for EditorView {
             .bg(cx.theme().background)
             .text_color(cx.theme().foreground)
             .pt_2()
+            .relative()
             .child(list)
+            .when(!sticky_lines.is_empty(), |el| {
+                el.child(
+                    v_flex()
+                        .id("sticky-scroll")
+                        .occlude()
+                        .absolute()
+                        .top(px(8.))
+                        .left_0()
+                        .right_0()
+                        .bg(cx.theme().background)
+                        .border_b_1()
+                        .border_color(cx.theme().border)
+                        .children(sticky_lines.into_iter().map(|(line, text)| {
+                            h_flex()
+                                .id(("sticky-line", line))
+                                .h(px(LINE_HEIGHT))
+                                .pl(px(GUTTER_WIDTH))
+                                .font_family(sticky_font.clone())
+                                .text_size(px(LINE_FONT_SIZE))
+                                .text_color(cx.theme().muted_foreground)
+                                .cursor_pointer()
+                                .hover(|s| s.bg(rgba(0xffffff08)))
+                                .on_click(cx.listener(move |this, _event, _window, cx| {
+                                    this.set_cursor_to_position(line as u32, 0, cx);
+                                }))
+                                .child(text)
+                        })),
+                )
+            })
     }
 }

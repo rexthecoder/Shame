@@ -1444,12 +1444,40 @@ impl DartIde {
                             .font_family("SF Mono")
                             .text_size(px(tokens::UI_XS))
                             .child(div().text_color(muted).child("Locals:"))
-                            .children(self.dap_variables.iter().map(|(k, v)| {
-                                h_flex()
-                                    .gap(px(3.))
-                                    .child(div().text_color(cyan).child(format!("{k} =")))
-                                    .child(div().text_color(yellow).child(v.clone()))
-                            })),
+                            .children(
+                                crate::debug::flatten_variables(
+                                    &self.dap_variables,
+                                    &self.dap_children,
+                                    &self.dap_expanded,
+                                )
+                                .into_iter()
+                                .enumerate()
+                                .map(|(ix, var)| {
+                                    let expandable = var.var_ref > 0;
+                                    let marker = if !expandable {
+                                        "  "
+                                    } else if self.dap_expanded.contains(&var.var_ref) {
+                                        "\u{25be} "
+                                    } else {
+                                        "\u{25b8} "
+                                    };
+                                    let var_ref = var.var_ref;
+                                    h_flex()
+                                        .id(("dap-var", ix))
+                                        .gap(px(3.))
+                                        .ml(px(var.depth as f32 * 10.))
+                                        .when(expandable, |el| {
+                                            el.cursor_pointer().on_click(cx.listener(
+                                                move |this, _e, _w, cx| {
+                                                    this.toggle_dap_variable(var_ref, cx);
+                                                },
+                                            ))
+                                        })
+                                        .child(div().text_color(muted).child(marker))
+                                        .child(div().text_color(cyan).child(format!("{} =", var.name)))
+                                        .child(div().text_color(yellow).child(var.value.clone()))
+                                }),
+                            ),
                     )
                 })
                 .when(!self.dap_watches.is_empty(), |el| {

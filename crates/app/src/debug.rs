@@ -5,6 +5,66 @@ use super::*;
 /// How many locals the debug dock lists (the adapter may return many more).
 const MAX_SHOWN_VARIABLES: usize = 30;
 
+/// One variable shown in the debug dock.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DapVar {
+    pub name: String,
+    pub value: String,
+    /// DAP `variablesReference`; `> 0` means it has children to expand.
+    pub var_ref: i64,
+    pub depth: usize,
+}
+
+/// Maximum nesting shown, which also bounds self-referential structures.
+const MAX_VARIABLE_DEPTH: usize = 6;
+
+/// Top-level variables followed (recursively) by the children of every
+/// expanded variable, with `depth` set for indentation.
+pub(crate) fn flatten_variables(
+    top: &[DapVar],
+    children: &HashMap<i64, Vec<DapVar>>,
+    expanded: &std::collections::HashSet<i64>,
+) -> Vec<DapVar> {
+    fn walk(
+        vars: &[DapVar],
+        depth: usize,
+        children: &HashMap<i64, Vec<DapVar>>,
+        expanded: &std::collections::HashSet<i64>,
+        out: &mut Vec<DapVar>,
+    ) {
+        for var in vars {
+            out.push(DapVar { depth, ..var.clone() });
+            if depth < MAX_VARIABLE_DEPTH && var.var_ref > 0 && expanded.contains(&var.var_ref) {
+                if let Some(kids) = children.get(&var.var_ref) {
+                    walk(kids, depth + 1, children, expanded, out);
+                }
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(top, 0, children, expanded, &mut out);
+    out
+}
+
+fn parse_variables(body: &serde_json::Value) -> Vec<DapVar> {
+    body.get("variables")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .take(MAX_SHOWN_VARIABLES)
+                .filter_map(|v| {
+                    Some(DapVar {
+                        name: v.get("name")?.as_str()?.to_string(),
+                        value: v.get("value")?.as_str()?.to_string(),
+                        var_ref: v.get("variablesReference").and_then(|r| r.as_i64()).unwrap_or(0),
+                        depth: 0,
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// What the debug input prompt is collecting.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum DebugPrompt {
@@ -158,7 +218,7 @@ impl DartIde {
                 "continued" => {
                     self.dap_paused_thread = None;
                     self.dap_stack_summary = None;
-                    self.dap_variables.clear();
+                    self.clear_dap_variables();
                     self.dap_frame_id = None;
                     self.clear_all_debug_lines(cx);
                     cx.notify();
@@ -244,19 +304,14 @@ impl DartIde {
                     }
                 }
                 "variables" => {
-                    if let Some(arr) = body.get("variables").and_then(|v| v.as_array()) {
-                        self.dap_variables = arr
-                            .iter()
-                            .take(MAX_SHOWN_VARIABLES)
-                            .filter_map(|v| {
-                                Some((
-                                    v.get("name")?.as_str()?.to_string(),
-                                    v.get("value")?.as_str()?.to_string(),
-                                ))
-                            })
-                            .collect();
-                        cx.notify();
+                    let vars = parse_variables(&body);
+                    match self.dap_var_pending.remove(&request_seq) {
+                        Some(parent_ref) => {
+                            self.dap_children.insert(parent_ref, vars);
+                        }
+                        None => self.dap_variables = vars,
                     }
+                    cx.notify();
                 }
                 _ => {}
             },
@@ -278,7 +333,6 @@ impl DartIde {
                     }
                 }
             }
-            _ => {}
         }
     }
 
@@ -297,7 +351,7 @@ impl DartIde {
             }
             self.dap_paused_thread = None;
             self.dap_stack_summary = None;
-            self.dap_variables.clear();
+            self.clear_dap_variables();
             self.clear_all_debug_lines(cx);
             self.push_flutter_log("\x1b[90m\u{25a0} DAP debug session ended.\x1b[0m");
             cx.notify();
@@ -312,7 +366,7 @@ impl DartIde {
             let _ = guard.continue_thread(tid);
         }
         self.dap_paused_thread = None;
-        self.dap_variables.clear();
+        self.clear_dap_variables();
         self.clear_all_debug_lines(cx);
         cx.notify();
     }
@@ -497,5 +551,62 @@ impl DartIde {
                         ),
                 ),
         )
+    }
+
+    pub(crate) fn clear_dap_variables(&mut self) {
+        self.dap_variables.clear();
+        self.dap_children.clear();
+        self.dap_expanded.clear();
+        self.dap_var_pending.clear();
+    }
+
+    /// Expand or collapse a variable with children, fetching them on first expand.
+    pub(crate) fn toggle_dap_variable(&mut self, var_ref: i64, cx: &mut Context<Self>) {
+        if self.dap_expanded.remove(&var_ref) {
+            cx.notify();
+            return;
+        }
+        self.dap_expanded.insert(var_ref);
+        if !self.dap_children.contains_key(&var_ref) {
+            if let Some(dap) = &self.dap_client {
+                if let Ok(guard) = dap.lock() {
+                    if let Ok(seq) = guard.variables(var_ref) {
+                        self.dap_var_pending.insert(seq, var_ref);
+                    }
+                }
+            }
+        }
+        cx.notify();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{DapVar, flatten_variables};
+    use std::collections::{HashMap, HashSet};
+
+    fn var(name: &str, var_ref: i64) -> DapVar {
+        DapVar { name: name.into(), value: "v".into(), var_ref, depth: 0 }
+    }
+
+    #[test]
+    fn flattens_only_expanded_children_with_depth() {
+        let top = vec![var("a", 1), var("b", 0), var("c", 2)];
+        let children = HashMap::from([(1, vec![var("a.x", 3)]), (3, vec![var("a.x.y", 0)])]);
+        let collapsed = flatten_variables(&top, &children, &HashSet::new());
+        assert_eq!(collapsed.len(), 3);
+
+        let expanded = HashSet::from([1, 3]);
+        let flat = flatten_variables(&top, &children, &expanded);
+        let shape: Vec<(&str, usize)> = flat.iter().map(|v| (v.name.as_str(), v.depth)).collect();
+        assert_eq!(shape, vec![("a", 0), ("a.x", 1), ("a.x.y", 2), ("b", 0), ("c", 0)]);
+    }
+
+    #[test]
+    fn self_referential_children_stop_at_max_depth() {
+        let top = vec![var("loop", 1)];
+        let children = HashMap::from([(1, vec![var("loop", 1)])]);
+        let flat = flatten_variables(&top, &children, &HashSet::from([1]));
+        assert!(flat.len() <= 8, "recursion must be bounded, got {}", flat.len());
     }
 }
