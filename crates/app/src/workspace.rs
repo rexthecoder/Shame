@@ -153,8 +153,16 @@ impl DartIde {
         self.all_files.clear();
         self.all_files_hash = 0;
         self.git.status = None;
+        self.git.stats.clear();
+        self.git.branches.clear();
+        self.git.branches_open = false;
+        self.git.expanded_commit = None;
+        self.git.expanded_commit_files.clear();
+        self.git.notice = None;
+        self.git.commit_types = None;
         self.git_branch = None;
         self.git_status.clear();
+        self.sidebar_tab = crate::git_panel::SidebarTab::Files;
         self.launch_configs.clear();
         self.test_launch_templates.clear();
         self.tree_state.update(cx, |state, cx| {

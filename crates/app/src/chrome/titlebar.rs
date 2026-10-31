@@ -44,7 +44,6 @@ impl DartIde {
         let muted = cx.theme().muted_foreground;
         let green = cx.theme().green;
         let info = cx.theme().info;
-        let has_changes = !self.git_status.is_empty();
 
         h_flex()
             .w_full()
@@ -129,57 +128,24 @@ impl DartIde {
                             .text_color(fg)
                             .child(root_name),
                     )
-                    .when_some(self.git_branch.clone(), |el, branch| {
-                        // From the cached status: never run `git` while rendering.
-                        let ahead = self.git.status.as_ref().map_or(0, |s| s.ahead);
-                        let behind = self.git.status.as_ref().map_or(0, |s| s.behind);
-                        el.child(
-                            h_flex()
-                                .id("titlebar-branch-chip")
-                                .items_center()
-                                .gap_1()
-                                .px_1p5()
-                                .py_0p5()
-                                .rounded(px(tokens::RADIUS_PILL))
-                                .hover(|s| s.bg(rgba(0xffffff10)))
-                                .text_size(px(tokens::UI_SM))
-                                .child(
-                                    Icon::new(gpui_kit::assets::IconName::GitBranch)
-                                        .small()
-                                        .text_color(green),
-                                )
-                                .child(div().text_color(fg).child(branch))
-                                .when(has_changes, |el| {
-                                    el.child(
-                                        div()
-                                            .text_size(px(8.))
-                                            .text_color(cx.theme().primary)
-                                            .child("\u{25cf}"),
+                    .when_some(
+                        self.git_branch.clone().filter(|_| self.has_workspace),
+                        |el, branch| {
+                            el.child(
+                                h_flex()
+                                    .items_center()
+                                    .gap_1()
+                                    .text_size(px(tokens::UI_SM))
+                                    .text_color(muted)
+                                    .child(
+                                        Icon::new(gpui_kit::assets::IconName::GitBranch)
+                                            .small()
+                                            .text_color(muted),
                                     )
-                                })
-                                .when(ahead > 0, |el| {
-                                    el.child(
-                                        div()
-                                            .text_color(info)
-                                            .child(format!("\u{2191}{ahead}")),
-                                    )
-                                })
-                                .when(behind > 0, |el| {
-                                    el.child(
-                                        div()
-                                            .text_color(cx.theme().warning)
-                                            .child(format!("\u{2193}{behind}")),
-                                    )
-                                })
-                                .on_mouse_down(MouseButton::Left, |_, _, cx| {
-                                    cx.stop_propagation();
-                                })
-                                .on_click(cx.listener(|this, _event, window, cx| {
-                                    cx.stop_propagation();
-                                    this.git_open_branch_switcher(window, cx);
-                                })),
-                        )
-                    })
+                                    .child(branch),
+                            )
+                        },
+                    )
                     .when(self.has_workspace, |el| {
                         el.child(
                             div()

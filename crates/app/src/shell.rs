@@ -1048,8 +1048,9 @@ impl DartIde {
                 .into_any_element()
         };
 
+        let sidebar_visible = self.sidebar_open && self.has_workspace;
         let split_id = match (
-            self.sidebar_open,
+            sidebar_visible,
             self.sim.attached,
             self.web_preview_open,
             self.agent_open,
@@ -1071,7 +1072,7 @@ impl DartIde {
         };
         let mut split = h_resizable(split_id);
 
-        if self.sidebar_open {
+        if sidebar_visible {
             split = split.child(
                 resizable_panel()
                     .size(px(tokens::RAIL_LEFT))

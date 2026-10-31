@@ -110,6 +110,10 @@ static GIT_LOCK: Mutex<()> = Mutex::new(());
 impl DartIde {
     /// Re-read the repository status (and the branch / file badges the rest of the UI shows).
     pub(crate) fn refresh_git(&mut self, cx: &mut Context<Self>) {
+        // No project open: there is no repository to read.
+        if !self.has_workspace {
+            return;
+        }
         if self.git.refreshing {
             self.git.refresh_queued = true;
             return;
@@ -184,7 +188,9 @@ impl DartIde {
                 let alive = weak
                     .update(cx, |this, cx| {
                         this.sync_workspace_files_if_changed(cx);
-                        if this.sidebar_open && this.sidebar_tab == SidebarTab::Git {
+                        if this.has_workspace
+                            && this.sidebar_open
+                            && this.sidebar_tab == SidebarTab::Git {
                             this.refresh_git(cx);
                         }
                     })
