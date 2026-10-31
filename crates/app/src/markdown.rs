@@ -11,6 +11,7 @@
 use std::ops::Range;
 
 use gpui_kit::component::{ActiveTheme as _, h_flex, v_flex};
+use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 use crate::tokens;
@@ -33,6 +34,8 @@ pub(crate) enum Block {
     ListItem { marker: String, indent: usize, spans: Vec<Span> },
     Quote(Vec<Span>),
     Code { lang: String, code: String },
+    /// A pipe table: a header row and body rows, each padded to the header's width.
+    Table { header: Vec<Vec<Span>>, rows: Vec<Vec<Vec<Span>>> },
     Rule,
 }
 
@@ -95,6 +98,30 @@ pub(crate) fn parse_markdown(text: &str) -> Vec<Block> {
             continue;
         }
 
+        if trimmed.contains('|') && lines.peek().is_some_and(|next| is_table_separator(next)) {
+            flush(&mut paragraph, &mut blocks);
+            let header_cells = split_cells(trimmed);
+            lines.next(); // the separator row
+            let mut body: Vec<Vec<String>> = Vec::new();
+            while let Some(next) = lines.peek() {
+                let t = next.trim_start();
+                if t.is_empty() || !t.contains('|') {
+                    break;
+                }
+                body.push(split_cells(t));
+                lines.next();
+            }
+            let width = header_cells.len();
+            let cells = |row: &[String]| -> Vec<Vec<Span>> {
+                (0..width).map(|c| parse_inline(row.get(c).map_or("", String::as_str))).collect()
+            };
+            blocks.push(Block::Table {
+                header: cells(&header_cells),
+                rows: body.iter().map(|r| cells(r)).collect(),
+            });
+            continue;
+        }
+
         if let Some((marker, rest)) = list_marker(trimmed) {
             flush(&mut paragraph, &mut blocks);
             let indent = (line.len() - trimmed.len()) / 2;
@@ -114,11 +141,48 @@ fn is_rule(line: &str) -> bool {
         && compact.chars().all(|c| c == compact.chars().next().unwrap_or('-'))
 }
 
-/// `- item`, `* item`, `+ item` or `12. item`.
+/// The cells of one `| a | b |` row (an escaped `\|` stays inside its cell).
+fn split_cells(line: &str) -> Vec<String> {
+    let line = line.trim();
+    let line = line.strip_prefix('|').unwrap_or(line);
+    let line = line.strip_suffix('|').filter(|_| !line.ends_with("\\|")).unwrap_or(line);
+    let mut cells = Vec::new();
+    let mut cell = String::new();
+    let mut chars = line.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\\' && chars.peek() == Some(&'|') {
+            cell.push('|');
+            chars.next();
+        } else if c == '|' {
+            cells.push(cell.trim().to_string());
+            cell.clear();
+        } else {
+            cell.push(c);
+        }
+    }
+    cells.push(cell.trim().to_string());
+    cells
+}
+
+/// `|---|:--:|` : the row under a table header.
+fn is_table_separator(line: &str) -> bool {
+    let cells = split_cells(line);
+    !cells.is_empty()
+        && line.contains('-')
+        && cells.iter().all(|c| !c.is_empty() && c.contains('-') && c.chars().all(|ch| matches!(ch, '-' | ':')))
+}
+
+/// `- item`, `* item`, `+ item` or `12. item`; `- [ ]` and `- [x]` become checkboxes.
 fn list_marker(line: &str) -> Option<(String, &str)> {
     for bullet in ["- ", "* ", "+ "] {
         if let Some(rest) = line.strip_prefix(bullet) {
-            return Some(("\u{2022}".to_string(), rest.trim_start()));
+            let rest = rest.trim_start();
+            for (box_text, glyph) in [("[ ] ", "\u{2610}"), ("[x] ", "\u{2611}"), ("[X] ", "\u{2611}")] {
+                if let Some(after) = rest.strip_prefix(box_text) {
+                    return Some((glyph.to_string(), after.trim_start()));
+                }
+            }
+            return Some(("\u{2022}".to_string(), rest));
         }
     }
     let digits = line.chars().take_while(|c| c.is_ascii_digit()).count();
@@ -244,9 +308,33 @@ fn flatten(spans: &[Span], base: &HighlightStyle, code_style: &HighlightStyle, l
     (text, runs)
 }
 
+/// Sizes for rendered markdown: compact for chat replies, roomier for documents (plans).
+pub(crate) struct MdStyle {
+    body: f32,
+    line: f32,
+    gap: f32,
+    h1: f32,
+    h2: f32,
+    h3: f32,
+    /// Underline the two biggest heading levels, like a document.
+    rules: bool,
+}
+
+const CHAT_STYLE: MdStyle = MdStyle { body: tokens::UI, line: 19., gap: 6., h1: tokens::UI + 3., h2: tokens::UI + 1.5, h3: tokens::UI, rules: false };
+const DOC_STYLE: MdStyle = MdStyle { body: 14., line: 23., gap: 11., h1: 21., h2: 17.5, h3: 15., rules: true };
+
 /// Render a reply. `id` namespaces element ids so several messages can show
 /// code blocks at once.
 pub(crate) fn render_markdown(text: &str, id: usize, cx: &App) -> Div {
+    render_markdown_with(text, id, &CHAT_STYLE, cx)
+}
+
+/// Render a document (a plan): larger text, more air, underlined headings.
+pub(crate) fn render_markdown_doc(text: &str, id: usize, cx: &App) -> Div {
+    render_markdown_with(text, id, &DOC_STYLE, cx)
+}
+
+fn render_markdown_with(text: &str, id: usize, style: &MdStyle, cx: &App) -> Div {
     let fg = cx.theme().foreground;
     let muted = cx.theme().muted_foreground;
     let border = cx.theme().border;
@@ -265,35 +353,39 @@ pub(crate) fn render_markdown(text: &str, id: usize, cx: &App) -> Div {
         StyledText::new(text).with_highlights(runs)
     };
 
-    let mut column = v_flex().w_full().gap(px(6.)).text_color(fg);
+    let mut column = v_flex().w_full().gap(px(style.gap)).text_color(fg);
     for (ix, block) in parse_markdown(text).into_iter().enumerate() {
         column = column.child(match block {
             Block::Paragraph(spans) => div()
                 .w_full()
-                .text_size(px(tokens::UI))
-                .line_height(px(19.))
+                .text_size(px(style.body))
+                .line_height(px(style.line))
                 .child(styled(&spans))
                 .into_any_element(),
-            Block::Heading { level, spans } => div()
-                .w_full()
-                .mt(px(4.))
-                .font_weight(FontWeight::BOLD)
-                .text_size(px(match level {
-                    1 => tokens::UI + 3.,
-                    2 => tokens::UI + 1.5,
-                    _ => tokens::UI,
-                }))
-                .line_height(px(21.))
-                .child(styled(&spans))
-                .into_any_element(),
+            Block::Heading { level, spans } => {
+                let size = match level {
+                    1 => style.h1,
+                    2 => style.h2,
+                    _ => style.h3,
+                };
+                div()
+                    .w_full()
+                    .mt(px(if ix == 0 { 0. } else { style.gap + 3. }))
+                    .when(style.rules && level <= 2, |h| h.pb(px(5.)).border_b_1().border_color(border))
+                    .font_weight(FontWeight::BOLD)
+                    .text_size(px(size))
+                    .line_height(px(size + 5.))
+                    .child(styled(&spans))
+                    .into_any_element()
+            }
             Block::ListItem { marker, indent, spans } => h_flex()
                 .w_full()
                 .items_start()
                 .gap(px(6.))
-                .pl(px(indent as f32 * 14.))
-                .text_size(px(tokens::UI))
-                .line_height(px(19.))
-                .child(div().flex_shrink_0().min_w(px(14.)).text_color(muted).child(marker))
+                .pl(px(indent as f32 * 16.))
+                .text_size(px(style.body))
+                .line_height(px(style.line))
+                .child(div().flex_shrink_0().min_w(px(18.)).text_color(muted).child(marker))
                 .child(div().flex_1().min_w(px(0.)).child(styled(&spans)))
                 .into_any_element(),
             Block::Quote(spans) => div()
@@ -302,10 +394,44 @@ pub(crate) fn render_markdown(text: &str, id: usize, cx: &App) -> Div {
                 .border_l_2()
                 .border_color(border)
                 .text_color(muted)
-                .text_size(px(tokens::UI))
-                .line_height(px(19.))
+                .text_size(px(style.body))
+                .line_height(px(style.line))
                 .child(styled(&spans))
                 .into_any_element(),
+            Block::Table { header, rows } => {
+                let cell = |spans: &[Span], first: bool, head: bool| {
+                    div()
+                        .flex_1()
+                        .min_w(px(0.))
+                        .px(px(9.))
+                        .py(px(6.))
+                        .when(!first, |c| c.border_l_1().border_color(border))
+                        .when(head, |c| c.font_weight(FontWeight::BOLD))
+                        .child(styled(spans))
+                };
+                v_flex()
+                    .w_full()
+                    .rounded(px(tokens::RADIUS_SM))
+                    .border_1()
+                    .border_color(border)
+                    .overflow_hidden()
+                    .text_size(px(style.body - 0.5))
+                    .line_height(px(style.line - 2.))
+                    .child(
+                        h_flex()
+                            .w_full()
+                            .bg(muted.opacity(0.10))
+                            .children(header.iter().enumerate().map(|(c, spans)| cell(spans, c == 0, true))),
+                    )
+                    .children(rows.iter().map(|row| {
+                        h_flex()
+                            .w_full()
+                            .border_t_1()
+                            .border_color(border)
+                            .children(row.iter().enumerate().map(|(c, spans)| cell(spans, c == 0, false)))
+                    }))
+                    .into_any_element()
+            }
             Block::Rule => div().w_full().h(px(1.)).my(px(4.)).bg(border).into_any_element(),
             Block::Code { lang, code } => {
                 let to_copy = code.clone();
@@ -433,5 +559,47 @@ mod tests {
         let blocks = parse_markdown("> careful\n\n---\n\ntext");
         assert!(matches!(&blocks[0], Block::Quote(s) if plain(s) == "careful"));
         assert_eq!(blocks[1], Block::Rule);
+    }
+
+    #[core::prelude::v1::test]
+    fn pipe_tables_become_a_header_and_padded_rows() {
+        let blocks = parse_markdown("Before\n\n| Area | Status |\n|------|:------:|\n| Auth | done |\n| UI |\n| Docs | todo | extra |\n\nAfter");
+        assert_eq!(blocks.len(), 3, "paragraph, table, paragraph");
+        let Block::Table { header, rows } = &blocks[1] else { panic!("expected a table: {blocks:?}") };
+        assert_eq!(header.iter().map(|c| plain(c)).collect::<Vec<_>>(), ["Area", "Status"]);
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0].iter().map(|c| plain(c)).collect::<Vec<_>>(), ["Auth", "done"]);
+        assert_eq!(rows[1].iter().map(|c| plain(c)).collect::<Vec<_>>(), ["UI", ""], "a short row is padded");
+        assert_eq!(rows[2].len(), 2, "an over-long row is cut to the header's width");
+    }
+
+    #[core::prelude::v1::test]
+    fn a_pipe_in_ordinary_text_is_not_a_table() {
+        let blocks = parse_markdown("Use a | b to mean either.\nSecond line.");
+        assert!(matches!(&blocks[0], Block::Paragraph(s) if plain(s) == "Use a | b to mean either. Second line."));
+        // A header row with no separator under it is just text too.
+        assert!(matches!(&parse_markdown("| a | b |\n| 1 | 2 |")[0], Block::Paragraph(_)));
+    }
+
+    #[core::prelude::v1::test]
+    fn table_cells_keep_inline_styles_and_escaped_pipes() {
+        let blocks = parse_markdown("| Name | Note |\n|---|---|\n| `a.dart` | x \\| y |");
+        let Block::Table { rows, .. } = &blocks[0] else { panic!("expected a table") };
+        assert!(rows[0][0].iter().any(|s| s.code && s.text == "a.dart"));
+        assert_eq!(plain(&rows[0][1]), "x | y");
+    }
+
+    #[core::prelude::v1::test]
+    fn task_list_items_get_checkbox_markers() {
+        let blocks = parse_markdown("- [ ] write tests\n- [x] add model\n- plain");
+        let markers: Vec<&str> = blocks
+            .iter()
+            .filter_map(|b| match b {
+                Block::ListItem { marker, .. } => Some(marker.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(markers, ["\u{2610}", "\u{2611}", "\u{2022}"]);
+        assert!(matches!(&blocks[0], Block::ListItem { spans, .. } if plain(spans) == "write tests"));
     }
 }

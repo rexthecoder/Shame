@@ -237,6 +237,7 @@ impl DartIde {
         self.agent.ai_touched_paths.clear();
         self.agent.attachments.clear();
         self.agent.session_id = None;
+        self.agent.question_inputs.clear();
         cx.notify();
     }
 
@@ -601,6 +602,11 @@ impl DartIde {
         }
 
         match key {
+            // Esc stops the agent mid-run (the indicator says so).
+            "escape" if self.agent.running_pid.is_some() => {
+                self.stop_agent_run(cx);
+                cx.stop_propagation();
+            }
             "enter" if !shift => {
                 self.agent_send_message(window, cx);
                 cx.stop_propagation();

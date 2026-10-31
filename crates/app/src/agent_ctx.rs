@@ -4,14 +4,15 @@
 
 use std::path::Path;
 
-/// How much the agent may change.
+/// How much the agent may do, and who decides.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ModeId {
-    /// Answer questions and explain; never touch files.
+    /// Manual: it asks before it edits a file or runs a command, and you
+    /// approve or deny each one. (Where a tool can't ask, it is read-only.)
     Ask,
     /// Investigate and propose a step-by-step plan; never touch files.
     Plan,
-    /// Edit files in the workspace; anything riskier is not auto-approved.
+    /// Like Claude's "accept edits": file edits go through; commands still ask.
     Edit,
     /// Edit and run commands without asking.
     Auto,
@@ -53,7 +54,7 @@ impl ModeId {
     /// `claude --permission-mode` value.
     pub(crate) fn claude_permission(self) -> &'static str {
         match self {
-            ModeId::Ask => "default",
+            ModeId::Ask => "manual",
             ModeId::Plan => "plan",
             ModeId::Edit => "acceptEdits",
             ModeId::Auto => "bypassPermissions",
@@ -78,10 +79,13 @@ impl ModeId {
 
     /// Leading instruction for every harness. CLIs without a read-only switch
     /// (OpenCode) rely on this alone, so it is worded as a hard rule.
-    pub(crate) fn instruction(self) -> Option<&'static str> {
+    /// `can_prompt` is whether the tool can ask you for approval mid-run; if it can,
+    /// Ask needs no rule (it will simply ask), and if not it is read-only.
+    pub(crate) fn instruction(self, can_prompt: bool) -> Option<&'static str> {
         match self {
+            ModeId::Ask if can_prompt => None,
             ModeId::Ask => Some(
-                "[Mode: Ask] Answer the question and explain. Do NOT create, edit or delete any file, and do not run commands that change anything.",
+                "[Mode: Ask] This tool cannot ask the user for approval, so work read-only: answer and explain, and do NOT create, edit or delete any file or run commands that change anything.",
             ),
             ModeId::Plan => Some(
                 "[Mode: Plan] Investigate as needed, then reply with a concise step-by-step plan. Do NOT create, edit or delete any file; wait for approval before changing anything.",
@@ -486,6 +490,66 @@ pub(crate) fn notification_body(reply: &str, max: usize) -> String {
     format!("{}\u{2026}", cut.trim_end())
 }
 
+/// The "working" spinner's frames, as in Claude Code's: a glyph that grows and shrinks.
+const SPINNER: [&str; 6] = ["\u{b7}", "\u{2722}", "\u{2733}", "\u{2736}", "\u{273b}", "\u{273d}"];
+
+/// Which spinner glyph to show `elapsed_ms` into a run: it cycles up through the
+/// frames and back down again, a new frame every 120 ms.
+pub(crate) fn spinner_glyph(elapsed_ms: u64) -> &'static str {
+    let n = SPINNER.len();
+    let period = 2 * (n - 1);
+    let step = (elapsed_ms / 120) as usize % period;
+    SPINNER[if step < n { step } else { period - step }]
+}
+
+/// Brightness (0.45 to 1.0) of the `index`th character of the activity label: a
+/// soft wave that travels along the text, so it reads as alive while it waits.
+pub(crate) fn shimmer_alpha(index: usize, elapsed_ms: u64) -> f32 {
+    let phase = elapsed_ms as f32 / 1600.0 * std::f32::consts::TAU - index as f32 * 0.55;
+    0.725 + 0.275 * phase.sin()
+}
+
+/// "7s", "42s", "1m 05s" for a running time.
+pub(crate) fn format_elapsed(elapsed_ms: u64) -> String {
+    let secs = elapsed_ms / 1000;
+    if secs < 60 { format!("{secs}s") } else { format!("{}m {:02}s", secs / 60, secs % 60) }
+}
+
+/// Whether `path` is a plan file Claude Code wrote (`~/.claude/plans/<name>.md`).
+pub(crate) fn is_plan_file(path: &str) -> bool {
+    path.ends_with(".md") && path.contains("/.claude/plans/")
+}
+
+/// Whether a reply reads like a plan (several steps or sections) rather than an
+/// answer to a question: used for harnesses that have no plan file.
+pub(crate) fn looks_like_plan(text: &str) -> bool {
+    let steps = text
+        .lines()
+        .map(str::trim_start)
+        .filter(|l| {
+            l.starts_with("- ")
+                || l.starts_with("* ")
+                || l.starts_with('#')
+                || l.split_once(". ").is_some_and(|(n, _)| !n.is_empty() && n.len() <= 2 && n.chars().all(|c| c.is_ascii_digit()))
+        })
+        .count();
+    steps >= 3 && text.len() >= 200
+}
+
+/// The text of the plan to show: the plan file's contents if one was written,
+/// else the plan the agent passed when it finished planning, else (if it looks
+/// like a plan) the reply itself.
+pub(crate) fn choose_plan_text(
+    file_text: Option<String>,
+    tool_plan: Option<String>,
+    reply: &str,
+) -> Option<String> {
+    let non_empty = |t: Option<String>| t.map(|t| t.trim().to_string()).filter(|t| !t.is_empty());
+    non_empty(file_text)
+        .or_else(|| non_empty(tool_plan))
+        .or_else(|| looks_like_plan(reply).then(|| reply.trim().to_string()))
+}
+
 /// Step through prompt history: `Up` goes to older prompts, `Down` to newer
 /// ones and finally back to an empty draft (`None`).
 pub(crate) fn history_step(len: usize, current: Option<usize>, older: bool) -> Option<usize> {
@@ -506,15 +570,18 @@ mod tests {
 
     #[core::prelude::v1::test]
     fn modes_map_to_each_harness_setting() {
-        assert_eq!(ModeId::Ask.claude_permission(), "default");
+        assert_eq!(ModeId::Ask.claude_permission(), "manual", "Ask is Claude's manual mode");
         assert_eq!(ModeId::Plan.claude_permission(), "plan");
         assert_eq!(ModeId::Edit.claude_permission(), "acceptEdits");
         assert_eq!(ModeId::Auto.claude_permission(), "bypassPermissions");
         assert_eq!(ModeId::Ask.codex_sandbox(), "read-only");
         assert_eq!(ModeId::Edit.codex_sandbox(), "workspace-write");
         assert_eq!(ModeId::Auto.codex_approval(), "never");
-        assert!(ModeId::Ask.instruction().is_some() && ModeId::Plan.instruction().is_some());
-        assert!(ModeId::Edit.instruction().is_none());
+        // Where the tool can ask, Ask is just "ask me"; where it can't, it is read-only.
+        assert_eq!(ModeId::Ask.instruction(true), None);
+        assert!(ModeId::Ask.instruction(false).unwrap().contains("read-only"));
+        assert!(ModeId::Plan.instruction(true).is_some() && ModeId::Plan.instruction(false).is_some());
+        assert!(ModeId::Edit.instruction(true).is_none() && ModeId::Auto.instruction(false).is_none());
         for (ix, mode) in AGENT_MODES.iter().enumerate() {
             assert_eq!(mode.id.index(), ix);
             assert_eq!(ModeId::from_key(mode.id.key()), Some(mode.id), "saved by name, restored by name");
@@ -706,6 +773,45 @@ mod tests {
         let long = "word ".repeat(40);
         let body = notification_body(&long, 30);
         assert!(body.chars().count() <= 31 && body.ends_with('\u{2026}'), "{body}");
+    }
+
+    #[core::prelude::v1::test]
+    fn the_spinner_cycles_up_and_back_and_the_label_shimmers() {
+        let frames: Vec<&str> = (0..10).map(|i| spinner_glyph(i * 120)).collect();
+        assert_eq!(frames[0], "\u{b7}");
+        assert_eq!(frames[5], "\u{273d}", "the biggest frame");
+        assert_eq!(frames[6], "\u{273b}", "then it shrinks again");
+        assert_eq!(frames[0], spinner_glyph(10 * 120), "and the cycle repeats");
+        for ms in (0..4000).step_by(37) {
+            for i in 0..12 {
+                let a = shimmer_alpha(i, ms);
+                assert!((0.44..=1.01).contains(&a), "alpha {a} out of range");
+            }
+        }
+        assert_ne!(shimmer_alpha(0, 0), shimmer_alpha(5, 0), "neighbouring characters differ, so it travels");
+        assert_eq!(format_elapsed(7_400), "7s");
+        assert_eq!(format_elapsed(65_000), "1m 05s");
+    }
+
+    #[core::prelude::v1::test]
+    fn plans_are_found_in_files_tool_calls_or_plan_shaped_replies() {
+        assert!(is_plan_file("/Users/me/.claude/plans/shame-ide-context-update-rosy-zebra.md"));
+        assert!(!is_plan_file("/Users/me/project/PLAN.md"));
+        assert!(!is_plan_file("/Users/me/.claude/plans/notes.txt"));
+
+        let plan = "# Plan\n\n1. Add the model\n2. Wire the UI\n3. Write tests\n\nThis covers the whole change end to end, step by step, with the risky parts first so they are verified early. ".repeat(2);
+        assert!(looks_like_plan(&plan));
+        assert!(!looks_like_plan("Sure! The function returns the sum of both inputs."), "an answer is not a plan");
+        assert!(!looks_like_plan("- one\n- two"), "too short to be a plan");
+
+        // The file wins, then the tool's plan, then a plan-shaped reply.
+        assert_eq!(
+            choose_plan_text(Some("  from file ".into()), Some("from tool".into()), "reply").as_deref(),
+            Some("from file")
+        );
+        assert_eq!(choose_plan_text(Some("  ".into()), Some("from tool".into()), "reply").as_deref(), Some("from tool"));
+        assert_eq!(choose_plan_text(None, None, &plan).as_deref(), Some(plan.trim()));
+        assert_eq!(choose_plan_text(None, None, "Just an answer."), None);
     }
 
     #[core::prelude::v1::test]

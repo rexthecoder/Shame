@@ -44,6 +44,17 @@ The `core-*` crates have no UI dependency, so the GPUI-based UI layer
 cargo run -p app
 ```
 
+## Agent modes
+
+| Mode | What happens |
+|---|---|
+| **Ask** | Manual. Claude stops before it edits a file or runs a command and shows what it wants to do; you Allow, Allow for the session, or Deny. (Codex and OpenCode can't ask mid-run, so Ask is read-only for them.) |
+| **Plan** | It investigates and writes a plan you can read in full, then you approve it (Edit or Auto) or send it back. Nothing changes until you approve. |
+| **Edit** | Like Claude's "accept edits": file edits go through without asking; commands still ask. |
+| **Auto** | Edits and runs commands without asking. |
+
+Esc stops a running agent.
+
 ## Keyboard shortcuts
 
 | Shortcut | Action |

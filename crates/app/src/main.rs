@@ -10,6 +10,9 @@ use std::path::{Path, PathBuf};
 
 mod agent_composer;
 mod agent_ctx;
+mod agent_indicator;
+mod agent_permission;
+mod agent_plan;
 mod chrome;
 mod diff_view;
 mod editor;

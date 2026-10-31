@@ -258,6 +258,13 @@ pub(crate) struct AgentToolCall {
     pub(crate) target_path: Option<String>,
 }
 
+/// What the app sends to a running Claude Code process on its stdin.
+pub(crate) enum AgentInput {
+    Line(String),
+    /// No more input: the turn is over, let the process exit.
+    Close,
+}
+
 #[derive(Clone)]
 pub(crate) enum AgentItem {
     ToolGroup {
@@ -270,6 +277,29 @@ pub(crate) enum AgentItem {
         is_user: bool,
         text: String,
     },
+    /// The agent asking to edit a file or run a command (Ask mode).
+    Permission {
+        request: crate::agent_permission::PermissionRequest,
+        summary: crate::agent_permission::PermissionSummary,
+        state: crate::agent_permission::PermissionState,
+    },
+    /// The agent asking you a multiple-choice question (`AskUserQuestion`).
+    Question {
+        request: crate::agent_permission::PermissionRequest,
+        questions: Vec<crate::agent_permission::Question>,
+        /// What you have chosen, per question.
+        choices: Vec<crate::agent_permission::Choice>,
+        state: crate::agent_permission::PermissionState,
+    },
+    /// The agent's plan, waiting for approval (Plan mode).
+    Plan {
+        text: String,
+        /// The plan file the agent wrote, if it wrote one.
+        path: Option<PathBuf>,
+        state: crate::agent_plan::PlanState,
+        /// Whether the body is open once the plan has been decided.
+        expanded: bool,
+    },
 }
 
 #[derive(Debug, PartialEq)]
@@ -279,6 +309,10 @@ pub(crate) enum StreamFragment {
     ReplaceText(String),
     /// The CLI's id for this conversation, used to resume it on the next message.
     SessionId(String),
+    /// The plan the agent passed when it finished planning (Claude Code's `ExitPlanMode`).
+    Plan(String),
+    /// The agent is waiting to be told it may do something.
+    Permission(crate::agent_permission::PermissionRequest),
     /// What the CLI reported about the finished turn (Claude Code only).
     Stats { cost_usd: Option<f64>, duration_ms: Option<u64> },
 }
@@ -331,6 +365,15 @@ pub(crate) fn parse_agent_stream_line(raw: &str) -> Vec<StreamFragment> {
                                 .and_then(|v| v.as_str())
                                 .unwrap_or("Tool");
                             let input = part.get("input");
+                            if name == "ExitPlanMode" {
+                                if let Some(plan) = input
+                                    .and_then(|i| i.get("plan"))
+                                    .and_then(|p| p.as_str())
+                                    .filter(|p| !p.trim().is_empty())
+                                {
+                                    out.push(StreamFragment::Plan(plan.to_string()));
+                                }
+                            }
                             out.push(StreamFragment::Tool(tool_call_from_name_and_input(
                                 name, input,
                             )));
@@ -338,6 +381,12 @@ pub(crate) fn parse_agent_stream_line(raw: &str) -> Vec<StreamFragment> {
                         _ => {}
                     }
                 }
+            }
+        }
+        // Claude Code asking permission to use a tool (`--permission-prompt-tool stdio`)
+        "control_request" => {
+            if let Some(request) = crate::agent_permission::parse_permission_request(&val) {
+                out.push(StreamFragment::Permission(request));
             }
         }
         // Claude Code final result summary
@@ -478,6 +527,25 @@ fn tool_call_from_name_and_input(
     }
 }
 
+/// What to tell the user the agent is doing, from the tool call it just made.
+pub(crate) fn activity_label(call: Option<&AgentToolCall>) -> String {
+    let Some(call) = call else { return "Thinking".to_string() };
+    if call.kind == AgentToolKind::Terminal {
+        return "Running a command".to_string();
+    }
+    let (verb, rest) = call.label.split_once(' ').unwrap_or((call.label.as_str(), ""));
+    let doing = match verb {
+        "Read" => "Reading",
+        "Edit" => "Editing",
+        "Write" => "Writing",
+        "Grep" | "Glob" | "Search" => "Searching",
+        "ExitPlanMode" => "Finishing the plan",
+        "AskUserQuestion" => "Preparing a question",
+        _ => return "Working".to_string(),
+    };
+    if rest.is_empty() { doing.to_string() } else { format!("{doing} {rest}") }
+}
+
 pub(crate) enum AgentStreamEvent {
     Started { pid: u32 },
     Fragment(StreamFragment),
@@ -518,6 +586,14 @@ pub(crate) struct AgentState {
     pub(crate) pending_mentions: Vec<Attachment>,
     /// While an `@query` is being typed: its byte range in the input.
     pub(crate) mention_range: Option<std::ops::Range<usize>>,
+    /// The animated "working" row shown while a run is in progress.
+    pub(crate) indicator: Entity<crate::agent_indicator::ThinkingIndicator>,
+    /// The way to answer the running Claude Code process (permission answers).
+    pub(crate) control_tx: Option<async_channel::Sender<AgentInput>>,
+    /// The text boxes behind the Other answers, by (message index, question index).
+    pub(crate) question_inputs: std::collections::HashMap<(usize, usize), Entity<InputState>>,
+    /// Ask mode was explained once for a tool that can't ask for approval.
+    pub(crate) ask_notice_shown: bool,
     /// Time and cost of each finished turn, by the index of its reply.
     pub(crate) turn_stats: std::collections::HashMap<usize, TurnStats>,
     /// Messages typed while the agent was busy; sent one by one when it finishes.
@@ -577,6 +653,10 @@ impl AgentState {
             next_mention: 0,
             pending_mentions: Vec::new(),
             mention_range: None,
+            indicator: cx.new(crate::agent_indicator::ThinkingIndicator::new),
+            control_tx: None,
+            question_inputs: std::collections::HashMap::new(),
+            ask_notice_shown: false,
             turn_stats: std::collections::HashMap::new(),
             queue: Vec::new(),
             last_mention_query: String::new(),
@@ -662,7 +742,10 @@ pub(crate) fn conversation_transcript(
                 let ellipsis = if text.chars().count() > max_chars { "\u{2026}" } else { "" };
                 Some(format!("{}: {clipped}{ellipsis}", if *is_user { "User" } else { "Assistant" }))
             }
-            AgentItem::ToolGroup { .. } => None,
+            AgentItem::ToolGroup { .. }
+            | AgentItem::Plan { .. }
+            | AgentItem::Permission { .. }
+            | AgentItem::Question { .. } => None,
         })
         .collect();
     let skip = turns.len().saturating_sub(max_messages);
@@ -689,11 +772,26 @@ impl DartIde {
     pub(crate) fn stop_agent_run(&mut self, cx: &mut Context<Self>) {
         // Stopping means "stop", not "go on to the next queued message".
         self.agent.queue.clear();
+        self.cancel_pending_permissions();
+        if let Some(tx) = self.agent.control_tx.take() {
+            let _ = tx.send_blocking(AgentInput::Close);
+        }
         if let Some(pid) = self.agent.running_pid.take() {
             let _ = Command::new("kill")
                 .args(["-TERM", &pid.to_string()])
                 .status();
             cx.notify();
+        }
+    }
+
+    /// Permission cards still waiting when a run ends or is stopped can no longer be answered.
+    fn cancel_pending_permissions(&mut self) {
+        for item in &mut self.agent.items {
+            if let AgentItem::Permission { state, .. } | AgentItem::Question { state, .. } = item {
+                if *state == crate::agent_permission::PermissionState::Pending {
+                    *state = crate::agent_permission::PermissionState::Cancelled;
+                }
+            }
         }
     }
 
@@ -938,7 +1036,7 @@ impl DartIde {
 
         // Order: environment, mode rule, attachments, earlier turns, the request.
         let mut sections = vec![ctx_header];
-        if let Some(rule) = mode.instruction() {
+        if let Some(rule) = mode.instruction(harness == AgentHarness::ClaudeCode) {
             sections.push(rule.to_string());
         }
         let everything: Vec<Attachment> =
@@ -972,6 +1070,17 @@ impl DartIde {
             return;
         };
 
+        if mode == ModeId::Ask && harness != AgentHarness::ClaudeCode && !self.agent.ask_notice_shown {
+            self.agent.ask_notice_shown = true;
+            self.agent.items.push(AgentItem::Message {
+                is_user: false,
+                text: format!(
+                    "Ask mode is read-only with {}: it can\u{2019}t stop and ask you to approve changes the way Claude Code can. Switch to Edit to let it change files.",
+                    harness.label()
+                ),
+            });
+        }
+
         // Reserve a tool group + assistant response bubble for live streaming
         let group_id = self.agent.items.len();
         self.agent.items.push(AgentItem::ToolGroup {
@@ -985,6 +1094,7 @@ impl DartIde {
             is_user: false,
             text: "Thinking\u{2026}".to_string(),
         });
+        self.agent.indicator.update(cx, |indicator, cx| indicator.start("Thinking", cx));
         cx.notify();
 
         let pre_run_unstaged: std::collections::HashSet<String> = self
@@ -995,6 +1105,11 @@ impl DartIde {
             .unwrap_or_default();
 
         let (tx, rx) = async_channel::unbounded::<AgentStreamEvent>();
+        // Claude Code is run with streaming input so it can stop and ask for approval:
+        // we write the message on its stdin, and later the answers to its questions.
+        let (in_tx, in_rx) = async_channel::unbounded::<AgentInput>();
+        self.agent.control_tx = Some(in_tx.clone());
+        let first_line = crate::agent_permission::user_message_line(&full_prompt);
         std::thread::spawn(move || {
             let mut cmd = Command::new(&bin_path);
             let home = std::env::var("HOME").unwrap_or_default();
@@ -1004,7 +1119,7 @@ impl DartIde {
             );
             cmd.current_dir(&root)
                 .env("PATH", enriched_path)
-                .stdin(Stdio::null())
+                .stdin(if harness == AgentHarness::ClaudeCode { Stdio::piped() } else { Stdio::null() })
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped());
 
@@ -1017,7 +1132,14 @@ impl DartIde {
                     if model_id != "default" {
                         cmd.args(["--model", &model_id]);
                     }
-                    cmd.args(["--permission-mode", mode.claude_permission(), &full_prompt]);
+                    cmd.args([
+                        "--permission-mode",
+                        mode.claude_permission(),
+                        "--input-format",
+                        "stream-json",
+                        "--permission-prompt-tool",
+                        "stdio",
+                    ]);
                 }
                 AgentHarness::OpenCode => {
                     cmd.args(["run", "--format", "json"]);
@@ -1056,6 +1178,26 @@ impl DartIde {
 
             let _ = tx.send_blocking(AgentStreamEvent::Started { pid: child.id() });
 
+            if harness == AgentHarness::ClaudeCode {
+                if let Some(mut stdin) = child.stdin.take() {
+                    std::thread::spawn(move || {
+                        use std::io::Write;
+                        let _ = writeln!(stdin, "{first_line}");
+                        let _ = stdin.flush();
+                        while let Ok(message) = in_rx.recv_blocking() {
+                            match message {
+                                AgentInput::Line(line) => {
+                                    let _ = writeln!(stdin, "{line}");
+                                    let _ = stdin.flush();
+                                }
+                                AgentInput::Close => break,
+                            }
+                        }
+                        // Dropping stdin tells the process there is no more input.
+                    });
+                }
+            }
+
             let stderr_handle = child.stderr.take().map(|stderr| {
                 let tx_err = tx.clone();
                 std::thread::spawn(move || {
@@ -1076,6 +1218,11 @@ impl DartIde {
                     for frag in parse_agent_stream_line(&line) {
                         let _ = tx.send_blocking(AgentStreamEvent::Fragment(frag));
                     }
+                    // The turn is over: with streaming input the process waits for more
+                    // messages unless we close its stdin.
+                    if crate::agent_permission::is_result_line(&line) {
+                        let _ = in_tx.send_blocking(AgentInput::Close);
+                    }
                 }
             }
             if let Some(h) = stderr_handle {
@@ -1091,7 +1238,12 @@ impl DartIde {
         });
 
         let started_at = std::time::Instant::now();
+        let was_plan_mode = mode == ModeId::Plan;
         cx.spawn(async move |weak, cx| {
+            // Plan mode: where the plan turned up (a file the agent wrote, or the
+            // plan it passed when it finished planning).
+            let mut plan_file: Option<PathBuf> = None;
+            let mut tool_plan: Option<String> = None;
             let mut streamed_text = String::new();
             let mut stderr_lines: Vec<String> = Vec::new();
             let mut reported_cost: Option<f64> = None;
@@ -1115,13 +1267,79 @@ impl DartIde {
                                 StreamFragment::Stats { cost_usd, .. } => {
                                     reported_cost = cost_usd.or(reported_cost);
                                 }
+                                StreamFragment::Plan(plan) => {
+                                    tool_plan = Some(plan);
+                                }
+                                StreamFragment::Permission(request) => {
+                                    if request.tool_name == "ExitPlanMode" {
+                                        // The plan card is where you approve a plan, so end
+                                        // the turn here instead of asking twice.
+                                        if let Some(plan) = request
+                                            .input
+                                            .get("plan")
+                                            .and_then(|p| p.as_str())
+                                            .filter(|p| !p.trim().is_empty())
+                                        {
+                                            tool_plan = Some(plan.to_string());
+                                        }
+                                        if let Some(tx) = &this.agent.control_tx {
+                                            let _ = tx.send_blocking(AgentInput::Line(
+                                                crate::agent_permission::control_response(
+                                                    &request,
+                                                    &crate::agent_permission::Decision::Deny(
+                                                        "The plan has been shown to the user, who will approve it or send it back. Stop now and wait for their decision.".to_string(),
+                                                    ),
+                                                ),
+                                            ));
+                                        }
+                                    } else if request.tool_name == "AskUserQuestion"
+                                        && !crate::agent_permission::parse_questions(&request.input).is_empty()
+                                    {
+                                        let questions = crate::agent_permission::parse_questions(&request.input);
+                                        let first = questions[0].question.clone();
+                                        this.agent.items.push(AgentItem::Question {
+                                            choices: vec![crate::agent_permission::Choice::default(); questions.len()],
+                                            questions,
+                                            request,
+                                            state: crate::agent_permission::PermissionState::Pending,
+                                        });
+                                        this.agent
+                                            .indicator
+                                            .update(cx, |i, cx| i.set_label("Waiting for your answer", cx));
+                                        if cx.active_window().is_none() {
+                                            notify_desktop("Shame", &format!("Claude asks: {first}"));
+                                        }
+                                    } else {
+                                        let summary =
+                                            crate::agent_permission::summarize_permission(&request, &this.root);
+                                        let title = summary.title.clone();
+                                        this.agent.items.push(AgentItem::Permission {
+                                            request,
+                                            summary,
+                                            state: crate::agent_permission::PermissionState::Pending,
+                                        });
+                                        this.agent
+                                            .indicator
+                                            .update(cx, |i, cx| i.set_label("Waiting for your approval", cx));
+                                        if cx.active_window().is_none() {
+                                            notify_desktop("Shame", &format!("Needs your approval: {title}"));
+                                        }
+                                    }
+                                }
                                 StreamFragment::Tool(call) => {
+                                    let label = activity_label(Some(&call));
+                                    this.agent.indicator.update(cx, |i, cx| i.set_label(&label, cx));
                                     if (call.label.starts_with("Edit ")
                                         || call.label.starts_with("Write "))
                                         && let Some(ref target_path) = call.target_path
                                     {
-                                        this.agent
-                                            .record_ai_touched_path(&this.root, target_path);
+                                        if crate::agent_ctx::is_plan_file(target_path) {
+                                            // The plan itself, not a change to your project.
+                                            plan_file = Some(PathBuf::from(target_path));
+                                        } else {
+                                            this.agent
+                                                .record_ai_touched_path(&this.root, target_path);
+                                        }
                                     }
                                     if let Some(AgentItem::ToolGroup { header, calls, .. }) =
                                         this.agent.items.get_mut(group_id)
@@ -1135,6 +1353,7 @@ impl DartIde {
                                     }
                                 }
                                 StreamFragment::TextDelta(delta) => {
+                                    this.agent.indicator.update(cx, |i, cx| i.set_label("Writing the reply", cx));
                                     streamed_text.push_str(&delta);
                                     if let Some(AgentItem::Message { text, .. }) =
                                         this.agent.items.get_mut(msg_ix)
@@ -1143,6 +1362,7 @@ impl DartIde {
                                     }
                                 }
                                 StreamFragment::ReplaceText(new_text) => {
+                                    this.agent.indicator.update(cx, |i, cx| i.set_label("Writing the reply", cx));
                                     streamed_text = new_text;
                                     if let Some(AgentItem::Message { text, .. }) =
                                         this.agent.items.get_mut(msg_ix)
@@ -1153,6 +1373,9 @@ impl DartIde {
                             },
                             AgentStreamEvent::Finished { error } => {
                                 this.agent.running_pid = None;
+                                this.agent.indicator.update(cx, |i, cx| i.stop(cx));
+                                this.cancel_pending_permissions();
+                                this.agent.control_tx = None;
                                 let elapsed = started_at.elapsed();
                                 this.agent.turn_stats.insert(
                                     msg_ix,
@@ -1171,6 +1394,22 @@ impl DartIde {
                                     notify_desktop("Shame", &body);
                                 }
                                 let failed = error.is_some();
+                                // A finished plan becomes a card to read and approve.
+                                if was_plan_mode && !failed {
+                                    let file_text = plan_file.as_ref().and_then(|p| std::fs::read_to_string(p).ok());
+                                    if let Some(plan) =
+                                        crate::agent_ctx::choose_plan_text(file_text, tool_plan.take(), &streamed_text)
+                                    {
+                                        if let Some(item) = this.agent.items.get_mut(msg_ix) {
+                                            *item = AgentItem::Plan {
+                                                text: plan,
+                                                path: plan_file.take(),
+                                                state: crate::agent_plan::PlanState::Pending,
+                                                expanded: false,
+                                            };
+                                        }
+                                    }
+                                }
                                 if error.is_some() && was_resumed {
                                     // The session may be gone; start fresh next time.
                                     this.agent.session_id = None;
@@ -1737,6 +1976,21 @@ impl DartIde {
                                     })
                                     .into_any_element()
                             }
+                            AgentItem::Question { questions, choices, state, .. } => {
+                                self.render_question_card(item_ix, questions, choices, *state, cx)
+                            }
+                            AgentItem::Permission { request, summary, state } => {
+                                self.render_permission_card(item_ix, request, summary, *state, cx)
+                            }
+                            AgentItem::Plan { text, path, state, expanded } => {
+                                self.render_plan_card(item_ix, text, path.as_ref(), *state, *expanded, cx)
+                            }
+                            // The animated indicator stands in for the "Thinking…" placeholder.
+                            AgentItem::Message { is_user: false, text }
+                                if is_running && text.as_str() == "Thinking\u{2026}" =>
+                            {
+                                div().into_any_element()
+                            }
                             AgentItem::Message { is_user, text } => {
                                 let streaming = is_running
                                     && !*is_user
@@ -1810,7 +2064,8 @@ impl DartIde {
                                     .into_any_element()
                             }
                         }
-                    })),
+                    }))
+                    .when(is_running, |el| el.child(self.agent.indicator.clone())),
             )
             // 29. PendingChanges card (strictly reflects files modified/created by the AI agent)
             .when(has_ai_changes, |el| {
@@ -2080,6 +2335,29 @@ mod tests {
             parse_agent_stream_line(codex_line),
             vec![StreamFragment::ReplaceText("All tests pass.".into())]
         );
+    }
+
+    #[core::prelude::v1::test]
+    fn a_finished_claude_plan_is_captured_from_exitplanmode() {
+        let line = r###"{"type":"assistant","message":{"content":[{"type":"tool_use","name":"ExitPlanMode","input":{"plan":"## Plan\n1. Do it"}}]}}"###;
+        let frags = parse_agent_stream_line(line);
+        assert_eq!(frags[0], StreamFragment::Plan("## Plan\n1. Do it".into()));
+        assert!(matches!(&frags[1], StreamFragment::Tool(call) if call.label == "ExitPlanMode"));
+        // An ExitPlanMode with no plan (newer versions read the plan file) only reports the tool.
+        let bare = r#"{"type":"assistant","message":{"content":[{"type":"tool_use","name":"ExitPlanMode","input":{}}]}}"#;
+        assert_eq!(parse_agent_stream_line(bare).len(), 1);
+    }
+
+    #[core::prelude::v1::test]
+    fn the_indicator_says_what_the_agent_is_doing() {
+        let tool = |kind, label: &str| AgentToolCall { kind, label: label.into(), target_path: None };
+        assert_eq!(activity_label(None), "Thinking");
+        assert_eq!(activity_label(Some(&tool(AgentToolKind::File, "Read main.dart"))), "Reading main.dart");
+        assert_eq!(activity_label(Some(&tool(AgentToolKind::File, "Edit lib/a.dart"))), "Editing lib/a.dart");
+        assert_eq!(activity_label(Some(&tool(AgentToolKind::File, "Write plan.md"))), "Writing plan.md");
+        assert_eq!(activity_label(Some(&tool(AgentToolKind::Terminal, "cargo test"))), "Running a command");
+        assert_eq!(activity_label(Some(&tool(AgentToolKind::File, "ExitPlanMode"))), "Finishing the plan");
+        assert_eq!(activity_label(Some(&tool(AgentToolKind::File, "TodoWrite"))), "Working");
     }
 
     #[core::prelude::v1::test]
