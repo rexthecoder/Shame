@@ -492,8 +492,7 @@ impl DartIde {
                             )
                             .child(keycap("\u{2318},", cx))
                             .on_click(cx.listener(|this, _event, _window, cx| {
-                                this.settings_open = true;
-                                cx.notify();
+                                this.toggle_settings(cx);
                             })),
                     ),
             )

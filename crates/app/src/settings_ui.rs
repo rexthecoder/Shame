@@ -39,6 +39,10 @@ impl DartIde {
             ("Panels & Layout", "Sidebar, terminal dock, web preview, and agent rails"),
             ("AI", "Coding harness, default model, and permission mode"),
             ("Flutter & Simulator", "Hot reload, embedded iOS Simulator, and VM overlays"),
+            (
+                "Language Servers",
+                "Installed language servers and their install commands",
+            ),
         ];
 
         // Helper for a Zed-style pill toggle switch (`38×20` track with `14×14` thumb circle)
@@ -451,6 +455,78 @@ impl DartIde {
                 )
                 .into_any_element(),
             );
+        }
+
+        // Category 7: Language Servers
+        if show_cat(7, "language server lsp pyright gopls rust-analyzer clangd diagnostics") {
+            let total = self.lsp_servers.len();
+            let ready = self
+                .lsp_servers
+                .iter()
+                .filter(|s| s.is_ready())
+                .count();
+            let missing = total.saturating_sub(ready);
+            let summary = if total == 0 {
+                "No language servers configured for this build.".to_string()
+            } else if missing == 0 {
+                format!("{ready} of {total} language servers available")
+            } else {
+                format!("{ready} of {total} available · {missing} missing")
+            };
+            let v1 = view.clone();
+            let ctrl = select_pill("settings-lsp-rescan", "Rescan".to_string())
+                .on_click(move |_e, _window, cx| {
+                    v1.update(cx, |this, cx| {
+                        this.refresh_lsp_health();
+                        cx.notify();
+                    });
+                })
+                .into_any_element();
+            rows.push(
+                setting_row("Language Servers", summary, ctrl).into_any_element(),
+            );
+
+            for server in &self.lsp_servers {
+                let ready_row = server.is_ready();
+                let detail = if let Some(path) = &server.path {
+                    let mut cmd = crate::lsp_health::compact_path(path);
+                    if !server.args.is_empty() {
+                        cmd.push(' ');
+                        cmd.push_str(&server.args);
+                    }
+                    cmd
+                } else {
+                    format!("Install: {}", server.install)
+                };
+                let (chip, chip_color) = if ready_row {
+                    (
+                        "Ready",
+                        cx.theme().success,
+                    )
+                } else {
+                    ("Missing", cx.theme().warning)
+                };
+                let chip_el = div()
+                    .h(px(22.))
+                    .px(px(8.))
+                    .flex()
+                    .items_center()
+                    .rounded(px(999.))
+                    .bg(chip_color.opacity(0.14))
+                    .text_size(px(11.))
+                    .font_medium()
+                    .text_color(chip_color)
+                    .child(chip)
+                    .into_any_element();
+                rows.push(
+                    setting_row(
+                        server.name,
+                        detail,
+                        chip_el,
+                    )
+                    .into_any_element(),
+                );
+            }
         }
 
         let (cat_title, cat_sub) = if !query.is_empty() {

@@ -503,8 +503,7 @@ impl DartIde {
                             "Settings & Preferences (\u{2318},)",
                         )
                         .on_click(cx.listener(|this, _event, _window, cx| {
-                            this.settings_open = !this.settings_open;
-                            cx.notify();
+                            this.toggle_settings(cx);
                         })),
                     ),
             )

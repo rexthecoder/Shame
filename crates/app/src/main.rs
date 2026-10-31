@@ -13,6 +13,7 @@ mod diff_view;
 mod editor;
 mod git_panel;
 mod history;
+mod lsp_health;
 mod rails;
 mod references;
 mod debug;
@@ -535,6 +536,9 @@ pub struct DartIde {
     pub(crate) slow_animations_on: bool,
     pub(crate) settings_open: bool,
     pub(crate) settings_tab: usize,
+    /// Language servers as resolved the last time Settings was opened, so the
+    /// panel never touches the filesystem mid-render.
+    pub(crate) lsp_servers: Vec<crate::lsp_health::LspServerStatus>,
     pub(crate) settings_search: Entity<InputState>,
     pub(crate) about_open: bool,
     pub(crate) light_theme: bool,
@@ -544,6 +548,22 @@ pub struct DartIde {
 }
 
 impl DartIde {
+    /// Open or close Settings, re-checking the installed language servers on
+    /// the way in so the list reflects what exists right now.
+    pub(crate) fn toggle_settings(&mut self, cx: &mut Context<Self>) {
+        self.settings_open = !self.settings_open;
+        if self.settings_open {
+            self.refresh_lsp_health();
+        }
+        cx.notify();
+    }
+
+    /// Re-resolve every configured language server binary.
+    pub(crate) fn refresh_lsp_health(&mut self) {
+        let root = self.has_workspace.then(|| self.root.clone());
+        self.lsp_servers = crate::lsp_health::scan(root.as_deref());
+    }
+
     fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         let (has_workspace, root, recent_workspaces) = resolve_initial_workspace();
         let show_hidden = true;
@@ -716,6 +736,7 @@ impl DartIde {
             slow_animations_on: false,
             settings_open: false,
             settings_tab: 0,
+            lsp_servers: Vec::new(),
             settings_search,
             about_open: false,
             light_theme: false,
@@ -863,8 +884,7 @@ impl DartIde {
         let primary_mod = keystroke.modifiers.platform || keystroke.modifiers.control;
 
         if primary_mod && keystroke.key.as_str() == "," {
-            self.settings_open = !self.settings_open;
-            cx.notify();
+            self.toggle_settings(cx);
             return;
         }
 
@@ -1041,8 +1061,7 @@ impl Render for DartIde {
                 cx.notify();
             }))
             .on_action(cx.listener(|this, _: &OpenSettings, _w, cx| {
-                this.settings_open = !this.settings_open;
-                cx.notify();
+                this.toggle_settings(cx);
             }))
             .on_action(|_: &QuitShame, _w, cx| {
                 cx.quit();

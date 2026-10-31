@@ -394,9 +394,7 @@ impl DartIde {
             "new-file" => self.new_scratch_tab(window, cx),
             "open-folder" => self.open_folder(window, cx),
             "close-folder" => self.close_workspace(cx),
-            "open-settings" => {
-                self.settings_open = true;
-            }
+            "open-settings" => self.toggle_settings(cx),
             "about-shame" => {
                 self.about_open = true;
             }

@@ -112,9 +112,9 @@ pub trait LanguageAdapter: Send + Sync {
 
 /// Resolve the appropriate `LanguageAdapter` for a file path (or a generic
 /// adapter when the buffer is untitled or has an unrecognized extension).
-pub fn language_for_path(path: Option<&Path>) -> Arc<dyn LanguageAdapter> {
+fn adapters() -> &'static [Arc<dyn LanguageAdapter>] {
     static REGISTRY: OnceLock<Vec<Arc<dyn LanguageAdapter>>> = OnceLock::new();
-    let adapters = REGISTRY.get_or_init(|| {
+    REGISTRY.get_or_init(|| {
         let mut list: Vec<Arc<dyn LanguageAdapter>> = vec![
             Arc::new(DartLanguageAdapter),
             Arc::new(RustLanguageAdapter),
@@ -124,7 +124,11 @@ pub fn language_for_path(path: Option<&Path>) -> Arc<dyn LanguageAdapter> {
             list.push(Arc::new(SimpleLanguageAdapter(spec)));
         }
         list
-    });
+    })
+}
+
+pub fn language_for_path(path: Option<&Path>) -> Arc<dyn LanguageAdapter> {
+    let adapters = adapters();
 
     if let Some(p) = path {
         for adapter in adapters {
@@ -1130,3 +1134,97 @@ fn find_call_expression_range(
     )
 }
 
+/// One language server this build knows how to start. Used by the Settings
+/// diagnostics list so a missing binary reads as an install step instead of
+/// silently degrading to lexical highlighting.
+#[derive(Clone, Debug)]
+pub struct LanguageServerSpec {
+    pub language_id: &'static str,
+    pub display_name: &'static str,
+    /// Executable that would be spawned (`dart` resolves to the Flutter SDK's).
+    pub program: String,
+    pub args: Vec<String>,
+    /// The shortest command that installs it on macOS.
+    pub install_hint: &'static str,
+}
+
+fn language_display_name(language_id: &str) -> &'static str {
+    match language_id {
+        "dart" => "Dart / Flutter",
+        "rust" => "Rust",
+        "typescript" => "TypeScript / JavaScript",
+        "python" => "Python",
+        "go" => "Go",
+        "swift" => "Swift",
+        "kotlin" => "Kotlin",
+        "cpp" => "C / C++",
+        "java" => "Java",
+        "ruby" => "Ruby",
+        "zig" => "Zig",
+        "csharp" => "C#",
+        "php" => "PHP",
+        "lua" => "Lua",
+        "html" => "HTML",
+        "css" => "CSS",
+        "json" => "JSON",
+        "yaml" => "YAML",
+        "toml" => "TOML",
+        "bash" => "Bash",
+        "sql" => "SQL",
+        "markdown" => "Markdown",
+        _ => "Other",
+    }
+}
+
+fn language_install_hint(language_id: &str) -> &'static str {
+    match language_id {
+        "dart" => "Install the Flutter SDK (ships the Dart language server)",
+        "rust" => "rustup component add rust-analyzer",
+        "typescript" | "html" | "css" | "json" => {
+            "npm i -g typescript typescript-language-server vscode-langservers-extracted"
+        }
+        "python" => "npm i -g pyright",
+        "go" => "go install golang.org/x/tools/gopls@latest",
+        "swift" => "xcode-select --install",
+        "kotlin" => "brew install kotlin-language-server",
+        "cpp" => "xcode-select --install  (Apple clangd)",
+        "java" => "brew install jdtls",
+        "ruby" => "gem install ruby-lsp",
+        "zig" => "brew install zls",
+        "csharp" => "dotnet tool install -g csharp-ls",
+        "php" => "npm i -g intelephense",
+        "lua" => "brew install lua-language-server",
+        "yaml" => "npm i -g yaml-language-server",
+        "toml" => "brew install taplo",
+        "bash" => "npm i -g bash-language-server",
+        "sql" => "npm i -g sql-language-server",
+        "markdown" => "brew install marksman",
+        _ => "",
+    }
+}
+
+/// Every language server this build can start, deduplicated by language and
+/// sorted for display. Dart's program is resolved through the Flutter SDK the
+/// same way the editor itself resolves it.
+pub fn language_server_specs(project_root: Option<&Path>) -> Vec<LanguageServerSpec> {
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    for adapter in adapters() {
+        let id = adapter.language_id();
+        let Some((program, args)) = adapter.lsp_command(project_root) else {
+            continue;
+        };
+        if !seen.insert(id) {
+            continue;
+        }
+        out.push(LanguageServerSpec {
+            language_id: id,
+            display_name: language_display_name(id),
+            program,
+            args,
+            install_hint: language_install_hint(id),
+        });
+    }
+    out.sort_by(|a, b| a.display_name.cmp(b.display_name));
+    out
+}
