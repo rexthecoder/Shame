@@ -36,18 +36,45 @@ use gpui_kit::*;
 
 use rails::files::{build_tree_items, render_file_icon};
 
-/// Directory/file names we never want to show in the file tree.
-pub(crate) const IGNORED_NAMES: &[&str] = &["target", "node_modules", ".DS_Store"];
+/// Directory/file names we never want to show in the file tree or scan during Quick Open.
+pub(crate) const IGNORED_NAMES: &[&str] = &[
+    "target",
+    "dist",
+    "node_modules",
+    ".dart_tool",
+    "build",
+    "Pods",
+    "DerivedData",
+    ".gradle",
+    ".next",
+    "__pycache__",
+    ".venv",
+    "Library",
+    ".Trash",
+    ".DS_Store",
+];
 
-/// Every file under `dir`, for the Quick Open palette.
+const MAX_SCAN_DEPTH: usize = 7;
+const MAX_FLATTENED_FILES: usize = 12_000;
+
+/// Every file under `dir`, bounded by depth and count for instantaneous startup.
 fn flatten_files(dir: &Path) -> Vec<PathBuf> {
     let mut files = Vec::new();
+    flatten_files_bounded(dir, 0, &mut files);
+    files
+}
 
+fn flatten_files_bounded(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) {
+    if depth > MAX_SCAN_DEPTH || out.len() >= MAX_FLATTENED_FILES {
+        return;
+    }
     let Ok(entries) = std::fs::read_dir(dir) else {
-        return files;
+        return;
     };
-
     for entry in entries.flatten() {
+        if out.len() >= MAX_FLATTENED_FILES {
+            return;
+        }
         let path = entry.path();
         let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
             continue;
@@ -56,13 +83,82 @@ fn flatten_files(dir: &Path) -> Vec<PathBuf> {
             continue;
         }
         if path.is_dir() {
-            files.extend(flatten_files(&path));
+            flatten_files_bounded(&path, depth + 1, out);
         } else {
-            files.push(path);
+            out.push(path);
+        }
+    }
+}
+
+fn last_workspace_config_path() -> Option<PathBuf> {
+    let home = std::env::var("HOME").ok()?;
+    Some(Path::new(&home).join(".config/shame/last_workspace"))
+}
+
+fn persist_last_workspace(root: &Path) {
+    if root == Path::new("/")
+        || root.starts_with("/Applications")
+        || root.starts_with("/System")
+    {
+        return;
+    }
+    if let Some(cfg) = last_workspace_config_path() {
+        if let Some(parent) = cfg.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let _ = std::fs::write(cfg, root.to_string_lossy().as_bytes());
+    }
+}
+
+/// When launched as a macOS `.app` bundle from Finder / Dock / Spotlight, LaunchServices
+/// sets the process `current_dir` to `/`. Detect that and restore the user's last workspace
+/// (or a sensible project folder under `$HOME`) instead of scanning `/`.
+fn resolve_initial_workspace_root() -> PathBuf {
+    if let Some(arg_path) = std::env::args().nth(1).filter(|a| !a.starts_with('-')) {
+        let p = PathBuf::from(arg_path);
+        if p.is_dir() {
+            persist_last_workspace(&p);
+            return p;
         }
     }
 
-    files
+    if let Ok(cwd) = std::env::current_dir() {
+        if cwd != Path::new("/")
+            && !cwd.starts_with("/Applications")
+            && !cwd.starts_with("/System")
+        {
+            persist_last_workspace(&cwd);
+            return cwd;
+        }
+    }
+
+    if let Some(cfg) = last_workspace_config_path()
+        && let Ok(saved) = std::fs::read_to_string(cfg)
+    {
+        let p = PathBuf::from(saved.trim());
+        if p.is_dir() && p != Path::new("/") {
+            let _ = std::env::set_current_dir(&p);
+            return p;
+        }
+    }
+
+    if let Ok(home) = std::env::var("HOME") {
+        let shame_proj = Path::new(&home).join("Desktop/Projects/shame");
+        if shame_proj.is_dir() {
+            let _ = std::env::set_current_dir(&shame_proj);
+            return shame_proj;
+        }
+        let projects = Path::new(&home).join("Desktop/Projects");
+        if projects.is_dir() {
+            let _ = std::env::set_current_dir(&projects);
+            return projects;
+        }
+        let home_path = PathBuf::from(home);
+        let _ = std::env::set_current_dir(&home_path);
+        return home_path;
+    }
+
+    PathBuf::from(".")
 }
 
 fn hash_paths(paths: &[PathBuf]) -> u64 {
@@ -355,7 +451,7 @@ pub struct DartIde {
 
 impl DartIde {
     fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        let root = resolve_initial_workspace_root();
         let show_hidden = true;
         let items = build_tree_items(&root, show_hidden);
         let all_files = flatten_files(&root);
@@ -1035,6 +1131,8 @@ impl DartIde {
     }
 
     fn set_root(&mut self, root: PathBuf, cx: &mut Context<Self>) {
+        persist_last_workspace(&root);
+        let _ = std::env::set_current_dir(&root);
         // Stop any running Flutter daemon from the previous project
         self.stop_flutter_run(cx);
 

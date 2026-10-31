@@ -15,7 +15,14 @@ use gpui_kit::*;
 use crate::{DartIde, IGNORED_NAMES, tokens};
 
 pub(crate) fn build_tree_items(dir: &Path, show_hidden: bool) -> Vec<TreeItem> {
+    build_tree_items_bounded(dir, show_hidden, 0)
+}
+
+fn build_tree_items_bounded(dir: &Path, show_hidden: bool, depth: usize) -> Vec<TreeItem> {
     let mut items = Vec::new();
+    if depth > 6 {
+        return items;
+    }
 
     let Ok(entries) = std::fs::read_dir(dir) else {
         return items;
@@ -36,7 +43,7 @@ pub(crate) fn build_tree_items(dir: &Path, show_hidden: bool) -> Vec<TreeItem> {
 
         let id = path.to_string_lossy().to_string();
         if path.is_dir() {
-            let children = build_tree_items(&path, show_hidden);
+            let children = build_tree_items_bounded(&path, show_hidden, depth + 1);
             items.push(TreeItem::new(id, name.to_string()).children(children));
         } else {
             items.push(TreeItem::new(id, name.to_string()));

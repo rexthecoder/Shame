@@ -1,4 +1,7 @@
 /target
+/dist
+/*.dmg
+/*.app
 **/*.rs.bk
 .DS_Store
 docks.json

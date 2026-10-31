@@ -112,8 +112,10 @@ dmg: bundle
 release: test dmg
 	@ls -lh "$(DMG_PATH)"
 
-# Install into /Applications
+# Install into /Applications and launch Shame.app
 install: bundle
-	@rm -rf "/Applications/$(APP_NAME).app"
+	@rm -rf "/Applications/Dart IDE.app" "/Applications/$(APP_NAME).app"
 	@cp -R "$(APP_DIR)" "/Applications/$(APP_NAME).app"
-	@echo "✓ Installed /Applications/$(APP_NAME).app"
+	@xattr -cr "/Applications/$(APP_NAME).app" 2>/dev/null || true
+	@open -a "/Applications/$(APP_NAME).app"
+	@echo "✓ Installed and launched /Applications/$(APP_NAME).app"
