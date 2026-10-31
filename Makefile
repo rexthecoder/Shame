@@ -13,13 +13,13 @@
 
 CRATE     := app
 BIN       := dart-ide
-APP_NAME  := Dart IDE
-BUNDLE_ID := dev.shame.dart-ide
+APP_NAME  := Shame
+BUNDLE_ID := dev.shame.ide
 VERSION   := 0.1.0
 DIST_DIR  := dist
 APP_DIR   := $(DIST_DIR)/$(APP_NAME).app
-DMG_PATH  := $(DIST_DIR)/Dart-IDE-$(VERSION)-macos.dmg
-LOG       := /tmp/dart-ide.log
+DMG_PATH  := $(DIST_DIR)/$(APP_NAME)-$(VERSION)-macos.dmg
+LOG       := /tmp/shame.log
 
 .PHONY: build run restart stop test check fmt clean icon release-build bundle dmg release install
 

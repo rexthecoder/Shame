@@ -147,6 +147,7 @@ const IDE_COMMANDS: &[IdeCommand] = &[
     IdeCommand { id: "toggle-problems", title: "View: Toggle Problems Panel", shortcut: "\u{2318}\u{21e7}M", flutter_only: false },
     IdeCommand { id: "toggle-terminal", title: "View: Toggle Terminal Dock", shortcut: "\u{2318}J", flutter_only: false },
     IdeCommand { id: "toggle-sidebar", title: "View: Toggle Left Sidebar", shortcut: "\u{2318}B", flutter_only: false },
+    IdeCommand { id: "toggle-web-preview", title: "View: Toggle Web Preview Rail", shortcut: "", flutter_only: false },
     IdeCommand { id: "toggle-agent", title: "View: Toggle Agent Rail", shortcut: "", flutter_only: false },
     IdeCommand { id: "format-doc", title: "Editor: Format Document", shortcut: "\u{21e7}\u{2318}F", flutter_only: false },
     IdeCommand { id: "goto-line", title: "Editor: Go to Line\u{2026}", shortcut: "\u{2318}G", flutter_only: false },
@@ -288,6 +289,12 @@ pub struct DartIde {
     pub(crate) sidebar_tab: git_panel::SidebarTab,
     pub(crate) git: git_panel::GitState,
     pub(crate) sim: crate::simulator::SimulatorState,
+    pub(crate) web_preview_open: bool,
+    pub(crate) web_preview_url: Entity<InputState>,
+    pub(crate) web_preview_image: Option<std::sync::Arc<ImagePreview>>,
+    pub(crate) web_preview_viewport: rails::web_preview::WebViewport,
+    pub(crate) web_preview_loading: bool,
+    pub(crate) web_preview_error: Option<String>,
     pub(crate) agent_open: bool,
     pub(crate) agent: rails::agent::AgentState,
     pub(crate) project_search_input: Entity<InputState>,
@@ -374,6 +381,11 @@ impl DartIde {
         let file_tree_input = cx.new(|cx| {
             InputState::new(window, cx).placeholder("path/to/file.dart\u{2026}")
         });
+        let web_preview_url = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("http://localhost:3000 or file://\u{2026}")
+                .default_value("http://localhost:3000")
+        });
         let agent = rails::agent::AgentState::new(window, cx);
 
         // Filled in by the first `refresh_git` (off the UI thread) right after construction.
@@ -418,6 +430,12 @@ impl DartIde {
             sidebar_tab: git_panel::SidebarTab::Files,
             git: git_panel::GitState::new(window, cx),
             sim: Default::default(),
+            web_preview_open: false,
+            web_preview_url,
+            web_preview_image: None,
+            web_preview_viewport: rails::web_preview::WebViewport::Desktop,
+            web_preview_loading: false,
+            web_preview_error: None,
             agent_open: false,
             agent,
             project_search_input,
@@ -757,6 +775,7 @@ impl DartIde {
             }
             "toggle-terminal" => self.terminal_open = !self.terminal_open,
             "toggle-sidebar" => self.sidebar_open = !self.sidebar_open,
+            "toggle-web-preview" => self.toggle_web_preview(window, cx),
             "toggle-agent" => self.agent_open = !self.agent_open,
             "format-doc" => {
                 if let Some(ed) = self.active_editor().cloned() {
@@ -820,6 +839,9 @@ impl DartIde {
                 }
                 EditorEvent::Saved { path } => {
                     this.refresh_git(cx);
+                    if this.web_preview_open {
+                        this.refresh_web_preview(cx);
+                    }
                     let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
                     let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
                     if name.eq_ignore_ascii_case("launch.json") {
@@ -3795,7 +3817,7 @@ fn main() {
         let window_options = WindowOptions {
             window_bounds: Some(WindowBounds::Windowed(bounds)),
             titlebar: Some(TitlebarOptions {
-                title: None,
+                title: Some(SharedString::from("Shame")),
                 appears_transparent: true,
                 traffic_light_position: Some(point(px(12.), px(12.))),
             }),

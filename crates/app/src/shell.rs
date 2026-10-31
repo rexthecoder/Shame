@@ -808,15 +808,26 @@ impl DartIde {
                 .into_any_element()
         };
 
-        let split_id = match (self.sidebar_open, self.sim.attached, self.agent_open) {
-            (true, true, true) => "shell-split-all",
-            (true, true, false) => "shell-split-left-sim",
-            (true, false, true) => "shell-split-both",
-            (true, false, false) => "shell-split-left",
-            (false, true, true) => "shell-split-sim-agent",
-            (false, true, false) => "shell-split-sim",
-            (false, false, true) => "shell-split-right",
-            (false, false, false) => "shell-split-center",
+        let split_id = match (
+            self.sidebar_open,
+            self.sim.attached,
+            self.web_preview_open,
+            self.agent_open,
+        ) {
+            (true, false, false, false) => "shell-split-left",
+            (true, false, false, true) => "shell-split-both",
+            (true, true, false, false) => "shell-split-left-sim",
+            (true, true, false, true) => "shell-split-all",
+            (true, false, true, false) => "shell-split-left-web",
+            (true, false, true, true) => "shell-split-left-web-agent",
+            (true, true, true, _) => "shell-split-left-sim-web",
+            (false, false, false, true) => "shell-split-right",
+            (false, true, false, false) => "shell-split-sim",
+            (false, true, false, true) => "shell-split-sim-agent",
+            (false, false, true, false) => "shell-split-web",
+            (false, false, true, true) => "shell-split-web-agent",
+            (false, true, true, _) => "shell-split-sim-web",
+            (false, false, false, false) => "shell-split-center",
         };
         let mut split = h_resizable(split_id);
 
@@ -850,8 +861,22 @@ impl DartIde {
                     .size_range(px(292.)..px(400.))
                     .fixed()
                     .pl(px(tokens::GUTTER / 2.))
-                    .when(self.agent_open, |p| p.pr(px(tokens::GUTTER / 2.)))
+                    .when(self.web_preview_open || self.agent_open, |p| {
+                        p.pr(px(tokens::GUTTER / 2.))
+                    })
                     .child(self.render_simulator_rail(cx)),
+            );
+        }
+
+        if self.web_preview_open {
+            split = split.child(
+                resizable_panel()
+                    .size(px(340.))
+                    .size_range(px(280.)..px(520.))
+                    .fixed()
+                    .pl(px(tokens::GUTTER / 2.))
+                    .when(self.agent_open, |p| p.pr(px(tokens::GUTTER / 2.)))
+                    .child(self.render_web_preview_rail(cx)),
             );
         }
 

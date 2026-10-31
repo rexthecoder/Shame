@@ -430,7 +430,22 @@ impl DartIde {
                             })),
                         )
                     })
-                    // Right-hand tool icons: Agent, Quick Open, Settings
+                    // Right-hand tool icons: Web Preview, Agent, Quick Open, Settings
+                    .child(
+                        icon_button(
+                            "titlebar-web-preview",
+                            gpui_kit::assets::IconName::Globe,
+                            Some(if self.web_preview_open {
+                                cx.theme().primary
+                            } else {
+                                muted
+                            }),
+                            "Toggle Web Preview rail",
+                        )
+                        .on_click(cx.listener(|this, _event, window, cx| {
+                            this.toggle_web_preview(window, cx);
+                        })),
+                    )
                     .child(
                         icon_button(
                             "agent-wand",

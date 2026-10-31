@@ -613,10 +613,61 @@ impl DartIde {
             .and_then(|p| p.strip_prefix(&self.root).ok().map(Path::to_path_buf))
             .map(|p| p.to_string_lossy().to_string());
 
-        let full_prompt = match &active_file {
-            Some(file) => format!("[Active file in IDE: {file}]\n{prompt}"),
-            None => prompt,
-        };
+        let open_tabs: Vec<String> = self
+            .tabs
+            .iter()
+            .filter_map(|t| t.path.as_ref())
+            .filter_map(|p| p.strip_prefix(&self.root).ok())
+            .map(|p| p.to_string_lossy().to_string())
+            .collect();
+
+        let mut diag_lines: Vec<String> = Vec::new();
+        for tab in &self.tabs {
+            let Some(path) = tab.path.as_ref() else {
+                continue;
+            };
+            let rel = path
+                .strip_prefix(&self.root)
+                .unwrap_or(path)
+                .to_string_lossy();
+            for d in tab.editor.read(cx).diagnostics().iter().take(6) {
+                let sev = match d.severity {
+                    Some(core_lsp::lsp_types::DiagnosticSeverity::ERROR) => "ERROR",
+                    Some(core_lsp::lsp_types::DiagnosticSeverity::WARNING) => "WARN",
+                    _ => "INFO",
+                };
+                let l = d.range.start.line + 1;
+                let c = d.range.start.character + 1;
+                let msg = d.message.lines().next().unwrap_or(&d.message).trim();
+                diag_lines.push(format!("{sev} {rel}:{l}:{c}: {msg}"));
+                if diag_lines.len() >= 10 {
+                    break;
+                }
+            }
+            if diag_lines.len() >= 10 {
+                break;
+            }
+        }
+
+        let mut ctx_header = format!(
+            "[Shame IDE Environment & Tooling]\n- Workspace root: {}\n- Git branch: {}\n- Active file: {}\n- Open editor tabs: {}\n- Available IDE & CLI tooling you have full access to:\n  1. Workspace Files & Diff Review: Read/Edit/Write any file in the workspace; edited files automatically appear in Shame's AI Changes diff reviewer.\n  2. Multi-Language Toolchains (21 languages): `dart` / `flutter` (including `.fvm/flutter_sdk/bin/flutter`, `flutter test`, `dart run build_runner build --delete-conflicting-outputs`, `flutter gen-l10n`), `cargo` / `rustc`, `bun` / `node` / `npm` / `tsc`, `python3`, `go`, `swift` / `xcodebuild`, `clang++`, `ruby` / `pod`, `zig`.\n  3. iOS Simulator & Mobile Tooling: `xcrun simctl` (list/boot devices, `xcrun simctl io booted screenshot` for visual verification).\n  4. Web Preview & Headless Browser: Shame's built-in Web Preview panel (`{}`) and headless Chrome (`/Applications/Google Chrome.app/Contents/MacOS/Google Chrome --headless=new --screenshot`).\n  5. Git & Shell: Full `git` CLI and shell command execution in `{}`.",
+            self.root.display(),
+            self.git_branch.as_deref().unwrap_or("detached"),
+            active_file.as_deref().unwrap_or("none"),
+            if open_tabs.is_empty() {
+                "none".to_string()
+            } else {
+                open_tabs.join(", ")
+            },
+            self.web_preview_url.read(cx).value(),
+            self.root.display(),
+        );
+        if !diag_lines.is_empty() {
+            ctx_header.push_str("\n- Active LSP Diagnostics in open files:\n  ");
+            ctx_header.push_str(&diag_lines.join("\n  "));
+        }
+
+        let full_prompt = format!("{ctx_header}\n\n[User Request]\n{prompt}");
 
         let Some(bin_path) = harness.resolve_binary() else {
             self.agent.items.push(AgentItem::Message {
@@ -831,6 +882,9 @@ impl DartIde {
                                 }
                                 this.refresh_git(cx);
                                 this.sync_workspace_files_if_changed(cx);
+                                if this.web_preview_open {
+                                    this.refresh_web_preview(cx);
+                                }
                             }
                         }
                         cx.notify();
@@ -1097,6 +1151,34 @@ impl DartIde {
                                                 .text_size(px(tokens::UI_XS))
                                                 .text_color(fg)
                                                 .child(format!("Context: {active_ctx}")),
+                                        ),
+                                )
+                                .child(
+                                    h_flex()
+                                        .flex_wrap()
+                                        .items_center()
+                                        .gap(px(4.))
+                                        .child(
+                                            div()
+                                                .text_size(px(tokens::UI_XS))
+                                                .text_color(muted)
+                                                .child("Tooling:"),
+                                        )
+                                        .children(
+                                            ["Files", "LSP", "Git", "Shell", "Simulator", "Web"]
+                                                .into_iter()
+                                                .map(|cap| {
+                                                    div()
+                                                        .px(px(5.))
+                                                        .py(px(1.))
+                                                        .rounded(px(3.))
+                                                        .bg(cx.theme().background)
+                                                        .border_1()
+                                                        .border_color(border)
+                                                        .text_size(px(9.5))
+                                                        .text_color(muted)
+                                                        .child(cap)
+                                                }),
                                         ),
                                 )
                                 .child(div().w_full().h(px(1.)).bg(border.opacity(0.6)))
