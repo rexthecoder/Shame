@@ -2011,9 +2011,10 @@ impl EditorView {
                             );
                             (*diag_color, col_range.clone(), shaped_lbl)
                         });
-                (bounds, shaped, shaped_closing, shaped_diag)
+                let hitbox = window.insert_hitbox(bounds, HitboxBehavior::Normal);
+                (hitbox, shaped, shaped_closing, shaped_diag)
             },
-            move |bounds, (_, shaped, shaped_closing, shaped_diag), window, cx| {
+            move |bounds, (hitbox, shaped, shaped_closing, shaped_diag), window, cx| {
                 // 1. Faint vertical indent guides at exact shaped column offsets
                 for column in (indent_width..leading_spaces).step_by(indent_width).take(16) {
                     let x = shaped.x_for_index(column.min(line_len));
@@ -2184,13 +2185,16 @@ impl EditorView {
                     window.paint_quad(fill(caret_rect, caret_color).corner_radii(px(0.75)));
                 }
 
-                // 6. Mouse interactions using the exact same `shaped` line
+                // 6. Mouse interactions using the exact same `shaped` line, gated by `hitbox.is_hovered(window)`
+                // so any `.occlude()` modal, popover, or menu above the editor blocks background clicks/hovers.
                 let down_shaped = shaped.clone();
                 let down_view = view.clone();
+                let down_hitbox = hitbox.clone();
                 window.on_mouse_event(move |event: &MouseDownEvent, phase, window, cx| {
                     if phase != DispatchPhase::Bubble
                         || event.button != MouseButton::Left
                         || !bounds.contains(&event.position)
+                        || !down_hitbox.is_hovered(window)
                     {
                         return;
                     }
@@ -2218,10 +2222,12 @@ impl EditorView {
 
                 let move_shaped = shaped.clone();
                 let move_view = view.clone();
-                window.on_mouse_event(move |event: &MouseMoveEvent, phase, _window, cx| {
+                let move_hitbox = hitbox.clone();
+                window.on_mouse_event(move |event: &MouseMoveEvent, phase, window, cx| {
                     if phase != DispatchPhase::Bubble
                         || event.pressed_button != Some(MouseButton::Left)
                         || !bounds.contains(&event.position)
+                        || !move_hitbox.is_hovered(window)
                     {
                         return;
                     }
@@ -2234,10 +2240,12 @@ impl EditorView {
 
                 let hover_shaped = shaped.clone();
                 let hover_view = view;
-                window.on_mouse_event(move |event: &MouseMoveEvent, phase, _window, cx| {
+                let hover_hitbox = hitbox;
+                window.on_mouse_event(move |event: &MouseMoveEvent, phase, window, cx| {
                     if phase != DispatchPhase::Bubble
                         || event.pressed_button.is_some()
                         || !bounds.contains(&event.position)
+                        || !hover_hitbox.is_hovered(window)
                     {
                         return;
                     }
@@ -2411,7 +2419,7 @@ impl EditorView {
                                         .absolute()
                                         .top(px(LINE_HEIGHT + 2.))
                                         .left(left_offset)
-                                        .w(px(500.))
+                                        .w(px(420.))
                                         .child(card),
                                 )
                                 .with_priority(10),
@@ -2503,34 +2511,45 @@ impl EditorView {
 
         let mut card = v_flex()
             .w_full()
-            .p_3()
-            .gap_2()
+            .max_h(px(200.))
+            .overflow_hidden()
+            .p_2p5()
+            .gap_1p5()
             .rounded(px(8.))
             .bg(cx.theme().popover)
             .border_1()
             .border_color(border)
             .shadow_xl()
             .font_family(ui_family)
-            .text_size(px(12.))
+            .text_size(px(11.5))
             .text_color(fg);
 
-        for block in code_blocks {
-            let tree = SyntaxTree::parse(&block);
-            let highlights = tree.highlights(&block);
+        // Render only the primary signature block (first fenced block), capped at 5 lines
+        if let Some(first_block) = code_blocks.into_iter().next() {
+            let all_sig_lines: Vec<&str> = first_block.lines().collect();
+            let capped_sig = if all_sig_lines.len() > 5 {
+                let mut head = all_sig_lines[..5].join("\n");
+                head.push_str("\n  \u{2026}");
+                head
+            } else {
+                first_block
+            };
+            let tree = SyntaxTree::parse(&capped_sig);
+            let highlights = tree.highlights(&capped_sig);
             let mut block_el = v_flex()
                 .w_full()
                 .px_2p5()
-                .py_2()
+                .py_1p5()
                 .gap_0p5()
                 .rounded(px(6.))
                 .bg(code_bg)
                 .border_1()
                 .border_color(border)
                 .font_family(mono_family.clone())
-                .text_size(px(12.));
+                .text_size(px(11.5));
 
             let mut byte_offset = 0;
-            for code_line in block.split('\n') {
+            for code_line in capped_sig.split('\n') {
                 let runs = Self::line_runs(byte_offset, code_line, &highlights);
                 let mut row = h_flex().w_full().flex_wrap().items_center();
                 for (range, kind) in runs {
@@ -2547,32 +2566,42 @@ impl EditorView {
             card = card.child(block_el);
         }
 
-        let non_empty_sections: Vec<Vec<String>> = sections
-            .into_iter()
-            .map(|sec| {
-                sec.into_iter()
-                    .map(|l| l.trim().to_string())
-                    .filter(|l| !l.is_empty())
-                    .collect::<Vec<_>>()
-            })
-            .filter(|sec| !sec.is_empty())
-            .collect();
-
-        for (sec_ix, sec) in non_empty_sections.into_iter().enumerate() {
-            if sec_ix > 0 {
-                card = card.child(div().w_full().h(px(1.)).bg(border));
+        // Collect clean summary lines (skipping Dartdoc `{@template}`, `{@macro}`, and `See also:` tails),
+        // capped strictly at 4 lines so the hover card stays compact and glanceable.
+        let mut prose_lines: Vec<String> = Vec::new();
+        'outer: for sec in sections {
+            for raw_l in sec {
+                let t = raw_l.trim();
+                if t.is_empty()
+                    || t.starts_with("{@")
+                    || t.starts_with("///")
+                {
+                    continue;
+                }
+                if t.starts_with("See also:") || t.starts_with("### ") || t.starts_with("## ") {
+                    break 'outer;
+                }
+                let clean = Self::clean_hover_markdown_line(t);
+                if !clean.is_empty() {
+                    prose_lines.push(clean);
+                    if prose_lines.len() >= 4 {
+                        break 'outer;
+                    }
+                }
             }
-            let mut sec_col = v_flex().w_full().gap_1();
-            for line in sec {
-                let clean = Self::clean_hover_markdown_line(&line);
-                let is_meta = clean.starts_with("Type:") || clean.starts_with("Declared in");
+        }
+
+        if !prose_lines.is_empty() {
+            let mut sec_col = v_flex().w_full().gap_0p5();
+            for line in prose_lines {
+                let is_meta = line.starts_with("Type:") || line.starts_with("Declared in");
                 sec_col = sec_col.child(
                     div()
                         .w_full()
-                        .text_size(px(if is_meta { 11.5 } else { 12. }))
+                        .truncate()
+                        .text_size(px(if is_meta { 11. } else { 11.5 }))
                         .text_color(if is_meta { muted } else { fg })
-                        .when(clean.contains('['), |el| el.text_color(fg))
-                        .child(clean),
+                        .child(line),
                 );
             }
             let _ = cyan;

@@ -612,6 +612,7 @@ impl DartIde {
         Some(
             div()
                 .id("branch-switcher-backdrop")
+                .occlude()
                 .absolute()
                 .inset_0()
                 .flex()

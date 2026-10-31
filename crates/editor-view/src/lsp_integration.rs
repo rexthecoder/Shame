@@ -403,6 +403,45 @@ impl EditorView {
         if self.hover_point == Some((line, column)) {
             return;
         }
+
+        // Only trigger hover on meaningful identifiers (types, widgets, functions, methods,
+        // properties) — never on whitespace, punctuation, comments, or basic keywords.
+        let line_text = if line < self.buffer.line_count() {
+            self.buffer.line(line)
+        } else {
+            String::new()
+        };
+        let display = line_text.trim_end_matches(['\n', '\r']);
+        let trimmed = display.trim_start();
+        if column >= display.len()
+            || trimmed.starts_with("//")
+            || trimmed.starts_with('#')
+            || !display
+                .as_bytes()
+                .get(column)
+                .is_some_and(|b| b.is_ascii_alphanumeric() || *b == b'_')
+        {
+            self.clear_hover(cx);
+            return;
+        }
+        let Some(word) = Self::word_at(display, column) else {
+            self.clear_hover(cx);
+            return;
+        };
+        const SKIP_HOVER_KEYWORDS: &[&str] = &[
+            "if", "else", "for", "while", "do", "switch", "case", "default", "break", "continue",
+            "return", "true", "false", "null", "void", "var", "final", "const", "late", "required",
+            "async", "await", "yield", "import", "export", "part", "library", "show", "hide", "as",
+            "is", "in", "class", "enum", "mixin", "extension", "extends", "implements", "with",
+            "super", "this", "new", "try", "catch", "finally", "throw", "rethrow", "assert",
+            "static", "covariant", "operator", "get", "set", "fn", "let", "mut", "pub", "use",
+            "mod", "impl", "struct", "trait", "where", "match", "loop", "self", "Self",
+        ];
+        if word.len() < 2 || SKIP_HOVER_KEYWORDS.contains(&word) {
+            self.clear_hover(cx);
+            return;
+        }
+
         self.hover_point = Some((line, column));
         let had_result = self.hover_result.take().is_some();
         self.hover_sequence += 1;
@@ -412,7 +451,7 @@ impl EditorView {
         }
 
         cx.spawn(async move |weak, cx| {
-            Timer::after(Duration::from_millis(300)).await;
+            Timer::after(Duration::from_millis(450)).await;
             let _ = weak.update(cx, |this, cx| {
                 if this.hover_sequence == sequence {
                     this.request_hover(line, column, cx);

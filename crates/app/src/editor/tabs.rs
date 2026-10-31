@@ -438,6 +438,7 @@ impl DartIde {
         Some(
             v_flex()
                 .id("tab-overflow-popover")
+                .occlude()
                 .absolute()
                 .top(px(tokens::TABSTRIP_H + 4.))
                 .right(px(tokens::SPACE_4))

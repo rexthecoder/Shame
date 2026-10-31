@@ -1820,6 +1820,7 @@ impl DartIde {
                 el.child(
                     v_flex()
                         .id("agent-tool-popover")
+                        .occlude()
                         .absolute()
                         .bottom(px(86.))
                         .left(px(tokens::SPACE_4))
@@ -1894,6 +1895,7 @@ impl DartIde {
                 el.child(
                     v_flex()
                         .id("agent-model-popover")
+                        .occlude()
                         .absolute()
                         .bottom(px(86.))
                         .left(px(tokens::SPACE_4))
