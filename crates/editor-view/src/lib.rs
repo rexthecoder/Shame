@@ -26,7 +26,6 @@ mod conflicts;
 mod lsp_integration;
 mod multicursor;
 mod snippet;
-mod sticky;
 
 use std::io;
 use std::ops::Range;
@@ -142,10 +141,6 @@ pub struct EditorView {
     hover_sequence: u64,
     hover_result: Option<(usize, String)>,
     signature_help: Option<lsp_integration::SignatureView>,
-    /// Memoized sticky-scroll header lines, keyed by (top line, fold count,
-    /// buffer revision, buffer byte length) so a different file reusing this
-    /// view can never inherit the previous file's header.
-    sticky_cache: Option<((usize, usize, u64, usize), Vec<(usize, String)>)>,
     snippet: Option<snippet::SnippetSession>,
     /// Active in-file search query (`⌘F`) and all case-insensitive byte ranges
     /// matching it across the buffer.
@@ -218,7 +213,6 @@ impl EditorView {
             hover_sequence: 0,
             hover_result: None,
             signature_help: None,
-            sticky_cache: None,
             snippet: None,
             search_query: String::new(),
             search_matches: Vec::new(),
@@ -434,7 +428,6 @@ impl EditorView {
         }
         self.folded_starts.clear();
         self.visible_lines.clear();
-        self.sticky_cache = None;
         self.synced_revision = self.buffer.revision();
         self.indent_width = self.buffer.detect_indent_width();
         self.line_changes.clear();
@@ -3207,78 +3200,14 @@ impl Render for EditorView {
         .track_scroll(&self.scroll_handle)
         .size_full();
 
-        let sticky_font = cx.theme().mono_font_family.clone();
-        let sticky_fg = cx.theme().foreground;
-        let sticky_muted = cx.theme().muted_foreground;
-        let sticky_border = cx.theme().border;
-        // Read the scroll position now (not from the list's layout pass, which
-        // runs after this and would leave the overlay a frame behind), and only
-        // rebuild the header lines when the top line, folds or text change.
-        let top_display = {
-            // A uniform list doesn't register per-row bounds (so
-            // `ScrollHandle::logical_scroll_top` is always 0), and its
-            // `last_item_size.item` is the whole viewport, not one row. Rows
-            // are a fixed `LINE_HEIGHT`, so derive the row from the pixel offset.
-            let state = self.scroll_handle.0.borrow();
-            // Real scroll extent from the last layout: total content minus the
-            // viewport (`item` is the list's visible area, `contents` all rows).
-            let max_scroll = state
-                .last_item_size
-                .as_ref()
-                .map(|size| (size.contents.height - size.item.height).to_f64());
-            let scrolled =
-                sticky::clamped_scroll(-state.base_handle.offset().y.to_f64(), max_scroll);
-            sticky::top_row(scrolled, LINE_HEIGHT as f64)
-        };
-        let top_line = if self.folded_starts.is_empty() {
-            top_display
-        } else {
-            self.visible_lines.get(top_display).copied().unwrap_or(top_display)
-        };
-        let sticky_key = (
-            top_line,
-            self.fold_ranges.len(),
-            self.buffer.revision(),
-            self.buffer.len_bytes(),
-        );
-        if self.sticky_cache.as_ref().map(|(k, _)| *k) != Some(sticky_key) {
-            let line_count = self.buffer.line_count();
-            let lines = sticky::sticky_scope_lines(&self.fold_ranges, top_line, 3)
-                .into_iter()
-                .filter(|line| *line < line_count)
-                .filter_map(|line| {
-                    let text = self
-                        .buffer
-                        .line(line)
-                        .trim_end_matches(['\n', '\r'])
-                        .trim_end()
-                        .to_string();
-                    // A header that is only a brace or blank reads as a bug.
-                    (!text.is_empty()).then_some((line, text))
-                })
-                .collect();
-            self.sticky_cache = Some((sticky_key, lines));
-        }
-        let sticky_lines: Vec<(usize, String)> = self
-            .sticky_cache
-            .as_ref()
-            .map(|(_, lines)| lines.clone())
-            .unwrap_or_default();
-        let sticky_count = sticky_lines.len();
-
         div()
             .id("editor-view")
             .key_context("Editor")
             .track_focus(&self.focus_handle)
-            // A `UniformList` scrolls its own content without re-rendering this
-            // view, but the sticky header is positioned from the pixel offset —
-            // without this it would freeze at whatever scope was on screen when
-            // something else last triggered a render.
             .on_scroll_wheel(cx.listener(|this, _event: &ScrollWheelEvent, _window, cx| {
                 // Scrolling moves the code out from under the pointer: the
                 // hover card must not ride along with it.
                 this.clear_hover(cx);
-                cx.notify();
             }))
             .on_hover(cx.listener(|this, hovered: &bool, _window, cx| {
                 if !hovered {
@@ -3296,65 +3225,6 @@ impl Render for EditorView {
             .bg(cx.theme().background)
             .text_color(cx.theme().foreground)
             .pt_2()
-            .relative()
             .child(list)
-            .when(!sticky_lines.is_empty(), |el| {
-                el.child(
-                    v_flex()
-                        .id("sticky-scroll")
-                        // Block clicks/hover on the code under the header but
-                        // let the wheel through, so scrolling never dies when
-                        // the pointer happens to rest on the header.
-                        .block_mouse_except_scroll()
-                        .absolute()
-                        .top(px(8.))
-                        .left_0()
-                        .right_0()
-                        .overflow_hidden()
-                        .bg(cx.theme().background)
-                        .border_b_1()
-                        .border_color(sticky_border.opacity(0.7))
-                        .children(sticky_lines.into_iter().enumerate().map(
-                            |(depth, (line, text))| {
-                                let is_innermost = depth + 1 == sticky_count;
-                                h_flex()
-                                    .id(("sticky-line", line))
-                                    .w_full()
-                                    .h(px(LINE_HEIGHT))
-                                    .flex_shrink_0()
-                                    .pl(px(GUTTER_WIDTH))
-                                    .pr_2()
-                                    .overflow_hidden()
-                                    .truncate()
-                                    .font_family(sticky_font.clone())
-                                    .text_size(px(LINE_FONT_SIZE))
-                                    .text_color(if is_innermost {
-                                        sticky_fg.opacity(0.88)
-                                    } else {
-                                        sticky_muted.opacity(0.62)
-                                    })
-                                    .cursor_pointer()
-                                    .hover(|s| s.bg(rgba(0xffffff08)))
-                                    .on_click(cx.listener(move |this, _event, _window, cx| {
-                                        if line < this.buffer.line_count() {
-                                            let byte = this.buffer.line_to_byte(line);
-                                            this.set_cursor(byte, cx);
-                                            // Land the clicked scope's header just
-                                            // below the remaining sticky rows instead
-                                            // of underneath them.
-                                            this.scroll_handle
-                                                .scroll_to_item_strict_with_offset(
-                                                    line,
-                                                    ScrollStrategy::Top,
-                                                    depth,
-                                                );
-                                            cx.notify();
-                                        }
-                                    }))
-                                    .child(text)
-                            },
-                        )),
-                )
-            })
     }
 }
