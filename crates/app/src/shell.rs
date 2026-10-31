@@ -996,6 +996,7 @@ impl DartIde {
             .rounded(px(tokens::RADIUS_CARD))
             .overflow_hidden()
             .when(has_tabs, |el| el.child(self.render_tabs(view, cx)))
+            .when_some(self.render_file_notice(cx), |el, banner| el.child(banner))
             .when_some(self.render_find_bar(view, cx), |el, bar| el.child(bar))
             .child(div().flex_1().w_full().min_h(px(0.)).child(editor_body))
             .when_some(self.render_tab_overflow_popover(view, cx), |el, pop| {
@@ -1086,6 +1087,9 @@ impl DartIde {
                         }
                         crate::git_panel::SidebarTab::Git => {
                             self.render_git_rail(cx).into_any_element()
+                        }
+                        crate::git_panel::SidebarTab::Widgets => {
+                            self.render_widgets_rail(cx).into_any_element()
                         }
                     }),
             );

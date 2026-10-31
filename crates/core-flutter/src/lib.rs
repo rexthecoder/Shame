@@ -28,6 +28,8 @@ mod inspector;
 mod launch;
 mod pubspec;
 mod sdk;
+mod tests;
+mod widget_tree;
 
 pub use daemon::{DaemonOutput, FlutterDaemon};
 pub use inspector::{WidgetLocation, file_uri_to_path, parse_selected_widget, path_to_file_uri};
@@ -42,3 +44,11 @@ pub use launch::{
 };
 pub use pubspec::{PubOutput, add_package, pub_get};
 pub use sdk::{FlutterSdk, detect_sdk};
+pub use widget_tree::{
+    TreeRow, WidgetNode, default_expanded, find_by_location, flatten as flatten_widget_tree, node_at,
+    parse_widget_tree,
+};
+pub use tests::{
+    Counts, GroupNode, SuiteNode, TestCase, TestRun, TestStatus, is_flutter_package, name_filter_regex,
+    test_args,
+};

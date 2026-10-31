@@ -161,7 +161,7 @@ impl DartIde {
                                                 move |_event, _window, cx| {
                                                     cx.stop_propagation();
                                                     view.update(cx, |this, cx| {
-                                                        this.close_tab(ix, cx);
+                                                        this.request_close_tab(ix, cx);
                                                     });
                                                 }
                                             }),
@@ -545,7 +545,7 @@ impl DartIde {
                                                 .on_click(move |_event, _window, cx| {
                                                     cx.stop_propagation();
                                                     view_close.update(cx, |this, cx| {
-                                                        this.close_tab(ix, cx);
+                                                        this.request_close_tab(ix, cx);
                                                     });
                                                 }),
                                         ),

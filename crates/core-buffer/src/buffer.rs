@@ -2,6 +2,7 @@ use std::fs::File;
 use std::io::{self, BufReader, BufWriter};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 
 use ropey::{LineType, Rope};
 
@@ -11,6 +12,64 @@ use crate::undo::{EditOp, UndoTree};
 /// Line-ending convention used for every line-based query below: lines end
 /// at `\n`, with an optional preceding `\r` treated as part of the ending.
 const LINES: LineType = LineType::LF_CR;
+
+/// What the file on disk looked like when this buffer last read or wrote it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct DiskStamp {
+    modified: Option<SystemTime>,
+    len: u64,
+}
+
+fn stamp_of(path: &Path) -> Option<DiskStamp> {
+    let meta = std::fs::metadata(path).ok()?;
+    Some(DiskStamp { modified: meta.modified().ok(), len: meta.len() })
+}
+
+/// How the file on disk compares with what the buffer last saw.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DiskState {
+    /// Same as when the buffer last read or wrote it (or the buffer has no file).
+    Unchanged,
+    /// Changed by something else (another program, git, an agent).
+    Modified,
+    /// No longer exists.
+    Deleted,
+}
+
+/// Write `rope` to `path` without ever leaving a half-written file: write a
+/// temporary file next to it, then rename it over the target. Symlinks are
+/// followed (the link stays a link) and the existing permissions are kept.
+/// If the directory refuses a new file, fall back to writing in place.
+fn write_atomic(path: &Path, rope: &Rope) -> io::Result<()> {
+    let target = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let dir = target.parent().unwrap_or_else(|| Path::new("."));
+    let name = target.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+    let tmp = dir.join(format!(".{name}.shame-tmp-{}", std::process::id()));
+
+    let attempt = (|| -> io::Result<()> {
+        let mut writer = BufWriter::new(File::create(&tmp)?);
+        rope.write_to(&mut writer)?;
+        let file = writer.into_inner().map_err(|e| e.into_error())?;
+        file.sync_all()?;
+        drop(file);
+        if let Ok(meta) = std::fs::metadata(&target) {
+            let _ = std::fs::set_permissions(&tmp, meta.permissions());
+        }
+        std::fs::rename(&tmp, &target)
+    })();
+
+    match attempt {
+        Ok(()) => Ok(()),
+        Err(err) => {
+            let _ = std::fs::remove_file(&tmp);
+            if err.kind() == io::ErrorKind::PermissionDenied {
+                rope.write_to(BufWriter::new(File::create(&target)?))
+            } else {
+                Err(err)
+            }
+        }
+    }
+}
 
 /// A rope-backed text buffer with selections and an undo tree.
 ///
@@ -25,6 +84,7 @@ pub struct Buffer {
     path: Option<PathBuf>,
     dirty: bool,
     revision: u64,
+    disk_stamp: Option<DiskStamp>,
 }
 
 impl Default for Buffer {
@@ -36,6 +96,7 @@ impl Default for Buffer {
             path: None,
             dirty: false,
             revision: 0,
+            disk_stamp: None,
         }
     }
 }
@@ -58,6 +119,7 @@ impl Buffer {
         Ok(Self {
             rope,
             path: Some(path.to_path_buf()),
+            disk_stamp: stamp_of(path),
             ..Self::default()
         })
     }
@@ -74,9 +136,49 @@ impl Buffer {
 
     pub fn save_as(&mut self, path: impl Into<PathBuf>) -> io::Result<()> {
         let path = path.into();
-        self.rope.write_to(BufWriter::new(File::create(&path)?))?;
+        write_atomic(&path, &self.rope)?;
+        self.disk_stamp = stamp_of(&path);
         self.path = Some(path);
         self.dirty = false;
+        Ok(())
+    }
+
+    /// Whether the file changed (or vanished) since this buffer last read or
+    /// wrote it. Cheap: one `stat`.
+    pub fn disk_state(&self) -> DiskState {
+        let (Some(path), Some(known)) = (&self.path, self.disk_stamp) else {
+            return DiskState::Unchanged;
+        };
+        match stamp_of(path) {
+            None => DiskState::Deleted,
+            Some(now) if now != known => DiskState::Modified,
+            Some(_) => DiskState::Unchanged,
+        }
+    }
+
+    /// Accept the current state of the file on disk as the baseline, e.g. when
+    /// the user chooses to keep their version: the next save overwrites it
+    /// knowingly, and `disk_state` stops reporting the change.
+    pub fn acknowledge_disk(&mut self) {
+        self.disk_stamp = self.path.as_deref().and_then(stamp_of);
+    }
+
+    /// Replace the text with what is on disk, dropping local edits and undo
+    /// history. The cursor stays at its offset (clamped to the new length).
+    pub fn reload_from_disk(&mut self) -> io::Result<()> {
+        let path = self
+            .path
+            .clone()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "buffer has no associated path"))?;
+        let fresh = Rope::from_reader(BufReader::new(File::open(&path)?))?;
+        let head = self.selections.primary().head;
+        self.rope = fresh;
+        self.undo_tree = UndoTree::default();
+        self.dirty = false;
+        self.revision = self.revision.wrapping_add(1);
+        let head = self.floor_char_boundary(head);
+        self.selections = SelectionSet::single(head);
+        self.disk_stamp = stamp_of(&path);
         Ok(())
     }
 
@@ -154,6 +256,19 @@ impl Buffer {
     }
 
     /// The byte offset one full UTF-8 character before `byte` (clamped to 0).
+    /// The largest char boundary at or before `byte` (clamped to the length).
+    fn floor_char_boundary(&self, byte: usize) -> usize {
+        let len = self.rope.len();
+        let mut at = byte.min(len);
+        let is_boundary = |this: &Self, at: usize| {
+            at == 0 || at == len || this.next_char_boundary(this.prev_char_boundary(at)) == at
+        };
+        while at > 0 && !is_boundary(self, at) {
+            at -= 1;
+        }
+        at
+    }
+
     pub fn prev_char_boundary(&self, byte: usize) -> usize {
         let end = byte.min(self.len_bytes());
         if end == 0 {
@@ -359,5 +474,105 @@ mod tests {
         assert_eq!(reopened.path(), Some(path.as_path()));
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    fn temp_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("core-buffer-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn save_writes_the_file_and_leaves_no_temp_files() {
+        let dir = temp_dir("atomic");
+        let file = dir.join("a.txt");
+        std::fs::write(&file, "old").unwrap();
+        let mut buffer = Buffer::open(&file).unwrap();
+        buffer.edit(0..3, "brand new");
+        buffer.save().unwrap();
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "brand new");
+        assert!(!buffer.is_dirty());
+        let leftovers: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .collect();
+        assert_eq!(leftovers, vec!["a.txt"], "no .shame-tmp file may remain");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn save_keeps_permissions_and_symlinks() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = temp_dir("perm");
+        let real = dir.join("real.sh");
+        std::fs::write(&real, "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let link = dir.join("link.sh");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        let mut buffer = Buffer::open(&link).unwrap();
+        buffer.insert(buffer.len_bytes(), "echo hi\n");
+        buffer.save().unwrap();
+
+        assert!(std::fs::symlink_metadata(&link).unwrap().file_type().is_symlink(), "the link survives");
+        assert_eq!(std::fs::read_to_string(&real).unwrap(), "#!/bin/sh\necho hi\n");
+        assert_eq!(std::fs::metadata(&real).unwrap().permissions().mode() & 0o777, 0o755);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn detects_external_changes_and_deletion() {
+        let dir = temp_dir("disk");
+        let file = dir.join("a.txt");
+        std::fs::write(&file, "one").unwrap();
+        let mut buffer = Buffer::open(&file).unwrap();
+        assert_eq!(buffer.disk_state(), DiskState::Unchanged);
+
+        std::fs::write(&file, "something longer").unwrap();
+        assert_eq!(buffer.disk_state(), DiskState::Modified);
+
+        // Our own save is not an external change.
+        buffer.edit(0..3, "mine");
+        buffer.save().unwrap();
+        assert_eq!(buffer.disk_state(), DiskState::Unchanged);
+
+        // Keeping our version acknowledges whatever is on disk now.
+        std::fs::write(&file, "theirs again, and longer").unwrap();
+        assert_eq!(buffer.disk_state(), DiskState::Modified);
+        buffer.acknowledge_disk();
+        assert_eq!(buffer.disk_state(), DiskState::Unchanged);
+
+        std::fs::remove_file(&file).unwrap();
+        assert_eq!(buffer.disk_state(), DiskState::Deleted);
+        assert_eq!(Buffer::from_str("scratch").disk_state(), DiskState::Unchanged, "no file, nothing to compare");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn reload_replaces_text_clears_dirty_and_keeps_the_cursor() {
+        let dir = temp_dir("reload");
+        let file = dir.join("a.txt");
+        std::fs::write(&file, "hello world").unwrap();
+        let mut buffer = Buffer::open(&file).unwrap();
+        buffer.edit(0..5, "HELLO"); // dirty local edit
+        buffer.selections_mut().set_primary(crate::selection::Selection::cursor(8));
+
+        std::fs::write(&file, "disk text that is longer").unwrap();
+        buffer.reload_from_disk().unwrap();
+        assert_eq!(buffer.text(), "disk text that is longer");
+        assert!(!buffer.is_dirty());
+        assert!(!buffer.can_undo(), "undo history belongs to the old text");
+        assert_eq!(buffer.selections().primary().head, 8);
+        assert_eq!(buffer.disk_state(), DiskState::Unchanged);
+
+        // A shorter file clamps the cursor.
+        buffer.selections_mut().set_primary(crate::selection::Selection::cursor(20));
+        std::fs::write(&file, "tiny").unwrap();
+        buffer.reload_from_disk().unwrap();
+        assert_eq!(buffer.selections().primary().head, 4);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

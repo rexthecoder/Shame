@@ -518,12 +518,12 @@ impl LanguageAdapter for RustLanguageAdapter {
             SnippetSpec {
                 trigger: "fn",
                 detail: "fn name() {}",
-                body: "fn name() {\n    \n}",
+                body: "fn ${1:name}(${2}) {\n    $0\n}",
             },
             SnippetSpec {
                 trigger: "test",
                 detail: "#[test] fn ...",
-                body: "#[test]\nfn it_works() {\n    \n}",
+                body: "#[test]\nfn ${1:it_works}() {\n    $0\n}",
             },
         ]
     }
@@ -645,21 +645,79 @@ impl LanguageAdapter for DartLanguageAdapter {
     }
 
     fn snippets(&self) -> &'static [SnippetSpec] {
+        // LSP snippet syntax, written for column 0: lines after the first take the
+        // indentation of the line they are inserted on. `${1:Name}` used twice is
+        // one placeholder shown in both places (Tab copies what you typed).
         &[
             SnippetSpec {
                 trigger: "stless",
                 detail: "Flutter StatelessWidget",
-                body: "class MyWidget extends StatelessWidget {\n  const MyWidget({super.key});\n\n  @override\n  Widget build(BuildContext context) {\n    return const Placeholder();\n  }\n}",
+                body: "class ${1:MyWidget} extends StatelessWidget {\n  const ${1:MyWidget}({super.key});\n\n  @override\n  Widget build(BuildContext context) {\n    return ${2:const Placeholder()};\n  }\n}",
             },
             SnippetSpec {
                 trigger: "stful",
-                detail: "Flutter StatefulWidget",
-                body: "class MyWidget extends StatefulWidget {\n  const MyWidget({super.key});\n\n  @override\n  State<MyWidget> createState() => _MyWidgetState();\n}\n\nclass _MyWidgetState extends State<MyWidget> {\n  @override\n  Widget build(BuildContext context) {\n    return const Placeholder();\n  }\n}",
+                detail: "Flutter StatefulWidget with its State",
+                body: "class ${1:MyWidget} extends StatefulWidget {\n  const ${1:MyWidget}({super.key});\n\n  @override\n  State<${1:MyWidget}> createState() => _${1:MyWidget}State();\n}\n\nclass _${1:MyWidget}State extends State<${1:MyWidget}> {\n  @override\n  Widget build(BuildContext context) {\n    return ${2:const Placeholder()};\n  }\n}",
             },
             SnippetSpec {
                 trigger: "build",
                 detail: "@override Widget build(BuildContext context)",
-                body: "@override\n  Widget build(BuildContext context) {\n    return const SizedBox.shrink();\n  }",
+                body: "@override\nWidget build(BuildContext context) {\n  return ${1:const SizedBox.shrink()};\n}",
+            },
+            SnippetSpec {
+                trigger: "initstate",
+                detail: "@override void initState()",
+                body: "@override\nvoid initState() {\n  super.initState();\n  $0\n}",
+            },
+            SnippetSpec {
+                trigger: "dispose",
+                detail: "@override void dispose()",
+                body: "@override\nvoid dispose() {\n  ${1:_controller.dispose();}\n  super.dispose();\n}",
+            },
+            SnippetSpec {
+                trigger: "setstate",
+                detail: "setState(() { ... })",
+                body: "setState(() {\n  $0\n});",
+            },
+            SnippetSpec {
+                trigger: "listb",
+                detail: "ListView.builder",
+                body: "ListView.builder(\n  itemCount: ${1:items.length},\n  itemBuilder: (context, index) {\n    return ${2:const SizedBox.shrink()};\n  },\n)",
+            },
+            SnippetSpec {
+                trigger: "futureb",
+                detail: "FutureBuilder",
+                body: "FutureBuilder<${1:Object}>(\n  future: ${2:future},\n  builder: (context, snapshot) {\n    if (snapshot.connectionState != ConnectionState.done) {\n      return const Center(child: CircularProgressIndicator());\n    }\n    return ${3:const SizedBox.shrink()};\n  },\n)",
+            },
+            SnippetSpec {
+                trigger: "streamb",
+                detail: "StreamBuilder",
+                body: "StreamBuilder<${1:Object}>(\n  stream: ${2:stream},\n  builder: (context, snapshot) {\n    if (!snapshot.hasData) {\n      return const Center(child: CircularProgressIndicator());\n    }\n    return ${3:const SizedBox.shrink()};\n  },\n)",
+            },
+            SnippetSpec {
+                trigger: "column",
+                detail: "Column(children: [...])",
+                body: "Column(\n  children: [\n    $0\n  ],\n)",
+            },
+            SnippetSpec {
+                trigger: "row",
+                detail: "Row(children: [...])",
+                body: "Row(\n  children: [\n    $0\n  ],\n)",
+            },
+            SnippetSpec {
+                trigger: "mainapp",
+                detail: "main() with a MaterialApp",
+                body: "import 'package:flutter/material.dart';\n\nvoid main() {\n  runApp(const ${1:MyApp}());\n}\n\nclass ${1:MyApp} extends StatelessWidget {\n  const ${1:MyApp}({super.key});\n\n  @override\n  Widget build(BuildContext context) {\n    return MaterialApp(\n      title: '${2:App}',\n      home: Scaffold(\n        appBar: AppBar(title: const Text('${2:App}')),\n        body: const Center(child: Text('Hello')),\n      ),\n    );\n  }\n}",
+            },
+            SnippetSpec {
+                trigger: "testw",
+                detail: "testWidgets(...)",
+                body: "testWidgets('${1:description}', (tester) async {\n  await tester.pumpWidget(${2:const MyApp()});\n  $0\n});",
+            },
+            SnippetSpec {
+                trigger: "testd",
+                detail: "test(...)",
+                body: "test('${1:description}', () {\n  $0\n});",
             },
         ]
     }
@@ -699,6 +757,7 @@ impl LanguageAdapter for DartLanguageAdapter {
             if prefix_lower.is_empty() || label.to_lowercase().starts_with(&prefix_lower) {
                 results.push(CompletionEntry {
                     snippet_stops: Vec::new(),
+                    snippet_mirrors: Vec::new(),
                     label: label.to_string(),
                     insert_text: insert.to_string(),
                     detail: Some(ty.to_string()),
@@ -752,6 +811,7 @@ impl LanguageAdapter for DartLanguageAdapter {
                 if label != prefix && label.to_lowercase().contains(&prefix_lower) {
                     results.push(CompletionEntry {
                         snippet_stops: Vec::new(),
+                        snippet_mirrors: Vec::new(),
                         label: label.to_string(),
                         insert_text: insert.to_string(),
                         detail: Some(pkg.to_string()),
@@ -1227,4 +1287,40 @@ pub fn language_server_specs(project_root: Option<&Path>) -> Vec<LanguageServerS
     }
     out.sort_by(|a, b| a.display_name.cmp(b.display_name));
     out
+}
+
+#[cfg(test)]
+mod snippet_tests {
+    use super::*;
+    use crate::snippet::parse_snippet;
+
+    #[test]
+    fn every_dart_snippet_expands_with_a_place_to_land() {
+        let adapter = DartLanguageAdapter;
+        let snippets = adapter.snippets();
+        assert!(snippets.len() >= 10);
+        let mut triggers = std::collections::HashSet::new();
+        for spec in snippets {
+            assert!(triggers.insert(spec.trigger), "duplicate trigger {}", spec.trigger);
+            let parsed = parse_snippet(spec.body);
+            assert!(!parsed.stops.is_empty(), "{} has no tab stops", spec.trigger);
+            assert!(!parsed.text.contains('$'), "{} left raw snippet syntax: {}", spec.trigger, parsed.text);
+            let opens = parsed.text.matches(['(', '{', '[']).count();
+            let closes = parsed.text.matches([')', '}', ']']).count();
+            assert_eq!(opens, closes, "{} has unbalanced brackets", spec.trigger);
+        }
+    }
+
+    #[test]
+    fn the_stateful_widget_name_is_one_placeholder_shown_six_times() {
+        let adapter = DartLanguageAdapter;
+        let spec = adapter.snippets().iter().find(|s| s.trigger == "stful").unwrap();
+        let parsed = parse_snippet(spec.body);
+        // First stop is the widget name; its five other appearances are mirrors.
+        assert_eq!(&parsed.text[parsed.stops[0].clone()], "MyWidget");
+        assert_eq!(parsed.mirrors[0].len(), 5);
+        for mirror in &parsed.mirrors[0] {
+            assert_eq!(&parsed.text[mirror.clone()], "MyWidget");
+        }
+    }
 }

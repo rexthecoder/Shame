@@ -175,7 +175,7 @@ impl DartIde {
             )
             .on_click(move |_e, _w, cx| {
                 if has_ws {
-                    v1.update(cx, |this, cx| this.close_workspace(cx));
+                    v1.update(cx, |this, cx| this.request_close_workspace(cx));
                 }
             })
             .into_any_element();
@@ -254,6 +254,88 @@ impl DartIde {
                     "Default Diff View",
                     "Choose between side-by-side split diff (with draggable column divider) or unified inline diff."
                         .to_string(),
+                    ctrl,
+                )
+                .into_any_element(),
+            );
+        }
+        if show_cat(2, "editor save autosave auto save files") {
+            let mode = self.autosave;
+            let v1 = view.clone();
+            let ctrl = select_pill("settings-autosave", mode.label().to_string())
+                .on_click(move |_e, _w, cx| {
+                    v1.update(cx, |this, cx| {
+                        let next = this.autosave.next();
+                        this.set_autosave(next, cx);
+                    });
+                })
+                .into_any_element();
+            rows.push(
+                setting_row(
+                    "Auto Save",
+                    "Save modified files automatically: a second after you stop typing, or when you switch to another app."
+                        .to_string(),
+                    ctrl,
+                )
+                .into_any_element(),
+            );
+        }
+        if show_cat(2, "editor save format on save formatter") {
+            let on = self.save_options.format_on_save;
+            let v1 = view.clone();
+            let ctrl = toggle_switch("settings-format-on-save", on)
+                .on_click(move |_e, _w, cx| {
+                    v1.update(cx, |this, cx| {
+                        this.update_save_options(|o| o.format_on_save = !o.format_on_save, cx)
+                    });
+                })
+                .into_any_element();
+            rows.push(
+                setting_row(
+                    "Format on Save",
+                    "Run the language server's formatter before writing the file (\u{2318}S). \"Save Without Formatting\" skips it once."
+                        .to_string(),
+                    ctrl,
+                )
+                .into_any_element(),
+            );
+        }
+        if show_cat(2, "editor save trim trailing whitespace") {
+            let on = self.save_options.trim_trailing_whitespace;
+            let v1 = view.clone();
+            let ctrl = toggle_switch("settings-trim-whitespace", on)
+                .on_click(move |_e, _w, cx| {
+                    v1.update(cx, |this, cx| {
+                        this.update_save_options(
+                            |o| o.trim_trailing_whitespace = !o.trim_trailing_whitespace,
+                            cx,
+                        )
+                    });
+                })
+                .into_any_element();
+            rows.push(
+                setting_row(
+                    "Trim Trailing Whitespace",
+                    "Remove spaces and tabs at the end of each line when saving.".to_string(),
+                    ctrl,
+                )
+                .into_any_element(),
+            );
+        }
+        if show_cat(2, "editor save final newline end of file") {
+            let on = self.save_options.insert_final_newline;
+            let v1 = view.clone();
+            let ctrl = toggle_switch("settings-final-newline", on)
+                .on_click(move |_e, _w, cx| {
+                    v1.update(cx, |this, cx| {
+                        this.update_save_options(|o| o.insert_final_newline = !o.insert_final_newline, cx)
+                    });
+                })
+                .into_any_element();
+            rows.push(
+                setting_row(
+                    "Insert Final Newline",
+                    "End every non-empty file with a single newline when saving.".to_string(),
                     ctrl,
                 )
                 .into_any_element(),

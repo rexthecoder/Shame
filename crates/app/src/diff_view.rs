@@ -28,7 +28,7 @@ const CONTEXT: usize = 3;
 const ROW_H: f32 = 22.;
 const GUTTER_W: f32 = 52.;
 
-type Spans = Vec<(Range<usize>, HighlightKind)>;
+pub(crate) type Spans = Vec<(Range<usize>, HighlightKind)>;
 
 enum DisplayItem {
     Row(usize),
@@ -131,7 +131,7 @@ impl DiffState {
 
 /// Syntax spans for each line of `text`, from a Dart parse. Overlaps are dropped so the spans can
 /// be handed straight to `StyledText`.
-fn line_spans(text: &str) -> Vec<Spans> {
+pub(crate) fn line_spans(text: &str) -> Vec<Spans> {
     let line_starts: Vec<usize> = std::iter::once(0)
         .chain(text.match_indices('\n').map(|(i, _)| i + 1))
         .collect();

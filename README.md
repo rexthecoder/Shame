@@ -59,7 +59,10 @@ cargo run -p app
 | ⇧F12 | Find references |
 | F2 | Rename symbol |
 | ⌘. | Code actions |
-| Tab | Next snippet tab stop |
+| Tab | Next snippet tab stop (names typed into a repeated placeholder are copied) |
+| ⌥F12 | Peek definition (↩ opens it, ⌘↩ opens to the side) |
+| ⇧⌘R | Refactor (wrap with widget, extract widget, ...) |
+| ⌥⌘S | Save all |
 | ⌥↓ / ⌥↑ | Next / previous change in a diff |
 | ⌥→ / ⌥← | Next / previous file in a diff |
 | ⌥↩ | Mark the open diff file reviewed |

@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
+use std::os::unix::process::CommandExt as _;
 use std::process::{Command, Stdio};
 
 use gpui_kit::base::StyledExt as _;
@@ -15,6 +16,24 @@ use gpui_kit::*;
 use crate::{DartIde, DockTab, tokens};
 
 const MAX_SCROLLBACK_LINES: usize = 2_000;
+
+/// Arguments for `kill` that signal a command's whole process group (the
+/// shell and everything it started), not just the shell.
+pub(crate) fn kill_args(signal: &str, pid: u32) -> Vec<String> {
+    vec![signal.to_string(), "--".to_string(), format!("-{pid}")]
+}
+
+/// Send `signal` (`-INT`, `-TERM`, `-KILL`) to the process group led by `pid`.
+/// Commands are started as group leaders, so this reaches child processes too.
+pub(crate) fn signal_process_group(pid: u32, signal: &str) {
+    let _ = Command::new("kill").args(kill_args(signal, pid)).status();
+}
+
+/// What ⌃C sends: a polite interrupt first, then a hard kill if the command
+/// ignored it (so a stuck process can always be stopped).
+pub(crate) fn interrupt_signal(already_interrupted: bool) -> &'static str {
+    if already_interrupted { "-KILL" } else { "-INT" }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum AnsiColor {
@@ -67,6 +86,10 @@ pub(crate) struct TerminalSession {
     pub(crate) history_index: Option<usize>,
     pub(crate) running_pid: Option<u32>,
     pub(crate) running_cmd: Option<String>,
+    /// ⌃C was pressed and the command has been sent an interrupt.
+    pub(crate) interrupt_sent: bool,
+    /// ⌃C was pressed before the process had started; interrupt it as soon as it does.
+    pub(crate) interrupt_pending: bool,
     pub(crate) scroll_handle: ScrollHandle,
 }
 
@@ -104,6 +127,8 @@ impl TerminalSession {
             history_index: None,
             running_pid: None,
             running_cmd: None,
+            interrupt_sent: false,
+            interrupt_pending: false,
             scroll_handle: ScrollHandle::new(),
         };
 
@@ -111,6 +136,11 @@ impl TerminalSession {
             session.seed_initial_git_log();
         }
         session
+    }
+
+    /// A command is running: the prompt is held until it finishes.
+    pub(crate) fn is_busy(&self) -> bool {
+        self.running_cmd.is_some()
     }
 
     pub(crate) fn dir_label(&self) -> String {
@@ -157,9 +187,11 @@ impl TerminalSession {
 
     pub(crate) fn reset(&mut self, root_cwd: PathBuf) {
         if let Some(pid) = self.running_pid.take() {
-            let _ = Command::new("kill").args(["-TERM", &pid.to_string()]).status();
+            signal_process_group(pid, "-TERM");
         }
         self.running_cmd = None;
+        self.interrupt_sent = false;
+        self.interrupt_pending = false;
         self.cwd = root_cwd;
         self.env_overrides.clear();
         self.lines.clear();
@@ -362,7 +394,7 @@ impl DartIde {
             return;
         }
         if let Some(pid) = self.terminals[ix].running_pid {
-            let _ = Command::new("kill").args(["-TERM", &pid.to_string()]).status();
+            signal_process_group(pid, "-TERM");
         }
         self.terminals.remove(ix);
         if self.terminals.is_empty() {
@@ -385,6 +417,11 @@ impl DartIde {
             TerminalEvent::Started { session_id, pid } => {
                 if let Some(session) = self.terminals.iter_mut().find(|t| t.id == session_id) {
                     session.running_pid = Some(pid);
+                    // ⌃C arrived before the process existed: deliver it now.
+                    if std::mem::take(&mut session.interrupt_pending) {
+                        signal_process_group(pid, interrupt_signal(false));
+                        session.interrupt_sent = true;
+                    }
                     cx.notify();
                 }
             }
@@ -399,6 +436,8 @@ impl DartIde {
                 if let Some(session) = self.terminals.iter_mut().find(|t| t.id == session_id) {
                     session.running_pid = None;
                     session.running_cmd = None;
+                    session.interrupt_sent = false;
+                    session.interrupt_pending = false;
                     session.scroll_handle.scroll_to_item(session.lines.len());
                 }
                 self.refresh_git(cx);
@@ -413,6 +452,18 @@ impl DartIde {
         cx: &mut Context<Self>,
     ) {
         let tx = self.terminal_tx.clone();
+        // Something else (a menu command, a test run) wants the terminal while a command
+        // is still running here: give it its own tab instead of mixing the output.
+        if self.active_terminal().is_some_and(|s| s.is_busy()) {
+            let id = self.next_terminal_id;
+            self.next_terminal_id += 1;
+            let cwd = self
+                .active_terminal()
+                .map(|s| s.cwd.clone())
+                .unwrap_or_else(|| self.root.clone());
+            self.terminals.push(TerminalSession::new(id, cwd, false));
+            self.active_terminal = self.terminals.len() - 1;
+        }
         let Some(session) = self.active_terminal_mut() else {
             return;
         };
@@ -510,6 +561,8 @@ impl DartIde {
         let cwd = session.cwd.clone();
         let envs = session.env_overrides.clone();
         session.running_cmd = Some(cmd.clone());
+        session.interrupt_sent = false;
+        session.interrupt_pending = false;
         session.scroll_handle.scroll_to_item(session.lines.len());
         cx.notify();
 
@@ -529,7 +582,9 @@ impl DartIde {
                 .env("GIT_PAGER", "cat")
                 .env("PAGER", "cat")
                 .env("TERM", "xterm-256color")
-                .envs(&envs);
+                .envs(&envs)
+                // Its own process group, so ⌃C can stop the shell *and* what it started.
+                .process_group(0);
 
             let mut child = match command.spawn() {
                 Ok(c) => c,
@@ -631,13 +686,19 @@ impl DartIde {
             return;
         }
 
-        // `Ctrl+C` interrupts running command or cancels current input line
+        // `Ctrl+C` interrupts the running command (a second press kills it outright), or
+        // cancels the line being typed.
         if modifiers.control && key == "c" {
             if let Some(session) = self.active_terminal_mut() {
-                if let Some(pid) = session.running_pid.take() {
-                    let _ = Command::new("kill").args(["-INT", &pid.to_string()]).status();
-                    session.push_output_line("^C");
-                    session.running_cmd = None;
+                if session.is_busy() {
+                    match session.running_pid {
+                        Some(pid) => {
+                            signal_process_group(pid, interrupt_signal(session.interrupt_sent));
+                            session.interrupt_sent = true;
+                            session.push_output_line("^C");
+                        }
+                        None => session.interrupt_pending = true,
+                    }
                 } else {
                     let user_host = session.user_host.clone();
                     let dir = session.dir_label();
@@ -654,6 +715,12 @@ impl DartIde {
                 session.scroll_handle.scroll_to_item(session.lines.len());
                 cx.notify();
             }
+            return;
+        }
+
+        // The prompt is held while a command runs: nothing below (typing, paste,
+        // Enter, history) applies until it finishes or is interrupted.
+        if self.active_terminal().is_some_and(|s| s.is_busy()) {
             return;
         }
 
@@ -949,6 +1016,7 @@ impl DartIde {
 
         let debug_active = self.dock_tab == DockTab::DebugConsole;
         let problems_active = self.dock_tab == DockTab::Problems;
+        let tests_active = self.dock_tab == DockTab::Tests;
         let debug_count_err = self
             .debug_lines
             .iter()
@@ -1060,6 +1128,46 @@ impl DartIde {
                 })
         };
 
+        let tests_pill = {
+            let view_select = view.clone();
+            let badge = self.tests_tab_badge();
+            h_flex()
+                .id("tests-dock-tab")
+                .items_center()
+                .gap(px(tokens::SPACE_2))
+                .px(px(tokens::SPACE_3))
+                .h(px(28.))
+                .rounded(px(tokens::RADIUS_PANEL))
+                .border_1()
+                .border_color(if tests_active { cx.theme().border } else { gpui_kit::transparent_black() })
+                .when(tests_active, |el| el.bg(cx.theme().tab_active).text_color(fg))
+                .when(!tests_active, |el| {
+                    el.text_color(muted).hover(move |s| s.bg(rgba(0xffffff08)).text_color(fg))
+                })
+                .text_size(px(tokens::UI_SM))
+                .cursor_pointer()
+                .on_click(move |_event, _window, cx| {
+                    view_select.update(cx, |this, cx| {
+                        this.dock_tab = DockTab::Tests;
+                        cx.notify();
+                    });
+                })
+                .child(Icon::new(gpui_kit::assets::IconName::Check).xsmall().text_color(muted))
+                .child("Tests")
+                .when_some(badge, |el, (count, failing)| {
+                    let tone = if failing { red } else { green };
+                    el.child(
+                        div()
+                            .px(px(5.))
+                            .rounded(px(8.))
+                            .bg(tone.opacity(0.18))
+                            .text_size(px(9.5))
+                            .text_color(tone)
+                            .child(count.to_string()),
+                    )
+                })
+        };
+
         const MAX_RENDERED_DOCK_LINES: usize = 350;
 
         let body_element = if problems_active {
@@ -1164,6 +1272,8 @@ impl DartIde {
                 })
                 .children(rows)
                 .into_any_element()
+        } else if tests_active {
+            self.render_tests_panel(cx).into_any_element()
         } else if debug_active {
             let running = self.flutter_daemon.is_some() || self.dap_client.is_some();
             let dap_paused = self.dap_paused_thread.is_some();
@@ -1639,6 +1749,23 @@ impl DartIde {
                     el.child(div().text_color(fg).child(after_cursor))
                 });
 
+            // While a command runs there is no prompt: just a quiet note on how to stop it.
+            let running_row = h_flex()
+                .w_full()
+                .min_h(px(20.))
+                .items_center()
+                .gap(px(tokens::SPACE_2))
+                .font_family("SF Mono")
+                .text_size(px(tokens::UI_XS))
+                .text_color(muted)
+                .child(div().size(px(6.)).rounded(px(3.)).bg(yellow))
+                .child(if session.interrupt_sent {
+                    "Stopping\u{2026} press \u{2303}C again to force quit"
+                } else {
+                    "Running\u{2026}  \u{2303}C to stop"
+                });
+            let busy = session.is_busy();
+
             v_flex()
                 .id("terminal-scrollback")
                 .flex_1()
@@ -1650,7 +1777,7 @@ impl DartIde {
                 .overflow_y_scroll()
                 .track_scroll(&session.scroll_handle)
                 .children(line_elements)
-                .child(prompt_row)
+                .child(if busy { running_row.into_any_element() } else { prompt_row.into_any_element() })
                 .into_any_element()
         } else {
             div().flex_1().into_any_element()
@@ -1696,6 +1823,10 @@ impl DartIde {
                                     || self.dap_client.is_some()
                                     || !self.debug_lines.is_empty(),
                                 |r| r.child(debug_pill),
+                            )
+                            .when(
+                                self.is_flutter_or_dart_workspace() || self.test_run.is_some(),
+                                |r| r.child(tests_pill),
                             )
                             .child(
                                 Button::new("new-terminal-tab")
@@ -1780,7 +1911,34 @@ impl DartIde {
 
 #[cfg(test)]
 mod tests {
-    use super::{AnsiColor, parse_ansi_line};
+    use super::{AnsiColor, interrupt_signal, kill_args, parse_ansi_line, signal_process_group};
+    use std::os::unix::process::CommandExt as _;
+    use std::process::Command;
+    use std::time::{Duration, Instant};
+
+    #[core::prelude::v1::test]
+    fn the_first_interrupt_is_polite_and_the_second_is_a_hard_kill() {
+        assert_eq!(interrupt_signal(false), "-INT");
+        assert_eq!(interrupt_signal(true), "-KILL");
+        assert_eq!(kill_args("-INT", 4242), ["-INT", "--", "-4242"], "a negative pid means the whole group");
+    }
+
+    /// The real thing: a shell that starts two long sleeps is stopped completely,
+    /// quickly, by signalling its process group.
+    #[core::prelude::v1::test]
+    fn interrupting_the_group_stops_the_shell_and_what_it_started() {
+        let mut child = Command::new("sh")
+            .args(["-c", "sleep 30 & sleep 30 & wait"])
+            .process_group(0)
+            .spawn()
+            .expect("sh should start");
+        std::thread::sleep(Duration::from_millis(200));
+        let started = Instant::now();
+        signal_process_group(child.id(), "-INT");
+        let status = child.wait().expect("the shell should exit");
+        assert!(!status.success(), "it was interrupted, not finished");
+        assert!(started.elapsed() < Duration::from_secs(5), "it must stop promptly, not after 30s");
+    }
 
     #[core::prelude::v1::test]
     fn parses_git_log_ansi_colors_and_resets() {

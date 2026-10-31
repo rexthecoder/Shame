@@ -142,6 +142,13 @@ impl DartIde {
         label: String,
         cx: &mut Context<Self>,
     ) {
+        // A plain run goes to the Tests panel (structured results). Runs with
+        // extra arguments (coverage, a custom launch config) keep using the terminal.
+        if extra_args.is_empty() {
+            self.start_test_run(crate::test_runner::TestTarget::File(path), test_name, None, cx);
+            return;
+        }
+
         // Walk up from `path` to find the nearest package directory containing `pubspec.yaml`
         let mut pkg_dir = path.parent().map(Path::to_path_buf).unwrap_or_else(|| self.root.clone());
         let mut cur = Some(pkg_dir.as_path());
@@ -422,6 +429,11 @@ impl DartIde {
                 self.finish_inspect(result.clone(), window, cx);
                 return;
             }
+            if self.widgets.request == Some(*id) {
+                self.widgets.request = None;
+                self.finish_widget_tree(result.clone(), cx);
+                return;
+            }
         }
         match output {
             core_flutter::DaemonOutput::Event { event, params } => match event.as_str() {
@@ -461,6 +473,7 @@ impl DartIde {
                         "\x1b[32m\u{2713} Flutter app running \u{2014} Save (\u{2318}S) or click \u{26a1} to Hot Reload\x1b[0m",
                     );
                     self.refresh_simulator_screenshot(cx);
+                    self.refresh_widget_tree_if_visible(cx);
                     cx.notify();
                 }
                 "app.log" => {
@@ -484,6 +497,14 @@ impl DartIde {
                 _ => {}
             },
             core_flutter::DaemonOutput::Response { result, .. } => {
+                // A reload or restart just finished: the widget tree may have changed.
+                let was_reloading = self
+                    .flutter_status
+                    .as_deref()
+                    .is_some_and(|s| s.starts_with("Hot reloading") || s.starts_with("Restarting"));
+                if was_reloading {
+                    self.refresh_widget_tree_if_visible(cx);
+                }
                 if let Ok(val) = result {
                     if let Some(msg) = val.get("message").and_then(|v| v.as_str()) {
                         if !msg.is_empty() {

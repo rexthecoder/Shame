@@ -635,6 +635,10 @@ impl DartIde {
         let is_running = self.agent.running_pid.is_some();
 
         // --- context chips ---
+        let active_name = self
+            .active_editor()
+            .and_then(|ed| ed.read(cx).buffer().path().map(Path::to_path_buf))
+            .and_then(|p| p.file_name().and_then(|n| n.to_str()).map(str::to_string));
         let problem_count: usize = self
             .tabs
             .iter()
@@ -658,6 +662,28 @@ impl DartIde {
                 .hover(move |s| s.bg(list_hover).text_color(fg))
         };
         let mut header_chips: Vec<AnyElement> = Vec::new();
+        // The file the agent is told is open. Click to stop sharing it; click again to share.
+        if let Some(name) = active_name {
+            let on = self.agent.include_active_file;
+            header_chips.push(
+                ghost("agent-ctx-active".into())
+                    .when(!on, |c| c.opacity(0.5))
+                    .child(crate::rails::files::render_file_icon(&name))
+                    .child(
+                        div()
+                            .max_w(px(110.))
+                            .truncate()
+                            .when(!on, |d| d.line_through())
+                            .child(name),
+                    )
+                    .when(!on, |c| c.child("off"))
+                    .on_click(cx.listener(|this, _e, _w, cx| {
+                        this.agent.include_active_file = !this.agent.include_active_file;
+                        cx.notify();
+                    }))
+                    .into_any_element(),
+            );
+        }
         if problem_count > 0 {
             let on = self.agent.include_problems;
             header_chips.push(

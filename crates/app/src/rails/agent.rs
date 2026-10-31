@@ -523,6 +523,9 @@ pub(crate) struct AgentState {
     /// Messages typed while the agent was busy; sent one by one when it finishes.
     pub(crate) queue: Vec<QueuedPrompt>,
     pub(crate) last_mention_query: String,
+    /// Tell the agent which file is open (and which tabs). Toggled by the chip
+    /// in the composer header.
+    pub(crate) include_active_file: bool,
     /// Send current editor diagnostics as context.
     pub(crate) include_problems: bool,
     pub(crate) attach_open: bool,
@@ -577,6 +580,7 @@ impl AgentState {
             turn_stats: std::collections::HashMap::new(),
             queue: Vec::new(),
             last_mention_query: String::new(),
+            include_active_file: true,
             include_problems: true,
             attach_open: false,
             attach_search,
@@ -850,6 +854,7 @@ impl DartIde {
             text: shown_prompt,
         });
         self.agent.scroll.scroll_to_bottom();
+        let include_active_file = self.agent.include_active_file;
         let include_problems = self.agent.include_problems;
 
         let harness = self.agent.harness;
@@ -859,6 +864,7 @@ impl DartIde {
         let root = self.root.clone();
         let active_file = self
             .active_editor()
+            .filter(|_| include_active_file)
             .and_then(|ed| ed.read(cx).buffer().path().map(Path::to_path_buf))
             .and_then(|p| p.strip_prefix(&self.root).ok().map(Path::to_path_buf))
             .map(|p| p.to_string_lossy().to_string());
@@ -866,6 +872,7 @@ impl DartIde {
         let open_tabs: Vec<String> = self
             .tabs
             .iter()
+            .filter(|_| include_active_file)
             .filter_map(|t| t.path.as_ref())
             .filter_map(|p| p.strip_prefix(&self.root).ok())
             .map(|p| p.to_string_lossy().to_string())

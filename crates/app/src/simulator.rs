@@ -186,6 +186,7 @@ impl DartIde {
             widget.column,
             widget.local,
         );
+        self.reveal_widget(&widget, cx);
         self.sim.inspected = Some(widget);
         // Only the project's own widgets are worth a jump; a framework widget just shows its name.
         if local {

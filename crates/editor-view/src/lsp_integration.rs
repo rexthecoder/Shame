@@ -78,6 +78,8 @@ pub struct CompletionEntry {
     pub additional_edits: Vec<TextEdit>,
     /// Tab stops (byte ranges within `insert_text`) from an LSP snippet.
     pub snippet_stops: Vec<std::ops::Range<usize>>,
+    /// Other occurrences of each stop (same index), filled with the same text on Tab.
+    pub snippet_mirrors: Vec<Vec<std::ops::Range<usize>>>,
 }
 
 struct SharedLspInner {
@@ -318,6 +320,8 @@ pub(crate) struct LspState {
     diagnostics: Vec<Diagnostic>,
     pending_hover_id: Option<i64>,
     pending_definition_id: Option<i64>,
+    /// The next definition reply should open a peek, not jump.
+    peek_definition: bool,
     pending_format_id: Option<i64>,
     pending_rename_id: Option<i64>,
     pending_code_action_id: Option<i64>,
@@ -381,6 +385,7 @@ impl EditorView {
             diagnostics: initial_diagnostics,
             pending_hover_id: None,
             pending_definition_id: None,
+            peek_definition: false,
             pending_format_id: None,
             pending_rename_id: None,
             pending_code_action_id: None,
@@ -557,7 +562,7 @@ impl EditorView {
     }
 
     /// Send `textDocument/references` for the symbol at the cursor. The
-    /// reply arrives as `EditorEvent::ShowReferences`. No-op without a
+    /// reply arrives as `EditorEvent::ShowPeek`. No-op without a
     /// ready server.
     pub fn request_references(&mut self) {
         let head = self.buffer.selections().primary().head;
@@ -616,6 +621,18 @@ impl EditorView {
     pub(crate) fn clear_signature_help(&mut self, cx: &mut Context<Self>) {
         if self.signature_help.take().is_some() {
             cx.notify();
+        }
+    }
+
+    /// Peek the definition of the symbol at the cursor instead of jumping to
+    /// it: the reply arrives as `EditorEvent::ShowPeek`. No-op without a ready server.
+    pub fn request_peek_definition(&mut self) {
+        let head = self.buffer.selections().primary().head;
+        let line = self.buffer.byte_to_line(head);
+        let column = head - self.buffer.line_to_byte(line);
+        self.request_definition(line, column);
+        if let Some(lsp) = &mut self.lsp {
+            lsp.peek_definition = lsp.ready && lsp.pending_definition_id.is_some();
         }
     }
 
@@ -698,6 +715,45 @@ impl EditorView {
         let builtin = self.builtin_language_code_actions(line);
         if !builtin.is_empty() {
             cx.emit(EditorEvent::ShowCodeActions { actions: builtin });
+        }
+    }
+
+    /// Ask the server for refactorings (wrap with a widget, extract widget or method,
+    /// and so on) for the selection, or the cursor if nothing is selected. They come
+    /// back through the same picker as quick fixes.
+    pub fn request_refactors(&mut self) -> bool {
+        let selection = self.buffer.selections().primary();
+        let position = |buffer: &core_buffer::Buffer, offset: usize| {
+            let line = buffer.byte_to_line(offset);
+            Position { line: line as u32, character: (offset - buffer.line_to_byte(line)) as u32 }
+        };
+        let range = Range {
+            start: position(&self.buffer, selection.start()),
+            end: position(&self.buffer, selection.end()),
+        };
+        let Some(lsp) = &mut self.lsp else {
+            return false;
+        };
+        if !lsp.ready {
+            return false;
+        }
+        let params = CodeActionParams {
+            text_document: TextDocumentIdentifier { uri: lsp.uri.clone() },
+            range,
+            context: CodeActionContext {
+                diagnostics: Vec::new(),
+                only: Some(vec![CodeActionKind::REFACTOR]),
+                trigger_kind: None,
+            },
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+        };
+        match lsp.client.request("textDocument/codeAction", serde_json::to_value(params).unwrap_or_default()) {
+            Ok(id) => {
+                lsp.pending_code_action_id = Some(id);
+                true
+            }
+            Err(_) => false,
         }
     }
 
@@ -959,6 +1015,7 @@ impl EditorView {
             }
             ServerMessage::Response { id, result } if lsp.pending_definition_id == Some(id) => {
                 lsp.pending_definition_id = None;
+                let peek = std::mem::take(&mut lsp.peek_definition);
                 let own_uri = lsp.uri.clone();
                 let Ok(value) = result else {
                     return;
@@ -966,6 +1023,13 @@ impl EditorView {
                 let Ok(Some(response)) = serde_json::from_value::<Option<GotoDefinitionResponse>>(value) else {
                     return;
                 };
+                if peek {
+                    let locations = all_definition_targets(&response);
+                    if !locations.is_empty() {
+                        cx.emit(EditorEvent::ShowPeek { title: "Definition".into(), locations });
+                    }
+                    return;
+                }
                 let Some((target_uri, line, column)) = first_definition_target(&response) else {
                     return;
                 };
@@ -996,7 +1060,7 @@ impl EditorView {
                     .flatten()
                     .unwrap_or_default();
                 if !locations.is_empty() {
-                    cx.emit(EditorEvent::ShowReferences { locations });
+                    cx.emit(EditorEvent::ShowPeek { title: "References".into(), locations });
                 }
             }
             ServerMessage::Response { id, result } if lsp.pending_signature_id == Some(id) => {
@@ -1016,13 +1080,18 @@ impl EditorView {
             ServerMessage::Response { id, result } if lsp.pending_format_id == Some(id) => {
                 lsp.pending_format_id = None;
                 let save_after = std::mem::take(&mut self.save_after_format);
-                if let Ok(Some(edits)) = result.map(|v| serde_json::from_value::<Option<Vec<TextEdit>>>(v).unwrap_or(None)) {
-                    if !edits.is_empty() {
-                        self.apply_text_edits(edits, cx);
-                        if save_after {
-                            self.flush_save(cx);
-                        }
-                    }
+                let edits = result
+                    .ok()
+                    .and_then(|v| serde_json::from_value::<Option<Vec<TextEdit>>>(v).ok())
+                    .flatten()
+                    .unwrap_or_default();
+                if !edits.is_empty() {
+                    self.apply_text_edits(edits, cx);
+                }
+                // Whether or not the formatter changed anything (or failed), a
+                // pending save still has to happen, exactly once.
+                if save_after {
+                    self.finish_save(cx);
                 }
             }
             ServerMessage::Response { id, result } if lsp.pending_rename_id == Some(id) => {
@@ -1229,6 +1298,18 @@ fn marked_string_text(marked: &MarkedString) -> String {
     }
 }
 
+/// Every target of a `textDocument/definition` reply as plain locations.
+pub(crate) fn all_definition_targets(response: &GotoDefinitionResponse) -> Vec<Location> {
+    match response {
+        GotoDefinitionResponse::Scalar(location) => vec![location.clone()],
+        GotoDefinitionResponse::Array(locations) => locations.clone(),
+        GotoDefinitionResponse::Link(links) => links
+            .iter()
+            .map(|link| Location { uri: link.target_uri.clone(), range: link.target_selection_range })
+            .collect(),
+    }
+}
+
 /// The first target `(uri, line, column)` out of a `textDocument/definition`
 /// response, whichever of its three possible shapes the server used.
 fn first_definition_target(response: &GotoDefinitionResponse) -> Option<(Uri, u32, u32)> {
@@ -1309,6 +1390,7 @@ pub(crate) fn completion_item_to_entry(item: CompletionItem) -> Option<Completio
         kind,
         additional_edits,
         snippet_stops: snippet.stops,
+        snippet_mirrors: snippet.mirrors,
     })
 }
 
@@ -1385,6 +1467,7 @@ pub(crate) fn parse_completion_entries_from_value(value: serde_json::Value) -> V
             kind,
             additional_edits: Vec::new(),
             snippet_stops: snippet.stops,
+            snippet_mirrors: snippet.mirrors,
         });
     }
     entries
@@ -1562,5 +1645,29 @@ mod tests {
         ]);
         let locations: Option<Vec<Location>> = serde_json::from_value(value).unwrap();
         assert_eq!(locations.unwrap()[0].range.start.line, 1);
+    }
+
+    #[test]
+    fn definition_targets_come_out_of_all_three_reply_shapes() {
+        let loc = |line: u32| serde_json::json!({
+            "uri": "file:///a.dart",
+            "range": {"start": {"line": line, "character": 0}, "end": {"line": line, "character": 3}}
+        });
+        let scalar: GotoDefinitionResponse = serde_json::from_value(loc(1)).unwrap();
+        assert_eq!(all_definition_targets(&scalar).len(), 1);
+
+        let array: GotoDefinitionResponse = serde_json::from_value(serde_json::json!([loc(1), loc(9)])).unwrap();
+        let targets = all_definition_targets(&array);
+        assert_eq!((targets[0].range.start.line, targets[1].range.start.line), (1, 9));
+
+        let link: GotoDefinitionResponse = serde_json::from_value(serde_json::json!([{
+            "targetUri": "file:///b.dart",
+            "targetRange": {"start": {"line": 4, "character": 0}, "end": {"line": 8, "character": 1}},
+            "targetSelectionRange": {"start": {"line": 5, "character": 6}, "end": {"line": 5, "character": 12}}
+        }]))
+        .unwrap();
+        let targets = all_definition_targets(&link);
+        assert_eq!(targets[0].uri.as_str(), "file:///b.dart");
+        assert_eq!(targets[0].range.start.line, 5, "the symbol's name, not the whole declaration");
     }
 }

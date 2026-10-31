@@ -276,6 +276,13 @@ impl DartIde {
         cx: &mut Context<Self>,
     ) {
         match id {
+            "widgets-open" => {
+                self.sidebar_open = true;
+                self.set_sidebar_tab(git_panel::SidebarTab::Widgets, cx);
+            }
+            "test-all" => self.start_test_run(crate::test_runner::TestTarget::All, None, None, cx),
+            "test-file" => self.run_tests_in_active_file(cx),
+            "test-rerun-failed" => self.rerun_failed_tests(cx),
             "run-flutter" => self.start_flutter_run(window, cx),
             "hot-reload" => self.trigger_hot_reload(cx),
             "hot-restart" => self.trigger_hot_restart(cx),
@@ -398,12 +405,34 @@ impl DartIde {
                 cx.notify();
             }
             "debug-breakpoint-condition" => self.open_breakpoint_condition_prompt(window, cx),
+            "save-all" => self.save_all(cx),
+            "save-no-format" => {
+                if let Some(ed) = self.active_editor().cloned() {
+                    ed.update(cx, |editor, cx| editor.save_without_format(cx));
+                }
+            }
+            "autosave-cycle" => {
+                let next = self.autosave.next();
+                self.set_autosave(next, cx);
+            }
             "local-history" => self.open_local_history(cx),
             "organize-imports" => {
                 if let Some(ed) = self.active_editor().cloned() {
                     ed.update(cx, |editor, _cx| {
                         editor.request_organize_imports();
                     });
+                }
+            }
+            "refactor" => {
+                if let Some(ed) = self.active_editor().cloned() {
+                    ed.update(cx, |editor, _cx| {
+                        editor.request_refactors();
+                    });
+                }
+            }
+            "peek-definition" => {
+                if let Some(ed) = self.active_editor().cloned() {
+                    ed.update(cx, |editor, _cx| editor.request_peek_definition());
                 }
             }
             "find-references" => {
@@ -416,7 +445,7 @@ impl DartIde {
             "goto-line" => self.open_go_to_line(window, cx),
             "new-file" => self.new_scratch_tab(window, cx),
             "open-folder" => self.open_folder(window, cx),
-            "close-folder" => self.close_workspace(cx),
+            "close-folder" => self.request_close_workspace(cx),
             "open-settings" => self.toggle_settings(cx),
             "about-shame" => {
                 self.about_open = true;

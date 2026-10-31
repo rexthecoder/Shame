@@ -42,6 +42,7 @@ use gpui_kit::prelude::FluentBuilder as _;
 use language::{LanguageAdapter, language_for_path};
 pub use conflicts::ConflictChoice;
 pub use lsp_integration::{CompletionEntry, CompletionKindBadge};
+pub use core_buffer::DiskState;
 use lsp_integration::LspState;
 
 /// Second pass on this editor's look. The first pass piled on chrome —
@@ -90,10 +91,13 @@ pub enum EditorEvent {
     OpenAt { path: PathBuf, line: u32, column: u32 },
     RequestRename { line: u32, column: u32 },
     ShowCodeActions { actions: Vec<lsp_types::CodeActionOrCommand> },
-    ShowReferences { locations: Vec<lsp_types::Location> },
+    /// A set of locations to peek at (references, or a definition's targets).
+    ShowPeek { title: String, locations: Vec<lsp_types::Location> },
     ExternalFileEdits { path: PathBuf, edits: Vec<lsp_types::TextEdit> },
     BreakpointsChanged { path: PathBuf, lines: Vec<u32> },
     Saved { path: PathBuf },
+    /// Writing the file failed; nothing on disk changed.
+    SaveFailed { path: PathBuf, message: String },
     RunTest {
         path: PathBuf,
         test_name: Option<String>,
@@ -117,6 +121,69 @@ fn should_parse_syntax(buffer: &Buffer) -> bool {
         ext.to_ascii_lowercase().as_str(),
         "lock" | "txt" | "log" | "csv" | "tsv" | "svg" | "map"
     )
+}
+
+/// How saving behaves. The app sets one of these as a global; the editor reads
+/// it each time it saves.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SaveOptions {
+    /// Run the language server's formatter first (⌘S; "save without formatting" skips it).
+    pub format_on_save: bool,
+    /// Strip spaces and tabs at the end of every line.
+    pub trim_trailing_whitespace: bool,
+    /// End a non-empty file with exactly one newline.
+    pub insert_final_newline: bool,
+}
+
+impl Default for SaveOptions {
+    fn default() -> Self {
+        Self { format_on_save: true, trim_trailing_whitespace: false, insert_final_newline: false }
+    }
+}
+
+impl Global for SaveOptions {}
+
+/// `text` with trailing whitespace trimmed and/or a final newline ensured, or
+/// `None` when nothing needs to change. Line endings (`\n` or `\r\n`) are kept.
+pub(crate) fn normalize_for_save(text: &str, trim: bool, final_newline: bool) -> Option<String> {
+    let mut out = String::with_capacity(text.len() + 1);
+    for piece in text.split_inclusive('\n') {
+        if trim {
+            let (body, ending) = match piece.strip_suffix("\r\n") {
+                Some(body) => (body, "\r\n"),
+                None => match piece.strip_suffix('\n') {
+                    Some(body) => (body, "\n"),
+                    None => (piece, ""),
+                },
+            };
+            out.push_str(body.trim_end_matches([' ', '\t']));
+            out.push_str(ending);
+        } else {
+            out.push_str(piece);
+        }
+    }
+    if final_newline && !out.is_empty() && !out.ends_with('\n') {
+        out.push('\n');
+    }
+    (out != text).then_some(out)
+}
+
+/// The smallest single replacement turning `old` into `new`: `(range in old, replacement)`.
+pub(crate) fn minimal_replacement<'a>(old: &str, new: &'a str) -> Option<(Range<usize>, &'a str)> {
+    if old == new {
+        return None;
+    }
+    let (a, b) = (old.as_bytes(), new.as_bytes());
+    let mut prefix = a.iter().zip(b).take_while(|(x, y)| x == y).count();
+    while !old.is_char_boundary(prefix) || !new.is_char_boundary(prefix) {
+        prefix -= 1;
+    }
+    let max_suffix = (a.len() - prefix).min(b.len() - prefix);
+    let mut suffix = (0..max_suffix).take_while(|&i| a[a.len() - 1 - i] == b[b.len() - 1 - i]).count();
+    while !old.is_char_boundary(a.len() - suffix) || !new.is_char_boundary(b.len() - suffix) {
+        suffix -= 1;
+    }
+    Some((prefix..a.len() - suffix, &new[prefix..b.len() - suffix]))
 }
 
 pub struct EditorView {
@@ -503,21 +570,86 @@ impl EditorView {
         cx.notify();
     }
 
+    /// Save: format first when enabled (waiting for the formatter, but never
+    /// longer than a couple of seconds), then write the file once.
     pub fn save(&mut self, cx: &mut Context<Self>) {
+        self.save_with(true, cx);
+    }
+
+    /// Save exactly what is in the buffer: no formatter, no waiting.
+    pub fn save_without_format(&mut self, cx: &mut Context<Self>) {
+        self.save_with(false, cx);
+    }
+
+    fn save_with(&mut self, format: bool, cx: &mut Context<Self>) {
         self.sync_buffer_state();
-        if should_parse_syntax(&self.buffer) && self.request_format() {
+        let options = cx.try_global::<SaveOptions>().copied().unwrap_or_default();
+        if format
+            && options.format_on_save
+            && should_parse_syntax(&self.buffer)
+            && self.request_format()
+        {
             self.save_after_format = true;
+            // A slow or dead language server must never leave the file unsaved.
+            cx.spawn(async move |weak, cx| {
+                smol::Timer::after(std::time::Duration::from_millis(2500)).await;
+                let _ = weak.update(cx, |this, cx| {
+                    if std::mem::take(&mut this.save_after_format) {
+                        this.finish_save(cx);
+                    }
+                });
+            })
+            .detach();
+            return;
+        }
+        self.finish_save(cx);
+    }
+
+    /// Apply the whitespace options, then write.
+    pub(crate) fn finish_save(&mut self, cx: &mut Context<Self>) {
+        let options = cx.try_global::<SaveOptions>().copied().unwrap_or_default();
+        if options.trim_trailing_whitespace || options.insert_final_newline {
+            let text = self.buffer.text();
+            if let Some(clean) =
+                normalize_for_save(&text, options.trim_trailing_whitespace, options.insert_final_newline)
+            {
+                if let Some((range, replacement)) = minimal_replacement(&text, &clean) {
+                    self.buffer.edit(range, replacement);
+                }
+            }
         }
         self.flush_save(cx);
     }
 
     pub(crate) fn flush_save(&mut self, cx: &mut Context<Self>) {
-        if self.buffer.save().is_ok() {
-            if let Some(path) = self.buffer.path().map(Path::to_path_buf) {
-                cx.emit(EditorEvent::Saved { path });
+        if let Some(path) = self.buffer.path().map(Path::to_path_buf) {
+            match self.buffer.save() {
+                Ok(()) => cx.emit(EditorEvent::Saved { path }),
+                Err(err) => cx.emit(EditorEvent::SaveFailed { path, message: err.to_string() }),
             }
         }
         self.refresh_line_changes(cx);
+        cx.notify();
+    }
+
+    /// How the file on disk compares with what this editor last read or wrote.
+    pub fn disk_state(&self) -> core_buffer::DiskState {
+        self.buffer.disk_state()
+    }
+
+    /// Replace the text with the file's current contents (dropping local edits).
+    pub fn reload_from_disk(&mut self, cx: &mut Context<Self>) -> io::Result<()> {
+        self.buffer.reload_from_disk()?;
+        self.refresh_line_changes(cx);
+        cx.notify();
+        Ok(())
+    }
+
+    /// Keep this editor's version: treat the file on disk as seen, so the next
+    /// save overwrites it knowingly.
+    pub fn keep_my_version(&mut self, cx: &mut Context<Self>) {
+        self.buffer.acknowledge_disk();
+        cx.notify();
     }
 
     fn set_cursor(&mut self, offset: usize, cx: &mut Context<Self>) {
@@ -1241,10 +1373,12 @@ impl EditorView {
                 if snippet.trigger.starts_with(&prefix_lower)
                     && seen.insert(snippet.trigger.to_string())
                 {
+                    let parsed = snippet::parse_snippet(snippet.body);
                     results.push(CompletionEntry {
-                        snippet_stops: Vec::new(),
+                        snippet_stops: parsed.stops,
+                        snippet_mirrors: parsed.mirrors,
                         label: snippet.trigger.to_string(),
-                        insert_text: snippet.body.to_string(),
+                        insert_text: parsed.text,
                         detail: Some(snippet.detail.to_string()),
                         kind: CompletionKindBadge::Keyword,
                         additional_edits: Vec::new(),
@@ -1270,6 +1404,7 @@ impl EditorView {
                     let is_type = kw.bytes().next().is_some_and(|b| b.is_ascii_uppercase());
                     results.push(CompletionEntry {
                         snippet_stops: Vec::new(),
+                        snippet_mirrors: Vec::new(),
                         label: kw.to_string(),
                         insert_text: kw.to_string(),
                         detail: Some(if is_type { "type" } else { "keyword" }.to_string()),
@@ -1316,6 +1451,7 @@ impl EditorView {
                         };
                         results.push(CompletionEntry {
                             snippet_stops: Vec::new(),
+                            snippet_mirrors: Vec::new(),
                             label: word.to_string(),
                             insert_text: word.to_string(),
                             detail: None,
@@ -1344,8 +1480,28 @@ impl EditorView {
         };
         let (prefix_range, _prefix, _after_dot) = self.current_completion_prefix();
         let insert_at = prefix_range.start;
-        self.buffer.edit(prefix_range, &entry.insert_text);
-        let mut cursor_pos = insert_at + entry.insert_text.len();
+        // A multi-line snippet continues at the indentation of the line it lands on.
+        let snippet = (!entry.snippet_stops.is_empty()).then(|| {
+            let line = self.buffer.byte_to_line(insert_at);
+            let line_start = self.buffer.line_to_byte(line);
+            let indent: String = self
+                .buffer
+                .slice(line_start..insert_at)
+                .chars()
+                .take_while(|c| *c == ' ' || *c == '\t')
+                .collect();
+            snippet::indent_snippet(
+                &snippet::ParsedSnippet {
+                    text: entry.insert_text.clone(),
+                    stops: entry.snippet_stops.clone(),
+                    mirrors: entry.snippet_mirrors.clone(),
+                },
+                &indent,
+            )
+        });
+        let insert_text = snippet.as_ref().map_or(entry.insert_text.clone(), |s| s.text.clone());
+        self.buffer.edit(prefix_range, &insert_text);
+        let mut cursor_pos = insert_at + insert_text.len();
 
         // Apply any additional edits (e.g. Dart LSP auto-import headers)
         if !entry.additional_edits.is_empty() {
@@ -1375,44 +1531,50 @@ impl EditorView {
         // Snippet tab stops: jump to the first and queue the rest for Tab.
         // Offsets are relative to the inserted text; account for additional
         // edits that landed before it.
-        if !entry.snippet_stops.is_empty() {
-            let inserted_end = insert_at + entry.insert_text.len();
+        if let Some(snippet) = snippet {
+            let inserted_end = insert_at + insert_text.len();
             let shift = cursor_pos as isize - inserted_end as isize;
-            let stops = entry
-                .snippet_stops
-                .iter()
-                .map(|r| {
-                    let at = |o: usize| ((insert_at + o) as isize + shift).max(0) as usize;
-                    at(r.start)..at(r.end)
-                })
-                .collect();
-            self.snippet = Some(snippet::SnippetSession {
-                stops,
-                len_at_active: self.buffer.len_bytes(),
-                active: None,
-            });
+            let at = |o: usize| ((insert_at + o) as isize + shift).max(0) as usize;
+            let place = |r: &Range<usize>| at(r.start)..at(r.end);
+            self.snippet = Some(snippet::SnippetSession::new(
+                snippet.stops.iter().map(place).collect(),
+                snippet.mirrors.iter().map(|ms| ms.iter().map(place).collect()).collect(),
+                self.buffer.len_bytes(),
+            ));
             self.advance_snippet(cx);
         }
     }
 
-    /// Tab inside a snippet: select the next tab stop. Returns whether one
-    /// was available (otherwise Tab falls through to indenting).
+    /// Tab inside a snippet: fill in the mirrors of the placeholder being left,
+    /// then select the next tab stop. Returns whether one was available
+    /// (otherwise Tab falls through to indenting).
     pub(crate) fn advance_snippet(&mut self, cx: &mut Context<Self>) -> bool {
-        let len = self.buffer.len_bytes();
         let head = self.buffer.selections().primary().head;
-        let Some(session) = self.snippet.as_mut() else {
+        let Some(mut session) = self.snippet.take() else {
             return false;
         };
-        if !session.cursor_in_active(head, len) {
-            self.snippet = None;
+        if !session.cursor_in_active(head, self.buffer.len_bytes()) {
             return false;
         }
-        let Some(stop) = session.next_stop(len) else {
-            self.snippet = None;
+        // What was typed into the placeholder we are leaving goes into its mirrors,
+        // last position first so the earlier ones stay valid.
+        if let Some((typed, mirrors)) = session.begin_advance(self.buffer.len_bytes()) {
+            let text = self.buffer.slice(typed);
+            let mut mirrors = mirrors;
+            mirrors.sort_by_key(|m| std::cmp::Reverse(m.start));
+            for mirror in mirrors {
+                let end = mirror.end.min(self.buffer.len_bytes());
+                let start = mirror.start.min(end);
+                self.buffer.edit(start..end, &text);
+                session.mirror_applied(&(start..end), text.len());
+            }
+        }
+        let len = self.buffer.len_bytes();
+        let Some(stop) = session.finish_advance(len) else {
             return false;
         };
-        if session.stops.is_empty() {
-            self.snippet = None;
+        if !(session.stops.is_empty() && session.active_mirrors.is_empty()) {
+            self.snippet = Some(session);
         }
         let end = stop.end.min(len);
         let start = stop.start.min(end);
@@ -1626,12 +1788,19 @@ impl EditorView {
                 "x" => self.cut(cx),
                 "v" => self.paste(cx),
                 "a" => self.select_all(cx),
+                "s" if keystroke.modifiers.alt => {
+                    // ⌥⌘S is "save all": the app handles it.
+                    return;
+                }
                 "s" => {
                     self.save(cx);
                     cx.notify();
                 }
                 "f" if keystroke.modifiers.shift => {
                     self.request_format();
+                }
+                "r" if keystroke.modifiers.shift => {
+                    self.request_refactors();
                 }
                 "r" => self.start_rename(cx),
                 "d" => self.select_next_occurrence(cx),
@@ -1659,6 +1828,7 @@ impl EditorView {
         let extend = keystroke.modifiers.shift;
         match keystroke.key.as_str() {
             "f2" => self.start_rename(cx),
+            "f12" if keystroke.modifiers.alt => self.request_peek_definition(),
             "f12" if keystroke.modifiers.shift => self.request_references(),
             "backspace" => self.backspace(cx),
             "delete" => self.delete_forward(cx),
@@ -3218,7 +3388,35 @@ pub fn highlight_color(kind: HighlightKind) -> Rgba {
 
 #[cfg(test)]
 mod tests {
-    use super::diff_as_edit;
+
+    #[core::prelude::v1::test]
+    fn normalizing_trims_trailing_whitespace_and_keeps_line_endings() {
+        assert_eq!(normalize_for_save("a  \nb\t\n", true, false).as_deref(), Some("a\nb\n"));
+        assert_eq!(normalize_for_save("a \r\nb \r\n", true, false).as_deref(), Some("a\r\nb\r\n"));
+        assert_eq!(normalize_for_save("clean\n", true, true), None, "already clean");
+        assert_eq!(normalize_for_save("  indented\n", true, false), None, "leading space is kept");
+    }
+
+    #[core::prelude::v1::test]
+    fn normalizing_adds_one_final_newline_only_to_non_empty_files() {
+        assert_eq!(normalize_for_save("a", false, true).as_deref(), Some("a\n"));
+        assert_eq!(normalize_for_save("a\n", false, true), None);
+        assert_eq!(normalize_for_save("", false, true), None, "an empty file stays empty");
+        assert_eq!(normalize_for_save("a ", true, true).as_deref(), Some("a\n"));
+        // Options off: nothing changes.
+        assert_eq!(normalize_for_save("a  ", false, false), None);
+    }
+
+    #[core::prelude::v1::test]
+    fn minimal_replacement_finds_the_changed_middle() {
+        assert_eq!(minimal_replacement("same", "same"), None);
+        assert_eq!(minimal_replacement("abcXdef", "abcYYdef"), Some((3..4, "YY")));
+        assert_eq!(minimal_replacement("a", "a\n"), Some((1..1, "\n")));
+        // Never splits a multi-byte character.
+        assert_eq!(minimal_replacement("h\u{e9}llo", "h\u{e8}llo"), Some((1..3, "\u{e8}")));
+    }
+
+    use super::{diff_as_edit, minimal_replacement, normalize_for_save};
 
     #[test]
     fn no_change_is_no_edit() {

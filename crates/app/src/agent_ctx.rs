@@ -30,6 +30,21 @@ pub(crate) const AGENT_MODES: [AgentMode; 4] = [
 ];
 
 impl ModeId {
+    /// Stable name used when saving preferences (not the position in the list,
+    /// which changes when modes are added).
+    pub(crate) fn key(self) -> &'static str {
+        match self {
+            ModeId::Ask => "ask",
+            ModeId::Plan => "plan",
+            ModeId::Edit => "edit",
+            ModeId::Auto => "auto",
+        }
+    }
+
+    pub(crate) fn from_key(key: &str) -> Option<ModeId> {
+        AGENT_MODES.iter().map(|m| m.id).find(|id| id.key() == key)
+    }
+
     /// Index into [`AGENT_MODES`].
     pub(crate) fn index(self) -> usize {
         AGENT_MODES.iter().position(|m| m.id == self).unwrap_or(0)
@@ -502,7 +517,9 @@ mod tests {
         assert!(ModeId::Edit.instruction().is_none());
         for (ix, mode) in AGENT_MODES.iter().enumerate() {
             assert_eq!(mode.id.index(), ix);
+            assert_eq!(ModeId::from_key(mode.id.key()), Some(mode.id), "saved by name, restored by name");
         }
+        assert_eq!(ModeId::from_key("nonsense"), None);
     }
 
     #[core::prelude::v1::test]

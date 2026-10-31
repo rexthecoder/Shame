@@ -13,18 +13,21 @@ mod agent_ctx;
 mod chrome;
 mod diff_view;
 mod editor;
+mod file_state;
 mod git_panel;
 mod history;
 mod markdown;
 mod lsp_health;
 mod rails;
-mod references;
+mod peek;
 mod debug;
 mod flutter;
 mod palette;
 mod prompts;
 mod settings_ui;
 mod tab_ops;
+mod test_runner;
+mod widgets;
 mod workspace;
 mod shell;
 mod simulator;
@@ -237,6 +240,7 @@ pub(crate) enum DockTab {
     Terminal,
     Problems,
     DebugConsole,
+    Tests,
 }
 
 actions!(
@@ -273,6 +277,10 @@ pub(crate) struct IdeCommand {
 }
 
 const IDE_COMMANDS: &[IdeCommand] = &[
+    IdeCommand { id: "widgets-open", title: "Flutter: Show Widget Tree", shortcut: "", flutter_only: true },
+    IdeCommand { id: "test-all", title: "Test: Run All Tests", shortcut: "", flutter_only: true },
+    IdeCommand { id: "test-file", title: "Test: Run Tests in Current File", shortcut: "", flutter_only: true },
+    IdeCommand { id: "test-rerun-failed", title: "Test: Re-run Failed Tests", shortcut: "", flutter_only: true },
     IdeCommand { id: "run-flutter", title: "Flutter: Run App on Selected Device", shortcut: "", flutter_only: true },
     IdeCommand { id: "hot-reload", title: "Flutter: Hot Reload", shortcut: "\u{2318}S", flutter_only: true },
     IdeCommand { id: "hot-restart", title: "Flutter: Hot Restart", shortcut: "", flutter_only: true },
@@ -307,10 +315,15 @@ const IDE_COMMANDS: &[IdeCommand] = &[
     IdeCommand { id: "toggle-web-preview", title: "View: Toggle Web Preview Rail", shortcut: "", flutter_only: false },
     IdeCommand { id: "toggle-agent", title: "View: Toggle Agent Rail", shortcut: "", flutter_only: false },
     IdeCommand { id: "format-doc", title: "Editor: Format Document", shortcut: "\u{21e7}\u{2318}F", flutter_only: false },
+    IdeCommand { id: "save-all", title: "File: Save All", shortcut: "\u{2325}\u{2318}S", flutter_only: false },
+    IdeCommand { id: "save-no-format", title: "File: Save Without Formatting", shortcut: "", flutter_only: false },
+    IdeCommand { id: "autosave-cycle", title: "File: Change Auto Save Mode", shortcut: "", flutter_only: false },
     IdeCommand { id: "local-history", title: "File: Local History\u{2026} (Restore Earlier Version)", shortcut: "", flutter_only: false },
     IdeCommand { id: "conflict-current", title: "Git: Accept Current Change (Merge Conflict)", shortcut: "", flutter_only: false },
     IdeCommand { id: "conflict-incoming", title: "Git: Accept Incoming Change (Merge Conflict)", shortcut: "", flutter_only: false },
     IdeCommand { id: "conflict-both", title: "Git: Accept Both Changes (Merge Conflict)", shortcut: "", flutter_only: false },
+    IdeCommand { id: "refactor", title: "Editor: Refactor\u{2026} (Wrap with Widget, Extract\u{2026})", shortcut: "\u{21e7}\u{2318}R", flutter_only: false },
+    IdeCommand { id: "peek-definition", title: "Editor: Peek Definition", shortcut: "\u{2325}F12", flutter_only: false },
     IdeCommand { id: "organize-imports", title: "Editor: Organize Imports", shortcut: "", flutter_only: false },
     IdeCommand { id: "find-references", title: "Editor: Find References", shortcut: "\u{21e7}F12", flutter_only: false },
     IdeCommand { id: "goto-workspace-symbol", title: "Editor: Go to Symbol in Workspace\u{2026}", shortcut: "\u{2318}T", flutter_only: false },
@@ -512,10 +525,21 @@ pub struct DartIde {
     pub(crate) rename_target: Option<(Entity<EditorView>, u32, u32)>,
     pub(crate) rename_input: Entity<InputState>,
     pub(crate) code_actions: Option<(Entity<EditorView>, Vec<lsp_types::CodeActionOrCommand>)>,
-    pub(crate) references: Option<Vec<references::ReferenceItem>>,
+    pub(crate) peek: Option<peek::PeekState>,
+    pub(crate) peek_focus: FocusHandle,
     pub(crate) workspace_symbols: Vec<core_workspace::WorkspaceSymbol>,
     pub(crate) symbols_indexing: bool,
     pub(crate) history: Option<(Entity<EditorView>, Vec<core_workspace::Snapshot>)>,
+    pub(crate) autosave: file_state::AutosaveMode,
+    pub(crate) test_run: Option<test_runner::TestRunState>,
+    pub(crate) widgets: widgets::WidgetTreeState,
+    pub(crate) save_options: editor_view::SaveOptions,
+    /// Per editor: the revision last seen and when it last changed (autosave timing).
+    pub(crate) edit_marks: HashMap<EntityId, (u64, std::time::Instant)>,
+    /// Things worth telling the user about each file (changed on disk, save failed).
+    pub(crate) file_notices: HashMap<PathBuf, file_state::FileNotice>,
+    pub(crate) unsaved_prompt: Option<file_state::UnsavedPrompt>,
+    pub(crate) disk_tick: u32,
     pub(crate) terminals: Vec<editor::dock::TerminalSession>,
     pub(crate) active_terminal: usize,
     pub(crate) next_terminal_id: usize,
@@ -719,10 +743,19 @@ impl DartIde {
             rename_target: None,
             rename_input,
             code_actions: None,
-            references: None,
+            peek: None,
+            peek_focus: cx.focus_handle(),
             workspace_symbols: Vec::new(),
             symbols_indexing: false,
             history: None,
+            autosave: file_state::AutosaveMode::Off,
+            test_run: None,
+            widgets: widgets::WidgetTreeState::default(),
+            save_options: editor_view::SaveOptions::default(),
+            edit_marks: HashMap::new(),
+            file_notices: HashMap::new(),
+            unsaved_prompt: None,
+            disk_tick: 0,
             terminals: vec![initial_terminal],
             active_terminal: 0,
             next_terminal_id: 1,
@@ -766,6 +799,7 @@ impl DartIde {
         } else {
             this.restore_preferences_only(window, cx);
         }
+        this.apply_save_options(cx);
         this.start_git_refresh_loop(cx);
         // The Commit button depends on whether the message box is empty.
         cx.observe(&this.git.message, |_, _, cx| cx.notify()).detach();
@@ -832,6 +866,43 @@ impl DartIde {
             );
             this._subscriptions.push(sub);
         }
+
+        // Files: autosave and outside-change checks, twice a second.
+        cx.spawn(async move |weak, cx| {
+            loop {
+                cx.background_executor().timer(std::time::Duration::from_millis(500)).await;
+                if weak.update(cx, |this, cx| this.tick_files(cx)).is_err() {
+                    break;
+                }
+            }
+        })
+        .detach();
+        // Leaving Shame can autosave; coming back re-checks what changed meanwhile.
+        let activation = cx.observe_window_activation(window, |this, window, cx| {
+            if window.is_window_active() {
+                this.check_disk_changes(cx);
+            } else if this.autosave == file_state::AutosaveMode::OnFocusChange {
+                this.save_all(cx);
+            }
+        });
+        this._subscriptions.push(activation);
+        // The red close button must not throw away unsaved work either.
+        let this_view = cx.entity();
+        window.on_window_should_close(cx, move |_window, cx| {
+            this_view.update(cx, |this, cx| {
+                let tabs = this.unsaved_tabs(cx);
+                if tabs.is_empty() {
+                    true
+                } else {
+                    this.unsaved_prompt = Some(file_state::UnsavedPrompt {
+                        tabs,
+                        then: file_state::AfterUnsaved::Quit,
+                    });
+                    cx.notify();
+                    false
+                }
+            })
+        });
         this
     }
 
@@ -864,9 +935,8 @@ impl DartIde {
                     this.code_actions = Some((editor.clone(), actions.clone()));
                     cx.notify();
                 }
-                EditorEvent::ShowReferences { locations } => {
-                    this.references = Some(references::reference_items(locations));
-                    cx.notify();
+                EditorEvent::ShowPeek { title, locations } => {
+                    this.open_peek(title.clone(), locations, window, cx);
                 }
                 EditorEvent::ExternalFileEdits { path, edits } => {
                     this.apply_external_file_edits(path.clone(), edits.clone(), cx);
@@ -880,7 +950,15 @@ impl DartIde {
                     this.send_breakpoints(path);
                     cx.notify();
                 }
+                EditorEvent::SaveFailed { path, message } => {
+                    this.file_notices.insert(
+                        path.clone(),
+                        file_state::FileNotice::SaveFailed(message.clone()),
+                    );
+                    cx.notify();
+                }
                 EditorEvent::Saved { path } => {
+                    this.file_notices.remove(path);
                     this.record_history_snapshot(path.clone());
                     this.refresh_git(cx);
                     if this.web_preview_open {
@@ -945,6 +1023,12 @@ impl DartIde {
             }
         }
 
+        // ⌥⌘S: save every file with unsaved changes.
+        if primary_mod && keystroke.modifiers.alt && keystroke.key.as_str() == "s" {
+            self.save_all(cx);
+            return;
+        }
+
         // ⌘L: send the selection (or the whole file) to the agent chat.
         if primary_mod && !keystroke.modifiers.shift && keystroke.key.as_str() == "l" {
             self.attach_editor_context(window, cx);
@@ -968,7 +1052,7 @@ impl DartIde {
 
         if primary_mod && keystroke.key.as_str() == "w" {
             if !self.tabs.is_empty() {
-                self.close_tab(self.active_tab, cx);
+                self.request_close_tab(self.active_tab, cx);
             }
             return;
         }
@@ -1129,14 +1213,14 @@ impl Render for DartIde {
             .on_action(cx.listener(|this, _: &OpenSettings, _w, cx| {
                 this.toggle_settings(cx);
             }))
-            .on_action(|_: &QuitShame, _w, cx| {
-                cx.quit();
-            })
+            .on_action(cx.listener(|this, _: &QuitShame, _w, cx| {
+                this.request_quit(cx);
+            }))
             .on_action(cx.listener(|this, _: &MenuOpenFolder, window, cx| {
                 this.open_folder(window, cx);
             }))
             .on_action(cx.listener(|this, _: &MenuCloseFolder, _w, cx| {
-                this.close_workspace(cx);
+                this.request_close_workspace(cx);
             }))
             .on_action(cx.listener(|this, _: &MenuNewFile, window, cx| {
                 this.new_scratch_tab(window, cx);
@@ -1148,7 +1232,7 @@ impl Render for DartIde {
             }))
             .on_action(cx.listener(|this, _: &MenuCloseTab, _w, cx| {
                 if !this.tabs.is_empty() {
-                    this.close_tab(this.active_tab, cx);
+                    this.request_close_tab(this.active_tab, cx);
                 }
             }))
             .on_action(cx.listener(|this, _: &MenuGoToFile, window, cx| {
@@ -1238,8 +1322,11 @@ impl Render for DartIde {
             .when_some(self.render_code_actions(&view, cx), |el, picker| {
                 el.child(deferred(picker).with_priority(100))
             })
-            .when_some(self.render_references(&view, cx), |el, picker| {
-                el.child(deferred(picker).with_priority(100))
+            .when_some(self.render_peek(cx), |el, peek| {
+                el.child(deferred(peek).with_priority(100))
+            })
+            .when_some(self.render_unsaved_prompt(cx), |el, prompt| {
+                el.child(deferred(prompt).with_priority(120))
             })
             .when_some(self.render_local_history(&view, cx), |el, picker| {
                 el.child(deferred(picker).with_priority(100))

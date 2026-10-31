@@ -195,7 +195,7 @@ impl DartIde {
                                 })
                                 .on_click(cx.listener(|this, _event, _window, cx| {
                                     cx.stop_propagation();
-                                    this.close_workspace(cx);
+                                    this.request_close_workspace(cx);
                                 })),
                         )
                     })

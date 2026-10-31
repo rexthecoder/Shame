@@ -147,7 +147,16 @@ impl DartIde {
                                 )
                             },
                         ),
-                    ),
+                    )
+                    .when(self.is_flutter_or_dart_workspace() || self.can_inspect(), |row| {
+                        row.child(tab(
+                            "sidebar-tab-widgets",
+                            if self.sidebar_tab == SidebarTab::Widgets { "Widgets" } else { "" },
+                            IconName::ListTree,
+                            SidebarTab::Widgets,
+                            cx,
+                        ))
+                    })
             )
             .child(
                 div()

@@ -103,15 +103,13 @@ impl DartIde {
         self.go_to_line_open = false;
         self.rename_target = None;
         self.code_actions = None;
-        self.references = None;
+        self.peek = None;
 
         // Kill any running terminal child processes from the old project and
         // start a fresh terminal session rooted at the new workspace
         for session in &mut self.terminals {
             if let Some(pid) = session.running_pid.take() {
-                let _ = std::process::Command::new("kill")
-                    .args(["-TERM", &pid.to_string()])
-                    .status();
+                crate::editor::dock::signal_process_group(pid, "-TERM");
             }
         }
         let id = self.next_terminal_id;
@@ -302,7 +300,15 @@ impl DartIde {
             "light_theme": self.light_theme,
             "unified_diff": self.git.unified_diff,
             "agent_harness": harness_str,
-            "agent_mode_ix": self.agent.mode_ix,
+            // By name, so adding or reordering modes never changes a saved choice.
+            "agent_mode": crate::agent_ctx::AGENT_MODES
+                [self.agent.mode_ix % crate::agent_ctx::AGENT_MODES.len()]
+            .id
+            .key(),
+            "autosave": self.autosave.key(),
+            "format_on_save": self.save_options.format_on_save,
+            "trim_trailing_whitespace": self.save_options.trim_trailing_whitespace,
+            "insert_final_newline": self.save_options.insert_final_newline,
         });
         if let Ok(json) = serde_json::to_vec_pretty(&val) {
             let _ = std::fs::write(path, json);
@@ -335,9 +341,26 @@ impl DartIde {
         if let Some(ud) = val.get("unified_diff").and_then(|v| v.as_bool()) {
             self.git.unified_diff = ud;
         }
-        if let Some(mode_ix) = val.get("agent_mode_ix").and_then(|v| v.as_u64()) {
-            self.agent.mode_ix = (mode_ix as usize) % 3;
+        if let Some(mode) = val
+            .get("agent_mode")
+            .and_then(|v| v.as_str())
+            .and_then(crate::agent_ctx::ModeId::from_key)
+        {
+            self.agent.mode_ix = mode.index();
         }
+        if let Some(key) = val.get("autosave").and_then(|v| v.as_str()) {
+            self.autosave = crate::file_state::AutosaveMode::from_key(key);
+        }
+        if let Some(v) = val.get("format_on_save").and_then(|v| v.as_bool()) {
+            self.save_options.format_on_save = v;
+        }
+        if let Some(v) = val.get("trim_trailing_whitespace").and_then(|v| v.as_bool()) {
+            self.save_options.trim_trailing_whitespace = v;
+        }
+        if let Some(v) = val.get("insert_final_newline").and_then(|v| v.as_bool()) {
+            self.save_options.insert_final_newline = v;
+        }
+        self.apply_save_options(cx);
         if let Some(h) = val.get("agent_harness").and_then(|v| v.as_str()) {
             let tool = match h {
                 "opencode" => rails::agent::AgentHarness::OpenCode,
