@@ -231,14 +231,17 @@ pub fn point_at(source: &str, byte: usize) -> Point {
 }
 
 fn collect_fold_ranges(node: Node, out: &mut Vec<FoldRange>) {
-    let mut cursor = node.walk();
-    let children: Vec<Node> = node.children(&mut cursor).collect();
+    // A fold must span several lines, and so must every ancestor of it:
+    // skipping single-line nodes prunes the vast majority of the tree.
+    let (start_line, end_line) = (node.start_position().row, node.end_position().row);
+    if end_line == start_line {
+        return;
+    }
 
-    if let (Some(first), Some(last)) = (children.first(), children.last()) {
-        if first.kind() == "{" && last.kind() == "}" {
-            let start_line = node.start_position().row;
-            let end_line = node.end_position().row;
-            if end_line > start_line {
+    let count = node.child_count();
+    if count > 0 {
+        if let (Some(first), Some(last)) = (node.child(0), node.child(count - 1)) {
+            if first.kind() == "{" && last.kind() == "}" {
                 out.push(FoldRange {
                     start_line,
                     end_line,
@@ -249,7 +252,8 @@ fn collect_fold_ranges(node: Node, out: &mut Vec<FoldRange>) {
         }
     }
 
-    for child in children {
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
         collect_fold_ranges(child, out);
     }
 }
@@ -330,5 +334,38 @@ mod tests {
                 .any(|h| h.kind == HighlightKind::Comment && new_source[h.range.clone()].contains("inserted")),
             "expected the newly inserted comment to be highlighted after reparse"
         );
+    }
+
+    /// The unpruned walk this function replaced, kept as an oracle.
+    fn naive_fold_ranges(node: Node, out: &mut Vec<FoldRange>) {
+        let mut cursor = node.walk();
+        let children: Vec<Node> = node.children(&mut cursor).collect();
+        if let (Some(first), Some(last)) = (children.first(), children.last()) {
+            if first.kind() == "{" && last.kind() == "}" {
+                let (start_line, end_line) = (node.start_position().row, node.end_position().row);
+                if end_line > start_line {
+                    out.push(FoldRange {
+                        start_line,
+                        end_line,
+                        start_byte: node.start_byte(),
+                        end_byte: node.end_byte(),
+                    });
+                }
+            }
+        }
+        for child in children {
+            naive_fold_ranges(child, out);
+        }
+    }
+
+    #[test]
+    fn pruned_fold_ranges_match_the_naive_walk() {
+        let source = "class A {\n  void f() { return; }\n  int g() {\n    if (x) {\n      y();\n    }\n    return 1;\n  }\n}\nvoid main() {\n  var m = {1: 2};\n}\n";
+        let tree = SyntaxTree::parse(source);
+        let mut expected = Vec::new();
+        naive_fold_ranges(tree.root(), &mut expected);
+        expected.sort_by_key(|r| r.start_byte);
+        assert!(!expected.is_empty());
+        assert_eq!(tree.fold_ranges(), expected);
     }
 }

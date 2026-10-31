@@ -2,6 +2,17 @@
 
 use super::*;
 
+/// How many locals the debug dock lists (the adapter may return many more).
+const MAX_SHOWN_VARIABLES: usize = 30;
+
+/// What the debug input prompt is collecting.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum DebugPrompt {
+    Watch,
+    /// A condition for the breakpoint at `(file, 1-indexed line)`.
+    BreakpointCondition(PathBuf, u32),
+}
+
 impl DartIde {
     pub(crate) fn push_debug_line(&mut self, raw: &str) {
         let spans = editor::dock::parse_ansi_line(raw);
@@ -84,7 +95,10 @@ impl DartIde {
         let _ = client.launch(&program_str, &cwd_str);
         for (bp_path, lines) in &self.dap_breakpoints {
             if !lines.is_empty() {
-                let _ = client.set_breakpoints(&bp_path.to_string_lossy(), lines);
+                let _ = client.set_breakpoints_ex(
+                    &bp_path.to_string_lossy(),
+                    &self.breakpoints_with_conditions(bp_path, lines),
+                );
             }
         }
         let _ = client.configuration_done();
@@ -145,6 +159,7 @@ impl DartIde {
                     self.dap_paused_thread = None;
                     self.dap_stack_summary = None;
                     self.dap_variables.clear();
+                    self.dap_frame_id = None;
                     self.clear_all_debug_lines(cx);
                     cx.notify();
                 }
@@ -164,10 +179,21 @@ impl DartIde {
                 _ => {}
             },
             core_dap::DapMessage::Response {
+                request_seq,
                 command,
                 result: Ok(body),
-                ..
             } => match command.as_str() {
+                "evaluate" => {
+                    if let Some(expr) = self.dap_eval_pending.remove(&request_seq) {
+                        let value = body
+                            .get("result")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        self.dap_watch_values.insert(expr, value);
+                        cx.notify();
+                    }
+                }
                 "stackTrace" => {
                     if let Some(frame) = body
                         .get("stackFrames")
@@ -182,6 +208,8 @@ impl DartIde {
                             .and_then(|s| s.get("path"))
                             .and_then(|v| v.as_str())
                             .map(PathBuf::from);
+                        self.dap_frame_id = Some(frame_id);
+                        self.refresh_watches();
                         self.dap_stack_summary = Some(format!("Paused in {fn_name}:{line_1}"));
                         if let Some(path) = src_path {
                             self.open_path(path, window, cx);
@@ -219,7 +247,7 @@ impl DartIde {
                     if let Some(arr) = body.get("variables").and_then(|v| v.as_array()) {
                         self.dap_variables = arr
                             .iter()
-                            .take(8)
+                            .take(MAX_SHOWN_VARIABLES)
                             .filter_map(|v| {
                                 Some((
                                     v.get("name")?.as_str()?.to_string(),
@@ -232,6 +260,17 @@ impl DartIde {
                 }
                 _ => {}
             },
+            core_dap::DapMessage::Response { request_seq, result: Err(err), .. } => {
+                if let Some(expr) = self.dap_eval_pending.remove(&request_seq) {
+                    let message = err
+                        .get("message")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("error")
+                        .to_string();
+                    self.dap_watch_values.insert(expr, format!("<{message}>"));
+                    cx.notify();
+                }
+            }
             core_dap::DapMessage::Request { seq, command, .. } => {
                 if let Some(dap) = &self.dap_client {
                     if let Ok(guard) = dap.lock() {
@@ -306,5 +345,157 @@ impl DartIde {
             let _ = guard.step_out(tid);
         }
         cx.notify();
+    }
+
+    /// Breakpoint list for `path` with any conditions attached.
+    pub(crate) fn breakpoints_with_conditions(&self, path: &Path, lines: &[u32]) -> Vec<core_dap::Breakpoint> {
+        let conditions = self.dap_conditions.get(path);
+        lines
+            .iter()
+            .map(|&line| core_dap::Breakpoint {
+                line,
+                condition: conditions.and_then(|c| c.get(&line)).cloned(),
+            })
+            .collect()
+    }
+
+    /// Push `path`'s breakpoints (and conditions) to the running adapter.
+    pub(crate) fn send_breakpoints(&self, path: &Path) {
+        let Some(dap) = &self.dap_client else { return };
+        let lines = self.dap_breakpoints.get(path).cloned().unwrap_or_default();
+        let breakpoints = self.breakpoints_with_conditions(path, &lines);
+        if let Ok(guard) = dap.lock() {
+            let _ = guard.set_breakpoints_ex(&path.to_string_lossy(), &breakpoints);
+        }
+    }
+
+    /// Re-evaluate every watch expression in the paused frame.
+    pub(crate) fn refresh_watches(&mut self) {
+        let (Some(frame), Some(dap)) = (self.dap_frame_id, self.dap_client.clone()) else {
+            return;
+        };
+        self.dap_eval_pending.clear();
+        let Ok(guard) = dap.lock() else { return };
+        for expr in &self.dap_watches {
+            if let Ok(seq) = guard.evaluate(expr, frame, "watch") {
+                self.dap_eval_pending.insert(seq, expr.clone());
+            }
+        }
+    }
+
+    pub(crate) fn open_debug_prompt(&mut self, kind: DebugPrompt, window: &mut Window, cx: &mut Context<Self>) {
+        let placeholder = match &kind {
+            DebugPrompt::Watch => "Expression to watch (e.g. items.length)",
+            DebugPrompt::BreakpointCondition(..) => "Stop only when… (e.g. i > 2); empty clears",
+        };
+        self.debug_prompt = Some(kind);
+        self.debug_prompt_input.update(cx, |state, cx| {
+            state.set_placeholder(placeholder, window, cx);
+            state.set_value("", window, cx);
+            state.focus(window, cx);
+        });
+        cx.notify();
+    }
+
+    /// Prompt for a condition on the breakpoint at the cursor line, creating
+    /// the breakpoint first if the line has none.
+    pub(crate) fn open_breakpoint_condition_prompt(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(editor) = self.active_editor().cloned() else { return };
+        let (path, line_1) = {
+            let ed = editor.read(cx);
+            let Some(path) = ed.buffer().path().map(|p| p.to_path_buf()) else { return };
+            (path, ed.cursor_position().0)
+        };
+        if !editor.read(cx).breakpoints().contains(&line_1) {
+            editor.update(cx, |ed, cx| ed.toggle_breakpoint(line_1, cx));
+        }
+        self.open_debug_prompt(DebugPrompt::BreakpointCondition(path, line_1), window, cx);
+    }
+
+    pub(crate) fn submit_debug_prompt(&mut self, cx: &mut Context<Self>) {
+        let Some(kind) = self.debug_prompt.take() else { return };
+        let text = self.debug_prompt_input.read(cx).value().trim().to_string();
+        match kind {
+            DebugPrompt::Watch => {
+                if !text.is_empty() && !self.dap_watches.contains(&text) {
+                    self.dap_watches.push(text);
+                    self.refresh_watches();
+                }
+            }
+            DebugPrompt::BreakpointCondition(path, line) => {
+                let conditions = self.dap_conditions.entry(path.clone()).or_default();
+                if text.is_empty() {
+                    conditions.remove(&line);
+                } else {
+                    conditions.insert(line, text);
+                }
+                self.send_breakpoints(&path);
+            }
+        }
+        cx.notify();
+    }
+
+    pub(crate) fn render_debug_prompt(&self, view: &Entity<Self>, cx: &mut Context<Self>) -> Option<Div> {
+        let kind = self.debug_prompt.as_ref()?;
+        let title = match kind {
+            DebugPrompt::Watch => "Add watch expression",
+            DebugPrompt::BreakpointCondition(..) => "Breakpoint condition",
+        };
+        Some(
+            div()
+                .absolute()
+                .inset_0()
+                .flex()
+                .justify_center()
+                .pt(px(84.))
+                .bg(rgba(0x00000066))
+                .child(
+                    v_flex()
+                        .w(px(420.))
+                        .bg(cx.theme().popover)
+                        .border_1()
+                        .border_color(cx.theme().border)
+                        .rounded(px(tokens::RADIUS_CARD))
+                        .shadow_xl()
+                        .child(
+                            div()
+                                .px_3()
+                                .py_2()
+                                .text_sm()
+                                .text_color(cx.theme().muted_foreground)
+                                .child(title),
+                        )
+                        .child(
+                            div()
+                                .px_3()
+                                .pb_3()
+                                .on_key_down({
+                                    let view = view.clone();
+                                    move |event, _window, cx| {
+                                        let key = event.keystroke.key.as_str();
+                                        if key == "escape" {
+                                            view.update(cx, |this, cx| {
+                                                this.debug_prompt = None;
+                                                cx.notify();
+                                            });
+                                        } else if key == "enter" {
+                                            view.update(cx, |this, cx| this.submit_debug_prompt(cx));
+                                        }
+                                    }
+                                })
+                                .child(
+                                    h_flex()
+                                        .h(px(28.))
+                                        .px_2p5()
+                                        .items_center()
+                                        .rounded(px(tokens::RADIUS_SM))
+                                        .bg(cx.theme().background)
+                                        .border_1()
+                                        .border_color(cx.theme().border)
+                                        .child(Input::new(&self.debug_prompt_input).appearance(false).small()),
+                                ),
+                        ),
+                ),
+        )
     }
 }

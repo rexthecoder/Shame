@@ -13,11 +13,13 @@ general-purpose widgets come from [GPUI] via [gpui-kit] and [gpui-component].
 
 ## Status
 
-**M0 (GPUI spike)**: a window with a resizable split layout, a file tree
-panel reading the real project directory, and a plain text area. No real
-buffer, syntax, or language-server wiring yet. See [`NOTES.md`](NOTES.md)
-for the measured startup time, idle RAM, and binary size, and the exit
-decision for this milestone.
+Daily-usable. Implemented: rope buffer with undo tree and multi-cursor,
+tree-sitter highlighting, LSP (completion, hover, definition, references,
+signature help, rename, formatting, code actions, organize imports,
+diagnostics), DAP debugging, Flutter run / hot reload / devices / tests,
+git panel and diff view, terminal dock, iOS simulator rail, web preview,
+and an agent rail. See [`NOTES.md`](NOTES.md) for the development log and
+[`docs/benchmarks.md`](docs/benchmarks.md) for performance numbers.
 
 ## Crate layout
 
@@ -42,11 +44,19 @@ The `core-*` crates have no UI dependency, so the GPUI-based UI layer
 cargo run -p app
 ```
 
-## Roadmap
+## Keyboard shortcuts
 
-See the project plan for the full milestone breakdown (M1: editor core,
-M2: language smarts, M3: running Flutter, M4: debugging, M5: widget
-inspector and git basics).
+| Shortcut | Action |
+|---|---|
+| ⌘P / ⇧⌘O / ⌘G | Quick open / go to symbol / go to line |
+| ⇧⌘F | Find in project |
+| ⌘D | Select next occurrence (multi-cursor) |
+| ⌥⌘↑ / ⌥⌘↓ | Add cursor above / below |
+| ⇧F12 | Find references |
+| F2 | Rename symbol |
+| ⌘. | Code actions |
+
+Everything else is in the command palette.
 
 ## License
 

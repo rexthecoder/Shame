@@ -222,6 +222,46 @@ impl DartIde {
                                     ),
                             ),
                     )
+                    .child(
+                        h_flex()
+                            .w_full()
+                            .h(px(28.))
+                            .px(px(tokens::SPACE_3))
+                            .gap(px(tokens::SPACE_2))
+                            .items_center()
+                            .rounded(px(tokens::RADIUS_SM))
+                            .bg(cx.theme().background)
+                            .border_1()
+                            .border_color(cx.theme().border)
+                            .child(
+                                div().flex_1().min_w(px(0.)).child(
+                                    Input::new(&self.project_replace_input)
+                                        .appearance(false)
+                                        .small(),
+                                ),
+                            )
+                            .child(
+                                div()
+                                    .id("project-replace-all")
+                                    .px(px(tokens::SPACE_2))
+                                    .text_size(px(tokens::UI_XS))
+                                    .cursor_pointer()
+                                    .text_color(fg)
+                                    .hover(|s| s.bg(cx.theme().list_hover))
+                                    .child("Replace all")
+                                    .on_click(cx.listener(|this, _event, _window, cx| {
+                                        this.replace_in_project(cx);
+                                    })),
+                            ),
+                    )
+                    .when_some(self.project_replace_status.clone(), |el, status| {
+                        el.child(
+                            div()
+                                .text_size(px(tokens::UI_XS))
+                                .text_color(muted)
+                                .child(status),
+                        )
+                    })
                     .when(!query.is_empty(), |el| {
                         el.child(
                             div()

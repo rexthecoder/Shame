@@ -66,6 +66,78 @@ fn search_dir(dir: &Path, query_lower: &str, matches: &mut Vec<SearchMatch>) {
     }
 }
 
+/// Replace every case-insensitive occurrence of `query` with `replacement`
+/// in every text file under `root` (same walk and ignore rules as
+/// [`search_text`]). Returns `(file, replacement_count)` for each file that
+/// changed. Files whose lowercase form changes byte length (rare Unicode
+/// case folding) are matched case-sensitively instead of risking a bad
+/// offset.
+pub fn replace_text(root: &Path, query: &str, replacement: &str) -> std::io::Result<Vec<(PathBuf, usize)>> {
+    let mut changed = Vec::new();
+    if query.is_empty() {
+        return Ok(changed);
+    }
+    replace_dir(root, query, replacement, &mut changed)?;
+    Ok(changed)
+}
+
+fn replace_dir(
+    dir: &Path,
+    query: &str,
+    replacement: &str,
+    changed: &mut Vec<(PathBuf, usize)>,
+) -> std::io::Result<()> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Ok(());
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        if name.starts_with('.') || IGNORED_NAMES.contains(&name) {
+            continue;
+        }
+        if path.is_dir() {
+            replace_dir(&path, query, replacement, changed)?;
+            continue;
+        }
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let (updated, count) = replace_in_text(&text, query, replacement);
+        if count > 0 {
+            std::fs::write(&path, updated)?;
+            changed.push((path, count));
+        }
+    }
+    Ok(())
+}
+
+fn replace_in_text(text: &str, query: &str, replacement: &str) -> (String, usize) {
+    let lower = text.to_lowercase();
+    let query_lower = query.to_lowercase();
+    let (haystack, needle) = if lower.len() == text.len() && query_lower.len() == query.len() {
+        (lower.as_str(), query_lower.as_str())
+    } else {
+        (text, query)
+    };
+    let mut out = String::with_capacity(text.len());
+    let mut last = 0;
+    let mut count = 0;
+    for (at, _) in haystack.match_indices(needle) {
+        if !text.is_char_boundary(at) || !text.is_char_boundary(at + needle.len()) {
+            continue;
+        }
+        out.push_str(&text[last..at]);
+        out.push_str(replacement);
+        last = at + needle.len();
+        count += 1;
+    }
+    out.push_str(&text[last..]);
+    (out, count)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -122,6 +194,27 @@ mod tests {
 
         assert!(search_text(&dir, "").is_empty());
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn replace_in_text_is_case_insensitive_and_counts() {
+        let (out, n) = replace_in_text("Foo foo FOO bar", "foo", "x");
+        assert_eq!(out, "x x x bar");
+        assert_eq!(n, 3);
+    }
+
+    #[test]
+    fn replace_text_rewrites_files_and_skips_ignored_dirs() {
+        let dir = std::env::temp_dir().join(format!("core-workspace-replace-test-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("target")).unwrap();
+        write(&dir, "a.dart", "old name, Old Name\n");
+        write(&dir.join("target"), "b.dart", "old name\n");
+        let changed = replace_text(&dir, "old name", "new").unwrap();
+        assert_eq!(changed.len(), 1);
+        assert_eq!(changed[0].1, 2);
+        assert_eq!(std::fs::read_to_string(dir.join("a.dart")).unwrap(), "new, new\n");
+        assert_eq!(std::fs::read_to_string(dir.join("target/b.dart")).unwrap(), "old name\n");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

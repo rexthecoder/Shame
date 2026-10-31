@@ -12,6 +12,7 @@ mod chrome;
 mod diff_view;
 mod editor;
 mod git_panel;
+mod history;
 mod rails;
 mod references;
 mod debug;
@@ -29,7 +30,7 @@ mod tokens;
 
 use core_buffer::Buffer;
 use core_lsp::lsp_types;
-use editor_view::{EditorEvent, EditorView};
+use editor_view::{ConflictChoice, EditorEvent, EditorView};
 use gpui_kit::assets::AllAssets;
 use gpui_kit::base::StyledExt as _;
 use gpui_kit::component::{
@@ -284,6 +285,9 @@ const IDE_COMMANDS: &[IdeCommand] = &[
     IdeCommand { id: "toggle-slow-animations", title: "Flutter: Toggle Slow Animations", shortcut: "", flutter_only: true },
     IdeCommand { id: "flutter-doctor", title: "Flutter: Run Flutter Doctor", shortcut: "", flutter_only: true },
     IdeCommand { id: "debug-dap", title: "Debug: Start Dart DAP Debugger", shortcut: "", flutter_only: true },
+    IdeCommand { id: "debug-add-watch", title: "Debug: Add Watch Expression\u{2026}", shortcut: "", flutter_only: true },
+    IdeCommand { id: "debug-clear-watches", title: "Debug: Clear Watch Expressions", shortcut: "", flutter_only: true },
+    IdeCommand { id: "debug-breakpoint-condition", title: "Debug: Set Breakpoint Condition on Current Line\u{2026}", shortcut: "", flutter_only: true },
     IdeCommand { id: "toggle-sim", title: "Simulator: Attach / Detach iOS Simulator", shortcut: "", flutter_only: true },
     IdeCommand { id: "open-git", title: "Git: Open Git Panel", shortcut: "\u{2318}\u{21e7}G", flutter_only: false },
     IdeCommand { id: "git-switch-branch", title: "Git: Switch / Create Branch\u{2026}", shortcut: "", flutter_only: false },
@@ -299,6 +303,10 @@ const IDE_COMMANDS: &[IdeCommand] = &[
     IdeCommand { id: "toggle-web-preview", title: "View: Toggle Web Preview Rail", shortcut: "", flutter_only: false },
     IdeCommand { id: "toggle-agent", title: "View: Toggle Agent Rail", shortcut: "", flutter_only: false },
     IdeCommand { id: "format-doc", title: "Editor: Format Document", shortcut: "\u{21e7}\u{2318}F", flutter_only: false },
+    IdeCommand { id: "local-history", title: "File: Local History\u{2026} (Restore Earlier Version)", shortcut: "", flutter_only: false },
+    IdeCommand { id: "conflict-current", title: "Git: Accept Current Change (Merge Conflict)", shortcut: "", flutter_only: false },
+    IdeCommand { id: "conflict-incoming", title: "Git: Accept Incoming Change (Merge Conflict)", shortcut: "", flutter_only: false },
+    IdeCommand { id: "conflict-both", title: "Git: Accept Both Changes (Merge Conflict)", shortcut: "", flutter_only: false },
     IdeCommand { id: "organize-imports", title: "Editor: Organize Imports", shortcut: "", flutter_only: false },
     IdeCommand { id: "find-references", title: "Editor: Find References", shortcut: "\u{21e7}F12", flutter_only: false },
     IdeCommand { id: "goto-symbol", title: "Editor: Go to Symbol in File\u{2026}", shortcut: "\u{21e7}\u{2318}O", flutter_only: false },
@@ -456,11 +464,22 @@ pub struct DartIde {
     pub(crate) agent: rails::agent::AgentState,
     pub(crate) project_search_input: Entity<InputState>,
     pub(crate) project_search_matches: Vec<core_workspace::SearchMatch>,
+    pub(crate) project_replace_input: Entity<InputState>,
+    pub(crate) project_replace_status: Option<String>,
     pub(crate) dap_client: Option<std::sync::Arc<std::sync::Mutex<core_dap::DapClient>>>,
     pub(crate) dap_breakpoints: HashMap<PathBuf, Vec<u32>>,
     pub(crate) dap_paused_thread: Option<i64>,
     pub(crate) dap_stack_summary: Option<String>,
     pub(crate) dap_variables: Vec<(String, String)>,
+    /// Conditional-breakpoint expressions, keyed by file then 1-indexed line.
+    pub(crate) dap_conditions: HashMap<PathBuf, std::collections::BTreeMap<u32, String>>,
+    pub(crate) dap_watches: Vec<String>,
+    pub(crate) dap_watch_values: HashMap<String, String>,
+    pub(crate) dap_frame_id: Option<i64>,
+    /// In-flight `evaluate` requests: request seq -> watch expression.
+    pub(crate) dap_eval_pending: HashMap<i64, String>,
+    pub(crate) debug_prompt: Option<debug::DebugPrompt>,
+    pub(crate) debug_prompt_input: Entity<InputState>,
     pub(crate) show_hidden: bool,
     pub(crate) file_tree_op: Option<FileTreeOp>,
     pub(crate) file_tree_input: Entity<InputState>,
@@ -485,6 +504,7 @@ pub struct DartIde {
     pub(crate) rename_input: Entity<InputState>,
     pub(crate) code_actions: Option<(Entity<EditorView>, Vec<lsp_types::CodeActionOrCommand>)>,
     pub(crate) references: Option<Vec<references::ReferenceItem>>,
+    pub(crate) history: Option<(Entity<EditorView>, Vec<core_workspace::Snapshot>)>,
     pub(crate) terminals: Vec<editor::dock::TerminalSession>,
     pub(crate) active_terminal: usize,
     pub(crate) next_terminal_id: usize,
@@ -551,6 +571,10 @@ impl DartIde {
         });
         let project_search_input = cx.new(|cx| {
             InputState::new(window, cx).placeholder("Search across files...")
+        });
+        let debug_prompt_input = cx.new(|cx| InputState::new(window, cx));
+        let project_replace_input = cx.new(|cx| {
+            InputState::new(window, cx).placeholder("Replace with...")
         });
         let file_tree_input = cx.new(|cx| {
             InputState::new(window, cx).placeholder("path/to/file.dart\u{2026}")
@@ -620,11 +644,20 @@ impl DartIde {
             agent,
             project_search_input,
             project_search_matches: Vec::new(),
+            project_replace_input,
+            project_replace_status: None,
             dap_client: None,
             dap_breakpoints: HashMap::new(),
             dap_paused_thread: None,
             dap_stack_summary: None,
             dap_variables: Vec::new(),
+            dap_conditions: HashMap::new(),
+            dap_watches: Vec::new(),
+            dap_watch_values: HashMap::new(),
+            dap_frame_id: None,
+            dap_eval_pending: HashMap::new(),
+            debug_prompt: None,
+            debug_prompt_input,
             show_hidden,
             file_tree_op: None,
             file_tree_input,
@@ -649,6 +682,7 @@ impl DartIde {
             rename_input,
             code_actions: None,
             references: None,
+            history: None,
             terminals: vec![initial_terminal],
             active_terminal: 0,
             next_terminal_id: 1,
@@ -776,14 +810,11 @@ impl DartIde {
                     } else {
                         this.dap_breakpoints.insert(path.clone(), lines.clone());
                     }
-                    if let Some(dap) = &this.dap_client {
-                        if let Ok(guard) = dap.lock() {
-                            let _ = guard.set_breakpoints(&path.to_string_lossy(), lines);
-                        }
-                    }
+                    this.send_breakpoints(path);
                     cx.notify();
                 }
                 EditorEvent::Saved { path } => {
+                    this.record_history_snapshot(path.clone());
                     this.refresh_git(cx);
                     if this.web_preview_open {
                         this.refresh_web_preview(cx);
@@ -1104,6 +1135,12 @@ impl Render for DartIde {
                 el.child(picker)
             })
             .when_some(self.render_references(&view, cx), |el, picker| {
+                el.child(picker)
+            })
+            .when_some(self.render_local_history(&view, cx), |el, picker| {
+                el.child(picker)
+            })
+            .when_some(self.render_debug_prompt(&view, cx), |el, picker| {
                 el.child(picker)
             })
     }

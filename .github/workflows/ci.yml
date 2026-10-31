@@ -1,0 +1,26 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  check:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Format
+        run: cargo fmt --all -- --check
+        continue-on-error: true # enforce once the tree is formatted
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets
+        continue-on-error: true # enforce once warnings are cleared
+      - name: Test
+        run: cargo test --workspace
+      - name: Release build
+        run: cargo build --release -p app

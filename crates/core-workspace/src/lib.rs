@@ -16,6 +16,7 @@
 
 mod diff;
 mod git;
+mod history;
 mod message;
 mod repo;
 mod search;
@@ -35,4 +36,5 @@ pub use repo::{
     last_commit_message, pull, push, recent_commits, repo_root, repo_status, stage, stage_all,
     stash_apply, stash_drop, stash_pop, stash_save, stashes, uncommit_last, unstage, unstage_all,
 };
-pub use search::{SearchMatch, search_text};
+pub use history::{Snapshot, list_snapshots, record_snapshot};
+pub use search::{SearchMatch, replace_text, search_text};

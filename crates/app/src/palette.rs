@@ -27,6 +27,46 @@ impl DartIde {
         .detach();
     }
 
+    /// Replace the search query with the replace input's text across the
+    /// workspace, then reload any open tabs whose files changed. Refuses
+    /// while a tab has unsaved edits, so a replace can't clobber them.
+    pub(crate) fn replace_in_project(&mut self, cx: &mut Context<Self>) {
+        let query = self.project_search_input.read(cx).value().trim().to_string();
+        let replacement = self.project_replace_input.read(cx).value().to_string();
+        if query.is_empty() {
+            return;
+        }
+        if self.tabs.iter().any(|t| t.editor.read(cx).buffer().is_dirty()) {
+            self.project_replace_status =
+                Some("Save or close tabs with unsaved changes first.".to_string());
+            cx.notify();
+            return;
+        }
+        match core_workspace::replace_text(&self.root, &query, &replacement) {
+            Ok(changed) => {
+                let total: usize = changed.iter().map(|(_, n)| n).sum();
+                for (path, _) in &changed {
+                    for tab in &self.tabs {
+                        if tab.path.as_deref() == Some(path.as_path()) {
+                            tab.editor.update(cx, |editor, cx| {
+                                let _ = editor.open_file(path, cx);
+                            });
+                        }
+                    }
+                }
+                self.project_replace_status = Some(format!(
+                    "Replaced {total} occurrence{} in {} file{}.",
+                    if total == 1 { "" } else { "s" },
+                    changed.len(),
+                    if changed.len() == 1 { "" } else { "s" },
+                ));
+                self.run_project_search(query, cx);
+            }
+            Err(err) => self.project_replace_status = Some(format!("Replace failed: {err}")),
+        }
+        cx.notify();
+    }
+
     pub(crate) fn palette_is_command_mode(&self, cx: &Context<Self>) -> bool {
         self.palette_input
             .read(cx)
@@ -250,6 +290,26 @@ impl DartIde {
                     });
                 }
             }
+            "conflict-current" | "conflict-incoming" | "conflict-both" => {
+                let choice = match id {
+                    "conflict-current" => ConflictChoice::Current,
+                    "conflict-incoming" => ConflictChoice::Incoming,
+                    _ => ConflictChoice::Both,
+                };
+                if let Some(ed) = self.active_editor().cloned() {
+                    ed.update(cx, |editor, cx| {
+                        editor.resolve_conflict_at_cursor(choice, cx);
+                    });
+                }
+            }
+            "debug-add-watch" => self.open_debug_prompt(debug::DebugPrompt::Watch, window, cx),
+            "debug-clear-watches" => {
+                self.dap_watches.clear();
+                self.dap_watch_values.clear();
+                cx.notify();
+            }
+            "debug-breakpoint-condition" => self.open_breakpoint_condition_prompt(window, cx),
+            "local-history" => self.open_local_history(cx),
             "organize-imports" => {
                 if let Some(ed) = self.active_editor().cloned() {
                     ed.update(cx, |editor, _cx| {

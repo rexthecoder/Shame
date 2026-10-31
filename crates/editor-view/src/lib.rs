@@ -22,7 +22,9 @@
 //!   files.
 
 pub mod language;
+mod conflicts;
 mod lsp_integration;
+mod multicursor;
 
 use std::io;
 use std::ops::Range;
@@ -37,6 +39,7 @@ use gpui_kit::component::{ActiveTheme as _, Sizable as _, h_flex, v_flex};
 use gpui_kit::*;
 use gpui_kit::prelude::FluentBuilder as _;
 use language::{LanguageAdapter, language_for_path};
+pub use conflicts::ConflictChoice;
 pub use lsp_integration::{CompletionEntry, CompletionKindBadge};
 use lsp_integration::LspState;
 
@@ -432,6 +435,15 @@ impl EditorView {
         Ok(())
     }
 
+    /// Replace the whole buffer text as a single undoable edit (used by
+    /// "restore from local history").
+    pub fn replace_all_text(&mut self, text: &str, cx: &mut Context<Self>) {
+        let len = self.buffer.len_bytes();
+        self.buffer.edit(0..len, text);
+        self.set_cursor(0, cx);
+        cx.notify();
+    }
+
     pub fn save(&mut self, cx: &mut Context<Self>) {
         self.sync_buffer_state();
         if should_parse_syntax(&self.buffer) && self.request_format() {
@@ -770,6 +782,10 @@ impl EditorView {
     }
 
     fn insert_at_cursor(&mut self, text: &str, cx: &mut Context<Self>) {
+        if self.has_multiple_cursors() {
+            self.multi_insert(text, cx);
+            return;
+        }
         let primary = self.buffer.selections().primary();
         let range = primary.range();
         let insert_at = range.start;
@@ -779,6 +795,10 @@ impl EditorView {
     }
 
     fn backspace(&mut self, cx: &mut Context<Self>) {
+        if self.has_multiple_cursors() {
+            self.multi_backspace(cx);
+            return;
+        }
         let primary = self.buffer.selections().primary();
         if !primary.is_empty() {
             let start = primary.start();
@@ -813,6 +833,10 @@ impl EditorView {
     /// indentation, adds one indent level after `{` / `(` / `[`, and splits an
     /// empty `{|}` block into three properly indented lines.
     fn insert_newline(&mut self, cx: &mut Context<Self>) {
+        if self.has_multiple_cursors() {
+            self.multi_insert("\n", cx);
+            return;
+        }
         let primary = self.buffer.selections().primary();
         let range = primary.range();
         let line_idx = self.buffer.byte_to_line(range.start);
@@ -857,6 +881,10 @@ impl EditorView {
     /// an active selection in brackets/quotes, and skipping over an existing
     /// closing bracket/quote.
     fn handle_char_input(&mut self, text: &str, cx: &mut Context<Self>) {
+        if self.has_multiple_cursors() {
+            self.multi_insert(text, cx);
+            return;
+        }
         let primary = self.buffer.selections().primary();
         let close_for = match text {
             "(" => Some(")"),
@@ -1216,6 +1244,10 @@ impl EditorView {
     }
 
     fn delete_forward(&mut self, cx: &mut Context<Self>) {
+        if self.has_multiple_cursors() {
+            self.multi_delete_forward(cx);
+            return;
+        }
         let primary = self.buffer.selections().primary();
         if !primary.is_empty() {
             let start = primary.start();
@@ -1362,6 +1394,7 @@ impl EditorView {
         }
         if keystroke.key == "escape" {
             self.clear_signature_help(cx);
+            self.collapse_selections(cx);
         }
 
         if primary_mod {
@@ -1378,6 +1411,9 @@ impl EditorView {
                     self.request_format();
                 }
                 "r" => self.start_rename(cx),
+                "d" => self.select_next_occurrence(cx),
+                "up" if keystroke.modifiers.alt => self.add_cursor_vertical(-1, cx),
+                "down" if keystroke.modifiers.alt => self.add_cursor_vertical(1, cx),
                 "." => self.request_code_actions(cx),
                 "/" => self.toggle_line_comment(cx),
                 "z" => {
@@ -1738,6 +1774,7 @@ impl EditorView {
             (head - line_start).min(display_text.len())
         });
 
+        let (extra_carets, extra_sels) = self.secondary_line_marks(line_start, display_text.len());
         let selection_bg = cx.theme().selection.opacity(0.35);
         let word_match_bg = cx.theme().blue.opacity(0.16);
         let search_match_bg = cx.theme().warning.opacity(0.22);
@@ -1959,6 +1996,19 @@ impl EditorView {
                     }
                 }
 
+                // 3a. Secondary (multi-cursor) selections
+                for sel in &extra_sels {
+                    let x1 = shaped.x_for_index(sel.start.min(line_len));
+                    let x2 = shaped.x_for_index(sel.end.min(line_len));
+                    if x2 > x1 {
+                        let rect = Bounds::new(
+                            point(bounds.origin.x + x1, bounds.origin.y + px(1.)),
+                            size(x2 - x1, bounds.size.height - px(2.)),
+                        );
+                        window.paint_quad(fill(rect, selection_bg).corner_radii(px(2.)));
+                    }
+                }
+
                 // 3. Selection highlight
                 if let Some(sel) = &local_selection {
                     let x1 = shaped.x_for_index(sel.start.min(line_len));
@@ -2053,6 +2103,15 @@ impl EditorView {
                 // 5. Paint caret on top of text at the exact shaped glyph boundary
                 if let Some(col) = cursor_col {
                     let x = shaped.x_for_index(col.min(line_len));
+                    let caret_h = px(LINE_FONT_SIZE + 3.);
+                    let y = bounds.origin.y + (bounds.size.height - caret_h) * 0.5;
+                    let caret_rect =
+                        Bounds::new(point(bounds.origin.x + x, y), size(px(1.5), caret_h));
+                    window.paint_quad(fill(caret_rect, caret_color).corner_radii(px(0.75)));
+                }
+
+                for col in &extra_carets {
+                    let x = shaped.x_for_index((*col).min(line_len));
                     let caret_h = px(LINE_FONT_SIZE + 3.);
                     let y = bounds.origin.y + (bounds.size.height - caret_h) * 0.5;
                     let caret_rect =

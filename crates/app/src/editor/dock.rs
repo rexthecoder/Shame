@@ -1452,6 +1452,34 @@ impl DartIde {
                             })),
                     )
                 })
+                .when(!self.dap_watches.is_empty(), |el| {
+                    el.child(
+                        h_flex()
+                            .w_full()
+                            .px(px(tokens::SPACE_4))
+                            .py(px(tokens::SPACE_1))
+                            .gap(px(tokens::SPACE_3))
+                            .flex_wrap()
+                            .items_center()
+                            .bg(cx.theme().tab_bar)
+                            .border_b_1()
+                            .border_color(cx.theme().border)
+                            .font_family("SF Mono")
+                            .text_size(px(tokens::UI_XS))
+                            .child(div().text_color(muted).child("Watch:"))
+                            .children(self.dap_watches.iter().map(|expr| {
+                                let value = self
+                                    .dap_watch_values
+                                    .get(expr)
+                                    .cloned()
+                                    .unwrap_or_else(|| "\u{2026}".to_string());
+                                h_flex()
+                                    .gap(px(3.))
+                                    .child(div().text_color(cyan).child(format!("{expr} =")))
+                                    .child(div().text_color(yellow).child(value))
+                            })),
+                    )
+                })
                 .child(
                     v_flex()
                         .id("debug-scrollback")

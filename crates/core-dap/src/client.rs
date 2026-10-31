@@ -26,6 +26,26 @@ pub enum DapMessage {
     Request { seq: i64, command: String, arguments: Value },
 }
 
+/// A line breakpoint, optionally conditional.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Breakpoint {
+    pub line: u32,
+    pub condition: Option<String>,
+}
+
+/// The `breakpoints` array of a `setBreakpoints` request.
+pub fn breakpoints_json(breakpoints: &[Breakpoint]) -> Vec<Value> {
+    breakpoints
+        .iter()
+        .map(|bp| match &bp.condition {
+            Some(condition) if !condition.trim().is_empty() => {
+                serde_json::json!({"line": bp.line, "condition": condition})
+            }
+            _ => serde_json::json!({"line": bp.line}),
+        })
+        .collect()
+}
+
 /// A client for a debug adapter speaking the Debug Adapter Protocol
 /// (`Content-Length`-framed JSON, same base framing as LSP) over its
 /// stdin/stdout.
@@ -112,10 +132,17 @@ impl DapClient {
     /// per the DAP spec this *replaces* whatever breakpoints were
     /// previously set for that file, it isn't additive.
     pub fn set_breakpoints(&self, path: &str, lines: &[u32]) -> io::Result<i64> {
-        let breakpoints: Vec<_> = lines.iter().map(|line| serde_json::json!({"line": line})).collect();
+        let plain: Vec<Breakpoint> = lines.iter().map(|&line| Breakpoint { line, condition: None }).collect();
+        self.set_breakpoints_ex(path, &plain)
+    }
+
+    /// Like [`set_breakpoints`](Self::set_breakpoints), but each breakpoint
+    /// may carry a `condition` expression the adapter evaluates at the
+    /// breakpoint (it only stops when the expression is true).
+    pub fn set_breakpoints_ex(&self, path: &str, breakpoints: &[Breakpoint]) -> io::Result<i64> {
         self.request(
             "setBreakpoints",
-            serde_json::json!({"source": {"path": path}, "breakpoints": breakpoints}),
+            serde_json::json!({"source": {"path": path}, "breakpoints": breakpoints_json(breakpoints)}),
         )
     }
 
@@ -530,5 +557,17 @@ mod tests {
 
         client.disconnect(true).ok();
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn breakpoints_json_includes_conditions_only_when_present() {
+        let json = breakpoints_json(&[
+            Breakpoint { line: 3, condition: None },
+            Breakpoint { line: 9, condition: Some("i > 2".into()) },
+            Breakpoint { line: 12, condition: Some("  ".into()) },
+        ]);
+        assert_eq!(json[0], serde_json::json!({"line": 3}));
+        assert_eq!(json[1], serde_json::json!({"line": 9, "condition": "i > 2"}));
+        assert_eq!(json[2], serde_json::json!({"line": 12}));
     }
 }
