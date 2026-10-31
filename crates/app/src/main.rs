@@ -13,6 +13,7 @@ mod diff_view;
 mod editor;
 mod git_panel;
 mod history;
+mod markdown;
 mod lsp_health;
 mod rails;
 mod references;
@@ -516,6 +517,10 @@ pub struct DartIde {
     pub(crate) active_terminal: usize,
     pub(crate) next_terminal_id: usize,
     pub(crate) terminal_focus: FocusHandle,
+    /// Focus target for the window itself. Menu-bar actions (About, Settings,
+    /// Open Folder, ...) only dispatch to views on the focus path, so without
+    /// this the menus are dead until an editor happens to take focus.
+    pub(crate) root_focus: FocusHandle,
     pub(crate) terminal_tx: async_channel::Sender<editor::dock::TerminalEvent>,
     /// Flutter devices, `.vscode/launch.json` configurations, running daemon, and Attached Simulator state.
     pub(crate) devices: Vec<core_flutter::Device>,
@@ -622,6 +627,7 @@ impl DartIde {
         let initial_terminal =
             editor::dock::TerminalSession::new(0, root.clone(), has_workspace);
         let terminal_focus = cx.focus_handle();
+        let root_focus = cx.focus_handle();
 
         cx.spawn(async move |weak, cx| {
             while let Ok(evt) = terminal_rx.recv().await {
@@ -717,6 +723,7 @@ impl DartIde {
             active_terminal: 0,
             next_terminal_id: 1,
             terminal_focus,
+            root_focus,
             terminal_tx,
             devices: vec![default_device.clone()],
             ios_simulators: Vec::new(),
@@ -893,6 +900,22 @@ impl DartIde {
             return;
         }
 
+        // Reviewing a diff: ⌥↓/⌥↑ step through changes, ⌥→/⌥← through files,
+        // ⌥↩ marks the file reviewed.
+        if self.diff.is_some() && keystroke.modifiers.alt && !primary_mod {
+            let handled = match keystroke.key.as_str() {
+                "down" => Some(self.diff_goto_change(1, cx)),
+                "up" => Some(self.diff_goto_change(-1, cx)),
+                "right" => Some(self.diff_goto_file(1, cx)),
+                "left" => Some(self.diff_goto_file(-1, cx)),
+                "enter" => Some(self.diff_toggle_reviewed(cx)),
+                _ => None,
+            };
+            if handled.is_some() {
+                return;
+            }
+        }
+
         if primary_mod && !keystroke.modifiers.shift && keystroke.key.as_str() == "t" {
             self.open_workspace_symbols(window, cx);
             return;
@@ -1051,10 +1074,18 @@ impl Render for DartIde {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let view = cx.entity();
 
+        // Whatever held focus can disappear (last tab closed, folder closed, a
+        // modal dismissed); fall back to the window so menu actions and
+        // shortcuts keep working with no editor open.
+        if window.focused(cx).is_none() {
+            window.focus(&self.root_focus, cx);
+        }
+
         v_flex()
             .size_full()
             .relative()
             .key_context("DartIde")
+            .track_focus(&self.root_focus)
             .on_key_down(cx.listener(Self::on_key_down))
             .on_action(cx.listener(|this, _: &AboutShame, _w, cx| {
                 this.about_open = true;

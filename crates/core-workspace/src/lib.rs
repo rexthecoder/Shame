@@ -20,6 +20,7 @@ mod history;
 mod message;
 mod repo;
 mod search;
+mod stats;
 mod symbols;
 
 pub use diff::{
@@ -38,5 +39,6 @@ pub use repo::{
     stash_apply, stash_drop, stash_pop, stash_save, stashes, uncommit_last, unstage, unstage_all,
 };
 pub use history::{Snapshot, list_snapshots, record_snapshot};
+pub use stats::{change_stats, parse_numstat};
 pub use symbols::{WorkspaceSymbol, filter_symbols, index_workspace_symbols, symbols_in_text};
 pub use search::{SearchMatch, replace_text, search_text};

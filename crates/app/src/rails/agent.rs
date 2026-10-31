@@ -255,6 +255,8 @@ pub(crate) enum StreamFragment {
     Tool(AgentToolCall),
     TextDelta(String),
     ReplaceText(String),
+    /// The CLI's id for this conversation, used to resume it on the next message.
+    SessionId(String),
 }
 
 /// Parse one line of output (either `claude --output-format stream-json`, `opencode run --format json`,
@@ -270,6 +272,17 @@ pub(crate) fn parse_agent_stream_line(raw: &str) -> Vec<StreamFragment> {
 
     let mut out = Vec::new();
     let ty = val.get("type").and_then(|v| v.as_str()).unwrap_or("");
+
+    // Claude Code stamps `session_id` on its `system` and `result` events;
+    // Codex announces its conversation as `thread.started` / `thread_id`.
+    let session_id = match ty {
+        "system" | "result" => val.get("session_id").and_then(|v| v.as_str()),
+        "thread.started" => val.get("thread_id").and_then(|v| v.as_str()),
+        _ => None,
+    };
+    if let Some(id) = session_id.filter(|id| !id.is_empty()) {
+        out.push(StreamFragment::SessionId(id.to_string()));
+    }
 
     match ty {
         // 1. Claude Code `stream-json` assistant message
@@ -451,6 +464,9 @@ pub(crate) struct AgentState {
     pub(crate) tasks: Vec<AgentTask>,
     pub(crate) items: Vec<AgentItem>,
     pub(crate) ai_touched_paths: Vec<String>,
+    /// Conversation id of the running thread (Claude Code / Codex), so the next
+    /// message resumes it instead of starting a fresh, memoryless process.
+    pub(crate) session_id: Option<String>,
     pub(crate) input: Entity<InputState>,
     pub(crate) scroll: ScrollHandle,
 }
@@ -479,6 +495,7 @@ impl AgentState {
             tasks: Vec::new(),
             items: Vec::new(),
             ai_touched_paths: Vec::new(),
+            session_id: None,
             input,
             scroll: ScrollHandle::new(),
         }
@@ -500,10 +517,24 @@ impl AgentState {
     }
 
     pub(crate) fn set_harness(&mut self, harness: AgentHarness) {
+        if self.harness != harness {
+            // A session id only means something to the CLI that issued it.
+            self.session_id = None;
+        }
         self.harness = harness;
         self.models = harness.models();
         self.model_ix = 0;
         self.tool_picker_open = false;
+    }
+
+    /// Whether the conversation is scrolled to its end, so streamed text should
+    /// keep following; a reader who scrolled up is left alone.
+    pub(crate) fn is_pinned_to_bottom(&self) -> bool {
+        near_bottom(
+            self.scroll.offset().y.to_f64(),
+            self.scroll.max_offset().y.to_f64(),
+            40.0,
+        )
     }
 
     pub(crate) fn active_model(&self) -> (&str, &str) {
@@ -514,48 +545,38 @@ impl AgentState {
     }
 }
 
-/// Render inline backtick spans (`code`) as small monospace pills inside a message bubble.
-fn render_rich_message(text: &str, cx: &App) -> Div {
-    let fg = cx.theme().foreground;
-    let code_bg = cx.theme().background;
-    let border = cx.theme().border;
-    let mono = cx.theme().mono_font_family.clone();
+/// Whether a scroll view is at (or within `slack` px of) its bottom. `offset_y`
+/// is the content offset (zero or negative) and `max_y` the scrollable extent.
+pub(crate) fn near_bottom(offset_y: f64, max_y: f64, slack: f64) -> bool {
+    max_y <= 0.0 || -offset_y >= max_y - slack
+}
 
-    let mut row = h_flex()
-        .w_full()
-        .flex_wrap()
-        .items_center()
-        .gap_x(px(3.))
-        .gap_y(px(3.))
-        .text_size(px(tokens::UI))
-        .line_height(px(19.))
-        .text_color(fg);
-
-    for (seg_ix, segment) in text.split('`').enumerate() {
-        if segment.is_empty() {
-            continue;
-        }
-        if seg_ix % 2 == 1 {
-            row = row.child(
-                div()
-                    .px(px(5.))
-                    .py(px(1.))
-                    .rounded(px(4.))
-                    .bg(code_bg)
-                    .border_1()
-                    .border_color(border)
-                    .font_family(mono.clone())
-                    .text_size(px(tokens::UI_SM))
-                    .text_color(fg)
-                    .child(segment.to_string()),
-            );
-        } else {
-            for word in segment.split_whitespace() {
-                row = row.child(div().child(word.to_string()));
+/// Earlier turns as plain text, for CLIs we can't resume natively: the last
+/// `max_messages` user / assistant messages, each cut to `max_chars`.
+/// Placeholders ("Thinking…") and empty messages are skipped.
+pub(crate) fn conversation_transcript(
+    items: &[AgentItem],
+    max_messages: usize,
+    max_chars: usize,
+) -> String {
+    let mut turns: Vec<String> = items
+        .iter()
+        .filter_map(|item| match item {
+            AgentItem::Message { is_user, text } => {
+                let text = text.trim();
+                if text.is_empty() || text == "Thinking\u{2026}" {
+                    return None;
+                }
+                let clipped: String = text.chars().take(max_chars).collect();
+                let ellipsis = if text.chars().count() > max_chars { "\u{2026}" } else { "" };
+                Some(format!("{}: {clipped}{ellipsis}", if *is_user { "User" } else { "Assistant" }))
             }
-        }
-    }
-    row
+            AgentItem::ToolGroup { .. } => None,
+        })
+        .collect();
+    let skip = turns.len().saturating_sub(max_messages);
+    turns.drain(..skip);
+    turns.join("\n\n")
 }
 
 impl DartIde {
@@ -597,10 +618,23 @@ impl DartIde {
         }
         self.agent.tool_picker_open = false;
         self.agent.model_picker_open = false;
+        // Claude Code and Codex resume their own conversation by id. OpenCode
+        // is stateless per run here, so it gets the earlier turns as text.
+        let resume_id = match self.agent.harness {
+            AgentHarness::ClaudeCode | AgentHarness::Codex => self.agent.session_id.clone(),
+            AgentHarness::OpenCode => None,
+        };
+        let prior_transcript = if self.agent.harness == AgentHarness::OpenCode {
+            conversation_transcript(&self.agent.items, 8, 1500)
+        } else {
+            String::new()
+        };
+        let was_resumed = resume_id.is_some();
         self.agent.items.push(AgentItem::Message {
             is_user: true,
             text: prompt.clone(),
         });
+        self.agent.scroll.scroll_to_bottom();
 
         let harness = self.agent.harness;
         let (model_id, _) = self.agent.active_model();
@@ -649,7 +683,7 @@ impl DartIde {
             }
         }
 
-        let mut ctx_header = format!(
+        let full_header = format!(
             "[Shame IDE Environment & Tooling]\n- Workspace root: {}\n- Git branch: {}\n- Active file: {}\n- Open editor tabs: {}\n- Available IDE & CLI tooling you have full access to:\n  1. Workspace Files & Diff Review: Read/Edit/Write any file in the workspace; edited files automatically appear in Shame's AI Changes diff reviewer.\n  2. Multi-Language Toolchains (21 languages): `dart` / `flutter` (including `.fvm/flutter_sdk/bin/flutter`, `flutter test`, `dart run build_runner build --delete-conflicting-outputs`, `flutter gen-l10n`), `cargo` / `rustc`, `bun` / `node` / `npm` / `tsc`, `python3`, `go`, `swift` / `xcodebuild`, `clang++`, `ruby` / `pod`, `zig`.\n  3. iOS Simulator & Mobile Tooling: `xcrun simctl` (list/boot devices, `xcrun simctl io booted screenshot` for visual verification).\n  4. Web Preview & Headless Browser: Shame's built-in Web Preview panel (`{}`) and headless Chrome (`/Applications/Google Chrome.app/Contents/MacOS/Google Chrome --headless=new --screenshot`).\n  5. Git & Shell: Full `git` CLI and shell command execution in `{}`.",
             self.root.display(),
             self.git_branch.as_deref().unwrap_or("detached"),
@@ -662,12 +696,30 @@ impl DartIde {
             self.web_preview_url.read(cx).value(),
             self.root.display(),
         );
+        // A resumed conversation already has the long tooling briefing; send only
+        // what changes between turns.
+        let mut ctx_header = if was_resumed {
+            format!(
+                "[Shame IDE context update]\n- Git branch: {}\n- Active file: {}\n- Open editor tabs: {}",
+                self.git_branch.as_deref().unwrap_or("detached"),
+                active_file.as_deref().unwrap_or("none"),
+                if open_tabs.is_empty() { "none".to_string() } else { open_tabs.join(", ") },
+            )
+        } else {
+            full_header
+        };
         if !diag_lines.is_empty() {
             ctx_header.push_str("\n- Active LSP Diagnostics in open files:\n  ");
             ctx_header.push_str(&diag_lines.join("\n  "));
         }
 
-        let full_prompt = format!("{ctx_header}\n\n[User Request]\n{prompt}");
+        let full_prompt = if prior_transcript.is_empty() {
+            format!("{ctx_header}\n\n[User Request]\n{prompt}")
+        } else {
+            format!(
+                "{ctx_header}\n\n[Conversation so far]\n{prior_transcript}\n\n[User Request]\n{prompt}"
+            )
+        };
 
         let Some(bin_path) = harness.resolve_binary() else {
             self.agent.items.push(AgentItem::Message {
@@ -721,6 +773,9 @@ impl DartIde {
             match harness {
                 AgentHarness::ClaudeCode => {
                     cmd.args(["-p", "--verbose", "--output-format", "stream-json"]);
+                    if let Some(id) = &resume_id {
+                        cmd.args(["--resume", id]);
+                    }
                     if model_id != "default" {
                         cmd.args(["--model", &model_id]);
                     }
@@ -739,9 +794,16 @@ impl DartIde {
                     cmd.arg(&full_prompt);
                 }
                 AgentHarness::Codex => {
-                    cmd.args(["exec", "--json", "--skip-git-repo-check"]);
+                    cmd.arg("exec");
+                    if resume_id.is_some() {
+                        cmd.arg("resume");
+                    }
+                    cmd.args(["--json", "--skip-git-repo-check"]);
                     if !model_id.is_empty() && model_id != "default" {
                         cmd.args(["-c", &format!("model=\"{model_id}\"")]);
+                    }
+                    if let Some(id) = &resume_id {
+                        cmd.arg(id);
                     }
                     cmd.arg(&full_prompt);
                 }
@@ -799,6 +861,7 @@ impl DartIde {
             while let Ok(evt) = rx.recv().await {
                 let alive = weak
                     .update(cx, |this, cx| {
+                        let pinned = this.agent.is_pinned_to_bottom();
                         match evt {
                             AgentStreamEvent::Started { pid } => {
                                 this.agent.running_pid = Some(pid);
@@ -807,6 +870,11 @@ impl DartIde {
                                 stderr_lines.push(line);
                             }
                             AgentStreamEvent::Fragment(frag) => match frag {
+                                StreamFragment::SessionId(id) => {
+                                    if this.agent.harness == harness {
+                                        this.agent.session_id = Some(id);
+                                    }
+                                }
                                 StreamFragment::Tool(call) => {
                                     if (call.label.starts_with("Edit ")
                                         || call.label.starts_with("Write "))
@@ -845,6 +913,10 @@ impl DartIde {
                             },
                             AgentStreamEvent::Finished { error } => {
                                 this.agent.running_pid = None;
+                                if error.is_some() && was_resumed {
+                                    // The session may be gone; start fresh next time.
+                                    this.agent.session_id = None;
+                                }
                                 if let Some(AgentItem::ToolGroup { header, calls, .. }) =
                                     this.agent.items.get_mut(group_id)
                                 {
@@ -886,6 +958,9 @@ impl DartIde {
                                     this.refresh_web_preview(cx);
                                 }
                             }
+                        }
+                        if pinned {
+                            this.agent.scroll.scroll_to_bottom();
                         }
                         cx.notify();
                     })
@@ -940,6 +1015,10 @@ impl DartIde {
             })
             .unwrap_or_default();
         let has_ai_changes = !ai_unstaged.is_empty();
+        let (ai_added, ai_removed) = ai_unstaged
+            .iter()
+            .filter_map(|f| self.git.stats.get(&f.path))
+            .fold((0u32, 0u32), |(a, r), (fa, fr)| (a + fa, r + fr));
 
         v_flex()
             .relative()
@@ -1000,6 +1079,7 @@ impl DartIde {
                                         this.agent.tasks.clear();
                                         this.agent.items.clear();
                                         this.agent.ai_touched_paths.clear();
+                                        this.agent.session_id = None;
                                         cx.notify();
                                     })),
                             ),
@@ -1406,24 +1486,62 @@ impl DartIde {
                                     })
                                     .into_any_element()
                             }
-                            AgentItem::Message { is_user, text } => div()
-                                .w_full()
-                                .px(px(tokens::SPACE_5))
-                                .py(px(10.))
-                                .rounded(px(tokens::RADIUS_CARD))
-                                .bg(if *is_user {
-                                    tokens::accent_dim()
-                                } else {
-                                    card_bg
-                                })
-                                .border_1()
-                                .border_color(if *is_user {
-                                    cx.theme().list_active_border
-                                } else {
-                                    border
-                                })
-                                .child(render_rich_message(text, cx))
-                                .into_any_element(),
+                            AgentItem::Message { is_user, text } => {
+                                let streaming = is_running
+                                    && !*is_user
+                                    && item_ix + 1 == self.agent.items.len();
+                                let can_copy = !*is_user && !streaming && !text.trim().is_empty();
+                                let to_copy = text.clone();
+                                v_flex()
+                                    .w_full()
+                                    .px(px(tokens::SPACE_5))
+                                    .py(px(10.))
+                                    .gap(px(6.))
+                                    .rounded(px(tokens::RADIUS_CARD))
+                                    .bg(if *is_user {
+                                        tokens::accent_dim()
+                                    } else {
+                                        card_bg
+                                    })
+                                    .border_1()
+                                    .border_color(if *is_user {
+                                        cx.theme().list_active_border
+                                    } else {
+                                        border
+                                    })
+                                    .child(if text.as_str() == "Thinking\u{2026}" {
+                                        div()
+                                            .text_size(px(tokens::UI))
+                                            .text_color(muted)
+                                            .child("Thinking\u{2026}")
+                                    } else {
+                                        crate::markdown::render_markdown(text, item_ix, cx)
+                                    })
+                                    .when(can_copy, |el| {
+                                        el.child(
+                                            h_flex().w_full().justify_end().child(
+                                                div()
+                                                    .id(("agent-copy-reply", item_ix))
+                                                    .px(px(6.))
+                                                    .py(px(2.))
+                                                    .rounded(px(tokens::RADIUS_SM))
+                                                    .cursor_pointer()
+                                                    .text_size(px(tokens::UI_XS))
+                                                    .text_color(muted)
+                                                    .hover(|s| s.bg(list_hover))
+                                                    .child("Copy reply")
+                                                    .on_click(move |_e, _w, cx| {
+                                                        cx.write_to_clipboard(
+                                                            ClipboardItem::new_string(
+                                                                to_copy.clone(),
+                                                            ),
+                                                        );
+                                                    }),
+                                            ),
+                                        )
+                                    })
+                                    .into_any_element()
+                            }
                         }
                     })),
             )
@@ -1464,8 +1582,13 @@ impl DartIde {
                                                 .font_medium()
                                                 .text_color(fg)
                                                 .child(format!(
-                                                    "{count} AI Change{}",
-                                                    if count == 1 { "" } else { "s" }
+                                                    "{count} AI Change{}{}",
+                                                    if count == 1 { "" } else { "s" },
+                                                    if ai_added + ai_removed > 0 {
+                                                        format!(" \u{b7} +{ai_added} \u{2212}{ai_removed}")
+                                                    } else {
+                                                        String::new()
+                                                    }
                                                 )),
                                         ),
                                 )
@@ -1539,6 +1662,12 @@ impl DartIde {
                                     .and_then(|n| n.to_str())
                                     .unwrap_or(&file.path)
                                     .to_string();
+                                let file_stat = self
+                                    .git
+                                    .stats
+                                    .get(&file.path)
+                                    .copied()
+                                    .filter(|(added, removed)| added + removed > 0);
                                 let diff_file = file.clone();
                                 let accept_path = file.path.clone();
                                 let discard_file = file.clone();
@@ -1566,7 +1695,12 @@ impl DartIde {
                                                     .text_size(px(12.))
                                                     .text_color(fg)
                                                     .child(name),
-                                            ),
+                                            )
+                                            .when_some(file_stat, |el, (added, removed)| {
+                                                el.child(crate::diff_view::stat_chip(
+                                                    added, removed, cx,
+                                                ))
+                                            }),
                                     )
                                     .child(
                                         h_flex()
@@ -1626,7 +1760,16 @@ impl DartIde {
                                         this.open_git_diff(diff_file.clone(), false, cx);
                                     }))
                             },
-                        )),
+                        ))
+                        .when(count > 6, |el| {
+                            el.child(
+                                div()
+                                    .px(px(tokens::SPACE_2))
+                                    .text_size(px(tokens::UI_XS))
+                                    .text_color(muted)
+                                    .child(format!("+{} more files", count - 6)),
+                            )
+                        }),
                 )
             })
             // 30. Composer (`Message agent…`, Tool selector, Model selector, Mode selector, Send / Stop button)
@@ -2009,6 +2152,57 @@ mod tests {
             parse_agent_stream_line(codex_line),
             vec![StreamFragment::ReplaceText("All tests pass.".into())]
         );
+    }
+
+    #[core::prelude::v1::test]
+    fn extracts_conversation_ids_from_claude_and_codex() {
+        let claude = r#"{"type":"system","subtype":"init","session_id":"abc-123"}"#;
+        assert_eq!(parse_agent_stream_line(claude), vec![StreamFragment::SessionId("abc-123".into())]);
+
+        let claude_result = r#"{"type":"result","result":"Done.","session_id":"abc-123"}"#;
+        assert_eq!(
+            parse_agent_stream_line(claude_result),
+            vec![
+                StreamFragment::SessionId("abc-123".into()),
+                StreamFragment::ReplaceText("Done.".into()),
+            ]
+        );
+
+        let codex = r#"{"type":"thread.started","thread_id":"0199-uuid"}"#;
+        assert_eq!(parse_agent_stream_line(codex), vec![StreamFragment::SessionId("0199-uuid".into())]);
+
+        // An assistant event carries a session id too, but only system/result are trusted.
+        let assistant = r#"{"type":"assistant","session_id":"x","message":{"content":[]}}"#;
+        assert!(parse_agent_stream_line(assistant).is_empty());
+    }
+
+    #[core::prelude::v1::test]
+    fn transcript_keeps_recent_turns_and_skips_placeholders() {
+        let msg = |is_user, text: &str| AgentItem::Message { is_user, text: text.to_string() };
+        let items = vec![
+            msg(true, "first question"),
+            msg(false, "first answer"),
+            AgentItem::ToolGroup { id: 1, header: String::new(), collapsed: false, calls: vec![] },
+            msg(true, "second question"),
+            msg(false, "Thinking\u{2026}"),
+        ];
+        assert_eq!(
+            conversation_transcript(&items, 8, 100),
+            "User: first question\n\nAssistant: first answer\n\nUser: second question"
+        );
+        assert_eq!(conversation_transcript(&items, 2, 100), "Assistant: first answer\n\nUser: second question");
+        assert_eq!(
+            conversation_transcript(&[msg(true, "abcdefghij")], 8, 4),
+            "User: abcd\u{2026}"
+        );
+    }
+
+    #[core::prelude::v1::test]
+    fn follows_the_stream_only_when_near_the_bottom() {
+        assert!(near_bottom(0.0, 0.0, 40.0), "nothing to scroll");
+        assert!(near_bottom(-500.0, 500.0, 40.0), "exactly at the end");
+        assert!(near_bottom(-470.0, 500.0, 40.0), "within the slack");
+        assert!(!near_bottom(-200.0, 500.0, 40.0), "scrolled up to read");
     }
 
     #[core::prelude::v1::test]

@@ -1457,6 +1457,12 @@ impl DartIde {
             ChangeKind::Deleted | ChangeKind::Conflicted => cx.theme().red,
             ChangeKind::Renamed | ChangeKind::Copied => cx.theme().info,
         };
+        let row_stat = self
+            .git
+            .stats
+            .get(&file.path)
+            .copied()
+            .filter(|(added, removed)| added + removed > 0);
         let path = Path::new(&file.path);
         let name = path
             .file_name()
@@ -1593,6 +1599,9 @@ impl DartIde {
                                 )
                             }),
                     )
+                    .when_some(row_stat, |el, (added, removed)| {
+                        el.child(crate::diff_view::stat_chip(added, removed, cx))
+                    })
                     .when(reviewed, |el| {
                         el.child(
                             Icon::new(IconName::Check)

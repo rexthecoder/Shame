@@ -408,6 +408,45 @@ impl DartIde {
         }
     }
 
+    /// The next file the agent changed that is still pending review, other than `after`.
+    fn next_ai_file(&self, after: &str) -> Option<ChangedFile> {
+        let status = self.git.status.as_ref()?;
+        status
+            .unstaged
+            .iter()
+            .find(|f| f.path != after && self.agent.ai_touched_paths.contains(&f.path))
+            .cloned()
+    }
+
+    /// Keep the agent's edits to the open file and move to the next pending one
+    /// (closing the diff when none is left).
+    pub(crate) fn diff_ai_accept(&mut self, cx: &mut Context<Self>) {
+        let Some(open) = &self.diff else { return };
+        let path = open.file.path.clone();
+        self.agent.ai_touched_paths.retain(|p| p != &path);
+        match self.next_ai_file(&path) {
+            Some(next) => self.open_git_diff(next, false, cx),
+            None => self.close_diff(cx),
+        }
+        cx.notify();
+    }
+
+    /// Discard the agent's edits to the open file. Destructive, so the first
+    /// click arms it and the second runs it (same as everywhere else).
+    pub(crate) fn diff_ai_reject(&mut self, window: &Window, cx: &mut Context<Self>) {
+        let Some(open) = &self.diff else { return };
+        let file = open.file.clone();
+        let armed = self.git.confirm_discard.as_deref() == Some(file.path.as_str());
+        self.git_discard_clicked(file.clone(), window, cx);
+        if armed {
+            self.agent.ai_touched_paths.retain(|p| p != &file.path);
+            match self.next_ai_file(&file.path) {
+                Some(next) => self.open_git_diff(next, false, cx),
+                None => self.close_diff(cx),
+            }
+        }
+    }
+
     /// Mark the open file reviewed (or not) and, when marking, move on to the next unreviewed one.
     pub(crate) fn diff_toggle_reviewed(&mut self, cx: &mut Context<Self>) {
         let Some(open) = &self.diff else { return };
@@ -554,6 +593,11 @@ impl DartIde {
             }
         };
         let is_commit_diff = state.commit.is_some();
+        let ai_pending = !state.staged
+            && !is_commit_diff
+            && self.agent.ai_touched_paths.contains(&state.file.path);
+        let reject_armed =
+            self.git.confirm_discard.as_deref() == Some(state.file.path.as_str());
         let staged = state.staged;
         let stage_file = state.file.clone();
         let open_path = state.full_path.clone();
@@ -748,6 +792,32 @@ impl DartIde {
                                 .on_click(cx.listener(|this, _e, _w, cx| {
                                     this.diff_toggle_reviewed(cx)
                                 })),
+                        )
+                    })
+                    .when(ai_pending, |el| {
+                        el.child(
+                            Button::new("diff-ai-reject")
+                                .ghost()
+                                .small()
+                                .icon(
+                                    Icon::new(IconName::X)
+                                        .with_size(px(13.))
+                                        .text_color(cx.theme().red),
+                                )
+                                .label(if reject_armed { "Discard?" } else { "Reject" })
+                                .tooltip("Discard the agent's changes to this file")
+                                .on_click(cx.listener(|this, _e, window, cx| {
+                                    this.diff_ai_reject(window, cx)
+                                })),
+                        )
+                        .child(
+                            Button::new("diff-ai-accept")
+                                .small()
+                                .primary()
+                                .icon(Icon::new(IconName::Check).with_size(px(13.)))
+                                .label("Accept")
+                                .tooltip("Keep the agent's changes to this file and go to the next one")
+                                .on_click(cx.listener(|this, _e, _w, cx| this.diff_ai_accept(cx))),
                         )
                     })
                     .when(can_open, |el| {
@@ -1719,4 +1789,21 @@ mod tests {
         assert!(png.width > 0 && png.height > 0);
         assert_eq!(png.format_label, "PNG");
     }
+}
+
+/// `+added −removed` for a file in a change list; empty counts are omitted so a
+/// pure addition shows only `+12`. Callers skip files with no counts at all.
+pub(crate) fn stat_chip(added: u32, removed: u32, cx: &App) -> Div {
+    let mono = cx.theme().mono_font_family.clone();
+    h_flex()
+        .flex_shrink_0()
+        .gap(px(4.))
+        .font_family(mono)
+        .text_size(px(10.))
+        .when(added > 0, |el| {
+            el.child(div().text_color(cx.theme().green).child(format!("+{added}")))
+        })
+        .when(removed > 0, |el| {
+            el.child(div().text_color(cx.theme().red).child(format!("\u{2212}{removed}")))
+        })
 }

@@ -57,6 +57,9 @@ cargo run -p app
 | F2 | Rename symbol |
 | ⌘. | Code actions |
 | Tab | Next snippet tab stop |
+| ⌥↓ / ⌥↑ | Next / previous change in a diff |
+| ⌥→ / ⌥← | Next / previous file in a diff |
+| ⌥↩ | Mark the open diff file reviewed |
 
 Everything else is in the command palette.
 

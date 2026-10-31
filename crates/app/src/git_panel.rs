@@ -32,6 +32,8 @@ pub(crate) struct GitNotice {
 pub(crate) struct GitState {
     /// `None` outside a repository.
     pub(crate) status: Option<RepoStatus>,
+    /// `(added, removed)` line counts per repo-relative path, vs `HEAD`.
+    pub(crate) stats: std::collections::HashMap<String, (u32, u32)>,
     /// A long action in flight ("Pushing…"); other long actions wait for it.
     pub(crate) busy: Option<&'static str>,
     pub(crate) notice: Option<GitNotice>,
@@ -93,6 +95,7 @@ impl GitState {
             confirm_discard: None,
             reviewed: Default::default(),
             commit_types: None,
+            stats: std::collections::HashMap::new(),
             refreshing: false,
             refresh_queued: false,
         }
@@ -124,7 +127,11 @@ impl DartIde {
                 .unwrap_or_default();
             let types =
                 (need_types && status.is_some()).then(|| core_workspace::commit_types(&root));
-            let _ = tx.send_blocking((status, branch, badges, types));
+            let stats = status
+                .as_ref()
+                .map(|s| core_workspace::change_stats(&root, &s.root, &s.unstaged))
+                .unwrap_or_default();
+            let _ = tx.send_blocking((status, branch, badges, types, stats));
         });
         cx.spawn(async move |weak, cx| {
             let result = rx.recv().await;
@@ -133,7 +140,7 @@ impl DartIde {
                 if std::mem::take(&mut this.git.refresh_queued) {
                     this.refresh_git(cx);
                 }
-                let Ok((status, branch, badges, types)) = result else {
+                let Ok((status, branch, badges, types, stats)) = result else {
                     return;
                 };
                 let types_changed = types.is_some();
@@ -141,10 +148,12 @@ impl DartIde {
                     this.git.commit_types = types;
                 }
                 let changed = types_changed
+                    || this.git.stats != stats
                     || this.git.status != status
                     || this.git_branch != branch
                     || this.git_status != badges;
                 this.git.status = status;
+                this.git.stats = stats;
                 this.git_branch = branch;
                 this.git_status = badges;
                 if changed {

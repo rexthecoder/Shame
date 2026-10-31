@@ -9,9 +9,6 @@ use std::path::{Path, PathBuf};
 #[derive(Clone, Debug)]
 pub(crate) struct LspServerStatus {
     pub name: &'static str,
-    pub language_id: &'static str,
-    /// Executable name as spawned (may already be an absolute path).
-    pub program: String,
     pub args: String,
     pub install: &'static str,
     pub path: Option<PathBuf>,
@@ -30,9 +27,7 @@ pub(crate) fn scan(project_root: Option<&Path>) -> Vec<LspServerStatus> {
         .into_iter()
         .map(|spec| LspServerStatus {
             name: spec.display_name,
-            language_id: spec.language_id,
             path: find_executable(&spec.program),
-            program: spec.program,
             args: spec.args.join(" "),
             install: spec.install_hint,
         })
