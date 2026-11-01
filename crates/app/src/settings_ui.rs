@@ -259,6 +259,26 @@ impl DartIde {
                 .into_any_element(),
             );
         }
+        if show_cat(2, "editor inlay hints types parameter names inline") {
+            let on = self.editor_options.inlay_hints;
+            let v1 = view.clone();
+            let ctrl = toggle_switch("settings-inlay-hints", on)
+                .on_click(move |_e, _w, cx| {
+                    v1.update(cx, |this, cx| {
+                        this.update_editor_options(|o| o.inlay_hints = !o.inlay_hints, cx)
+                    });
+                })
+                .into_any_element();
+            rows.push(
+                setting_row(
+                    "Inlay Hints",
+                    "Show inferred types and parameter names inline, from the language server."
+                        .to_string(),
+                    ctrl,
+                )
+                .into_any_element(),
+            );
+        }
         if show_cat(2, "editor save autosave auto save files") {
             let mode = self.autosave;
             let v1 = view.clone();

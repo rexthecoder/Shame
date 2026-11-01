@@ -7,6 +7,6 @@ mod buffer;
 mod selection;
 mod undo;
 
-pub use buffer::{Buffer, DiskState};
+pub use buffer::{Buffer, DiskState, byte_to_utf16_col, utf16_to_byte_col};
 pub use selection::{Selection, SelectionSet};
 pub use undo::UndoTree;

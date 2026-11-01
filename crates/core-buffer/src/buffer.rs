@@ -255,6 +255,30 @@ impl Buffer {
         self.slice(start..end)
     }
 
+    /// The LSP position `(line, character)` of byte `offset`. LSP counts
+    /// columns in UTF-16 code units, not bytes, so any non-ASCII text
+    /// before the offset on its line changes the number.
+    pub fn lsp_position(&self, offset: usize) -> (u32, u32) {
+        let offset = self.floor_char_boundary(offset);
+        let line = self.byte_to_line(offset);
+        let line_start = self.line_to_byte(line);
+        let column = byte_to_utf16_col(&self.slice(line_start..offset), offset - line_start);
+        (line as u32, column)
+    }
+
+    /// The byte offset of LSP position `(line, character)`. A line past the
+    /// end maps to the end of the buffer, and a character past the end of
+    /// its line clamps to the line's end (before the line break), as the
+    /// LSP spec asks.
+    pub fn offset_from_lsp(&self, line: u32, character: u32) -> usize {
+        let line = line as usize;
+        if line >= self.line_count() {
+            return self.len_bytes();
+        }
+        let text = self.line(line);
+        self.line_to_byte(line) + utf16_to_byte_col(text.trim_end_matches(['\n', '\r']), character)
+    }
+
     /// The byte offset one full UTF-8 character before `byte` (clamped to 0).
     /// The largest char boundary at or before `byte` (clamped to the length).
     fn floor_char_boundary(&self, byte: usize) -> usize {
@@ -367,9 +391,62 @@ impl Buffer {
     }
 }
 
+/// UTF-16 column of byte `byte_col` within `line` (clamped to the line).
+pub fn byte_to_utf16_col(line: &str, byte_col: usize) -> u32 {
+    let mut end = byte_col.min(line.len());
+    while !line.is_char_boundary(end) {
+        end -= 1;
+    }
+    let prefix = &line[..end];
+    if prefix.is_ascii() {
+        return end as u32;
+    }
+    prefix.chars().map(|c| c.len_utf16() as u32).sum()
+}
+
+/// Byte column within `line` of UTF-16 column `utf16_col`, clamped to the
+/// line's length and never inside a character.
+pub fn utf16_to_byte_col(line: &str, utf16_col: u32) -> usize {
+    let target = utf16_col as usize;
+    if line.is_ascii() {
+        return target.min(line.len());
+    }
+    let mut units = 0usize;
+    for (byte, c) in line.char_indices() {
+        if units >= target {
+            return byte;
+        }
+        units += c.len_utf16();
+    }
+    line.len()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn lsp_columns_count_utf16_units_not_bytes() {
+        // `é` is 2 bytes / 1 unit; `😀` is 4 bytes / 2 units.
+        let line = "a\u{e9}\u{1f600}b";
+        assert_eq!(byte_to_utf16_col(line, 1), 1);
+        assert_eq!(byte_to_utf16_col(line, 3), 2);
+        assert_eq!(byte_to_utf16_col(line, 7), 4);
+        assert_eq!(utf16_to_byte_col(line, 2), 3);
+        assert_eq!(utf16_to_byte_col(line, 4), 7);
+        assert_eq!(utf16_to_byte_col(line, 99), line.len());
+    }
+
+    #[test]
+    fn lsp_positions_round_trip_through_the_buffer() {
+        let buffer = Buffer::from_str("var s = 'caf\u{e9}';\nprint(s);\n");
+        let semicolon = buffer.text().find("';").unwrap() + 1;
+        assert_eq!(buffer.lsp_position(semicolon), (0, 14), "byte 15, but `é` is one UTF-16 unit");
+        assert_eq!(buffer.offset_from_lsp(0, 14), semicolon);
+        // Past the line's end clamps before the newline; past the last line is EOF.
+        assert_eq!(buffer.offset_from_lsp(1, 99), buffer.text().find("s);").unwrap() + 3);
+        assert_eq!(buffer.offset_from_lsp(9, 0), buffer.len_bytes());
+    }
     use crate::selection::Selection;
 
     #[test]

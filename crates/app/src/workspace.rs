@@ -316,6 +316,7 @@ impl DartIde {
             "format_on_save": self.save_options.format_on_save,
             "trim_trailing_whitespace": self.save_options.trim_trailing_whitespace,
             "insert_final_newline": self.save_options.insert_final_newline,
+            "inlay_hints": self.editor_options.inlay_hints,
         });
         if let Ok(json) = serde_json::to_vec_pretty(&val) {
             let _ = std::fs::write(path, json);
@@ -368,6 +369,10 @@ impl DartIde {
             self.save_options.insert_final_newline = v;
         }
         self.apply_save_options(cx);
+        if let Some(v) = val.get("inlay_hints").and_then(|v| v.as_bool()) {
+            self.editor_options.inlay_hints = v;
+        }
+        self.apply_editor_options(cx);
         if let Some(h) = val.get("agent_harness").and_then(|v| v.as_str()) {
             let tool = match h {
                 "opencode" => rails::agent::AgentHarness::OpenCode,

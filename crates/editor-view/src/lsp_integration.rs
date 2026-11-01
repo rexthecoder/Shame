@@ -15,11 +15,10 @@
 //!   `range`, i.e. "replace everything"). Always valid LSP regardless of
 //!   what the server negotiated, and far simpler than incremental sync,
 //!   at the cost of re-sending the whole buffer on every keystroke.
-//! - Hover positions (and everything else here) use byte offsets as LSP
-//!   "character" columns, same approximation `editor-view` already makes
-//!   elsewhere — correct for ASCII, wrong for a line with non-ASCII text
-//!   before the hovered column (LSP's default position encoding is
-//!   UTF-16 code units, which this doesn't convert to).
+//! - Positions sent to and read from the server are converted between
+//!   buffer bytes and LSP's UTF-16 columns (`Buffer::lsp_position` /
+//!   `Buffer::offset_from_lsp`) at this boundary; everything inside the
+//!   editor stays in bytes.
 //! - The hover popup renders at a fixed spot below the hovered line, not
 //!   anchored to the exact hovered column.
 //! - The popup is dismissed on any keystroke, but not when the mouse
@@ -35,6 +34,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::str::FromStr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
@@ -137,14 +137,55 @@ impl SharedLspServer {
 
 type PoolKey = (&'static str, Option<PathBuf>);
 
+fn server_pool() -> &'static Mutex<HashMap<PoolKey, Arc<SharedLspServer>>> {
+    static POOL: OnceLock<Mutex<HashMap<PoolKey, Arc<SharedLspServer>>>> = OnceLock::new();
+    POOL.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Whether servers are told to compute inlay hints. Global because servers
+/// are shared across editors; editors mirror `EditorOptions` into it.
+static INLAY_HINTS_SETTING: AtomicBool = AtomicBool::new(true);
+
+/// Record the inlay-hint setting and, when it changed, tell every running
+/// server to re-read its configuration (it asks back via
+/// `workspace/configuration`, answered in `shared_lsp_server`).
+pub(crate) fn set_inlay_hints_setting(enabled: bool) {
+    if INLAY_HINTS_SETTING.swap(enabled, Ordering::Relaxed) == enabled {
+        return;
+    }
+    let servers: Vec<Arc<SharedLspServer>> =
+        server_pool().lock().unwrap_or_else(|e| e.into_inner()).values().cloned().collect();
+    for server in servers {
+        let _ = server
+            .client
+            .notify("workspace/didChangeConfiguration", serde_json::json!({ "settings": null }));
+    }
+}
+
+/// The reply to a `workspace/configuration` request: one entry per item
+/// asked for. Only the `dart` section is ours to set (inlay hints); anything
+/// else gets `null`, meaning "use your defaults".
+fn configuration_response(params: &serde_json::Value) -> serde_json::Value {
+    let items = params.get("items").and_then(|v| v.as_array()).map_or(&[][..], Vec::as_slice);
+    let inlay = INLAY_HINTS_SETTING.load(Ordering::Relaxed);
+    serde_json::Value::Array(
+        items
+            .iter()
+            .map(|item| match item.get("section").and_then(|s| s.as_str()) {
+                Some("dart") => serde_json::json!({ "inlayHints": inlay }),
+                _ => serde_json::Value::Null,
+            })
+            .collect(),
+    )
+}
+
 fn shared_lsp_server(
     language_id: &'static str,
     project_root: Option<PathBuf>,
     program: &str,
     args: &[String],
 ) -> Option<Arc<SharedLspServer>> {
-    static POOL: OnceLock<Mutex<HashMap<PoolKey, Arc<SharedLspServer>>>> = OnceLock::new();
-    let pool = POOL.get_or_init(|| Mutex::new(HashMap::new()));
+    let pool = server_pool();
     let key = (language_id, project_root.clone());
     if let Some(existing) = pool
         .lock()
@@ -182,6 +223,9 @@ fn shared_lsp_server(
         capabilities: ClientCapabilities {
             workspace: Some(WorkspaceClientCapabilities {
                 apply_edit: Some(true),
+                // Lets the server ask for settings (inlay hints) instead of
+                // assuming its defaults.
+                configuration: Some(true),
                 workspace_edit: Some(WorkspaceEditClientCapabilities {
                     document_changes: Some(true),
                     ..Default::default()
@@ -274,8 +318,10 @@ fn shared_lsp_server(
                             .retain(|sub| sub.send_blocking(message.clone()).is_ok());
                     }
                 }
-                ServerMessage::Request { id, method, .. } => {
-                    if method == "workspace/applyEdit" {
+                ServerMessage::Request { id, method, params } => {
+                    if method == "workspace/configuration" {
+                        let _ = server_bg.client.respond(*id, configuration_response(params));
+                    } else if method == "workspace/applyEdit" {
                         let _ = server_bg
                             .client
                             .respond(*id, serde_json::json!({"applied": true}));
@@ -499,16 +545,14 @@ impl EditorView {
     }
 
     fn request_hover(&mut self, line: usize, column: usize, _cx: &mut Context<Self>) {
+        let position = self.lsp_position_at(line, column);
         let Some(lsp) = &mut self.lsp else {
             return;
         };
         let params = HoverParams {
             text_document_position_params: TextDocumentPositionParams {
                 text_document: TextDocumentIdentifier { uri: lsp.uri.clone() },
-                position: Position {
-                    line: line as u32,
-                    character: column as u32,
-                },
+                position,
             },
             work_done_progress_params: Default::default(),
         };
@@ -532,21 +576,22 @@ impl EditorView {
             return;
         }
         let head = self.buffer.selections().primary().head;
-        let line = self.buffer.byte_to_line(head) as u32;
-        let column = (head - self.buffer.line_to_byte(line as usize)) as u32;
+        let (line, column) = self.buffer.lsp_position(head);
         cx.emit(EditorEvent::RequestRename { line, column });
     }
 
     /// Send `textDocument/rename` for `(line, column)` with `new_name`.
     /// Called by `app` once it's collected the new name from the user.
+    /// `(line, column)` is the LSP position `RequestRename` carried.
     pub fn send_rename(&mut self, line: u32, column: u32, new_name: String) {
+        let position = Position { line, character: column };
         let Some(lsp) = &mut self.lsp else {
             return;
         };
         let params = RenameParams {
             text_document_position: TextDocumentPositionParams {
                 text_document: TextDocumentIdentifier { uri: lsp.uri.clone() },
-                position: Position { line, character: column },
+                position,
             },
             new_name,
             work_done_progress_params: Default::default(),
@@ -560,6 +605,7 @@ impl EditorView {
     /// is running and ready. No-op otherwise (e.g. cmd+click on a buffer
     /// with no LSP, or before `initialize` finished).
     pub(crate) fn request_definition(&mut self, line: usize, column: usize) {
+        let position = self.lsp_position_at(line, column);
         let Some(lsp) = &mut self.lsp else {
             return;
         };
@@ -569,10 +615,7 @@ impl EditorView {
         let params = GotoDefinitionParams {
             text_document_position_params: TextDocumentPositionParams {
                 text_document: TextDocumentIdentifier { uri: lsp.uri.clone() },
-                position: Position {
-                    line: line as u32,
-                    character: column as u32,
-                },
+                position,
             },
             work_done_progress_params: Default::default(),
             partial_result_params: Default::default(),
@@ -589,8 +632,7 @@ impl EditorView {
     /// ready server.
     pub fn request_references(&mut self) {
         let head = self.buffer.selections().primary().head;
-        let line = self.buffer.byte_to_line(head) as u32;
-        let column = (head - self.buffer.line_to_byte(line as usize)) as u32;
+        let (line, column) = self.buffer.lsp_position(head);
         let Some(lsp) = &mut self.lsp else {
             return;
         };
@@ -617,8 +659,7 @@ impl EditorView {
     /// after `(` or `,` is typed. No-op without a ready server.
     pub(crate) fn request_signature_help(&mut self) {
         let head = self.buffer.selections().primary().head;
-        let line = self.buffer.byte_to_line(head) as u32;
-        let column = (head - self.buffer.line_to_byte(line as usize)) as u32;
+        let (line, column) = self.buffer.lsp_position(head);
         let Some(lsp) = &mut self.lsp else {
             return;
         };
@@ -640,13 +681,19 @@ impl EditorView {
         }
     }
 
+    /// The LSP position of byte `column` on `line` (UTF-16 columns).
+    fn lsp_position_at(&self, line: usize, column: usize) -> Position {
+        let (line, character) = self.buffer.lsp_position(self.buffer.line_to_byte(line) + column);
+        Position { line, character }
+    }
+
     /// Schedule a debounced `textDocument/inlayHint` request when the text
     /// changed since the last one, or when diagnostics reset the schedule.
     /// Cheap to call on every `render`.
     pub(crate) fn maybe_schedule_inlay_hints(&mut self, cx: &mut Context<Self>) {
         let revision = self.buffer.revision();
-        // Above the syntax size limit `didChange` isn't sent, so the
-        // server's copy of the text (and any hints for it) would be stale.
+        // Above the syntax size limit there's no `synced_text` diff to
+        // shift hints by, so they'd be cleared on every edit anyway.
         if !self.inlay_hints_enabled
             || self.inlay_scheduled_revision == Some(revision)
             || !self.lsp.as_ref().is_some_and(|lsp| lsp.ready)
@@ -699,6 +746,7 @@ impl EditorView {
             return;
         }
         self.inlay_hints_enabled = enabled;
+        set_inlay_hints_setting(enabled);
         self.inlay_hints.clear();
         self.inlay_scheduled_revision = None;
         cx.notify();
@@ -711,12 +759,7 @@ impl EditorView {
         if line >= self.buffer.line_count() {
             return None;
         }
-        let line_text = self.buffer.line(line);
-        let display_len = line_text.trim_end_matches(['\n', '\r']).len();
-        let mut column = (hint.position.character as usize).min(display_len);
-        while !line_text.is_char_boundary(column) {
-            column -= 1;
-        }
+        let offset = self.buffer.offset_from_lsp(hint.position.line, hint.position.character);
         let label = match hint.label {
             InlayHintLabel::String(s) => s,
             InlayHintLabel::LabelParts(parts) => parts.into_iter().map(|p| p.value).collect(),
@@ -726,7 +769,7 @@ impl EditorView {
             return None;
         }
         Some(InlayHintView {
-            offset: self.buffer.line_to_byte(line) + column,
+            offset,
             label,
             pad_left: hint.padding_left.unwrap_or(false),
             pad_right: hint.padding_right.unwrap_or(false),
@@ -854,8 +897,8 @@ impl EditorView {
         let head = selection.head;
         let revision = self.buffer.revision();
         let position = |buffer: &core_buffer::Buffer, offset: usize| {
-            let line = buffer.byte_to_line(offset);
-            Position { line: line as u32, character: (offset - buffer.line_to_byte(line)) as u32 }
+            let (line, character) = buffer.lsp_position(offset);
+            Position { line, character }
         };
         let cursor = position(&self.buffer, head);
         let mut range = Range { start: position(&self.buffer, selection.start()), end: position(&self.buffer, selection.end()) };
@@ -904,8 +947,8 @@ impl EditorView {
         let selection = self.buffer.selections().primary();
         let revision = self.buffer.revision();
         let position = |buffer: &core_buffer::Buffer, offset: usize| {
-            let line = buffer.byte_to_line(offset);
-            Position { line: line as u32, character: (offset - buffer.line_to_byte(line)) as u32 }
+            let (line, character) = buffer.lsp_position(offset);
+            Position { line, character }
         };
         let range = Range {
             start: position(&self.buffer, selection.start()),
@@ -999,6 +1042,7 @@ impl EditorView {
 
     /// Send `textDocument/completion` for the current cursor position.
     pub(crate) fn request_lsp_completion(&mut self, line: usize, column: usize) {
+        let position = self.lsp_position_at(line, column);
         let Some(lsp) = &mut self.lsp else {
             return;
         };
@@ -1010,10 +1054,7 @@ impl EditorView {
                 text_document: TextDocumentIdentifier {
                     uri: lsp.uri.clone(),
                 },
-                position: Position {
-                    line: line as u32,
-                    character: column as u32,
-                },
+                position,
             },
             work_done_progress_params: Default::default(),
             partial_result_params: Default::default(),
@@ -1128,11 +1169,9 @@ impl EditorView {
     pub(crate) fn apply_text_edits(&mut self, mut edits: Vec<TextEdit>, cx: &mut Context<Self>) {
         edits.sort_by_key(|edit| (edit.range.start.line, edit.range.start.character));
         for edit in edits.into_iter().rev() {
-            let start = self.buffer.line_to_byte(edit.range.start.line as usize)
-                + edit.range.start.character as usize;
-            let end = self.buffer.line_to_byte(edit.range.end.line as usize)
-                + edit.range.end.character as usize;
-            self.buffer.edit(start..end, &edit.new_text);
+            let start = self.buffer.offset_from_lsp(edit.range.start.line, edit.range.start.character);
+            let end = self.buffer.offset_from_lsp(edit.range.end.line, edit.range.end.character);
+            self.buffer.edit(start.min(end)..end, &edit.new_text);
         }
         cx.notify();
     }
@@ -1220,7 +1259,7 @@ impl EditorView {
                 };
 
                 if target_uri.as_str() == own_uri.as_str() {
-                    let offset = self.buffer.line_to_byte(line as usize) + column as usize;
+                    let offset = self.buffer.offset_from_lsp(line, column);
                     self.set_cursor(offset, cx);
                 } else if let Some(path) = uri_to_path(&target_uri) {
                     cx.emit(EditorEvent::OpenAt { path, line, column });
@@ -1429,9 +1468,10 @@ impl EditorView {
             if first_line.is_empty() {
                 continue;
             }
-            let start_col = diagnostic.range.start.character as usize;
+            let line_text = self.buffer.line(line as usize);
+            let start_col = core_buffer::utf16_to_byte_col(&line_text, diagnostic.range.start.character);
             let end_col = if diagnostic.range.end.line == line {
-                (diagnostic.range.end.character as usize).max(start_col + 1)
+                core_buffer::utf16_to_byte_col(&line_text, diagnostic.range.end.character).max(start_col + 1)
             } else {
                 usize::MAX
             };
@@ -1683,6 +1723,21 @@ pub(crate) fn parse_completion_entries_from_value(value: serde_json::Value) -> V
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn configuration_answers_each_item_and_only_sets_the_dart_section() {
+        let params = serde_json::json!({
+            "items": [{"section": "dart"}, {"section": "editor"}, {"scopeUri": "file:///x", "section": "dart"}]
+        });
+        let reply = configuration_response(&params);
+        let expected_inlay = INLAY_HINTS_SETTING.load(Ordering::Relaxed);
+        assert_eq!(
+            reply,
+            serde_json::json!([{"inlayHints": expected_inlay}, null, {"inlayHints": expected_inlay}]),
+            "one entry per item, in order"
+        );
+        assert_eq!(configuration_response(&serde_json::json!({})), serde_json::json!([]));
+    }
 
     /// Not synthetic JSON — this is the exact `result` array the real
     /// `dart language-server` sent back for `textDocument/formatting` on

@@ -245,11 +245,9 @@ impl DartIde {
         } else if let Ok(mut buffer) = Buffer::open(&canonical) {
             edits.sort_by_key(|edit| (edit.range.start.line, edit.range.start.character));
             for edit in edits.into_iter().rev() {
-                let start = buffer.line_to_byte(edit.range.start.line as usize)
-                    + edit.range.start.character as usize;
-                let end = buffer.line_to_byte(edit.range.end.line as usize)
-                    + edit.range.end.character as usize;
-                buffer.edit(start..end, &edit.new_text);
+                let start = buffer.offset_from_lsp(edit.range.start.line, edit.range.start.character);
+                let end = buffer.offset_from_lsp(edit.range.end.line, edit.range.end.character);
+                buffer.edit(start.min(end)..end, &edit.new_text);
             }
             let _ = buffer.save();
         }

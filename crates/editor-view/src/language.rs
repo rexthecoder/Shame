@@ -845,8 +845,16 @@ impl LanguageAdapter for DartLanguageAdapter {
             return Vec::new();
         }
 
-        let (target_range, expr_text, indent_str) =
+        let (byte_range, expr_text, indent_str) =
             find_call_expression_range(text, buffer, line_idx, line_start_byte, display_line);
+        // `find_call_expression_range` measures columns in bytes; edits go
+        // through `apply_text_edits`, which reads LSP (UTF-16) columns.
+        let to_lsp = |p: Position| {
+            let (line, character) =
+                buffer.lsp_position(buffer.line_to_byte(p.line as usize) + p.character as usize);
+            Position { line, character }
+        };
+        let target_range = Range { start: to_lsp(byte_range.start), end: to_lsp(byte_range.end) };
         if expr_text.trim().is_empty() {
             return Vec::new();
         }

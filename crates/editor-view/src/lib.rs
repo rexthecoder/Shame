@@ -95,6 +95,7 @@ pub struct TestCodeLensTemplate {
 #[derive(Debug, Clone)]
 pub enum EditorEvent {
     OpenAt { path: PathBuf, line: u32, column: u32 },
+    /// LSP position (UTF-16 column) of the symbol to rename; pass it back to `send_rename`.
     RequestRename { line: u32, column: u32 },
     /// A set of locations to peek at (references, or a definition's targets).
     ShowPeek { title: String, locations: Vec<lsp_types::Location> },
@@ -148,6 +149,22 @@ impl Default for SaveOptions {
 
 impl Global for SaveOptions {}
 
+/// How the editor displays code. The app sets one of these as a global;
+/// each editor picks up changes on its next render.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct EditorOptions {
+    /// Show language-server inlay hints (inferred types, parameter names).
+    pub inlay_hints: bool,
+}
+
+impl Default for EditorOptions {
+    fn default() -> Self {
+        Self { inlay_hints: true }
+    }
+}
+
+impl Global for EditorOptions {}
+
 /// `text` with trailing whitespace trimmed and/or a final newline ensured, or
 /// `None` when nothing needs to change. Line endings (`\n` or `\r\n`) are kept.
 pub(crate) fn normalize_for_save(text: &str, trim: bool, final_newline: bool) -> Option<String> {
@@ -195,6 +212,9 @@ pub struct EditorView {
     buffer: Buffer,
     focus_handle: FocusHandle,
     scroll_handle: UniformListScrollHandle,
+    /// Width of the text area (right of the gutter) as last painted, so
+    /// popups can be kept from running off its right edge.
+    text_area_width: std::rc::Rc<std::cell::Cell<Pixels>>,
     language: Arc<dyn LanguageAdapter>,
     syntax_tree: Option<SyntaxTree>,
     /// The text `syntax_tree` was last parsed/reparsed from, so `render`
@@ -298,6 +318,7 @@ impl EditorView {
             buffer,
             focus_handle: cx.focus_handle(),
             scroll_handle: UniformListScrollHandle::new(),
+            text_area_width: std::rc::Rc::new(std::cell::Cell::new(px(800.))),
             language,
             syntax_tree,
             synced_text,
@@ -414,6 +435,10 @@ impl EditorView {
             self.sync_lsp_text(&text);
             self.synced_text = text;
         } else {
+            // Too big to parse, but the language server still needs every
+            // edit: without this its copy of the file freezes at open time
+            // and diagnostics, rename and code actions act on stale text.
+            self.sync_lsp_text(&self.buffer.text());
             self.syntax_tree = None;
             self.closing_labels.clear();
             self.fold_ranges.clear();
@@ -692,11 +717,11 @@ impl EditorView {
     }
 
     /// Move the cursor to a 0-indexed (line, column) — e.g. where a
-    /// go-to-definition in a newly-opened file landed. `column` is
-    /// treated as a byte offset within the line, the same approximation
-    /// used everywhere else in this crate.
+    /// go-to-definition in a newly-opened file landed. `column` is an LSP
+    /// (UTF-16) column, which is also a plain character count for typical
+    /// text; past the line's end it clamps to the end of that line.
     pub fn set_cursor_to_position(&mut self, line: u32, column: u32, cx: &mut Context<Self>) {
-        let offset = self.buffer.line_to_byte(line as usize) + column as usize;
+        let offset = self.buffer.offset_from_lsp(line, column);
         self.set_cursor(offset, cx);
         self.scroll_handle
             .scroll_to_item(line as usize, ScrollStrategy::Center);
@@ -1438,12 +1463,11 @@ impl EditorView {
             let mut edits = entry.additional_edits;
             edits.sort_by_key(|edit| (edit.range.start.line, edit.range.start.character));
             for edit in edits.into_iter().rev() {
-                let start = self.buffer.line_to_byte(edit.range.start.line as usize)
-                    + edit.range.start.character as usize;
-                let end = self.buffer.line_to_byte(edit.range.end.line as usize)
-                    + edit.range.end.character as usize;
-                let end = end.min(self.buffer.len_bytes());
-                let start = start.min(end);
+                let end = self.buffer.offset_from_lsp(edit.range.end.line, edit.range.end.character);
+                let start = self
+                    .buffer
+                    .offset_from_lsp(edit.range.start.line, edit.range.start.character)
+                    .min(end);
                 self.buffer.edit(start..end, &edit.new_text);
                 if end <= insert_at {
                     let removed = end - start;
@@ -1960,6 +1984,7 @@ impl EditorView {
         indent_width: usize,
         current_word: Option<&str>,
         bracket_pair: Option<(usize, usize)>,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let is_active_line = cursor_line == Some(index);
@@ -2288,6 +2313,26 @@ impl EditorView {
         let inlay_font = font(mono_family.clone());
         let inlay_color: Hsla = cx.theme().muted_foreground.opacity(0.8);
         let inlay_bg: Hsla = cx.theme().muted_foreground.opacity(0.12);
+        // Exact x of a column in the text area, for anchoring popups. Shapes
+        // the same text and runs as the canvas below (GPUI reuses the layout
+        // within a frame), plus any inlay hints in front of the column.
+        let has_popup = (is_active_line && (!self.completions.is_empty() || self.code_action_menu.is_some()))
+            || self.signature_help.as_ref().is_some_and(|sig| sig.line == index)
+            || self.hover_point.is_some_and(|(line, _)| line == index);
+        let column_x: Option<Box<dyn Fn(usize) -> Pixels>> = has_popup.then(|| {
+            let shaped = window.text_system().shape_line(line_shared.clone(), px(LINE_FONT_SIZE), &text_runs, None);
+            let (_, inlays) = shape_inlays(window, &line_inlays, &inlay_font, inlay_color);
+            Box::new(move |col: usize| shaped.x_for_index(col.min(line_len)) + inlays.shift(col, true))
+                as Box<dyn Fn(usize) -> Pixels>
+        });
+        let text_area_width = self.text_area_width.get();
+        // Keep a `width`-wide popup inside the text area.
+        let popup_left = |col: usize, width: f32| -> Pixels {
+            let x = column_x.as_ref().map_or(px(0.), |x_at| x_at(col));
+            let max = (text_area_width - px(width + 8.)).max(px(0.));
+            x.min(max).max(px(0.))
+        };
+        let width_cell = self.text_area_width.clone();
         let view = cx.entity();
         let line_canvas = canvas(
             move |bounds, window, _cx| {
@@ -2297,35 +2342,7 @@ impl EditorView {
                     &text_runs,
                     None,
                 );
-                // Each hint is shaped on its own; `inlays` records how far
-                // it pushes the text after it.
-                let shaped_inlays: Vec<(usize, ShapedLine, Pixels)> = line_inlays
-                    .iter()
-                    .map(|(col, label, pad_left, _)| {
-                        let run = TextRun {
-                            len: label.len(),
-                            font: inlay_font.clone(),
-                            color: inlay_color,
-                            background_color: None,
-                            underline: None,
-                            strikethrough: None,
-                        };
-                        let shaped_hint =
-                            window.text_system().shape_line(label.clone(), px(LINE_FONT_SIZE - 1.), &[run], None);
-                        let left = if *pad_left { INLAY_PAD } else { px(0.) };
-                        (*col, shaped_hint, left)
-                    })
-                    .collect();
-                let inlays = inlay_hints::InlayLayout {
-                    items: shaped_inlays
-                        .iter()
-                        .zip(&line_inlays)
-                        .map(|((col, shaped_hint, left), (_, _, _, pad_right))| {
-                            let right = if *pad_right { INLAY_PAD } else { px(0.) };
-                            (*col, *left + shaped_hint.width + INLAY_INNER * 2. + right)
-                        })
-                        .collect(),
-                };
+                let (shaped_inlays, inlays) = shape_inlays(window, &line_inlays, &inlay_font, inlay_color);
                 let shaped_closing = closing_label_shared.as_ref().map(|lbl| {
                     let run = TextRun {
                         len: lbl.len(),
@@ -2366,6 +2383,7 @@ impl EditorView {
                 (hitbox, shaped, shaped_closing, shaped_diag, inlays, shaped_inlays)
             },
             move |bounds, (hitbox, shaped, shaped_closing, shaped_diag, inlays, shaped_inlays), window, cx| {
+                width_cell.set(bounds.size.width);
                 // Buffer column -> x, past any inlay hints in front of it:
                 // `xs` for a character's left edge (caret, range start),
                 // `xe` for a range end, which stops before a hint there.
@@ -2798,8 +2816,7 @@ impl EditorView {
                     .when(
                         is_active_line && !self.completions.is_empty(),
                         |el| {
-                            let col = cursor_col.unwrap_or(0);
-                            let left_offset = px((col as f32 * 7.5).min(360.));
+                            let left_offset = popup_left(cursor_col.unwrap_or(0), 340.);
                             let popup = self.render_completion_popup(&mono_family, cx);
                             el.child(
                                 deferred(
@@ -2818,8 +2835,7 @@ impl EditorView {
                     .when(
                         is_active_line && self.code_action_menu.is_some(),
                         |el| {
-                            let col = cursor_col.unwrap_or(0);
-                            let left_offset = px((col as f32 * 7.5).min(360.));
+                            let left_offset = popup_left(cursor_col.unwrap_or(0), 360.);
                             let menu = self.render_code_action_menu(cx);
                             el.child(
                                 deferred(
@@ -2838,7 +2854,7 @@ impl EditorView {
                     .when_some(
                         self.signature_help.as_ref().filter(|sig| sig.line == index),
                         |el, sig| {
-                            let left_offset = px((sig.column as f32 * 7.5).min(280.));
+                            let left_offset = popup_left(sig.column, 420.);
                             let card = Self::render_signature_card(sig, &mono_family, cx);
                             el.child(
                                 deferred(
@@ -2862,7 +2878,7 @@ impl EditorView {
                                 .filter(|(l, _)| *l == index)
                                 .map(|(_, c)| c)
                                 .unwrap_or(0);
-                            let left_offset = px((hover_col as f32 * 7.5).min(280.));
+                            let left_offset = popup_left(hover_col, 420.);
                             let card = Self::render_hover_card(text, &mono_family, cx);
                             el.child(
                                 deferred(
@@ -3421,6 +3437,35 @@ fn diff_as_edit(old: &str, new: &str) -> Option<InputEdit> {
 /// Whether `b` can be part of an identifier — ASCII alphanumerics and
 /// underscore, plus (conservatively) every non-ASCII byte, so a run never
 /// gets split in the middle of a multi-byte UTF-8 character.
+/// Shape a line's inlay hint labels `(column, label, pad_left, pad_right)`
+/// and measure how far each pushes the text after it. Returns each hint's
+/// shaped label with its left padding, plus the layout used to shift x.
+fn shape_inlays(
+    window: &mut Window,
+    hints: &[(usize, SharedString, bool, bool)],
+    font: &Font,
+    color: Hsla,
+) -> (Vec<(usize, ShapedLine, Pixels)>, inlay_hints::InlayLayout) {
+    let mut shaped = Vec::with_capacity(hints.len());
+    let mut items = Vec::with_capacity(hints.len());
+    for (col, label, pad_left, pad_right) in hints {
+        let run = TextRun {
+            len: label.len(),
+            font: font.clone(),
+            color,
+            background_color: None,
+            underline: None,
+            strikethrough: None,
+        };
+        let shaped_hint = window.text_system().shape_line(label.clone(), px(LINE_FONT_SIZE - 1.), &[run], None);
+        let left = if *pad_left { INLAY_PAD } else { px(0.) };
+        let right = if *pad_right { INLAY_PAD } else { px(0.) };
+        items.push((*col, left + shaped_hint.width + INLAY_INNER * 2. + right));
+        shaped.push((*col, shaped_hint, left));
+    }
+    (shaped, inlay_hints::InlayLayout { items })
+}
+
 fn is_word_byte(b: u8) -> bool {
     b.is_ascii_alphanumeric() || b == b'_' || b >= 0x80
 }
@@ -3798,6 +3843,8 @@ impl Render for EditorView {
         // actually incremented `buffer.revision()`. Hovering, scrolling, or
         // moving the cursor does zero full-buffer work.
         self.sync_buffer_state();
+        let options = cx.try_global::<EditorOptions>().copied().unwrap_or_default();
+        self.set_inlay_hints_enabled(options.inlay_hints, cx);
         self.maybe_schedule_inlay_hints(cx);
         self.maybe_prefetch_code_actions(cx);
 
@@ -3846,7 +3893,7 @@ impl Render for EditorView {
         let list = uniform_list(
             "editor-lines",
             line_count,
-            cx.processor(move |this, visible_range: Range<usize>, _window, cx| {
+            cx.processor(move |this, visible_range: Range<usize>, window, cx| {
                 if visible_range.is_empty() {
                     return Vec::new();
                 }
@@ -3907,6 +3954,7 @@ impl Render for EditorView {
                             indent_width,
                             current_word.as_deref(),
                             bracket_pair,
+                            window,
                             cx,
                         )
                         .into_any_element()

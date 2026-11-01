@@ -533,6 +533,7 @@ pub struct DartIde {
     pub(crate) autosave: file_state::AutosaveMode,
     pub(crate) test_run: Option<test_runner::TestRunState>,
     pub(crate) save_options: editor_view::SaveOptions,
+    pub(crate) editor_options: editor_view::EditorOptions,
     /// Per editor: the revision last seen and when it last changed (autosave timing).
     pub(crate) edit_marks: HashMap<EntityId, (u64, std::time::Instant)>,
     /// Things worth telling the user about each file (changed on disk, save failed).
@@ -749,6 +750,7 @@ impl DartIde {
             autosave: file_state::AutosaveMode::Off,
             test_run: None,
             save_options: editor_view::SaveOptions::default(),
+            editor_options: editor_view::EditorOptions::default(),
             edit_marks: HashMap::new(),
             file_notices: HashMap::new(),
             unsaved_prompt: None,
@@ -797,6 +799,7 @@ impl DartIde {
             this.restore_preferences_only(window, cx);
         }
         this.apply_save_options(cx);
+        this.apply_editor_options(cx);
         this.start_git_refresh_loop(cx);
         // The Commit button depends on whether the message box is empty.
         cx.observe(&this.git.message, |_, _, cx| cx.notify()).detach();
