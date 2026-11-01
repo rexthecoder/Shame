@@ -22,6 +22,8 @@ pub const SPACE_7: f32 = 24.;
 
 /// Controls: icon buttons, tree rows, inputs.
 pub const RADIUS_SM: f32 = 6.;
+/// Counters and tiny badges.
+pub const RADIUS_BADGE: f32 = 4.;
 /// Panels and inner sections.
 pub const RADIUS_PANEL: f32 = 8.;
 /// Cards: tool calls, messages, pending-changes, terminal dock.

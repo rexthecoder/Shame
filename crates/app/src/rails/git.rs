@@ -52,36 +52,33 @@ fn neutral_pill(cx: &App) -> ButtonCustomVariant {
 }
 
 impl DartIde {
-    /// The "Files | Git" tab strip at the top of the left sidebar, shared by both views.
+    /// The "Files | Search | Git" tab strip at the top of the left sidebar, shared by all views.
     pub(crate) fn render_sidebar_tabs(&self, cx: &mut Context<Self>) -> Div {
         let muted = cx.theme().muted_foreground;
         let fg = cx.theme().foreground;
         let primary = cx.theme().primary;
-        let tab_active = cx.theme().tab_active;
+        let strong = cx.theme().tab_active_foreground;
         let border = cx.theme().border;
-        let list_hover = cx.theme().list_hover;
+
+        let changes = self
+            .git
+            .status
+            .as_ref()
+            .map_or(0, |s| s.staged.len() + s.unstaged.len() + s.conflicts.len());
 
         let tab = |id: &'static str,
                    label: &'static str,
                    icon: IconName,
                    which: SidebarTab,
+                   show_badge: bool,
                    cx: &mut Context<Self>| {
             let active = self.sidebar_tab == which;
             h_flex()
                 .id(id)
+                .relative()
                 .items_center()
                 .gap(px(tokens::SPACE_2))
-                .h(px(26.))
-                .px(px(tokens::SPACE_2))
-                .rounded(px(tokens::RADIUS_SM))
-                .border_1()
-                .border_color(if active {
-                    border
-                } else {
-                    gpui_kit::transparent_black()
-                })
-                .when(active, |s| s.bg(tab_active))
-                .when(!active, |s| s.hover(|h| h.bg(list_hover)))
+                .h(px(36.))
                 .cursor_pointer()
                 .child(
                     Icon::new(icon)
@@ -91,70 +88,78 @@ impl DartIde {
                 .child(
                     div()
                         .text_size(px(tokens::UI_SM))
-                        .font_medium()
-                        .text_color(if active { fg } else { muted })
+                        .when(active, |el| el.font_medium().text_color(strong))
+                        .when(!active, |el| el.text_color(muted).hover(|h| h.text_color(fg)))
                         .child(label),
                 )
+                .when(show_badge && changes > 0, |el| {
+                    el.child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .h(px(15.))
+                            .min_w(px(15.))
+                            .px(px(3.))
+                            .rounded(px(tokens::RADIUS_BADGE))
+                            .bg(primary.opacity(0.15))
+                            .text_size(px(9.5))
+                            .line_height(px(9.5))
+                            .font_medium()
+                            .text_color(primary)
+                            .child(changes.to_string()),
+                    )
+                })
+                .when(active, |el| {
+                    el.child(
+                        div()
+                            .absolute()
+                            .left_0()
+                            .right_0()
+                            .bottom(px(-1.))
+                            .h(px(2.))
+                            .rounded(px(2.))
+                            .bg(primary),
+                    )
+                })
                 .on_click(
                     cx.listener(move |this, _event, _window, cx| this.set_sidebar_tab(which, cx)),
                 )
         };
-        let changes = self
-            .git
-            .status
-            .as_ref()
-            .map_or(0, |s| s.staged.len() + s.unstaged.len() + s.conflicts.len());
+
         h_flex()
             .w_full()
-            .h(px(30.))
+            .h(px(36.))
             .flex_shrink_0()
             .items_center()
-            .px(px(tokens::SPACE_3))
-            .gap(px(tokens::SPACE_1))
+            .gap(px(tokens::SPACE_6))
+            .px(px(tokens::SPACE_5))
             .border_b_1()
             .border_color(border)
-            .child(
-                h_flex()
-                    .items_center()
-                    .gap(px(tokens::SPACE_1))
-                    .child(tab(
-                        "sidebar-tab-files",
-                        "Files",
-                        IconName::Folder,
-                        SidebarTab::Files,
-                        cx,
-                    ))
-                    .child(tab(
-                        "sidebar-tab-search",
-                        "Search",
-                        IconName::Search,
-                        SidebarTab::Search,
-                        cx,
-                    ))
-                    .child(
-                        tab(
-                            "sidebar-tab-git",
-                            "Git",
-                            IconName::GitBranch,
-                            SidebarTab::Git,
-                            cx,
-                        )
-                        .when(
-                            changes > 0 && self.sidebar_tab != SidebarTab::Git,
-                            |el| {
-                                el.child(
-                                    div()
-                                        .px(px(5.))
-                                        .rounded(px(tokens::RADIUS_PILL))
-                                        .bg(primary.opacity(0.2))
-                                        .text_size(px(9.5))
-                                        .text_color(primary)
-                                        .child(changes.to_string()),
-                                )
-                            },
-                        ),
-                    )
-            )
+            .child(tab(
+                "sidebar-tab-files",
+                "Files",
+                IconName::Folder,
+                SidebarTab::Files,
+                false,
+                cx,
+            ))
+            .child(tab(
+                "sidebar-tab-search",
+                "Search",
+                IconName::Search,
+                SidebarTab::Search,
+                false,
+                cx,
+            ))
+            .child(tab(
+                "sidebar-tab-git",
+                "Git",
+                IconName::GitBranch,
+                SidebarTab::Git,
+                true,
+                cx,
+            ))
     }
 
     pub(crate) fn render_git_rail(&self, cx: &mut Context<Self>) -> impl IntoElement {

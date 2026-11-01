@@ -318,6 +318,7 @@ impl DartIde {
             .to_string();
 
         let muted = cx.theme().muted_foreground;
+        let fg = cx.theme().foreground;
 
         v_flex()
             .size_full()
@@ -336,7 +337,9 @@ impl DartIde {
                             .child(
                                 div()
                                     .text_size(px(tokens::UI_SM))
-                                    .text_color(muted)
+                                    .font_medium()
+                                    .text_color(fg)
+                                    .truncate()
                                     .child(root_name),
                             )
                     )
