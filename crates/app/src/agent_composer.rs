@@ -238,6 +238,8 @@ impl DartIde {
         self.agent.attachments.clear();
         self.agent.session_id = None;
         self.agent.question_inputs.clear();
+        // An empty thread removes the saved one, so this is a real "forget it".
+        self.save_agent_conversation();
         cx.notify();
     }
 

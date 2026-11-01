@@ -1,5 +1,32 @@
 # Milestone notes
 
+## The agent thread now survives a restart
+
+The agent rail was the one part of the app that threw its work away. Closing
+the window dropped the whole transcript, and `New thread` cleared it with no
+way back; the CLI's session id went with it, so the next message also started
+from a blank memory. That's wrong for the part of the app meant to be used
+all day.
+
+Each workspace now keeps its thread in
+`~/.config/shame/agent/<hash-of-root>.json` (`agent_store.rs`): the messages,
+tool groups, plan cards, task checklist, the files the agent touched, the
+harness and model, and the session id. Permissions and questions are
+deliberately *not* restored — they belong to a process that has exited — and
+the file keeps only the last 400 items so a long thread doesn't grow without
+bound. A version field means a file from a newer build is ignored rather than
+half-read.
+
+Saved when a message is sent (so quitting mid-run keeps the turn), when a
+turn finishes, on window close, on `New thread` (which deletes the file, so
+"forget it" is real), and when switching workspaces. Restored at startup and
+in `set_root`, after `session.json`, so the saved harness/model win. Because
+the session id comes back too, Claude Code and Codex resume the same CLI
+conversation rather than only replaying text.
+
+`cargo test -p app` covers the round trip, the version/corrupt-file guard,
+plan-state mapping, the per-workspace path, and the item cap.
+
 ## Correcting the Fleet read: tabs aren't in the titlebar
 
 The user asked for a closer look at the same reference screenshots —

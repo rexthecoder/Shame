@@ -202,6 +202,7 @@ dependencies = [
  "editor-view",
  "gpui-kit",
  "image",
+ "serde",
  "serde_json",
 ]
 

@@ -952,6 +952,9 @@ impl DartIde {
             text: shown_prompt,
         });
         self.agent.scroll.scroll_to_bottom();
+        // Save the prompt now: if the app is quit mid-run, the turn is still
+        // in the thread when it comes back.
+        self.save_agent_conversation();
         let include_active_file = self.agent.include_active_file;
         let include_problems = self.agent.include_problems;
 
@@ -1454,6 +1457,7 @@ impl DartIde {
                                 if this.web_preview_open {
                                     this.refresh_web_preview(cx);
                                 }
+                                this.save_agent_conversation();
                                 if failed {
                                     this.agent.queue.clear();
                                 } else {

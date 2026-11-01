@@ -13,6 +13,7 @@ mod agent_ctx;
 mod agent_indicator;
 mod agent_permission;
 mod agent_plan;
+mod agent_store;
 mod chrome;
 mod diff_view;
 mod editor;
@@ -894,6 +895,7 @@ impl DartIde {
         let this_view = cx.entity();
         window.on_window_should_close(cx, move |_window, cx| {
             this_view.update(cx, |this, cx| {
+                this.save_agent_conversation();
                 let tabs = this.unsaved_tabs(cx);
                 if tabs.is_empty() {
                     true

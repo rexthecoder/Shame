@@ -90,6 +90,12 @@ impl DartIde {
         // Stop any running Flutter daemon from the previous project
         self.stop_flutter_run(cx);
 
+        // The agent thread belongs to the workspace being left: save it under
+        // the old root, then load the new workspace's own thread below.
+        self.save_agent_conversation();
+        self.stop_agent_run(cx);
+        self.clear_agent_conversation(cx);
+
         // Close tabs and overlays from the previous project workspace
         self.tabs.clear();
         self.active_tab = 0;
@@ -125,6 +131,7 @@ impl DartIde {
             state.set_items(items, cx);
         });
         self.root = root;
+        self.restore_agent_conversation(cx);
         // A different folder is a different repository.
         self.git.status = None;
         self.git.commit_types = None;
@@ -142,6 +149,9 @@ impl DartIde {
     pub(crate) fn close_workspace(&mut self, cx: &mut Context<Self>) {
         self.stop_flutter_run(cx);
         self.stop_dap_debug(cx);
+        // Keep the thread on disk so reopening the folder brings it back.
+        self.save_agent_conversation();
+        self.clear_agent_conversation(cx);
         self.has_workspace = false;
         self.sidebar_open = false;
         self.terminal_open = false;
@@ -290,11 +300,7 @@ impl DartIde {
             .filter_map(|t| t.path.as_ref())
             .map(|p| p.to_string_lossy().to_string())
             .collect();
-        let harness_str = match self.agent.harness {
-            rails::agent::AgentHarness::ClaudeCode => "claude",
-            rails::agent::AgentHarness::OpenCode => "opencode",
-            rails::agent::AgentHarness::Codex => "codex",
-        };
+        let harness_str = crate::agent_store::harness_key(self.agent.harness);
         let val = serde_json::json!({
             "workspace": self.has_workspace.then(|| self.root.to_string_lossy().to_string()),
             "open_tabs": open_tabs,
@@ -370,11 +376,8 @@ impl DartIde {
         self.apply_save_options(cx);
         self.apply_editor_options(cx);
         if let Some(h) = val.get("agent_harness").and_then(|v| v.as_str()) {
-            let tool = match h {
-                "opencode" => rails::agent::AgentHarness::OpenCode,
-                "codex" => rails::agent::AgentHarness::Codex,
-                _ => rails::agent::AgentHarness::ClaudeCode,
-            };
+            let tool = crate::agent_store::harness_from_key(h)
+                .unwrap_or(rails::agent::AgentHarness::ClaudeCode);
             self.agent.set_harness(tool);
         }
         if let Some(lt) = val.get("light_theme").and_then(|v| v.as_bool()) {
@@ -439,5 +442,7 @@ impl DartIde {
                 self.split_tab = Some(sp_ix);
             }
         }
+        // The agent thread is saved per workspace, not in session.json.
+        self.restore_agent_conversation(cx);
     }
 }

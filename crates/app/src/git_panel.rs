@@ -737,3 +737,90 @@ impl DartIde {
         );
     }
 }
+
+/// A commit subject split for display: `feat: [MOBL-4665] show the RFIs`
+/// becomes kind `feat`, ticket `MOBL-4665`, text `show the RFIs`.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct CommitSubject<'a> {
+    /// Conventional-commit type (`feat`, `fix`, `build`, …), scope dropped.
+    pub kind: Option<&'a str>,
+    /// A leading `[TICKET-123]` reference.
+    pub ticket: Option<&'a str>,
+    pub text: &'a str,
+    /// `Merge branch …` / `Merge pull request …`: shown quieter.
+    pub is_merge: bool,
+}
+
+pub(crate) fn parse_commit_subject(subject: &str) -> CommitSubject<'_> {
+    let mut rest = subject.trim();
+    let is_merge = rest.starts_with("Merge ");
+    let mut kind = None;
+    // `type(scope)!: ` with a short, lowercase type.
+    if let Some(colon) = rest.find(": ") {
+        let head = &rest[..colon];
+        let ty = head.split(['(', '!']).next().unwrap_or(head);
+        let scope_ok = head[ty.len()..].is_empty()
+            || head[ty.len()..].trim_end_matches('!').starts_with('(') && head.trim_end_matches('!').ends_with(')')
+            || &head[ty.len()..] == "!";
+        if !ty.is_empty() && ty.len() <= 10 && ty.bytes().all(|b| b.is_ascii_lowercase()) && scope_ok {
+            kind = Some(ty);
+            rest = rest[colon + 2..].trim_start();
+        }
+    }
+    let mut ticket = None;
+    if let Some(inner) = rest.strip_prefix('[') {
+        if let Some(close) = inner.find(']') {
+            let t = &inner[..close];
+            if !t.is_empty() && !t.contains(' ') {
+                ticket = Some(t);
+                rest = inner[close + 1..].trim_start();
+            }
+        }
+    }
+    CommitSubject { kind, ticket, text: if rest.is_empty() { subject } else { rest }, is_merge }
+}
+
+/// `git stash list` messages look like `On main: tidy` or
+/// `WIP on main: 1a2b3c4 last commit`; split out the branch.
+pub(crate) fn parse_stash_message(message: &str) -> (Option<&str>, &str) {
+    for prefix in ["WIP on ", "On "] {
+        if let Some(rest) = message.strip_prefix(prefix) {
+            if let Some((branch, text)) = rest.split_once(": ") {
+                return (Some(branch), text.trim());
+            }
+        }
+    }
+    (None, message.trim())
+}
+
+#[cfg(test)]
+mod display_tests {
+    use super::*;
+
+    #[core::prelude::v1::test]
+    fn conventional_subjects_split_into_kind_ticket_and_text() {
+        let s = parse_commit_subject("feat: [MOBL-4665] show the RFIs a customer");
+        assert_eq!(s, CommitSubject { kind: Some("feat"), ticket: Some("MOBL-4665"), text: "show the RFIs a customer", is_merge: false });
+        let s = parse_commit_subject("build(deps): bump the bundler group");
+        assert_eq!((s.kind, s.ticket, s.text), (Some("build"), None, "bump the bundler group"));
+        let s = parse_commit_subject("fix!: drop old API");
+        assert_eq!((s.kind, s.text), (Some("fix"), "drop old API"));
+    }
+
+    #[core::prelude::v1::test]
+    fn plain_and_merge_subjects_are_left_alone() {
+        let s = parse_commit_subject("Merge branch 'main' into busha-pro");
+        assert!(s.is_merge);
+        assert_eq!((s.kind, s.text), (None, "Merge branch 'main' into busha-pro"));
+        // A capitalised word before a colon isn't a commit type.
+        let s = parse_commit_subject("Note: this is prose");
+        assert_eq!((s.kind, s.text), (None, "Note: this is prose"));
+    }
+
+    #[core::prelude::v1::test]
+    fn stash_messages_split_out_the_branch() {
+        assert_eq!(parse_stash_message("On main: tidy up"), (Some("main"), "tidy up"));
+        assert_eq!(parse_stash_message("WIP on feat/x: 1a2b3c4 last"), (Some("feat/x"), "1a2b3c4 last"));
+        assert_eq!(parse_stash_message("pro trade tab design"), (None, "pro trade tab design"));
+    }
+}

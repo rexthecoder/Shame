@@ -11,6 +11,7 @@ use gpui_kit::component::{
     button::{Button, ButtonCustomVariant, ButtonVariants as _},
     h_flex,
     input::{Input, Textarea},
+    resizable::{resizable_panel, v_resizable},
     v_flex,
 };
 use gpui_kit::prelude::FluentBuilder as _;
@@ -50,6 +51,12 @@ fn neutral_pill(cx: &App) -> ButtonCustomVariant {
         .active(cx.theme().list_hover)
         .shadow(false)
 }
+
+/// Starting height of the history half (stashes + recent commits) of the
+/// git panel, and how far the divider can be dragged.
+const GIT_HISTORY_H: f32 = 300.;
+const GIT_HISTORY_MIN: f32 = 72.;
+const GIT_HISTORY_MAX: f32 = 900.;
 
 impl DartIde {
     /// The "Files | Search | Git" tab strip at the top of the left sidebar, shared by all views.
@@ -1118,16 +1125,15 @@ impl DartIde {
             )
     }
 
+    /// Working changes on top, history (stashes and recent commits) below,
+    /// with a drag handle between them; each half scrolls on its own.
     fn render_git_changes(&self, status: &RepoStatus, cx: &mut Context<Self>) -> impl IntoElement {
         let list = v_flex()
             .id("git-changes")
-            .flex_1()
-            .w_full()
+            .size_full()
             .min_h(px(0.))
             .overflow_y_scroll()
-            .border_t_1()
-            .border_color(cx.theme().border)
-            .pb(px(tokens::SPACE_4));
+            .pb(px(tokens::SPACE_2));
         let list = if status.is_clean() {
             list.child(self.render_git_clean_state(status, cx))
         } else {
@@ -1159,12 +1165,38 @@ impl DartIde {
                 ))
             })
         };
-        list.when(!status.stashes.is_empty(), |el| {
-            el.child(self.render_git_stashes(&status.stashes, cx))
-        })
-        .when(!status.recent_commits.is_empty(), |el| {
-            el.child(self.render_git_commits(status, cx))
-        })
+        let frame = div()
+            .flex_1()
+            .w_full()
+            .min_h(px(0.))
+            .border_t_1()
+            .border_color(cx.theme().border);
+        if status.stashes.is_empty() && status.recent_commits.is_empty() {
+            return frame.child(list);
+        }
+        let history = v_flex()
+            .id("git-history")
+            .size_full()
+            .min_h(px(0.))
+            .overflow_y_scroll()
+            .pb(px(tokens::SPACE_4))
+            .when(!status.stashes.is_empty(), |el| {
+                el.child(self.render_git_stashes(&status.stashes, cx))
+            })
+            .when(!status.recent_commits.is_empty(), |el| {
+                el.child(self.render_git_commits(status, cx))
+            });
+        frame.child(
+            v_resizable("git-panel-split")
+                .child(resizable_panel().child(list))
+                .child(
+                    resizable_panel()
+                        .size(px(GIT_HISTORY_H))
+                        .size_range(px(GIT_HISTORY_MIN)..px(GIT_HISTORY_MAX))
+                        .fixed()
+                        .child(history),
+                ),
+        )
     }
 
     /// Nothing to commit: say so, and offer the one sensible next step (push, pull or publish).
@@ -1733,7 +1765,7 @@ impl DartIde {
                     .h(px(28.))
                     .items_center()
                     .gap(px(tokens::SPACE_2))
-                    .pl(px(tokens::SPACE_5))
+                    .pl(px(tokens::SPACE_3 + tokens::SPACE_2))
                     .pr(px(tokens::SPACE_3))
                     .cursor_pointer()
                     .text_size(px(tokens::UI_XS))
@@ -1768,6 +1800,20 @@ impl DartIde {
                     let drop_key = format!("stash-drop:{index}");
                     let drop_armed =
                         self.git.confirm_discard.as_deref() == Some(drop_key.as_str());
+                    let (branch, message) = crate::git_panel::parse_stash_message(&stash.message);
+                    let tooltip = match branch {
+                        Some(branch) => format!("stash@{{{index}}} on {branch}\n{message}"),
+                        None => format!("stash@{{{index}}}\n{message}"),
+                    };
+                    let row_bg = cx.theme().list_hover;
+                    let icon_button = |id: (&'static str, usize), icon: IconName, tip: &'static str| {
+                        Button::new(id)
+                            .ghost()
+                            .xsmall()
+                            .icon(Icon::new(icon).with_size(px(12.)).text_color(muted))
+                            .tooltip(tip)
+                    };
+                    // Same box as a file row: 28px slot, 26px row, icon at 14px.
                     div()
                         .w_full()
                         .h(px(tokens::TREE_ROW_H))
@@ -1778,64 +1824,63 @@ impl DartIde {
                             h_flex()
                                 .id(("git-stash-row", index))
                                 .group(group.clone())
+                                .relative()
                                 .w_full()
                                 .h(px(26.))
                                 .pl(px(tokens::SPACE_4))
                                 .pr(px(tokens::SPACE_2))
-                                .items_center()
-                                .justify_between()
                                 .gap(px(tokens::SPACE_2))
+                                .items_center()
                                 .rounded(px(tokens::RADIUS_SM))
-                                .hover(|s| s.bg(cx.theme().list_hover))
+                                .hover(move |s| s.bg(row_bg))
+                                .tooltip(move |window, cx| {
+                                    gpui_kit::component::tooltip::Tooltip::new(tooltip.clone()).build(window, cx)
+                                })
                                 .child(
-                                    h_flex()
+                                    Icon::new(IconName::Archive)
+                                        .with_size(px(13.))
+                                        .text_color(muted)
+                                        .flex_shrink_0(),
+                                )
+                                .child(
+                                    div()
                                         .flex_1()
                                         .min_w(px(0.))
-                                        .items_center()
-                                        .gap(px(tokens::SPACE_2))
-                                        .child(
-                                            div()
-                                                .flex_shrink_0()
-                                                .font_family(cx.theme().mono_font_family.clone())
-                                                .text_size(px(tokens::UI_XS))
-                                                .text_color(cx.theme().info)
-                                                .child(format!("#{index}")),
-                                        )
-                                        .child(
-                                            div()
-                                                .truncate()
-                                                .text_size(px(tokens::UI_SM))
-                                                .text_color(fg)
-                                                .child(stash.message.clone()),
-                                        ),
+                                        .truncate()
+                                        .text_size(px(tokens::UI_SM))
+                                        .text_color(fg)
+                                        .child(message.to_string()),
                                 )
+                                // Actions keep their own space at the right end and
+                                // show on hover (and while a drop waits for
+                                // confirmation); `stash@{n}` and the branch are in
+                                // the tooltip.
                                 .child(
                                     h_flex()
                                         .flex_shrink_0()
                                         .items_center()
-                                        .gap(px(tokens::SPACE_1))
+                                        .gap(px(2.))
+                                        .when(!drop_armed, |row| {
+                                            row.invisible().group_hover(group.clone(), |s| s.visible())
+                                        })
+                                        .child(
+                                            icon_button(
+                                                ("git-stash-apply", index),
+                                                IconName::ArchiveRestore,
+                                                "Apply (keep the stash)",
+                                            )
+                                            .on_click(cx.listener(move |this, _e, window, cx| {
+                                                this.git_stash_apply(index, window, cx)
+                                            })),
+                                        )
                                         .child(
                                             Button::new(("git-stash-pop", index))
                                                 .ghost()
                                                 .xsmall()
                                                 .label("Pop")
-                                                .tooltip("Apply and remove stash")
+                                                .tooltip("Apply and remove the stash")
                                                 .on_click(cx.listener(move |this, _e, window, cx| {
                                                     this.git_stash_pop(index, window, cx)
-                                                })),
-                                        )
-                                        .child(
-                                            Button::new(("git-stash-apply", index))
-                                                .ghost()
-                                                .xsmall()
-                                                .icon(
-                                                    Icon::new(IconName::Check)
-                                                        .with_size(px(11.))
-                                                        .text_color(muted),
-                                                )
-                                                .tooltip("Apply stash (keep in list)")
-                                                .on_click(cx.listener(move |this, _e, window, cx| {
-                                                    this.git_stash_apply(index, window, cx)
                                                 })),
                                         )
                                         .child(if drop_armed {
@@ -1848,15 +1893,7 @@ impl DartIde {
                                                 }))
                                                 .into_any_element()
                                         } else {
-                                            Button::new(("git-stash-drop", index))
-                                                .ghost()
-                                                .xsmall()
-                                                .icon(
-                                                    Icon::new(IconName::X)
-                                                        .with_size(px(11.))
-                                                        .text_color(muted),
-                                                )
-                                                .tooltip("Drop stash")
+                                            icon_button(("git-stash-drop", index), IconName::Trash, "Drop the stash")
                                                 .on_click(cx.listener(move |this, _e, window, cx| {
                                                     this.git_stash_drop_clicked(index, window, cx)
                                                 }))
@@ -1945,14 +1982,21 @@ impl DartIde {
                         .recent_commits
                         .iter()
                         .enumerate()
-                        .map(|(ix, commit)| self.render_git_commit_row(ix, commit, has_upstream, cx)),
+                        .map(|(ix, commit)| {
+                            let last = ix + 1 == status.recent_commits.len();
+                            self.render_git_commit_row(ix, last, commit, has_upstream, cx)
+                        }),
                 )
             })
     }
 
+    /// One commit on the history rail: the plain subject first (type tag
+    /// and ticket pulled out of it), then ticket · author · time · hash.
+    /// The dot is filled orange when unpushed and hollow for merges.
     fn render_git_commit_row(
         &self,
         ix: usize,
+        last: bool,
         commit: &CommitInfo,
         has_upstream: bool,
         cx: &mut Context<Self>,
@@ -1963,98 +2007,151 @@ impl DartIde {
         let hash = commit.hash.clone();
         let unpushed = commit.unpushed && has_upstream;
 
+        let subject = crate::git_panel::parse_commit_subject(&commit.subject);
+        let kind_color = match subject.kind {
+            Some("feat") => cx.theme().green,
+            Some("fix") => cx.theme().warning,
+            _ => muted,
+        };
+        let rail_color = cx.theme().border;
+        let dot_color = if unpushed { cx.theme().primary } else { muted.opacity(0.8) };
+        let sep = || div().text_color(muted.opacity(0.45)).child("\u{b7}");
+        // Where the rail line runs within this row: from the dot down for
+        // the newest commit, up to the dot for the oldest.
+        const DOT_Y: f32 = 11.;
+        let first = ix == 0;
+
         v_flex()
             .w_full()
             .child(
-                div()
-                    .w_full()
-                    .h(px(tokens::TREE_ROW_H))
-                    .px(px(tokens::SPACE_3))
-                    .flex()
-                    .items_center()
-                    .child(
-                        h_flex()
-                            .id(("git-commit-row", ix))
-                            .w_full()
-                            .h(px(26.))
-                            .px(px(tokens::SPACE_3))
-                            .items_center()
-                            .gap(px(tokens::SPACE_2))
-                            .rounded(px(tokens::RADIUS_SM))
-                            .cursor_pointer()
-                            .when(expanded, |s| s.bg(cx.theme().list_hover))
-                            .hover(|s| s.bg(cx.theme().list_hover))
-                            .child(
-                                Icon::new(if expanded {
-                                    IconName::ChevronDown
-                                } else {
-                                    IconName::ChevronRight
+                div().w_full().px(px(tokens::SPACE_3)).child(
+                    h_flex()
+                        .id(("git-commit-row", ix))
+                        .w_full()
+                        .pr(px(tokens::SPACE_3))
+                        .gap(px(tokens::SPACE_2))
+                        .rounded(px(tokens::RADIUS_SM))
+                        .cursor_pointer()
+                        .when(expanded, |s| s.bg(cx.theme().list_hover))
+                        .hover(|s| s.bg(cx.theme().list_hover))
+                        // The rail.
+                        .child(
+                            div()
+                                .relative()
+                                .w(px(18.))
+                                .flex_shrink_0()
+                                .self_stretch()
+                                .when(!(first && last), |rail| {
+                                    let line = div().absolute().left(px(8.5)).w(px(1.)).bg(rail_color);
+                                    let line = match (first, last) {
+                                        (true, _) => line.top(px(DOT_Y + 4.)).bottom_0(),
+                                        (_, true) => line.top_0().h(px(DOT_Y + 4.)),
+                                        _ => line.top_0().bottom_0(),
+                                    };
+                                    rail.child(line)
                                 })
-                                .xsmall()
-                                .text_color(muted),
-                            )
-                            .when(unpushed, |el| {
-                                el.child(
+                                .child(
                                     div()
-                                        .text_size(px(tokens::UI_XS))
-                                        .text_color(cx.theme().primary)
-                                        .child("\u{2191}"),
+                                        .absolute()
+                                        .left(px(5.))
+                                        .top(px(DOT_Y))
+                                        .size(px(8.))
+                                        .rounded(px(4.))
+                                        .when(subject.is_merge && !unpushed, |d| {
+                                            d.border(px(1.5)).border_color(dot_color).bg(cx.theme().sidebar)
+                                        })
+                                        .when(!subject.is_merge || unpushed, |d| d.bg(dot_color)),
+                                ),
+                        )
+                        .child(
+                            v_flex()
+                                .flex_1()
+                                .min_w(px(0.))
+                                .py(px(5.))
+                                .gap(px(1.))
+                                .child(
+                                    h_flex()
+                                        .min_w(px(0.))
+                                        .items_center()
+                                        .gap(px(6.))
+                                        .when_some(subject.kind, |row, kind| {
+                                            row.child(
+                                                div()
+                                                    .flex_shrink_0()
+                                                    .text_size(px(tokens::UI_XS))
+                                                    .font_medium()
+                                                    .text_color(kind_color)
+                                                    .child(kind.to_string()),
+                                            )
+                                        })
+                                        .child(
+                                            div()
+                                                .flex_1()
+                                                .min_w(px(0.))
+                                                .truncate()
+                                                .text_size(px(tokens::UI_SM))
+                                                .text_color(if subject.is_merge { muted } else { fg })
+                                                .child(subject.text.to_string()),
+                                        ),
                                 )
-                            })
-                            .child({
-                                let copy_hash = commit.hash.clone();
-                                div()
-                                    .id(("git-copy-sha", ix))
-                                    .flex_shrink_0()
-                                    .px(px(4.))
-                                    .rounded(px(3.))
-                                    .bg(cx.theme().background)
-                                    .border_1()
-                                    .border_color(cx.theme().border)
-                                    .font_family(cx.theme().mono_font_family.clone())
-                                    .text_size(px(tokens::UI_XS))
-                                    .text_color(if unpushed {
-                                        cx.theme().primary
-                                    } else {
-                                        cx.theme().info
-                                    })
-                                    .hover(|s| s.border_color(cx.theme().primary))
-                                    .child(commit.hash.clone())
-                                    .on_mouse_down(MouseButton::Left, |_, _, cx| {
-                                        cx.stop_propagation();
-                                    })
-                                    .on_click(cx.listener(move |this, _e, _w, cx| {
-                                        cx.stop_propagation();
-                                        cx.write_to_clipboard(ClipboardItem::new_string(
-                                            copy_hash.clone(),
-                                        ));
-                                        this.git.notice = Some(crate::git_panel::GitNotice {
-                                            text: format!("Copied commit {copy_hash}"),
-                                            is_error: false,
-                                        });
-                                        cx.notify();
-                                    }))
-                            })
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .min_w(px(0.))
-                                    .truncate()
-                                    .text_size(px(tokens::UI_SM))
-                                    .text_color(fg)
-                                    .child(commit.subject.clone()),
-                            )
-                            .child(
-                                div()
-                                    .flex_shrink_0()
-                                    .text_size(px(tokens::UI_XS))
-                                    .text_color(muted.opacity(0.75))
-                                    .child(commit.relative_time.clone()),
-                            )
-                            .on_click(cx.listener(move |this, _e, _w, cx| {
-                                this.git_toggle_commit(hash.clone(), cx);
-                            })),
-                    ),
+                                .child(
+                                    h_flex()
+                                        .min_w(px(0.))
+                                        .items_center()
+                                        .gap(px(5.))
+                                        .text_size(px(tokens::UI_XS))
+                                        .text_color(muted)
+                                        .when_some(subject.ticket, |row, ticket| {
+                                            row.child(
+                                                div()
+                                                    .flex_shrink_0()
+                                                    .font_family(cx.theme().mono_font_family.clone())
+                                                    .text_size(px(tokens::UI_XS - 0.5))
+                                                    .child(ticket.to_string()),
+                                            )
+                                            .child(sep())
+                                        })
+                                        .child(div().min_w(px(0.)).truncate().child(commit.author.clone()))
+                                        .child(sep())
+                                        .child(div().flex_shrink_0().child(commit.relative_time.clone()))
+                                        .child(sep())
+                                        .child({
+                                            let copy_hash = commit.hash.clone();
+                                            div()
+                                                .id(("git-copy-sha", ix))
+                                                .flex_shrink_0()
+                                                .font_family(cx.theme().mono_font_family.clone())
+                                                .text_size(px(tokens::UI_XS - 0.5))
+                                                .text_color(if unpushed { cx.theme().primary } else { muted })
+                                                .hover(move |s| s.text_color(fg))
+                                                .child(commit.hash.clone())
+                                                .tooltip(move |window, cx| {
+                                                    gpui_kit::component::tooltip::Tooltip::new(if unpushed {
+                                                        "Not pushed yet \u{b7} click to copy"
+                                                    } else {
+                                                        "Click to copy"
+                                                    })
+                                                    .build(window, cx)
+                                                })
+                                                .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                                                    cx.stop_propagation();
+                                                })
+                                                .on_click(cx.listener(move |this, _e, _w, cx| {
+                                                    cx.stop_propagation();
+                                                    cx.write_to_clipboard(ClipboardItem::new_string(copy_hash.clone()));
+                                                    this.git.notice = Some(crate::git_panel::GitNotice {
+                                                        text: format!("Copied commit {copy_hash}"),
+                                                        is_error: false,
+                                                    });
+                                                    cx.notify();
+                                                }))
+                                        }),
+                                ),
+                        )
+                        .on_click(cx.listener(move |this, _e, _w, cx| {
+                            this.git_toggle_commit(hash.clone(), cx);
+                        })),
+                ),
             )
             .when(expanded, |el| {
                 let commit_hash = commit.hash.clone();
