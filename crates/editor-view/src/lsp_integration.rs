@@ -49,7 +49,8 @@ use lsp_types::{
     DidChangeTextDocumentParams, DidOpenTextDocumentParams, DocumentChangeOperation,
     DocumentChanges, DocumentFormattingParams, ExecuteCommandParams, FormattingOptions,
     GotoDefinitionParams, GotoDefinitionResponse, Hover, HoverContents, HoverParams,
-    InitializeParams, LanguageString, Location, MarkedString, OneOf, ParameterLabel, Position,
+    InitializeParams, InlayHint, InlayHintClientCapabilities, InlayHintLabel, InlayHintParams,
+    LanguageString, Location, MarkedString, OneOf, ParameterLabel, Position,
     PublishDiagnosticsParams, Range, ReferenceContext, ReferenceParams, RenameParams,
     SignatureHelp, SignatureHelpParams, SignatureInformation, TextDocumentClientCapabilities,
     TextDocumentContentChangeEvent, TextDocumentIdentifier, TextDocumentItem,
@@ -57,6 +58,8 @@ use lsp_types::{
     WorkspaceClientCapabilities, WorkspaceEdit, WorkspaceEditClientCapabilities, WorkspaceFolder,
 };
 
+use crate::code_actions;
+use crate::inlay_hints::InlayHintView;
 use crate::{EditorEvent, EditorView};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -197,6 +200,7 @@ fn shared_lsp_server(
                     code_action_literal_support: Some(CodeActionLiteralSupport::default()),
                     ..Default::default()
                 }),
+                inlay_hint: Some(InlayHintClientCapabilities::default()),
                 ..Default::default()
             }),
             ..Default::default()
@@ -325,10 +329,26 @@ pub(crate) struct LspState {
     pending_format_id: Option<i64>,
     pending_rename_id: Option<i64>,
     pending_code_action_id: Option<i64>,
+    /// What the in-flight `textDocument/codeAction` was for.
+    code_action_request: Option<CodeActionRequest>,
     pending_completion_id: Option<i64>,
     pending_references_id: Option<i64>,
     pending_signature_id: Option<i64>,
     pending_organize_id: Option<i64>,
+    pending_inlay_id: Option<i64>,
+    /// Buffer revision the in-flight inlay-hint request was sent for.
+    inlay_request_revision: u64,
+}
+
+/// The cursor position a code-action request was sent for, and what to do
+/// with the reply.
+struct CodeActionRequest {
+    revision: u64,
+    head: usize,
+    /// Open the menu when the reply arrives (`⌘.` / lightbulb click).
+    open_menu: bool,
+    /// Store the reply as the lightbulb's set for this position.
+    cache: bool,
 }
 
 impl EditorView {
@@ -389,10 +409,13 @@ impl EditorView {
             pending_format_id: None,
             pending_rename_id: None,
             pending_code_action_id: None,
+            code_action_request: None,
             pending_completion_id: None,
             pending_references_id: None,
             pending_signature_id: None,
             pending_organize_id: None,
+            pending_inlay_id: None,
+            inlay_request_revision: 0,
         });
     }
 
@@ -617,6 +640,99 @@ impl EditorView {
         }
     }
 
+    /// Schedule a debounced `textDocument/inlayHint` request when the text
+    /// changed since the last one, or when diagnostics reset the schedule.
+    /// Cheap to call on every `render`.
+    pub(crate) fn maybe_schedule_inlay_hints(&mut self, cx: &mut Context<Self>) {
+        let revision = self.buffer.revision();
+        // Above the syntax size limit `didChange` isn't sent, so the
+        // server's copy of the text (and any hints for it) would be stale.
+        if !self.inlay_hints_enabled
+            || self.inlay_scheduled_revision == Some(revision)
+            || !self.lsp.as_ref().is_some_and(|lsp| lsp.ready)
+            || !crate::should_parse_syntax(&self.buffer)
+        {
+            return;
+        }
+        self.inlay_scheduled_revision = Some(revision);
+        self.inlay_sequence += 1;
+        let sequence = self.inlay_sequence;
+        cx.spawn(async move |weak, cx| {
+            Timer::after(Duration::from_millis(300)).await;
+            let _ = weak.update(cx, |this, _cx| {
+                if this.inlay_sequence == sequence {
+                    this.request_inlay_hints();
+                }
+            });
+        })
+        .detach();
+    }
+
+    fn request_inlay_hints(&mut self) {
+        let revision = self.buffer.revision();
+        let end_line = self.buffer.line_count() as u32;
+        let Some(lsp) = &mut self.lsp else {
+            return;
+        };
+        if !lsp.ready {
+            return;
+        }
+        let params = InlayHintParams {
+            work_done_progress_params: Default::default(),
+            text_document: TextDocumentIdentifier { uri: lsp.uri.clone() },
+            range: Range {
+                start: Position { line: 0, character: 0 },
+                end: Position { line: end_line, character: 0 },
+            },
+        };
+        if let Ok(id) =
+            lsp.client.request("textDocument/inlayHint", serde_json::to_value(params).unwrap_or_default())
+        {
+            lsp.pending_inlay_id = Some(id);
+            lsp.inlay_request_revision = revision;
+        }
+    }
+
+    /// Turn inlay hints on or off (e.g. from settings). Off clears them.
+    pub fn set_inlay_hints_enabled(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        if self.inlay_hints_enabled == enabled {
+            return;
+        }
+        self.inlay_hints_enabled = enabled;
+        self.inlay_hints.clear();
+        self.inlay_scheduled_revision = None;
+        cx.notify();
+    }
+
+    /// A server hint as a buffer byte offset, using the same byte-column
+    /// approximation as the rest of this module.
+    fn inlay_hint_view(&self, hint: InlayHint) -> Option<InlayHintView> {
+        let line = hint.position.line as usize;
+        if line >= self.buffer.line_count() {
+            return None;
+        }
+        let line_text = self.buffer.line(line);
+        let display_len = line_text.trim_end_matches(['\n', '\r']).len();
+        let mut column = (hint.position.character as usize).min(display_len);
+        while !line_text.is_char_boundary(column) {
+            column -= 1;
+        }
+        let label = match hint.label {
+            InlayHintLabel::String(s) => s,
+            InlayHintLabel::LabelParts(parts) => parts.into_iter().map(|p| p.value).collect(),
+        };
+        let label = label.trim().to_string();
+        if label.is_empty() {
+            return None;
+        }
+        Some(InlayHintView {
+            offset: self.buffer.line_to_byte(line) + column,
+            label,
+            pad_left: hint.padding_left.unwrap_or(false),
+            pad_right: hint.padding_right.unwrap_or(false),
+        })
+    }
+
     /// Dismiss the signature-help popup (e.g. on `)` or Escape).
     pub(crate) fn clear_signature_help(&mut self, cx: &mut Context<Self>) {
         if self.signature_help.take().is_some() {
@@ -665,56 +781,119 @@ impl EditorView {
         }
     }
 
-    /// Send `textDocument/codeAction` for the cursor's current line,
-    /// including whatever diagnostics on that line the server already
-    /// told us about (so quick-fixes for a visible error/warning show
-    /// up), and fallback/merge with built-in Flutter Widget Assists (`Wrap with Column`,
-    /// `Wrap with Padding`, etc.) so `⌘.` and the gutter lightbulb always respond immediately.
+    /// `⌘.`, the gutter lightbulb, or the tab-bar button: open the code
+    /// action menu at the cursor. Instant when the actions were already
+    /// prefetched for this cursor position; otherwise the menu opens when
+    /// the server replies. Without a ready server, falls back to the
+    /// language adapter's built-in assists.
     pub fn request_code_actions(&mut self, cx: &mut Context<Self>) {
         let head = self.buffer.selections().primary().head;
-        let line = self.buffer.byte_to_line(head) as u32;
-        let column = (head - self.buffer.line_to_byte(line as usize)) as u32;
-        let position = Position { line, character: column };
-
+        let revision = self.buffer.revision();
+        if let Some(set) = self.code_actions.as_ref().filter(|s| s.revision == revision && s.head == head) {
+            let items = set.items.clone();
+            self.open_code_action_menu(items, cx);
+            return;
+        }
+        // A prefetch for this exact position is already in flight: just
+        // have its reply open the menu instead of asking twice.
         if let Some(lsp) = &mut self.lsp {
-            if lsp.ready {
-                let diagnostics: Vec<Diagnostic> = lsp
-                    .diagnostics
-                    .iter()
-                    .filter(|d| d.range.start.line == line)
-                    .cloned()
-                    .collect();
-
-                let params = CodeActionParams {
-                    text_document: TextDocumentIdentifier {
-                        uri: lsp.uri.clone(),
-                    },
-                    range: Range {
-                        start: position,
-                        end: position,
-                    },
-                    context: CodeActionContext {
-                        diagnostics,
-                        only: None,
-                        trigger_kind: None,
-                    },
-                    work_done_progress_params: Default::default(),
-                    partial_result_params: Default::default(),
-                };
-                if let Ok(id) = lsp.client.request(
-                    "textDocument/codeAction",
-                    serde_json::to_value(params).unwrap_or_default(),
-                ) {
-                    lsp.pending_code_action_id = Some(id);
-                    return;
+            if lsp.pending_code_action_id.is_some()
+                && lsp.code_action_request.as_ref().is_some_and(|r| r.revision == revision && r.head == head)
+            {
+                if let Some(request) = &mut lsp.code_action_request {
+                    request.open_menu = true;
                 }
+                return;
             }
         }
+        if self.send_code_action_request(true) {
+            return;
+        }
+        let line = self.buffer.byte_to_line(head) as u32;
+        let items = code_actions::organize(self.builtin_language_code_actions(line));
+        self.open_code_action_menu(items, cx);
+    }
 
-        // If LSP isn't ready yet, show the language adapter's built-in code actions immediately
-        let builtin = self.builtin_language_code_actions(line);
-        if !builtin.is_empty() {
-            cx.emit(EditorEvent::ShowCodeActions { actions: builtin });
+    /// Prefetch code actions ~250 ms after the cursor or text stops
+    /// changing, so the lightbulb reflects what's really available. Cheap
+    /// to call on every `render`.
+    pub(crate) fn maybe_prefetch_code_actions(&mut self, cx: &mut Context<Self>) {
+        let head = self.buffer.selections().primary().head;
+        let key = (self.buffer.revision(), head);
+        if self.code_action_scheduled == Some(key) {
+            return;
+        }
+        self.code_action_scheduled = Some(key);
+        // The cursor moved or the text changed: a menu for the old spot
+        // would apply its edits in the wrong place.
+        if self.code_action_menu.is_some() {
+            self.code_action_menu = None;
+        }
+        if !self.lsp.as_ref().is_some_and(|lsp| lsp.ready) {
+            return;
+        }
+        self.code_action_sequence += 1;
+        let sequence = self.code_action_sequence;
+        cx.spawn(async move |weak, cx| {
+            Timer::after(Duration::from_millis(250)).await;
+            let _ = weak.update(cx, |this, _cx| {
+                if this.code_action_sequence == sequence {
+                    this.send_code_action_request(false);
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// Send `textDocument/codeAction` for the cursor (or selection) with
+    /// the diagnostics it touches. When the cursor isn't on a diagnostic
+    /// but its line has one, ask about that diagnostic's range instead so
+    /// the line's quick fixes still show. Returns whether a request went out.
+    fn send_code_action_request(&mut self, open_menu: bool) -> bool {
+        let selection = self.buffer.selections().primary();
+        let head = selection.head;
+        let revision = self.buffer.revision();
+        let position = |buffer: &core_buffer::Buffer, offset: usize| {
+            let line = buffer.byte_to_line(offset);
+            Position { line: line as u32, character: (offset - buffer.line_to_byte(line)) as u32 }
+        };
+        let cursor = position(&self.buffer, head);
+        let mut range = Range { start: position(&self.buffer, selection.start()), end: position(&self.buffer, selection.end()) };
+        let Some(lsp) = &mut self.lsp else {
+            return false;
+        };
+        if !lsp.ready {
+            return false;
+        }
+        let touches = |d: &Diagnostic, r: &Range| {
+            (d.range.start.line, d.range.start.character) <= (r.end.line, r.end.character)
+                && (r.start.line, r.start.character) <= (d.range.end.line, d.range.end.character)
+        };
+        if selection.is_empty() && !lsp.diagnostics.iter().any(|d| touches(d, &range)) {
+            if let Some(d) = lsp
+                .diagnostics
+                .iter()
+                .filter(|d| d.range.start.line == cursor.line)
+                .min_by_key(|d| d.severity.unwrap_or(DiagnosticSeverity::HINT))
+            {
+                range = d.range;
+            }
+        }
+        let diagnostics: Vec<Diagnostic> = lsp.diagnostics.iter().filter(|d| touches(d, &range)).cloned().collect();
+        let params = CodeActionParams {
+            text_document: TextDocumentIdentifier { uri: lsp.uri.clone() },
+            range,
+            context: CodeActionContext { diagnostics, only: None, trigger_kind: None },
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+        };
+        match lsp.client.request("textDocument/codeAction", serde_json::to_value(params).unwrap_or_default()) {
+            Ok(id) => {
+                lsp.pending_code_action_id = Some(id);
+                lsp.code_action_request = Some(CodeActionRequest { revision, head, open_menu, cache: true });
+                true
+            }
+            Err(_) => false,
         }
     }
 
@@ -723,6 +902,7 @@ impl EditorView {
     /// back through the same picker as quick fixes.
     pub fn request_refactors(&mut self) -> bool {
         let selection = self.buffer.selections().primary();
+        let revision = self.buffer.revision();
         let position = |buffer: &core_buffer::Buffer, offset: usize| {
             let line = buffer.byte_to_line(offset);
             Position { line: line as u32, character: (offset - buffer.line_to_byte(line)) as u32 }
@@ -751,6 +931,8 @@ impl EditorView {
         match lsp.client.request("textDocument/codeAction", serde_json::to_value(params).unwrap_or_default()) {
             Ok(id) => {
                 lsp.pending_code_action_id = Some(id);
+                lsp.code_action_request =
+                    Some(CodeActionRequest { revision, head: selection.head, open_menu: true, cache: false });
                 true
             }
             Err(_) => false,
@@ -999,6 +1181,9 @@ impl EditorView {
                 if let Ok(parsed) = serde_json::from_value::<PublishDiagnosticsParams>(params) {
                     if parsed.uri.as_str() == lsp.uri.as_str() {
                         lsp.diagnostics = parsed.diagnostics;
+                        // Diagnostics mean the server finished analysing:
+                        // hints asked for earlier may have come back empty.
+                        self.inlay_scheduled_revision = None;
                         cx.notify();
                     }
                 }
@@ -1104,32 +1289,34 @@ impl EditorView {
             }
             ServerMessage::Response { id, result } if lsp.pending_code_action_id == Some(id) => {
                 lsp.pending_code_action_id = None;
+                let Some(request) = lsp.code_action_request.take() else {
+                    return;
+                };
                 let head = self.buffer.selections().primary().head;
-                let line = self.buffer.byte_to_line(head) as u32;
-                let mut actions: Vec<CodeActionOrCommand> = result
+                if request.revision != self.buffer.revision() || request.head != head {
+                    // Stale: its edits target text or a spot that moved.
+                    if request.open_menu {
+                        self.request_code_actions(cx);
+                    }
+                    return;
+                }
+                let actions: Vec<CodeActionOrCommand> = result
                     .ok()
                     .and_then(|v| serde_json::from_value::<Option<Vec<CodeActionOrCommand>>>(v).ok())
                     .flatten()
                     .unwrap_or_default();
-                let builtin = self.builtin_language_code_actions(line);
-                for b in builtin {
-                    let b_title = match &b {
-                        CodeActionOrCommand::Command(c) => &c.title,
-                        CodeActionOrCommand::CodeAction(a) => &a.title,
-                    };
-                    let already = actions.iter().any(|existing| {
-                        let t = match existing {
-                            CodeActionOrCommand::Command(c) => &c.title,
-                            CodeActionOrCommand::CodeAction(a) => &a.title,
-                        };
-                        t.eq_ignore_ascii_case(b_title)
+                let items = code_actions::organize(actions);
+                if request.cache {
+                    self.code_actions = Some(code_actions::CodeActionSet {
+                        revision: request.revision,
+                        head,
+                        line: self.buffer.byte_to_line(head),
+                        items: items.clone(),
                     });
-                    if !already {
-                        actions.push(b);
-                    }
+                    cx.notify();
                 }
-                if !actions.is_empty() {
-                    cx.emit(EditorEvent::ShowCodeActions { actions });
+                if request.open_menu {
+                    self.open_code_action_menu(items, cx);
                 }
             }
             ServerMessage::Response { id, result } if lsp.pending_completion_id == Some(id) => {
@@ -1140,6 +1327,26 @@ impl EditorView {
                 let entries = parse_completion_entries_from_value(value);
                 if !entries.is_empty() {
                     self.merge_lsp_completion_entries(entries, cx);
+                }
+            }
+            ServerMessage::Response { id, result } if lsp.pending_inlay_id == Some(id) => {
+                lsp.pending_inlay_id = None;
+                // Edited since the request went out: its positions are for
+                // old text, and `render` has already scheduled a new one.
+                if lsp.inlay_request_revision != self.buffer.revision() {
+                    return;
+                }
+                let hints = result
+                    .ok()
+                    .and_then(|v| serde_json::from_value::<Option<Vec<InlayHint>>>(v).ok())
+                    .flatten()
+                    .unwrap_or_default();
+                let mut views: Vec<InlayHintView> =
+                    hints.into_iter().filter_map(|h| self.inlay_hint_view(h)).collect();
+                views.sort_by_key(|h| h.offset);
+                if views != self.inlay_hints {
+                    self.inlay_hints = views;
+                    cx.notify();
                 }
             }
             // A request *from* the server (already replied to by `SharedLspServer`).

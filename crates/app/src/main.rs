@@ -525,7 +525,6 @@ pub struct DartIde {
     pub(crate) go_to_line_input: Entity<InputState>,
     pub(crate) rename_target: Option<(Entity<EditorView>, u32, u32)>,
     pub(crate) rename_input: Entity<InputState>,
-    pub(crate) code_actions: Option<(Entity<EditorView>, Vec<lsp_types::CodeActionOrCommand>)>,
     pub(crate) peek: Option<peek::PeekState>,
     pub(crate) peek_focus: FocusHandle,
     pub(crate) workspace_symbols: Vec<core_workspace::WorkspaceSymbol>,
@@ -742,7 +741,6 @@ impl DartIde {
             go_to_line_input,
             rename_target: None,
             rename_input,
-            code_actions: None,
             peek: None,
             peek_focus: cx.focus_handle(),
             workspace_symbols: Vec::new(),
@@ -928,10 +926,6 @@ impl DartIde {
                         state.set_value("", window, cx);
                         state.focus(window, cx);
                     });
-                    cx.notify();
-                }
-                EditorEvent::ShowCodeActions { actions } => {
-                    this.code_actions = Some((editor.clone(), actions.clone()));
                     cx.notify();
                 }
                 EditorEvent::ShowPeek { title, locations } => {
@@ -1317,9 +1311,6 @@ impl Render for DartIde {
             })
             .when_some(self.render_rename_prompt(&view, cx), |el, prompt| {
                 el.child(deferred(prompt).with_priority(100))
-            })
-            .when_some(self.render_code_actions(&view, cx), |el, picker| {
-                el.child(deferred(picker).with_priority(100))
             })
             .when_some(self.render_peek(cx), |el, peek| {
                 el.child(deferred(peek).with_priority(100))

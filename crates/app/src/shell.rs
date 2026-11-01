@@ -27,6 +27,35 @@ fn keycap(label: &'static str, cx: &App) -> Div {
         .child(label)
 }
 
+/// A small on/off chip inside the find input (match case, whole word).
+fn search_toggle(
+    id: &'static str,
+    label: &'static str,
+    tooltip: &'static str,
+    on: bool,
+    toggle: impl Fn(&mut App) + 'static,
+    cx: &App,
+) -> Stateful<Div> {
+    let fg = cx.theme().foreground;
+    h_flex()
+        .id(id)
+        .h(px(18.))
+        .px(px(4.))
+        .items_center()
+        .rounded(px(tokens::RADIUS_SM))
+        .border_1()
+        .border_color(if on { cx.theme().primary.opacity(0.85) } else { transparent_black() })
+        .when(on, |el| el.bg(cx.theme().primary.opacity(0.22)))
+        .cursor_pointer()
+        .hover(move |s| s.bg(rgba(0xffffff0c)).text_color(fg))
+        .font_family("SF Mono")
+        .text_size(px(tokens::UI_XS))
+        .text_color(if on { fg } else { cx.theme().muted_foreground })
+        .child(label)
+        .tooltip(move |window, cx| gpui_kit::component::tooltip::Tooltip::new(tooltip).build(window, cx))
+        .on_click(move |_e, _w, cx| toggle(cx))
+}
+
 impl DartIde {
     fn render_find_bar(
         &self,
@@ -38,6 +67,7 @@ impl DartIde {
         }
         let editor = self.active_editor()?.clone();
         let (current_match, total_matches) = editor.read(cx).search_status();
+        let (case_sensitive, whole_word) = editor.read(cx).search_options();
         let query_empty = self.find_input.read(cx).value().is_empty();
         let muted = cx.theme().muted_foreground;
         let fg = cx.theme().foreground;
@@ -65,8 +95,18 @@ impl DartIde {
                     let editor = editor.clone();
                     move |event, window, cx| {
                         let key = event.keystroke.key.as_str();
+                        let mods = &event.keystroke.modifiers;
                         if key == "escape" {
                             view.update(cx, |this, cx| this.close_find(window, cx));
+                        } else if mods.platform && mods.alt && (key == "c" || key == "w") {
+                            editor.update(cx, |ed, cx| {
+                                let (case, word) = ed.search_options();
+                                if key == "c" {
+                                    ed.set_search_options(!case, word, cx);
+                                } else {
+                                    ed.set_search_options(case, !word, cx);
+                                }
+                            });
                         } else if key == "enter" {
                             let shift = event.keystroke.modifiers.shift;
                             editor.update(cx, |ed, cx| {
@@ -87,7 +127,7 @@ impl DartIde {
                         // Find input
                         .child(
                             h_flex()
-                                .w(px(220.))
+                                .w(px(270.))
                                 .h(px(24.))
                                 .px(px(tokens::SPACE_3))
                                 .gap(px(tokens::SPACE_2))
@@ -110,7 +150,39 @@ impl DartIde {
                                                 .appearance(false)
                                                 .xsmall(),
                                         ),
-                                ),
+                                )
+                                .child(search_toggle(
+                                    "find-case-sensitive",
+                                    "Aa",
+                                    "Match Case (⌥⌘C)",
+                                    case_sensitive,
+                                    {
+                                        let editor = editor.clone();
+                                        move |cx: &mut App| {
+                                            editor.update(cx, |ed, cx| {
+                                                let (case, word) = ed.search_options();
+                                                ed.set_search_options(!case, word, cx);
+                                            })
+                                        }
+                                    },
+                                    cx,
+                                ))
+                                .child(search_toggle(
+                                    "find-whole-word",
+                                    "ab",
+                                    "Match Whole Word (⌥⌘W)",
+                                    whole_word,
+                                    {
+                                        let editor = editor.clone();
+                                        move |cx: &mut App| {
+                                            editor.update(cx, |ed, cx| {
+                                                let (case, word) = ed.search_options();
+                                                ed.set_search_options(case, !word, cx);
+                                            })
+                                        }
+                                    },
+                                    cx,
+                                )),
                         )
                         // Replace input
                         .child(

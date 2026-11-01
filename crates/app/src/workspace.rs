@@ -102,7 +102,6 @@ impl DartIde {
         self.find_open = false;
         self.go_to_line_open = false;
         self.rename_target = None;
-        self.code_actions = None;
         self.peek = None;
 
         // Kill any running terminal child processes from the old project and

@@ -22,7 +22,9 @@
 //!   files.
 
 pub mod language;
+mod code_actions;
 mod conflicts;
+mod inlay_hints;
 mod lsp_integration;
 mod multicursor;
 mod snippet;
@@ -61,6 +63,10 @@ const GUTTER_FONT_SIZE: f32 = 11.5;
 /// Enough breathing room to read as an editor without the file feeling
 /// sparse (the first pass tried 26px, which did).
 const LINE_HEIGHT: f32 = 22.;
+/// Gap kept between an inlay hint pill and neighbouring text when the
+/// server asks for padding, and the pill's own inner horizontal padding.
+const INLAY_PAD: Pixels = px(4.);
+const INLAY_INNER: Pixels = px(3.);
 /// `tokens::LINE_ACTIVE` in the app crate — duplicated here because this
 /// crate deliberately has no dependency on `app`.
 const ACTIVE_LINE_BG: u32 = 0x15161a;
@@ -90,7 +96,6 @@ pub struct TestCodeLensTemplate {
 pub enum EditorEvent {
     OpenAt { path: PathBuf, line: u32, column: u32 },
     RequestRename { line: u32, column: u32 },
-    ShowCodeActions { actions: Vec<lsp_types::CodeActionOrCommand> },
     /// A set of locations to peek at (references, or a definition's targets).
     ShowPeek { title: String, locations: Vec<lsp_types::Location> },
     ExternalFileEdits { path: PathBuf, edits: Vec<lsp_types::TextEdit> },
@@ -218,6 +223,9 @@ pub struct EditorView {
     search_query: String,
     search_matches: Vec<Range<usize>>,
     active_search_match: usize,
+    /// Find-bar toggles: match case exactly / only match whole words.
+    search_case_sensitive: bool,
+    search_whole_word: bool,
     /// Active autocomplete candidates and selected row index.
     completions: Vec<CompletionEntry>,
     completion_selected: usize,
@@ -237,6 +245,24 @@ pub struct EditorView {
     visible_lines: Vec<usize>,
     /// Whether a `save()` triggered an LSP format request that should re-flush once applied.
     pub(crate) save_after_format: bool,
+    /// Language-server inlay hints, sorted by offset and shifted on every
+    /// edit so they stay put while a fresh request is debounced.
+    pub(crate) inlay_hints: Vec<inlay_hints::InlayHintView>,
+    /// Bumped for each scheduled inlay-hint request; a debounced request
+    /// only fires if no newer one was scheduled meanwhile.
+    pub(crate) inlay_sequence: u64,
+    /// Buffer revision the last inlay-hint request was scheduled for.
+    pub(crate) inlay_scheduled_revision: Option<u64>,
+    /// User setting; when off no requests are sent and nothing is drawn.
+    inlay_hints_enabled: bool,
+    /// Code actions prefetched for the cursor; drives the gutter lightbulb.
+    code_actions: Option<code_actions::CodeActionSet>,
+    /// The open code-action menu, anchored under the cursor.
+    code_action_menu: Option<code_actions::CodeActionMenu>,
+    /// Debounce token for code-action prefetches.
+    code_action_sequence: u64,
+    /// `(revision, cursor head)` the last prefetch was scheduled for.
+    code_action_scheduled: Option<(u64, usize)>,
 }
 
 impl EditorView {
@@ -289,6 +315,8 @@ impl EditorView {
             search_query: String::new(),
             search_matches: Vec::new(),
             active_search_match: 0,
+            search_case_sensitive: false,
+            search_whole_word: false,
             completions: Vec::new(),
             completion_selected: 0,
             closing_labels,
@@ -299,6 +327,14 @@ impl EditorView {
             folded_starts: std::collections::HashSet::new(),
             visible_lines: Vec::new(),
             save_after_format: false,
+            inlay_hints: Vec::new(),
+            inlay_sequence: 0,
+            inlay_scheduled_revision: None,
+            inlay_hints_enabled: true,
+            code_actions: None,
+            code_action_menu: None,
+            code_action_sequence: 0,
+            code_action_scheduled: None,
         };
         this.maybe_start_lsp(cx);
         this.refresh_line_changes(cx);
@@ -347,10 +383,19 @@ impl EditorView {
         }
         if should_parse_syntax(&self.buffer) {
             let text = self.buffer.text();
+            let edit = diff_as_edit(&self.synced_text, &text);
+            if let Some(edit) = &edit {
+                inlay_hints::shift_inlay_hints(
+                    &mut self.inlay_hints,
+                    edit.start_byte,
+                    edit.old_end_byte,
+                    edit.new_end_byte,
+                );
+            }
             let is_dart = self.language.language_id() == "dart" || self.buffer.path().is_none();
             if is_dart {
                 if let Some(tree) = &mut self.syntax_tree {
-                    if let Some(edit) = diff_as_edit(&self.synced_text, &text) {
+                    if let Some(edit) = edit {
                         tree.reparse(&text, edit);
                     }
                 } else {
@@ -373,6 +418,7 @@ impl EditorView {
             self.closing_labels.clear();
             self.fold_ranges.clear();
             self.synced_text.clear();
+            self.inlay_hints.clear();
         }
         if !self.folded_starts.is_empty() {
             self.rebuild_visible_lines();
@@ -529,6 +575,10 @@ impl EditorView {
         self.bracket_pair_cache = None;
         self.indent_width = self.buffer.detect_indent_width();
         self.line_changes.clear();
+        self.inlay_hints.clear();
+        self.inlay_scheduled_revision = None;
+        self.code_actions = None;
+        self.code_action_menu = None;
         self.lsp = None;
         self.maybe_start_lsp(cx);
         self.refresh_line_changes(cx);
@@ -661,6 +711,28 @@ impl EditorView {
         }
         self.search_query = query.to_string();
         self.recompute_search_matches();
+        self.jump_to_nearest_search_match();
+        cx.notify();
+    }
+
+    /// `(case_sensitive, whole_word)` for the find bar's toggle buttons.
+    pub fn search_options(&self) -> (bool, bool) {
+        (self.search_case_sensitive, self.search_whole_word)
+    }
+
+    pub fn set_search_options(&mut self, case_sensitive: bool, whole_word: bool, cx: &mut Context<Self>) {
+        if (self.search_case_sensitive, self.search_whole_word) == (case_sensitive, whole_word) {
+            return;
+        }
+        self.search_case_sensitive = case_sensitive;
+        self.search_whole_word = whole_word;
+        self.recompute_search_matches();
+        self.jump_to_nearest_search_match();
+        cx.notify();
+    }
+
+    /// Select the first match at or after the cursor and scroll to it.
+    fn jump_to_nearest_search_match(&mut self) {
         if !self.search_matches.is_empty() {
             let head = self.buffer.selections().primary().start();
             self.active_search_match = self
@@ -676,7 +748,6 @@ impl EditorView {
             self.scroll_handle
                 .scroll_to_item(line, ScrollStrategy::Center);
         }
-        cx.notify();
     }
 
     pub fn clear_search(&mut self, cx: &mut Context<Self>) {
@@ -875,28 +946,12 @@ impl EditorView {
             return;
         }
         let text = self.buffer.text();
-        let needle = self.search_query.to_lowercase();
-        let needle_len = needle.len();
-        if needle_len == 0 {
-            return;
-        }
-        // ASCII folding keeps byte offsets identical between `hay` and
-        // `text`; full Unicode `to_lowercase` can change lengths (e.g. `İ`)
-        // and shift every later match off its real position.
-        let needle = needle.to_ascii_lowercase();
-        let hay = text.to_ascii_lowercase();
-        let mut from = 0;
-        while let Some(pos) = hay[from..].find(&needle) {
-            let start = from + pos;
-            let end = start + needle_len;
-            if text.is_char_boundary(start) && text.is_char_boundary(end) {
-                self.search_matches.push(start..end);
-            }
-            from = start + needle_len.max(1);
-            if from >= hay.len() {
-                break;
-            }
-        }
+        self.search_matches = find_matches(
+            &text,
+            &self.search_query,
+            self.search_case_sensitive,
+            self.search_whole_word,
+        );
         if self.active_search_match >= self.search_matches.len() {
             self.active_search_match = 0;
         }
@@ -1622,6 +1677,38 @@ impl EditorView {
             return;
         }
 
+        // Navigate / apply / dismiss the code-action menu. Any other key
+        // closes it and is handled normally.
+        if let Some(menu) = &mut self.code_action_menu {
+            let count = menu.items.len();
+            match keystroke.key.as_str() {
+                "down" if count > 0 => {
+                    menu.selected = (menu.selected + 1) % count;
+                    cx.notify();
+                    return;
+                }
+                "up" if count > 0 => {
+                    menu.selected = (menu.selected + count - 1) % count;
+                    cx.notify();
+                    return;
+                }
+                "enter" | "tab" if count > 0 => {
+                    let ix = menu.selected;
+                    self.apply_code_action_from_menu(ix, cx);
+                    return;
+                }
+                "escape" => {
+                    self.code_action_menu = None;
+                    cx.notify();
+                    return;
+                }
+                _ => {
+                    self.code_action_menu = None;
+                    cx.notify();
+                }
+            }
+        }
+
         // Navigate / accept / dismiss active autocomplete popup
         if !self.completions.is_empty() && !primary_mod {
             match keystroke.key.as_str() {
@@ -1892,6 +1979,13 @@ impl EditorView {
             _ => cx.theme().muted_foreground.opacity(0.45),
         };
         let line_1 = (index + 1) as u32;
+        let lightbulb: Option<bool> = self
+            .code_actions
+            .as_ref()
+            .filter(|set| {
+                set.line == index && set.revision == self.buffer.revision() && !set.items.is_empty()
+            })
+            .map(|set| set.has_quick_fix());
         let has_breakpoint = self.breakpoints.contains(&line_1);
         let is_debug_line = self.active_debug_line == Some(line_1);
         let mono_family = cx.theme().mono_font_family.clone();
@@ -1944,8 +2038,14 @@ impl EditorView {
                     .items_center()
                     .justify_center()
                     .gap(px(2.))
-                    .when(is_active_line, |el| {
+                    .when_some(lightbulb.filter(|_| is_active_line), |el, has_fix| {
                         let view = cx.entity();
+                        // Amber when a fix is on offer, quiet for refactors only.
+                        let color = if has_fix {
+                            cx.theme().warning
+                        } else {
+                            cx.theme().muted_foreground.opacity(0.7)
+                        };
                         el.child(
                             div()
                                 .cursor_pointer()
@@ -1954,7 +2054,7 @@ impl EditorView {
                                         gpui_kit::assets::IconName::Lightbulb,
                                     )
                                     .with_size(px(11.))
-                                    .text_color(cx.theme().warning),
+                                    .text_color(color),
                                 )
                                 .on_mouse_down(MouseButton::Left, move |_event, window, cx| {
                                     cx.stop_propagation();
@@ -2177,6 +2277,17 @@ impl EditorView {
         };
         let diag_font = font(mono_family.clone());
         let closing_color: Hsla = cx.theme().muted_foreground.opacity(0.42);
+        // Inlay hints on this line as `(column, label, pad_left, pad_right)`.
+        let line_inlays: Vec<(usize, SharedString, bool, bool)> = if self.inlay_hints_enabled {
+            inlay_hints::hints_on_line(&self.inlay_hints, line_start..line_end)
+                .map(|(col, h)| (col, SharedString::from(h.label.clone()), h.pad_left, h.pad_right))
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let inlay_font = font(mono_family.clone());
+        let inlay_color: Hsla = cx.theme().muted_foreground.opacity(0.8);
+        let inlay_bg: Hsla = cx.theme().muted_foreground.opacity(0.12);
         let view = cx.entity();
         let line_canvas = canvas(
             move |bounds, window, _cx| {
@@ -2186,6 +2297,35 @@ impl EditorView {
                     &text_runs,
                     None,
                 );
+                // Each hint is shaped on its own; `inlays` records how far
+                // it pushes the text after it.
+                let shaped_inlays: Vec<(usize, ShapedLine, Pixels)> = line_inlays
+                    .iter()
+                    .map(|(col, label, pad_left, _)| {
+                        let run = TextRun {
+                            len: label.len(),
+                            font: inlay_font.clone(),
+                            color: inlay_color,
+                            background_color: None,
+                            underline: None,
+                            strikethrough: None,
+                        };
+                        let shaped_hint =
+                            window.text_system().shape_line(label.clone(), px(LINE_FONT_SIZE - 1.), &[run], None);
+                        let left = if *pad_left { INLAY_PAD } else { px(0.) };
+                        (*col, shaped_hint, left)
+                    })
+                    .collect();
+                let inlays = inlay_hints::InlayLayout {
+                    items: shaped_inlays
+                        .iter()
+                        .zip(&line_inlays)
+                        .map(|((col, shaped_hint, left), (_, _, _, pad_right))| {
+                            let right = if *pad_right { INLAY_PAD } else { px(0.) };
+                            (*col, *left + shaped_hint.width + INLAY_INNER * 2. + right)
+                        })
+                        .collect(),
+                };
                 let shaped_closing = closing_label_shared.as_ref().map(|lbl| {
                     let run = TextRun {
                         len: lbl.len(),
@@ -2223,12 +2363,18 @@ impl EditorView {
                             (*diag_color, col_range.clone(), shaped_lbl)
                         });
                 let hitbox = window.insert_hitbox(bounds, HitboxBehavior::Normal);
-                (hitbox, shaped, shaped_closing, shaped_diag)
+                (hitbox, shaped, shaped_closing, shaped_diag, inlays, shaped_inlays)
             },
-            move |bounds, (hitbox, shaped, shaped_closing, shaped_diag), window, cx| {
+            move |bounds, (hitbox, shaped, shaped_closing, shaped_diag, inlays, shaped_inlays), window, cx| {
+                // Buffer column -> x, past any inlay hints in front of it:
+                // `xs` for a character's left edge (caret, range start),
+                // `xe` for a range end, which stops before a hint there.
+                let xs = |col: usize| shaped.x_for_index(col.min(line_len)) + inlays.shift(col, true);
+                let xe = |col: usize| shaped.x_for_index(col.min(line_len)) + inlays.shift(col, false);
+                let text_w = shaped.width + inlays.total();
                 // 1. Faint vertical indent guides at exact shaped column offsets
                 for column in (indent_width..leading_spaces).step_by(indent_width).take(16) {
-                    let x = shaped.x_for_index(column.min(line_len));
+                    let x = xs(column);
                     let guide_rect = Bounds::new(
                         point(bounds.origin.x + x, bounds.origin.y + px(3.)),
                         size(px(1.), bounds.size.height - px(6.)),
@@ -2240,8 +2386,8 @@ impl EditorView {
                 let box_h = px(LINE_FONT_SIZE + 4.);
                 let box_y = bounds.origin.y + (bounds.size.height - box_h) * 0.5;
                 for range in &local_word_matches {
-                    let x1 = shaped.x_for_index(range.start.min(line_len));
-                    let x2 = shaped.x_for_index(range.end.min(line_len));
+                    let x1 = xs(range.start);
+                    let x2 = xe(range.end);
                     if x2 > x1 {
                         let rect = Bounds::new(
                             point(bounds.origin.x + x1, box_y),
@@ -2251,8 +2397,8 @@ impl EditorView {
                     }
                 }
                 for (range, is_active_match) in &local_search_matches {
-                    let x1 = shaped.x_for_index(range.start.min(line_len));
-                    let x2 = shaped.x_for_index(range.end.min(line_len));
+                    let x1 = xs(range.start);
+                    let x2 = xe(range.end);
                     if x2 > x1 {
                         let rect = Bounds::new(
                             point(bounds.origin.x + x1, box_y),
@@ -2275,8 +2421,8 @@ impl EditorView {
 
                 // 3a. Secondary (multi-cursor) selections
                 for sel in &extra_sels {
-                    let x1 = shaped.x_for_index(sel.start.min(line_len));
-                    let x2 = shaped.x_for_index(sel.end.min(line_len));
+                    let x1 = xs(sel.start);
+                    let x2 = xe(sel.end);
                     if x2 > x1 {
                         let rect = Bounds::new(
                             point(bounds.origin.x + x1, bounds.origin.y + px(1.)),
@@ -2288,8 +2434,8 @@ impl EditorView {
 
                 // 3. Selection highlight
                 if let Some(sel) = &local_selection {
-                    let x1 = shaped.x_for_index(sel.start.min(line_len));
-                    let x2 = shaped.x_for_index(sel.end.min(line_len));
+                    let x1 = xs(sel.start);
+                    let x2 = xe(sel.end);
                     if x2 > x1 {
                         let rect = Bounds::new(
                             point(bounds.origin.x + x1, bounds.origin.y + px(1.)),
@@ -2303,10 +2449,10 @@ impl EditorView {
                 if let Some((diag_color, col_range, _)) = &shaped_diag {
                     let start_idx = col_range.start.clamp(leading_spaces, line_len);
                     let end_idx = col_range.end.clamp(start_idx, line_len);
-                    let x1 = shaped.x_for_index(start_idx);
-                    let mut x2 = shaped.x_for_index(end_idx);
+                    let x1 = xs(start_idx);
+                    let mut x2 = xe(end_idx);
                     if x2 <= x1 {
-                        x2 = (x1 + px(14.)).min(shaped.width.max(x1 + px(6.)));
+                        x2 = (x1 + px(14.)).min(text_w.max(x1 + px(6.)));
                     }
                     let token_bg = Bounds::new(
                         point(bounds.origin.x + x1, box_y),
@@ -2324,15 +2470,74 @@ impl EditorView {
 
                 // 4. Paint syntax-highlighted text & optional closing label (`// WidgetName`)
                 let text_y = bounds.origin.y + (bounds.size.height - px(LINE_HEIGHT)) * 0.5;
-                let _ = shaped.paint(
-                    point(bounds.origin.x, text_y),
-                    px(LINE_HEIGHT),
-                    TextAlign::Left,
-                    None,
-                    window,
-                    cx,
-                );
-                let mut after_text_x = shaped.width;
+                if shaped_inlays.is_empty() {
+                    let _ = shaped.paint(
+                        point(bounds.origin.x, text_y),
+                        px(LINE_HEIGHT),
+                        TextAlign::Left,
+                        None,
+                        window,
+                        cx,
+                    );
+                } else {
+                    // Paint the one shaped line once per gap between hints,
+                    // each copy shifted right and clipped to its segment.
+                    let mut cuts: Vec<usize> = shaped_inlays.iter().map(|(col, _, _)| *col).collect();
+                    cuts.dedup();
+                    cuts.push(line_len);
+                    let mut seg_start = 0usize;
+                    for (i, &seg_end) in cuts.iter().enumerate() {
+                        if seg_end > seg_start {
+                            let shift = inlays.shift(seg_start, true);
+                            let left = if seg_start == 0 {
+                                px(0.)
+                            } else {
+                                shaped.x_for_index(seg_start) + shift
+                            };
+                            let right = if i + 1 == cuts.len() {
+                                bounds.size.width.max(text_w)
+                            } else {
+                                shaped.x_for_index(seg_end) + shift
+                            };
+                            let clip = Bounds::new(
+                                point(bounds.origin.x + left, bounds.origin.y),
+                                size(right - left, bounds.size.height),
+                            );
+                            window.with_content_mask(Some(ContentMask { bounds: clip }), |window| {
+                                let _ = shaped.paint(
+                                    point(bounds.origin.x + shift, text_y),
+                                    px(LINE_HEIGHT),
+                                    TextAlign::Left,
+                                    None,
+                                    window,
+                                    cx,
+                                );
+                            });
+                        }
+                        seg_start = seg_end;
+                    }
+                    for (i, (col, shaped_hint, left_pad)) in shaped_inlays.iter().enumerate() {
+                        // Sum by index, not column, so hints sharing a column sit side by side.
+                        let before: Pixels = inlays.items[..i].iter().map(|(_, advance)| *advance).sum();
+                        let x = bounds.origin.x + shaped.x_for_index(*col) + before + *left_pad;
+                        let w = shaped_hint.width + INLAY_INNER * 2.;
+                        let box_h = px(LINE_FONT_SIZE + 2.);
+                        let pill = Bounds::new(
+                            point(x, bounds.origin.y + (bounds.size.height - box_h) * 0.5),
+                            size(w, box_h),
+                        );
+                        window.paint_quad(fill(pill, inlay_bg).corner_radii(px(3.)));
+                        let _ = shaped_hint.paint(
+                            point(x + INLAY_INNER, text_y),
+                            px(LINE_HEIGHT),
+                            TextAlign::Left,
+                            None,
+                            window,
+                            cx,
+                        );
+                    }
+                }
+                let mut after_text_x = text_w;
                 if let Some(closing) = &shaped_closing {
                     let closing_x = after_text_x + px(12.);
                     let _ = closing.paint(
@@ -2379,7 +2584,7 @@ impl EditorView {
 
                 // 5. Paint caret on top of text at the exact shaped glyph boundary
                 if let Some(col) = cursor_col {
-                    let x = shaped.x_for_index(col.min(line_len));
+                    let x = xs(col);
                     let caret_h = px(LINE_FONT_SIZE + 3.);
                     let y = bounds.origin.y + (bounds.size.height - caret_h) * 0.5;
                     let caret_rect =
@@ -2388,7 +2593,7 @@ impl EditorView {
                 }
 
                 for col in &extra_carets {
-                    let x = shaped.x_for_index((*col).min(line_len));
+                    let x = xs(*col);
                     let caret_h = px(LINE_FONT_SIZE + 3.);
                     let y = bounds.origin.y + (bounds.size.height - caret_h) * 0.5;
                     let caret_rect =
@@ -2399,6 +2604,7 @@ impl EditorView {
                 // 6. Mouse interactions using the exact same `shaped` line, gated by `hitbox.is_hovered(window)`
                 // so any `.occlude()` modal, popover, or menu above the editor blocks background clicks/hovers.
                 let down_shaped = shaped.clone();
+                let down_inlays = inlays.clone();
                 let down_view = view.clone();
                 let down_hitbox = hitbox.clone();
                 window.on_mouse_event(move |event: &MouseDownEvent, phase, window, cx| {
@@ -2410,7 +2616,11 @@ impl EditorView {
                         return;
                     }
                     let rel_x = (event.position.x - bounds.origin.x).max(px(0.));
-                    let column = down_shaped.closest_index_for_x(rel_x);
+                    let column = down_inlays.column_for_x(
+                        rel_x,
+                        |i| down_shaped.x_for_index(i),
+                        |x| down_shaped.closest_index_for_x(x),
+                    );
                     let go_to_definition = event.modifiers.platform || event.modifiers.control;
                     let click_count = event.click_count;
                     down_view.update(cx, |this, cx| {
@@ -2432,6 +2642,7 @@ impl EditorView {
                 });
 
                 let move_shaped = shaped.clone();
+                let move_inlays = inlays.clone();
                 let move_view = view.clone();
                 let move_hitbox = hitbox.clone();
                 window.on_mouse_event(move |event: &MouseMoveEvent, phase, window, cx| {
@@ -2443,13 +2654,18 @@ impl EditorView {
                         return;
                     }
                     let rel_x = (event.position.x - bounds.origin.x).max(px(0.));
-                    let column = move_shaped.closest_index_for_x(rel_x);
+                    let column = move_inlays.column_for_x(
+                        rel_x,
+                        |i| move_shaped.x_for_index(i),
+                        |x| move_shaped.closest_index_for_x(x),
+                    );
                     move_view.update(cx, |this, cx| {
                         this.extend_to(line_start + column, cx);
                     });
                 });
 
                 let hover_shaped = shaped.clone();
+                let hover_inlays = inlays.clone();
                 let hover_view = view;
                 let hover_hitbox = hitbox;
                 window.on_mouse_event(move |event: &MouseMoveEvent, phase, window, cx| {
@@ -2461,7 +2677,11 @@ impl EditorView {
                         return;
                     }
                     let rel_x = (event.position.x - bounds.origin.x).max(px(0.));
-                    let column = hover_shaped.closest_index_for_x(rel_x);
+                    let column = hover_inlays.column_for_x(
+                        rel_x,
+                        |i| hover_shaped.x_for_index(i),
+                        |x| hover_shaped.closest_index_for_x(x),
+                    );
                     hover_view.update(cx, |this, cx| {
                         this.note_hover_position(index, column, cx);
                     });
@@ -2592,6 +2812,26 @@ impl EditorView {
                                         .child(popup),
                                 )
                                 .with_priority(20),
+                            )
+                        },
+                    )
+                    .when(
+                        is_active_line && self.code_action_menu.is_some(),
+                        |el| {
+                            let col = cursor_col.unwrap_or(0);
+                            let left_offset = px((col as f32 * 7.5).min(360.));
+                            let menu = self.render_code_action_menu(cx);
+                            el.child(
+                                deferred(
+                                    div()
+                                        .occlude()
+                                        .absolute()
+                                        .top(px(LINE_HEIGHT + 2.))
+                                        .left(left_offset)
+                                        .w(px(360.))
+                                        .child(menu),
+                                )
+                                .with_priority(21),
                             )
                         },
                     )
@@ -2838,6 +3078,164 @@ impl EditorView {
         out
     }
 
+    /// Show the code-action menu under the cursor (empty list shows a
+    /// short "nothing here" note rather than silently doing nothing).
+    pub(crate) fn open_code_action_menu(&mut self, items: Vec<code_actions::ActionItem>, cx: &mut Context<Self>) {
+        self.dismiss_completions(cx);
+        self.clear_hover(cx);
+        self.code_action_menu = Some(code_actions::CodeActionMenu { items, selected: 0 });
+        cx.notify();
+    }
+
+    fn apply_code_action_from_menu(&mut self, ix: usize, cx: &mut Context<Self>) {
+        let Some(menu) = self.code_action_menu.take() else {
+            return;
+        };
+        if let Some(item) = menu.items.into_iter().nth(ix) {
+            self.apply_code_action(item.action, cx);
+        }
+        cx.notify();
+    }
+
+    fn render_code_action_menu(&self, cx: &mut Context<Self>) -> Div {
+        let view = cx.entity();
+        let fg = cx.theme().popover_foreground;
+        let muted = cx.theme().muted_foreground;
+        let border = cx.theme().border;
+        let primary = cx.theme().primary;
+        let ui_family = cx.theme().font_family.clone();
+        let Some(menu) = &self.code_action_menu else {
+            return div();
+        };
+
+        let mut rows: Vec<AnyElement> = Vec::new();
+        if menu.items.is_empty() {
+            rows.push(
+                div()
+                    .px_2()
+                    .py_1()
+                    .text_size(px(12.))
+                    .text_color(muted)
+                    .child("No code actions here")
+                    .into_any_element(),
+            );
+        }
+        let mut last_group = None;
+        for (ix, item) in menu.items.iter().enumerate() {
+            if last_group != Some(item.group) {
+                last_group = Some(item.group);
+                rows.push(
+                    div()
+                        .px_2()
+                        .pt(px(if ix == 0 { 2. } else { 6. }))
+                        .pb(px(2.))
+                        .text_size(px(10.))
+                        .text_color(muted.opacity(0.8))
+                        .child(item.group.label().to_uppercase())
+                        .into_any_element(),
+                );
+            }
+            let is_sel = ix == menu.selected;
+            let icon_color: Hsla = match item.group {
+                code_actions::ActionGroup::QuickFix => cx.theme().warning,
+                code_actions::ActionGroup::Refactor => cx.theme().info,
+                _ => muted,
+            };
+            let view_click = view.clone();
+            let view_hover = view.clone();
+            rows.push(
+                h_flex()
+                    .id(("code-action-item", ix))
+                    .relative()
+                    .w_full()
+                    .h(px(24.))
+                    .px_2()
+                    .gap_2()
+                    .items_center()
+                    .rounded(px(5.))
+                    .when(is_sel, |el| {
+                        el.bg(primary.opacity(0.14)).child(
+                            div()
+                                .absolute()
+                                .left(px(1.5))
+                                .top(px(5.))
+                                .bottom(px(5.))
+                                .w(px(2.))
+                                .rounded(px(1.))
+                                .bg(primary),
+                        )
+                    })
+                    .cursor_pointer()
+                    .on_hover(move |hovered, _window, cx| {
+                        if *hovered {
+                            view_hover.update(cx, |this, cx| {
+                                if let Some(menu) = &mut this.code_action_menu {
+                                    if menu.selected != ix {
+                                        menu.selected = ix;
+                                        cx.notify();
+                                    }
+                                }
+                            });
+                        }
+                    })
+                    .on_mouse_down(MouseButton::Left, move |_event, _window, cx| {
+                        cx.stop_propagation();
+                        view_click.update(cx, |this, cx| this.apply_code_action_from_menu(ix, cx));
+                    })
+                    .child(
+                        gpui_kit::component::Icon::new(match item.group {
+                            code_actions::ActionGroup::QuickFix => gpui_kit::assets::IconName::Lightbulb,
+                            _ => gpui_kit::assets::IconName::ChevronRight,
+                        })
+                        .with_size(px(11.))
+                        .text_color(icon_color),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.))
+                            .truncate()
+                            .text_size(px(12.5))
+                            .text_color(fg)
+                            .child(item.title.clone()),
+                    )
+                    .when(item.preferred, |el| {
+                        el.child(
+                            div()
+                                .text_size(px(10.))
+                                .text_color(cx.theme().warning.opacity(0.9))
+                                .child("preferred"),
+                        )
+                    })
+                    .into_any_element(),
+            );
+        }
+
+        v_flex()
+            .w_full()
+            .max_h(px(320.))
+            .p_1()
+            .rounded(px(8.))
+            .bg(cx.theme().popover)
+            .border_1()
+            .border_color(border)
+            .shadow_xl()
+            .font_family(ui_family)
+            .children(rows)
+            .child(
+                div()
+                    .w_full()
+                    .mt_1()
+                    .pt_1()
+                    .px_2()
+                    .border_t_1()
+                    .border_color(border.opacity(0.6))
+                    .text_size(px(10.))
+                    .text_color(muted)
+                    .child("\u{2191}\u{2193} select   \u{21b5} apply   esc close"),
+            )
+    }
+
     fn render_completion_popup(
         &self,
         mono_family: &SharedString,
@@ -3025,6 +3423,45 @@ fn diff_as_edit(old: &str, new: &str) -> Option<InputEdit> {
 /// gets split in the middle of a multi-byte UTF-8 character.
 fn is_word_byte(b: u8) -> bool {
     b.is_ascii_alphanumeric() || b == b'_' || b >= 0x80
+}
+
+/// Byte ranges of every non-overlapping occurrence of `query` in `text`.
+/// Case-insensitive matching folds ASCII only, so offsets in the folded copy
+/// stay identical to `text` (Unicode lowercasing can change byte lengths).
+/// `whole_word` rejects matches with a word byte directly on either side.
+fn find_matches(text: &str, query: &str, case_sensitive: bool, whole_word: bool) -> Vec<Range<usize>> {
+    if query.is_empty() {
+        return Vec::new();
+    }
+    let (hay, needle) = if case_sensitive {
+        (std::borrow::Cow::Borrowed(text), std::borrow::Cow::Borrowed(query))
+    } else {
+        (
+            std::borrow::Cow::Owned(text.to_ascii_lowercase()),
+            std::borrow::Cow::Owned(query.to_ascii_lowercase()),
+        )
+    };
+    let bytes = text.as_bytes();
+    let mut matches = Vec::new();
+    let mut from = 0;
+    while let Some(pos) = hay[from..].find(needle.as_ref()) {
+        let start = from + pos;
+        let end = start + needle.len();
+        let bounded = !whole_word
+            || ((start == 0 || !is_word_byte(bytes[start - 1]))
+                && (end == bytes.len() || !is_word_byte(bytes[end])));
+        if bounded && text.is_char_boundary(start) && text.is_char_boundary(end) {
+            matches.push(start..end);
+            from = end;
+        } else {
+            // A rejected candidate may still overlap a valid one further on.
+            from = start + hay[start..].chars().next().map_or(1, char::len_utf8);
+        }
+        if from >= hay.len() {
+            break;
+        }
+    }
+    matches
 }
 
 /// Zero-allocation ASCII case-insensitive prefix check (`needle_lower` must be lowercase).
@@ -3278,7 +3715,7 @@ mod tests {
         assert_eq!(minimal_replacement("h\u{e9}llo", "h\u{e8}llo"), Some((1..3, "\u{e8}")));
     }
 
-    use super::{diff_as_edit, minimal_replacement, normalize_for_save};
+    use super::{diff_as_edit, find_matches, minimal_replacement, normalize_for_save};
 
     #[test]
     fn no_change_is_no_edit() {
@@ -3318,6 +3755,33 @@ mod tests {
         assert_eq!(edit.old_end_byte, old.len());
         assert_eq!(edit.new_end_byte, new.len());
     }
+
+    #[test]
+    fn search_is_case_insensitive_by_default() {
+        let text = "Foo foo FOO";
+        assert_eq!(find_matches(text, "foo", false, false), vec![0..3, 4..7, 8..11]);
+        assert_eq!(find_matches(text, "foo", true, false), vec![4..7]);
+    }
+
+    #[test]
+    fn whole_word_skips_matches_inside_identifiers() {
+        let text = "count counter recount count_x count.";
+        assert_eq!(find_matches(text, "count", false, true), vec![0..5, 30..35]);
+    }
+
+    #[test]
+    fn whole_word_finds_a_match_overlapping_a_rejected_one() {
+        // `aa` at 0 is glued to the next `a`; the real word starts at 4.
+        assert_eq!(find_matches("aaa aa", "aa", false, true), vec![4..6]);
+    }
+
+    #[test]
+    fn search_offsets_stay_aligned_after_non_ascii_text() {
+        let text = "İstanbul foo";
+        let matches = find_matches(text, "FOO", false, false);
+        assert_eq!(matches, vec![10..13]);
+        assert_eq!(&text[matches[0].clone()], "foo");
+    }
 }
 
 impl Focusable for EditorView {
@@ -3334,6 +3798,8 @@ impl Render for EditorView {
         // actually incremented `buffer.revision()`. Hovering, scrolling, or
         // moving the cursor does zero full-buffer work.
         self.sync_buffer_state();
+        self.maybe_schedule_inlay_hints(cx);
+        self.maybe_prefetch_code_actions(cx);
 
         let primary = self.buffer.selections().primary();
         let head = primary.head;
@@ -3469,6 +3935,9 @@ impl Render for EditorView {
                 MouseButton::Left,
                 cx.listener(|this, _event, window, cx| {
                     window.focus(&this.focus_handle, cx);
+                    if this.code_action_menu.take().is_some() {
+                        cx.notify();
+                    }
                 }),
             )
             .on_key_down(cx.listener(Self::on_key_down))
