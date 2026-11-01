@@ -319,32 +319,40 @@ impl DartIde {
 
         let muted = cx.theme().muted_foreground;
         let fg = cx.theme().foreground;
+        let border = cx.theme().border;
 
         v_flex()
             .size_full()
             .child(
                 h_flex()
                     .w_full()
-                    .h(px(30.))
+                    .h(px(tokens::TREE_ROW_H))
                     .flex_shrink_0()
                     .items_center()
                     .justify_between()
-                    .px(px(tokens::SPACE_4))
+                    .gap(px(tokens::SPACE_2))
+                    .px(px(tokens::SPACE_5))
+                    .border_b_1()
+                    .border_color(border)
                     .child(
                         h_flex()
+                            .flex_1()
+                            .min_w(px(0.))
                             .items_center()
                             .gap(px(tokens::SPACE_2))
                             .child(
                                 div()
+                                    .min_w(px(0.))
+                                    .truncate()
                                     .text_size(px(tokens::UI_SM))
                                     .font_medium()
                                     .text_color(fg)
-                                    .truncate()
                                     .child(root_name),
                             )
                     )
                     .child(
                         h_flex()
+                            .flex_shrink_0()
                             .items_center()
                             .gap(px(tokens::SPACE_1))
                             .child(
@@ -353,7 +361,7 @@ impl DartIde {
                                     .small()
                                     .icon(
                                         Icon::new(gpui_kit::assets::IconName::FilePlus)
-                                            .xsmall()
+                                            .with_size(px(12.))
                                             .text_color(muted),
                                     )
                                     .tooltip("New File on Disk\u{2026}")
@@ -371,7 +379,7 @@ impl DartIde {
                                     .small()
                                     .icon(
                                         Icon::new(gpui_kit::assets::IconName::FolderPlus)
-                                            .xsmall()
+                                            .with_size(px(12.))
                                             .text_color(muted),
                                     )
                                     .tooltip("New Folder on Disk\u{2026}")
@@ -389,7 +397,7 @@ impl DartIde {
                                     .small()
                                     .icon(
                                         Icon::new(gpui_kit::assets::IconName::CopyMinus)
-                                            .xsmall()
+                                            .with_size(px(12.))
                                             .text_color(muted),
                                     )
                                     .tooltip("Collapse all folders")
@@ -411,7 +419,7 @@ impl DartIde {
                                         } else {
                                             gpui_kit::assets::IconName::Eye
                                         })
-                                        .xsmall()
+                                        .with_size(px(12.))
                                         .text_color(muted),
                                     )
                                     .tooltip(if self.show_hidden {
