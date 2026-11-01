@@ -103,18 +103,7 @@ impl DartIde {
                                     cx.notify();
                                 });
                             })
-                    })
-                    .child(
-                        h_flex()
-                            .gap_1()
-                            .items_center()
-                            .child(
-                                Icon::new(gpui_kit::assets::IconName::Clock)
-                                    .xsmall()
-                                    .text_color(muted),
-                            )
-                            .child("WakaTime"),
-                    ),
+                    }),
             )
             .child(
                 h_flex()
