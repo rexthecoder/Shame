@@ -778,6 +778,7 @@ impl DartIde {
         }
         // --- mode switch ---
         let mode_switch = h_flex()
+            .flex_shrink_0()
             .p(px(2.))
             .gap(px(2.))
             .rounded(px(tokens::RADIUS_SM + 2.))
@@ -833,7 +834,9 @@ impl DartIde {
             .gap(px(tokens::SPACE_2))
             .child(
                 h_flex()
+                    .flex_1()
                     .min_w(px(0.))
+                    .overflow_hidden()
                     .items_center()
                     .gap(px(2.))
                     // Attach files (also: type `@`, or ⌘L in the editor).
@@ -861,6 +864,7 @@ impl DartIde {
                     )
                     .child(
                         trigger("agent-tool-select", self.agent.tool_picker_open)
+                            .flex_shrink_0()
                             .child(
                                 div()
                                     .text_color(if self.agent.tool_picker_open { primary } else { muted })
@@ -876,6 +880,7 @@ impl DartIde {
                     )
                     .child(
                         trigger("agent-model-select", self.agent.model_picker_open)
+                            .min_w(px(0.))
                             .child(
                                 div()
                                     .max_w(px(170.))
@@ -930,7 +935,9 @@ impl DartIde {
             });
 
         v_flex()
-            .w_auto()
+            // Fill the panel but never push it wider: `w_auto` sized the
+            // composer to its widest row, which spilled past narrow panels.
+            .min_w(px(0.))
             .flex_shrink_0()
             .mx(px(tokens::SPACE_4))
             .mb(px(tokens::SPACE_4))
@@ -977,6 +984,7 @@ impl DartIde {
             .child(
                 v_flex()
                     .w_full()
+                    .min_w(px(0.))
                     .rounded(px(tokens::RADIUS_CARD))
                     .bg(cx.theme().input)
                     .border_1()
@@ -1009,11 +1017,13 @@ impl DartIde {
                             .pt(px(tokens::SPACE_2))
                             .items_center()
                             .justify_between()
-                            .gap(px(tokens::SPACE_3))
+                            .flex_wrap()
+                            .gap(px(tokens::SPACE_2))
                             .child(mode_switch)
                             .child(
                                 h_flex()
                                     .min_w(px(0.))
+                                    .overflow_hidden()
                                     .gap(px(2.))
                                     .children(header_chips),
                             ),
