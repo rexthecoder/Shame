@@ -1079,17 +1079,27 @@ impl DartIde {
                     .size_range(px(tokens::RAIL_LEFT_MIN)..px(tokens::RAIL_LEFT_MAX))
                     .fixed()
                     .pr(px(tokens::GUTTER / 2.))
-                    .child(match self.sidebar_tab {
-                        crate::git_panel::SidebarTab::Files => {
-                            self.render_files_rail(view, cx).into_any_element()
-                        }
-                        crate::git_panel::SidebarTab::Search => {
-                            self.render_search_rail(cx).into_any_element()
-                        }
-                        crate::git_panel::SidebarTab::Git => {
-                            self.render_git_rail(cx).into_any_element()
-                        }
-                    }),
+                    .child(
+                        v_flex()
+                            .size_full()
+                            .bg(cx.theme().sidebar)
+                            .border_1()
+                            .border_color(cx.theme().border)
+                            .rounded(px(tokens::RADIUS_CARD))
+                            .overflow_hidden()
+                            .child(self.render_sidebar_tabs(cx))
+                            .child(match self.sidebar_tab {
+                                crate::git_panel::SidebarTab::Files => {
+                                    self.render_files_rail(view, cx).into_any_element()
+                                }
+                                crate::git_panel::SidebarTab::Search => {
+                                    self.render_search_rail(cx).into_any_element()
+                                }
+                                crate::git_panel::SidebarTab::Git => {
+                                    self.render_git_rail(cx).into_any_element()
+                                }
+                            }),
+                    ),
             );
         }
 

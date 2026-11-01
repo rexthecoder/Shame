@@ -55,6 +55,12 @@ impl DartIde {
     /// The "Files | Git" tab strip at the top of the left sidebar, shared by both views.
     pub(crate) fn render_sidebar_tabs(&self, cx: &mut Context<Self>) -> Div {
         let muted = cx.theme().muted_foreground;
+        let fg = cx.theme().foreground;
+        let primary = cx.theme().primary;
+        let tab_active = cx.theme().tab_active;
+        let border = cx.theme().border;
+        let list_hover = cx.theme().list_hover;
+
         let tab = |id: &'static str,
                    label: &'static str,
                    icon: IconName,
@@ -65,32 +71,30 @@ impl DartIde {
                 .id(id)
                 .items_center()
                 .gap(px(tokens::SPACE_2))
-                .h(px(28.))
+                .h(px(26.))
                 .px(px(tokens::SPACE_2))
                 .rounded(px(tokens::RADIUS_SM))
                 .border_1()
                 .border_color(if active {
-                    cx.theme().border
+                    border
                 } else {
                     gpui_kit::transparent_black()
                 })
-                .when(active, |s| s.bg(cx.theme().tab_active))
-                .when(!active, |s| s.hover(|h| h.bg(cx.theme().list_hover)))
+                .when(active, |s| s.bg(tab_active))
+                .when(!active, |s| s.hover(|h| h.bg(list_hover)))
                 .cursor_pointer()
-                .child(Icon::new(icon).small().text_color(if active {
-                    cx.theme().primary
-                } else {
-                    muted
-                }))
-                .when(active, |el| {
-                    el.child(
-                        div()
-                            .text_size(px(tokens::UI_SM))
-                            .font_medium()
-                            .text_color(cx.theme().foreground)
-                            .child(label),
-                    )
-                })
+                .child(
+                    Icon::new(icon)
+                        .small()
+                        .text_color(if active { primary } else { muted }),
+                )
+                .child(
+                    div()
+                        .text_size(px(tokens::UI_SM))
+                        .font_medium()
+                        .text_color(if active { fg } else { muted })
+                        .child(label),
+                )
                 .on_click(
                     cx.listener(move |this, _event, _window, cx| this.set_sidebar_tab(which, cx)),
                 )
@@ -102,12 +106,13 @@ impl DartIde {
             .map_or(0, |s| s.staged.len() + s.unstaged.len() + s.conflicts.len());
         h_flex()
             .w_full()
-            .h(px(tokens::TABSTRIP_H))
+            .h(px(30.))
             .flex_shrink_0()
             .items_center()
-            .px(px(tokens::SPACE_4))
+            .px(px(tokens::SPACE_3))
+            .gap(px(tokens::SPACE_1))
             .border_b_1()
-            .border_color(cx.theme().border)
+            .border_color(border)
             .child(
                 h_flex()
                     .items_center()
@@ -141,9 +146,9 @@ impl DartIde {
                                     div()
                                         .px(px(5.))
                                         .rounded(px(tokens::RADIUS_PILL))
-                                        .bg(cx.theme().primary.opacity(0.2))
+                                        .bg(primary.opacity(0.2))
                                         .text_size(px(9.5))
-                                        .text_color(cx.theme().primary)
+                                        .text_color(primary)
                                         .child(changes.to_string()),
                                 )
                             },
@@ -155,12 +160,6 @@ impl DartIde {
     pub(crate) fn render_git_rail(&self, cx: &mut Context<Self>) -> impl IntoElement {
         v_flex()
             .size_full()
-            .bg(cx.theme().sidebar)
-            .border_1()
-            .border_color(cx.theme().border)
-            .rounded(px(tokens::RADIUS_CARD))
-            .overflow_hidden()
-            .child(self.render_sidebar_tabs(cx))
             .child(match self.git.status.clone() {
                 Some(status) => self.render_git_body(&status, cx).into_any_element(),
                 None => self.render_git_not_a_repo(cx).into_any_element(),
@@ -175,12 +174,6 @@ impl DartIde {
 
         v_flex()
             .size_full()
-            .bg(cx.theme().sidebar)
-            .border_1()
-            .border_color(cx.theme().border)
-            .rounded(px(tokens::RADIUS_CARD))
-            .overflow_hidden()
-            .child(self.render_sidebar_tabs(cx))
             .child(
                 v_flex()
                     .w_full()

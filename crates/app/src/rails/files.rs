@@ -321,12 +321,6 @@ impl DartIde {
 
         v_flex()
             .size_full()
-            .bg(cx.theme().sidebar)
-            .border_1()
-            .border_color(cx.theme().border)
-            .rounded(px(tokens::RADIUS_CARD))
-            .overflow_hidden()
-            .child(self.render_sidebar_tabs(cx))
             .child(
                 h_flex()
                     .w_full()
