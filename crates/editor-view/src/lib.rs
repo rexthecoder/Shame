@@ -159,7 +159,8 @@ pub struct EditorOptions {
 
 impl Default for EditorOptions {
     fn default() -> Self {
-        Self { inlay_hints: true }
+        // Off for now: both type and parameter-name hints read as clutter.
+        Self { inlay_hints: false }
     }
 }
 
@@ -351,7 +352,7 @@ impl EditorView {
             inlay_hints: Vec::new(),
             inlay_sequence: 0,
             inlay_scheduled_revision: None,
-            inlay_hints_enabled: true,
+            inlay_hints_enabled: false,
             code_actions: None,
             code_action_menu: None,
             code_action_sequence: 0,

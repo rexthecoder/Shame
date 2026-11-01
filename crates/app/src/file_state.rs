@@ -201,17 +201,6 @@ impl DartIde {
         cx.set_global(self.editor_options);
     }
 
-    pub(crate) fn update_editor_options(
-        &mut self,
-        change: impl FnOnce(&mut editor_view::EditorOptions),
-        cx: &mut Context<Self>,
-    ) {
-        change(&mut self.editor_options);
-        self.apply_editor_options(cx);
-        self.save_session_state();
-        cx.notify();
-    }
-
     pub(crate) fn set_autosave(&mut self, mode: AutosaveMode, cx: &mut Context<Self>) {
         self.autosave = mode;
         self.save_session_state();

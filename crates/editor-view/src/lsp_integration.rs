@@ -49,7 +49,7 @@ use lsp_types::{
     DidChangeTextDocumentParams, DidOpenTextDocumentParams, DocumentChangeOperation,
     DocumentChanges, DocumentFormattingParams, ExecuteCommandParams, FormattingOptions,
     GotoDefinitionParams, GotoDefinitionResponse, Hover, HoverContents, HoverParams,
-    InitializeParams, InlayHint, InlayHintClientCapabilities, InlayHintLabel, InlayHintParams,
+    InitializeParams, InlayHint, InlayHintClientCapabilities, InlayHintKind, InlayHintLabel, InlayHintParams,
     LanguageString, Location, MarkedString, OneOf, ParameterLabel, Position,
     PublishDiagnosticsParams, Range, ReferenceContext, ReferenceParams, RenameParams,
     SignatureHelp, SignatureHelpParams, SignatureInformation, TextDocumentClientCapabilities,
@@ -144,7 +144,7 @@ fn server_pool() -> &'static Mutex<HashMap<PoolKey, Arc<SharedLspServer>>> {
 
 /// Whether servers are told to compute inlay hints. Global because servers
 /// are shared across editors; editors mirror `EditorOptions` into it.
-static INLAY_HINTS_SETTING: AtomicBool = AtomicBool::new(true);
+static INLAY_HINTS_SETTING: AtomicBool = AtomicBool::new(false);
 
 /// Record the inlay-hint setting and, when it changed, tell every running
 /// server to re-read its configuration (it asks back via
@@ -755,6 +755,11 @@ impl EditorView {
     /// A server hint as a buffer byte offset, using the same byte-column
     /// approximation as the rest of this module.
     fn inlay_hint_view(&self, hint: InlayHint) -> Option<InlayHintView> {
+        // Type hints (`final Result<…> result`, `(Failure<…> r) =>`) crowd
+        // the line more than they help; keep parameter names only for now.
+        if hint.kind == Some(InlayHintKind::TYPE) {
+            return None;
+        }
         let line = hint.position.line as usize;
         if line >= self.buffer.line_count() {
             return None;
