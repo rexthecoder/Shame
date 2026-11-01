@@ -20,7 +20,7 @@ use crate::{DartIde, tokens};
 /// Cap on rows; a symbol used thousands of times would otherwise build thousands of elements.
 const MAX_ITEMS: usize = 200;
 /// Lines shown above and below the target in the preview.
-const CONTEXT_LINES: usize = 7;
+const CONTEXT_LINES: usize = 40;
 /// Files bigger than this are previewed without syntax colors.
 const MAX_HIGHLIGHT_BYTES: usize = 256 * 1024;
 
@@ -47,11 +47,22 @@ pub(crate) struct PeekState {
     pub items: Vec<ReferenceItem>,
     pub selected: usize,
     pub preview: Vec<PreviewLine>,
+    /// Scroll position of the code preview.
+    pub scroll: ScrollHandle,
+    /// The row whose target line the preview has been scrolled to.
+    positioned: std::cell::Cell<Option<usize>>,
 }
 
 impl PeekState {
     pub(crate) fn new(title: String, items: Vec<ReferenceItem>) -> Self {
-        let mut state = Self { title, items, selected: 0, preview: Vec::new() };
+        let mut state = Self {
+            title,
+            items,
+            selected: 0,
+            preview: Vec::new(),
+            scroll: ScrollHandle::new(),
+            positioned: std::cell::Cell::new(None),
+        };
         state.refresh_preview();
         state
     }
@@ -60,6 +71,7 @@ impl PeekState {
         let ix = ix.min(self.items.len().saturating_sub(1));
         if ix != self.selected {
             self.selected = ix;
+            self.positioned.set(None);
             self.refresh_preview();
         }
     }
@@ -202,7 +214,7 @@ impl DartIde {
         cx.notify();
     }
 
-    pub(crate) fn render_peek(&self, cx: &mut Context<Self>) -> Option<Div> {
+    pub(crate) fn render_peek(&self, cx: &mut Context<Self>) -> Option<Stateful<Div>> {
         let peek = self.peek.as_ref()?;
         let fg = cx.theme().foreground;
         let muted = cx.theme().muted_foreground;
@@ -268,9 +280,18 @@ impl DartIde {
                     }))
             }));
 
+        // Start with the target a few lines below the top, so the code before it is a scroll away.
+        if peek.positioned.get() != Some(peek.selected) {
+            let target = peek.preview.iter().position(|l| l.is_target).unwrap_or(0);
+            let top = (target as f32 * 20. - 60.).max(0.);
+            peek.scroll.set_offset(point(px(0.), px(-top)));
+            peek.positioned.set(Some(peek.selected));
+        }
+
         let number_width = peek.preview.last().map_or(1, |l| l.number.to_string().len());
         let code = v_flex()
             .id("peek-preview")
+            .track_scroll(&peek.scroll)
             .flex_1()
             .min_w(px(0.))
             .h_full()
@@ -313,6 +334,7 @@ impl DartIde {
 
         Some(
             div()
+                .id("peek-overlay")
                 .absolute()
                 .inset_0()
                 .flex()
@@ -320,6 +342,16 @@ impl DartIde {
                 .justify_center()
                 .pt(px(70.))
                 .bg(rgba(0x00000066))
+                // The editor underneath must not see clicks, scrolls or keys.
+                .occlude()
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _e, window, cx| {
+                        this.close_peek(window, cx);
+                        cx.stop_propagation();
+                    }),
+                )
+                .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
                 .track_focus(&self.peek_focus)
                 .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
                     match event.keystroke.key.as_str() {
@@ -332,12 +364,15 @@ impl DartIde {
                             let to_side = event.keystroke.modifiers.platform || event.keystroke.modifiers.control;
                             this.open_peek_item(to_side, window, cx)
                         }
-                        _ => return,
+                        // Anything else is swallowed: typing must not reach the editor.
+                        _ => {}
                     }
                     cx.stop_propagation();
                 }))
                 .child(
                     v_flex()
+                        .id("peek-panel")
+                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                         .w(px(if many { 940. } else { 700. }))
                         .h(px(420.))
                         .overflow_hidden()
@@ -464,10 +499,10 @@ mod tests {
 
     #[core::prelude::v1::test]
     fn the_preview_marks_the_target_line_and_colors_dart() {
-        let source: String = (1..=30).map(|n| format!("int v{n} = {n};\n")).collect();
+        let source: String = (1..=200).map(|n| format!("int v{n} = {n};\n")).collect();
         let file = temp_file("target", &source);
         let preview = build_preview(&file, 10);
-        assert_eq!(preview.len(), 15);
+        assert_eq!(preview.len(), 2 * super::CONTEXT_LINES + 1);
         let target: Vec<_> = preview.iter().filter(|l| l.is_target).collect();
         assert_eq!(target.len(), 1);
         assert_eq!(target[0].number, 11);

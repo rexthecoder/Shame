@@ -233,28 +233,6 @@ pub struct EditorView {
     visible_lines: Vec<usize>,
     /// Whether a `save()` triggered an LSP format request that should re-flush once applied.
     pub(crate) save_after_format: bool,
-    /// Horizontal scroll offset in pixels, measured from the first column of
-    /// the text area (the gutter stays pinned). `0` keeps column zero flush
-    /// against the gutter, the way every editor opens a file.
-    h_offset: f32,
-    /// Width of the text area (editor width minus the gutter) as measured
-    /// during the previous layout. One frame behind on resize, which only
-    /// matters while the window is being dragged.
-    h_viewport: f32,
-    /// Advance width of one monospace glyph at `LINE_FONT_SIZE`, measured once
-    /// from the real font so the scroll extent matches what is painted.
-    char_advance: f32,
-    /// Widest line (in display columns) among the rows rendered so far. Lines
-    /// are laid out lazily, so the scrollable width follows what you can
-    /// actually see instead of scanning the whole file on every keystroke.
-    observed_max_columns: usize,
-    /// Set while the horizontal scrollbar thumb is being dragged.
-    h_dragging: bool,
-    /// Width of the text area, written by the canvas that measures it. The
-    /// element tree is built before layout, so it cannot be known any earlier.
-    h_viewport_cell: std::rc::Rc<std::cell::Cell<f32>>,
-    /// Bounds of the horizontal scrollbar track, for click/drag positioning.
-    hbar_bounds: std::rc::Rc<std::cell::Cell<Bounds<Pixels>>>,
 }
 
 impl EditorView {
@@ -316,13 +294,6 @@ impl EditorView {
             folded_starts: std::collections::HashSet::new(),
             visible_lines: Vec::new(),
             save_after_format: false,
-            h_offset: 0.0,
-            h_viewport: 0.0,
-            char_advance: 0.0,
-            observed_max_columns: 0,
-            h_dragging: false,
-            h_viewport_cell: std::rc::Rc::new(std::cell::Cell::new(0.0)),
-            hbar_bounds: std::rc::Rc::new(std::cell::Cell::new(Bounds::default())),
         };
         this.maybe_start_lsp(cx);
         this.refresh_line_changes(cx);
@@ -548,9 +519,6 @@ impl EditorView {
         }
         self.folded_starts.clear();
         self.visible_lines.clear();
-        // A new file starts at column zero with no remembered width.
-        self.h_offset = 0.0;
-        self.observed_max_columns = 0;
         self.synced_revision = self.buffer.revision();
         self.indent_width = self.buffer.detect_indent_width();
         self.line_changes.clear();
@@ -664,115 +632,6 @@ impl EditorView {
         let line = self.buffer.byte_to_line(head);
         self.scroll_handle
             .scroll_to_item(line, ScrollStrategy::Nearest);
-        self.ensure_cursor_visible_horizontally(head);
-    }
-
-    /// Width of `text` in display columns: tabs expand to the editor's indent
-    /// width and East-Asian / emoji characters count as two, matching the
-    /// monospace grid the text is painted on.
-    fn display_columns(text: &str, tab_width: usize) -> usize {
-        let mut col = 0;
-        for ch in text.chars() {
-            match ch {
-                '\t' => {
-                    let w = tab_width.max(1);
-                    col += w - (col % w);
-                }
-                c if Self::is_wide_char(c) => col += 2,
-                _ => col += 1,
-            }
-        }
-        col
-    }
-
-    fn is_wide_char(c: char) -> bool {
-        matches!(c as u32,
-            0x1100..=0x115F
-            | 0x2E80..=0x303E
-            | 0x3041..=0x33FF
-            | 0x3400..=0x4DBF
-            | 0x4E00..=0x9FFF
-            | 0xA000..=0xA4CF
-            | 0xAC00..=0xD7A3
-            | 0xF900..=0xFAFF
-            | 0xFE30..=0xFE4F
-            | 0xFF00..=0xFF60
-            | 0xFFE0..=0xFFE6
-            | 0x1F300..=0x1F64F
-            | 0x1F900..=0x1F9FF
-            | 0x20000..=0x2FFFD
-            | 0x30000..=0x3FFFD)
-    }
-
-    /// Remember the widest row drawn so far, so the horizontal extent follows
-    /// the lines that are actually on screen.
-    fn note_line_columns(&mut self, line: &str) {
-        let cols = Self::display_columns(line.trim_end_matches(['\n', '\r']), self.indent_width);
-        if cols > self.observed_max_columns {
-            self.observed_max_columns = cols;
-        }
-    }
-
-    /// Total width of the scrollable text, including a trailing comfort gap so
-    /// the last character of a long line is never flush against the edge.
-    fn content_width_px(&self) -> f32 {
-        if self.char_advance <= 0.0 {
-            return 0.0;
-        }
-        let cols = self.observed_max_columns.max(self.cursor_line_columns());
-        cols as f32 * self.char_advance + 120.0
-    }
-
-    /// Display columns of the line the caret is on, up to the caret. Used so a
-    /// jump to a long line can widen the scroll extent in the same frame it
-    /// becomes visible, without scanning the whole buffer.
-    fn cursor_line_columns(&self) -> usize {
-        let head = self.buffer.selections().primary().head;
-        let line = self.buffer.byte_to_line(head);
-        let line_start = self.buffer.line_to_byte(line);
-        let text = self.buffer.line(line);
-        let display = text.trim_end_matches(['\n', '\r']);
-        let col = (head - line_start).min(display.len());
-        Self::display_columns(&display[..col], self.indent_width)
-    }
-
-    fn max_h_offset(&self) -> f32 {
-        (self.content_width_px() - self.h_viewport).max(0.0)
-    }
-
-    fn clamp_h_offset(&mut self) {
-        self.h_offset = self.h_offset.clamp(0.0, self.max_h_offset());
-    }
-
-    /// Scroll the text area the least amount needed to put the caret back in
-    /// view, plus a little breathing room, then clamp to the real extent.
-    fn ensure_cursor_visible_horizontally(&mut self, head: usize) {
-        if self.char_advance <= 0.0 || self.h_viewport <= 0.0 {
-            return;
-        }
-        let line = self.buffer.byte_to_line(head);
-        let line_start = self.buffer.line_to_byte(line);
-        let text = self.buffer.line(line);
-        let display = text.trim_end_matches(['\n', '\r']);
-        let col = (head - line_start).min(display.len());
-        let caret_x =
-            Self::display_columns(&display[..col], self.indent_width) as f32 * self.char_advance;
-        let margin = self.char_advance * 3.0;
-        if caret_x < self.h_offset {
-            self.h_offset = (caret_x - margin).max(0.0);
-        } else if caret_x + margin > self.h_offset + self.h_viewport {
-            self.h_offset = caret_x + margin - self.h_viewport;
-        }
-        self.clamp_h_offset();
-    }
-
-    /// Horizontal scroll by `dx` pixels (positive scrolls right).
-    fn scroll_h_by(&mut self, dx: f32, cx: &mut Context<Self>) {
-        let before = self.h_offset;
-        self.h_offset = (self.h_offset + dx).clamp(0.0, self.max_h_offset());
-        if self.h_offset != before {
-            cx.notify();
-        }
     }
 
     /// Move the cursor to a 0-indexed (line, column) — e.g. where a
@@ -1804,6 +1663,9 @@ impl EditorView {
                 }
                 "r" => self.start_rename(cx),
                 "d" => self.select_next_occurrence(cx),
+                // F12 is often taken by the system, so peek also lives on ⌘Y.
+                "y" if keystroke.modifiers.shift => self.request_references(),
+                "y" => self.request_peek_definition(),
                 "up" if keystroke.modifiers.alt => self.add_cursor_vertical(-1, cx),
                 "down" if keystroke.modifiers.alt => self.add_cursor_vertical(1, cx),
                 "." => self.request_code_actions(cx),
@@ -1998,12 +1860,6 @@ impl EditorView {
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let is_active_line = cursor_line == Some(index);
-        // Only give the row a real content width once the text is known to be
-        // wider than the pane; otherwise the row fills the pane and the text
-        // area hit-test covers what is visible.
-        let content_w = self.content_width_px();
-        let overflowing = self.h_viewport > 0.0 && content_w > self.h_viewport + 1.0;
-        let h_offset = self.h_offset.max(0.0);
         let display_text_check = line_text.trim_end_matches(['\n', '\r']);
         let is_comment_or_blank = display_text_check.trim().is_empty()
             || display_text_check.trim_start().starts_with("//");
@@ -2620,20 +2476,8 @@ impl EditorView {
                     .relative()
                     .flex_1()
                     .h_full()
-                    // The text area clips; inside it a content-width strip is
-                    // shifted left by the horizontal scroll offset so long
-                    // lines can be reached without moving the gutter.
                     .overflow_hidden()
-                    .child(
-                        div()
-                            .relative()
-                            .h_full()
-                            .flex_shrink_0()
-                            .left(px(-h_offset))
-                            .when(overflowing, |d| d.w(px(content_w)))
-                            .when(!overflowing, |d| d.w_full())
-                            .child(line_canvas),
-                    )
+                    .child(div().relative().h_full().w_full().child(line_canvas))
                     .when_some(
                         self.language
                             .detect_test_target(self.buffer.path(), display_text)
@@ -3473,18 +3317,6 @@ impl Render for EditorView {
         // moving the cursor does zero full-buffer work.
         self.sync_buffer_state();
 
-        // Measure one glyph of the real monospace font once, so the scroll
-        // extent lines up with the painted text instead of a guessed ratio.
-        if self.char_advance <= 0.0 {
-            let mono = cx.theme().mono_font_family.clone();
-            let font_id = cx.text_system().resolve_font(&font(mono));
-            if let Ok(advance) = cx.text_system().em_advance(font_id, px(LINE_FONT_SIZE)) {
-                self.char_advance = advance.to_f64() as f32;
-            }
-        }
-        self.h_viewport = self.h_viewport_cell.get();
-        self.h_offset = self.h_offset.clamp(0.0, self.max_h_offset());
-
         let primary = self.buffer.selections().primary();
         let head = primary.head;
         let cursor_line = Some(self.buffer.byte_to_line(head));
@@ -3572,9 +3404,6 @@ impl Render for EditorView {
                         } else {
                             String::new()
                         };
-                        // Rows are laid out lazily, so the scrollable width is
-                        // learned from the lines that have actually been drawn.
-                        this.note_line_columns(&line);
                         this.render_line(
                             ix,
                             &line,
@@ -3597,131 +3426,14 @@ impl Render for EditorView {
         .track_scroll(&self.scroll_handle)
         .size_full();
 
-        // A 4px overlay bar along the bottom of the text area. Only present
-        // while a line is wider than the pane, so short files keep the full
-        // height they had before.
-        let content_w = self.content_width_px();
-        let viewport_w = self.h_viewport;
-        let hbar = (self.char_advance > 0.0 && viewport_w > 1.0 && content_w > viewport_w + 1.0)
-            .then(|| {
-                let visible_frac = (viewport_w / content_w).clamp(0.05, 1.0);
-                let start_frac = (self.h_offset / content_w).clamp(0.0, 1.0 - visible_frac);
-                let bounds_cell = self.hbar_bounds.clone();
-                let thumb = cx.theme().muted_foreground.opacity(0.5);
-                let thumb_hover = cx.theme().muted_foreground.opacity(0.8);
-                div()
-                    .id("editor-hbar")
-                    .absolute()
-                    .left(px(GUTTER_WIDTH + 6.))
-                    .right(px(10.))
-                    .bottom(px(2.))
-                    .h(px(4.))
-                    .rounded(px(2.))
-                    .bg(cx.theme().border.opacity(0.14))
-                    .cursor_pointer()
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(move |this, event: &MouseDownEvent, window, cx| {
-                            let track = bounds_cell.get();
-                            let track_w = track.size.width.to_f64();
-                            if track_w <= 0.0 {
-                                return;
-                            }
-                            let frac = ((event.position.x.to_f64() - track.origin.x.to_f64())
-                                / track_w)
-                                .clamp(0.0, 1.0);
-                            this.h_offset = (frac * content_w as f64
-                                - this.h_viewport as f64 / 2.0)
-                                .max(0.0) as f32;
-                            this.clamp_h_offset();
-                            this.h_dragging = true;
-                            cx.notify();
-
-                            let view = cx.entity();
-                            let bounds_cell = bounds_cell.clone();
-                            window.on_mouse_event(
-                                move |event: &MouseMoveEvent, phase, _window, cx| {
-                                    if phase != DispatchPhase::Bubble {
-                                        return;
-                                    }
-                                    if event.pressed_button != Some(MouseButton::Left) {
-                                        if view.read(cx).h_dragging {
-                                            view.update(cx, |this, cx| {
-                                                this.h_dragging = false;
-                                                cx.notify();
-                                            });
-                                        }
-                                        return;
-                                    }
-                                    let track = bounds_cell.get();
-                                    let track_w = track.size.width.to_f64();
-                                    if track_w <= 0.0 {
-                                        return;
-                                    }
-                                    let frac = ((event.position.x.to_f64()
-                                        - track.origin.x.to_f64())
-                                        / track_w)
-                                        .clamp(0.0, 1.0);
-                                    view.update(cx, |this, cx| {
-                                        if !this.h_dragging {
-                                            return;
-                                        }
-                                        this.h_offset = (frac * content_w as f64
-                                            - this.h_viewport as f64 / 2.0)
-                                            .max(0.0)
-                                            as f32;
-                                        this.clamp_h_offset();
-                                        cx.notify();
-                                    });
-                                },
-                            );
-                        }),
-                    )
-                    .child(
-                        div()
-                            .absolute()
-                            .top_0()
-                            .left(relative(start_frac))
-                            .w(relative(visible_frac))
-                            .h_full()
-                            .rounded(px(2.))
-                            .bg(thumb)
-                            .hover(move |s| s.bg(thumb_hover)),
-                    )
-                    .child(
-                        div().absolute().top_0().left_0().size_full().child({
-                            let cell = self.hbar_bounds.clone();
-                            canvas(
-                                move |bounds, _window, _cx| {
-                                    cell.set(bounds);
-                                },
-                                |_, _, _, _| {},
-                            )
-                        }),
-                    )
-            });
-
         div()
             .id("editor-view")
             .key_context("Editor")
             .track_focus(&self.focus_handle)
-            .on_scroll_wheel(cx.listener(|this, event: &ScrollWheelEvent, _window, cx| {
+            .on_scroll_wheel(cx.listener(|this, _event: &ScrollWheelEvent, _window, cx| {
                 // Scrolling moves the code out from under the pointer: the
                 // hover card must not ride along with it.
                 this.clear_hover(cx);
-                // Trackpads report horizontal panes in `delta.x`; a shifted
-                // mouse wheel arrives as vertical movement.
-                let delta = event.delta.pixel_delta(px(LINE_HEIGHT));
-                let dx = if !delta.x.is_zero() {
-                    delta.x
-                } else if event.modifiers.shift && !delta.y.is_zero() {
-                    delta.y
-                } else {
-                    px(0.)
-                };
-                if !dx.is_zero() {
-                    this.scroll_h_by(dx.to_f64() as f32, cx);
-                }
             }))
             .on_hover(cx.listener(|this, hovered: &bool, _window, cx| {
                 if !hovered {
@@ -3740,21 +3452,5 @@ impl Render for EditorView {
             .text_color(cx.theme().foreground)
             .pt_2()
             .child(list)
-            .child(
-                // Measures the text viewport (width minus the pinned gutter)
-                // for the scroll extent and the overlay bar.
-                div().absolute().top_0().left_0().size_full().child({
-                    let cell = self.h_viewport_cell.clone();
-                    canvas(
-                        move |bounds, _window, _cx| {
-                            cell.set(
-                                (bounds.size.width.to_f64() as f32 - GUTTER_WIDTH).max(0.0),
-                            );
-                        },
-                        |_, _, _, _| {},
-                    )
-                }),
-            )
-            .when_some(hbar, |el, hbar| el.child(hbar))
     }
 }
