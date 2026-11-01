@@ -23,6 +23,7 @@
 
 pub mod language;
 mod code_actions;
+pub mod keymap;
 mod conflicts;
 mod inlay_hints;
 mod lsp_integration;
@@ -1695,9 +1696,11 @@ impl EditorView {
         self.clear_hover(cx);
         let keystroke = &event.keystroke;
         let primary_mod = keystroke.modifiers.platform || keystroke.modifiers.control;
+        let command = keymap::resolve(cx, keystroke);
 
-        // `Ctrl+Space` manually triggers autocomplete
-        if keystroke.modifiers.control && keystroke.key.as_str() == "space" {
+        // Manual autocomplete (Ctrl-Space by default) works even while a
+        // popup is open, so it's checked before the popups take keys.
+        if command.as_deref() == Some("trigger-completion") {
             self.trigger_completions(true, cx);
             return;
         }
@@ -1769,57 +1772,23 @@ impl EditorView {
             self.snippet = None;
         }
 
-        if primary_mod {
-            match keystroke.key.as_str() {
-                "c" => self.copy(cx),
-                "x" => self.cut(cx),
-                "v" => self.paste(cx),
-                "a" => self.select_all(cx),
-                "s" if keystroke.modifiers.alt => {
-                    // ⌥⌘S is "save all": the app handles it.
-                    return;
-                }
-                "s" => {
-                    self.save(cx);
-                    cx.notify();
-                }
-                "f" if keystroke.modifiers.shift => {
-                    self.request_format();
-                }
-                "r" if keystroke.modifiers.shift => {
-                    self.request_refactors();
-                }
-                "r" => self.start_rename(cx),
-                "d" => self.select_next_occurrence(cx),
-                // F12 is often taken by the system, so peek also lives on ⌘Y.
-                "y" if keystroke.modifiers.shift => self.request_references(),
-                "y" => self.request_peek_definition(),
-                "up" if keystroke.modifiers.alt => self.add_cursor_vertical(-1, cx),
-                "down" if keystroke.modifiers.alt => self.add_cursor_vertical(1, cx),
-                "." => self.request_code_actions(cx),
-                "/" => self.toggle_line_comment(cx),
-                "z" => {
-                    if keystroke.modifiers.shift {
-                        self.buffer.redo();
-                    } else {
-                        self.buffer.undo();
-                    }
-                    cx.notify();
-                }
-                _ => {
-                    // Let app-level shortcuts (`⌘F`, `⌘P`, `⌘L`, `⌘G`, `⌘B`, `⌘J`, `⌘W`, `⌘N`, `⌘O`)
-                    // bubble up to `DartIde::on_key_down`.
-                    return;
-                }
+        // Rebindable shortcuts (see `keymap.rs`).
+        if let Some(command) = command.as_deref() {
+            if self.run_editor_command(command, cx) {
+                return;
             }
+            // An app-level command (`⌘B`, `⌘P`, …): leave it for
+            // `DartIde::on_key_down`. Without ⌘/Ctrl (e.g. ⌥↑, which reviews a
+            // diff in the app) the key still does its normal editing job too.
+            if primary_mod {
+                return;
+            }
+        } else if primary_mod {
+            // Unbound ⌘/Ctrl chords never type a character.
             return;
         }
-
         let extend = keystroke.modifiers.shift;
         match keystroke.key.as_str() {
-            "f2" => self.start_rename(cx),
-            "f12" if keystroke.modifiers.alt => self.request_peek_definition(),
-            "f12" if keystroke.modifiers.shift => self.request_references(),
             "backspace" => self.backspace(cx),
             "delete" => self.delete_forward(cx),
             "enter" => self.insert_newline(cx),
@@ -1860,6 +1829,46 @@ impl EditorView {
                 }
             }
         }
+    }
+
+    /// Run an editor-level keymap command. Returns `false` for commands the
+    /// editor doesn't own (app-level ones such as `toggle-sidebar`).
+    fn run_editor_command(&mut self, command: &str, cx: &mut Context<Self>) -> bool {
+        match command {
+            "copy" => self.copy(cx),
+            "cut" => self.cut(cx),
+            "paste" => self.paste(cx),
+            "select-all" => self.select_all(cx),
+            "save" => {
+                self.save(cx);
+                cx.notify();
+            }
+            "undo" => {
+                self.buffer.undo();
+                cx.notify();
+            }
+            "redo" => {
+                self.buffer.redo();
+                cx.notify();
+            }
+            "toggle-comment" => self.toggle_line_comment(cx),
+            "select-next-occurrence" => self.select_next_occurrence(cx),
+            "add-cursor-above" => self.add_cursor_vertical(-1, cx),
+            "add-cursor-below" => self.add_cursor_vertical(1, cx),
+            "trigger-completion" => self.trigger_completions(true, cx),
+            "code-actions" => self.request_code_actions(cx),
+            "refactor" => {
+                self.request_refactors();
+            }
+            "rename" => self.start_rename(cx),
+            "peek-definition" => self.request_peek_definition(),
+            "find-references" => self.request_references(),
+            "format-doc" => {
+                self.request_format();
+            }
+            _ => return false,
+        }
+        true
     }
 
     /// Highlight spans intersecting `line_text`'s byte range, run-length
@@ -2711,6 +2720,8 @@ impl EditorView {
 
         div()
             .id(("editor-line", index))
+            // Lets UI tests find a row; compiled out of normal builds.
+            .debug_selector(|| format!("editor-line-{index}"))
             .relative()
             .flex()
             .w_full()
@@ -2841,6 +2852,7 @@ impl EditorView {
                             el.child(
                                 deferred(
                                     div()
+                                        .debug_selector(|| "code-action-menu".into())
                                         .occlude()
                                         .absolute()
                                         .top(px(LINE_HEIGHT + 2.))

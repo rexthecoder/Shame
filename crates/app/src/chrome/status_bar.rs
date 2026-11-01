@@ -28,6 +28,11 @@ impl DartIde {
         let (errors, warnings) = active_editor
             .map(|ed| ed.diagnostic_summary())
             .unwrap_or((0, 0));
+        // Mistakes in `keymap.json` (those entries are skipped, the rest work).
+        let keymap_errors: Vec<String> = cx
+            .try_global::<editor_view::keymap::Keymap>()
+            .map(|k| k.errors.clone())
+            .unwrap_or_default();
         let total_issues = errors + warnings;
         let muted = cx.theme().muted_foreground;
         let fg = cx.theme().foreground;
@@ -109,6 +114,26 @@ impl DartIde {
                 h_flex()
                     .gap_3()
                     .items_center()
+                    .when(!keymap_errors.is_empty(), |el| {
+                        let tooltip = keymap_errors.join("\n");
+                        let view = cx.entity();
+                        el.child(
+                            h_flex()
+                                .id("status-keymap-errors")
+                                .gap_1()
+                                .items_center()
+                                .cursor_pointer()
+                                .text_color(cx.theme().warning)
+                                .child(Icon::new(IconName::TriangleAlert).small())
+                                .child("Keymap")
+                                .tooltip(move |window, cx| {
+                                    gpui_kit::component::tooltip::Tooltip::new(tooltip.clone()).build(window, cx)
+                                })
+                                .on_click(move |_e, window, cx| {
+                                    view.update(cx, |this, cx| this.execute_ide_command("open-keymap", window, cx));
+                                }),
+                        )
+                    })
                     .when(errors > 0, |el| {
                         el.child(
                             h_flex()

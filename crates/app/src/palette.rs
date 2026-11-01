@@ -402,6 +402,18 @@ impl DartIde {
             }
             "debug-breakpoint-condition" => self.open_breakpoint_condition_prompt(window, cx),
             "save-all" => self.save_all(cx),
+            "open-keymap" => {
+                let Some(path) = editor_view::keymap::Keymap::user_path() else {
+                    return;
+                };
+                if !path.exists() {
+                    if let Some(dir) = path.parent() {
+                        let _ = std::fs::create_dir_all(dir);
+                    }
+                    let _ = std::fs::write(&path, editor_view::keymap::template());
+                }
+                self.open_path(path, window, cx);
+            }
             "save-no-format" => {
                 if let Some(ed) = self.active_editor().cloned() {
                     ed.update(cx, |editor, cx| editor.save_without_format(cx));
@@ -647,6 +659,13 @@ impl DartIde {
                     let is_selected = ix == selected;
                     let cmd_id = cmd.id;
                     let view = view.clone();
+                    // The keymap's binding wins; the static label stays for
+                    // descriptive ones like Hot Reload's "on ⌘S".
+                    let shortcut: SharedString = cx
+                        .try_global::<editor_view::keymap::Keymap>()
+                        .and_then(|k| k.label_for(cmd.id))
+                        .map(SharedString::from)
+                        .unwrap_or_else(|| SharedString::from(cmd.shortcut));
                     h_flex()
                         .id(("palette-cmd", ix))
                         .relative()
@@ -693,7 +712,7 @@ impl DartIde {
                                         .child(cmd.title),
                                 ),
                         )
-                        .when(!cmd.shortcut.is_empty(), |el| {
+                        .when(!shortcut.is_empty(), |el| {
                             el.child(
                                 div()
                                     .px_1p5()
@@ -705,7 +724,7 @@ impl DartIde {
                                     .font_family("SF Mono")
                                     .text_size(px(tokens::UI_XS))
                                     .text_color(cx.theme().muted_foreground)
-                                    .child(cmd.shortcut),
+                                    .child(shortcut),
                             )
                         })
                         .on_click(move |_event, window, cx| {

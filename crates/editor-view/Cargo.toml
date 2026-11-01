@@ -14,3 +14,9 @@ core-workspace = { path = "../core-workspace" }
 serde_json.workspace = true
 smol.workspace = true
 async-channel.workspace = true
+
+[dev-dependencies]
+# GPUI's own headless test platform (`TestAppContext`, simulated keystrokes).
+# gpui-kit's umbrella `test-support` feature drags in platform crates whose
+# pinned versions conflict with this lockfile, so use gpui directly.
+gpui = { package = "gpui-pre", version = "=0.3.9", features = ["test-support"] }

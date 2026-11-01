@@ -197,6 +197,20 @@ impl DartIde {
         cx.set_global(self.save_options);
     }
 
+    /// Pick up edits to `keymap.json` a couple of seconds after it's saved.
+    fn reload_keymap_if_changed(&mut self, cx: &mut Context<Self>) {
+        let Some(path) = editor_view::keymap::Keymap::user_path() else {
+            return;
+        };
+        let mtime = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
+        if mtime == self.keymap_mtime {
+            return;
+        }
+        self.keymap_mtime = mtime;
+        cx.set_global(editor_view::keymap::Keymap::load(&path));
+        cx.notify();
+    }
+
     pub(crate) fn apply_editor_options(&self, cx: &mut Context<Self>) {
         cx.set_global(self.editor_options);
     }
@@ -259,6 +273,7 @@ impl DartIde {
 
         if self.disk_tick % 4 == 0 {
             self.check_disk_changes(cx);
+            self.reload_keymap_if_changed(cx);
         }
     }
 

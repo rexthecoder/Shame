@@ -318,6 +318,7 @@ const IDE_COMMANDS: &[IdeCommand] = &[
     IdeCommand { id: "format-doc", title: "Editor: Format Document", shortcut: "\u{21e7}\u{2318}F", flutter_only: false },
     IdeCommand { id: "save-all", title: "File: Save All", shortcut: "\u{2325}\u{2318}S", flutter_only: false },
     IdeCommand { id: "save-no-format", title: "File: Save Without Formatting", shortcut: "", flutter_only: false },
+    IdeCommand { id: "open-keymap", title: "Preferences: Open Keyboard Shortcuts (keymap.json)", shortcut: "", flutter_only: false },
     IdeCommand { id: "autosave-cycle", title: "File: Change Auto Save Mode", shortcut: "", flutter_only: false },
     IdeCommand { id: "local-history", title: "File: Local History\u{2026} (Restore Earlier Version)", shortcut: "", flutter_only: false },
     IdeCommand { id: "conflict-current", title: "Git: Accept Current Change (Merge Conflict)", shortcut: "", flutter_only: false },
@@ -540,6 +541,8 @@ pub struct DartIde {
     pub(crate) file_notices: HashMap<PathBuf, file_state::FileNotice>,
     pub(crate) unsaved_prompt: Option<file_state::UnsavedPrompt>,
     pub(crate) disk_tick: u32,
+    /// Modification time of `keymap.json` when last loaded, to reload on save.
+    pub(crate) keymap_mtime: Option<std::time::SystemTime>,
     pub(crate) terminals: Vec<editor::dock::TerminalSession>,
     pub(crate) active_terminal: usize,
     pub(crate) next_terminal_id: usize,
@@ -755,6 +758,7 @@ impl DartIde {
             file_notices: HashMap::new(),
             unsaved_prompt: None,
             disk_tick: 0,
+            keymap_mtime: None,
             terminals: vec![initial_terminal],
             active_terminal: 0,
             next_terminal_id: 1,
@@ -991,161 +995,13 @@ impl DartIde {
 
     fn on_key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         let keystroke = &event.keystroke;
-        let primary_mod = keystroke.modifiers.platform || keystroke.modifiers.control;
 
-        if primary_mod && keystroke.key.as_str() == "," {
-            self.toggle_settings(cx);
-            return;
-        }
-
-        if primary_mod && keystroke.modifiers.shift && keystroke.key.as_str() == "o" {
-            self.open_symbol_outline(window, cx);
-            return;
-        }
-
-        // Reviewing a diff: ⌥↓/⌥↑ step through changes, ⌥→/⌥← through files,
-        // ⌥↩ marks the file reviewed.
-        if self.diff.is_some() && keystroke.modifiers.alt && !primary_mod {
-            let handled = match keystroke.key.as_str() {
-                "down" => Some(self.diff_goto_change(1, cx)),
-                "up" => Some(self.diff_goto_change(-1, cx)),
-                "right" => Some(self.diff_goto_file(1, cx)),
-                "left" => Some(self.diff_goto_file(-1, cx)),
-                "enter" => Some(self.diff_toggle_reviewed(cx)),
-                _ => None,
-            };
-            if handled.is_some() {
+        // Rebindable shortcuts (`~/.config/shame/keymap.json`, see
+        // `editor_view::keymap`). Editor-level ones were already handled by
+        // the focused editor.
+        if let Some(command) = editor_view::keymap::resolve(cx, keystroke) {
+            if self.run_shortcut(&command, window, cx) {
                 return;
-            }
-        }
-
-        // ⌥⌘S: save every file with unsaved changes.
-        if primary_mod && keystroke.modifiers.alt && keystroke.key.as_str() == "s" {
-            self.save_all(cx);
-            return;
-        }
-
-        // ⌘L: send the selection (or the whole file) to the agent chat.
-        if primary_mod && !keystroke.modifiers.shift && keystroke.key.as_str() == "l" {
-            self.attach_editor_context(window, cx);
-            return;
-        }
-
-        if primary_mod && !keystroke.modifiers.shift && keystroke.key.as_str() == "t" {
-            self.open_workspace_symbols(window, cx);
-            return;
-        }
-
-        if primary_mod && keystroke.key.as_str() == "o" {
-            self.open_folder(window, cx);
-            return;
-        }
-
-        if primary_mod && keystroke.key.as_str() == "n" {
-            self.new_scratch_tab(window, cx);
-            return;
-        }
-
-        if primary_mod && keystroke.key.as_str() == "w" {
-            if !self.tabs.is_empty() {
-                self.request_close_tab(self.active_tab, cx);
-            }
-            return;
-        }
-
-        if primary_mod && keystroke.key.as_str() == "p" {
-            self.palette_open = true;
-            self.palette_selected = 0;
-            let shift = keystroke.modifiers.shift;
-            self.palette_input.update(cx, |state, cx| {
-                if shift {
-                    state.set_value("> ", window, cx);
-                } else if state.value().trim_start().starts_with('>') {
-                    state.set_value("", window, cx);
-                }
-                state.focus(window, cx);
-            });
-            cx.notify();
-            return;
-        }
-
-        if primary_mod && keystroke.modifiers.shift && keystroke.key.as_str() == "m" {
-            if self.terminal_open && self.dock_tab == DockTab::Problems {
-                self.terminal_open = false;
-            } else {
-                self.terminal_open = true;
-                self.dock_tab = DockTab::Problems;
-            }
-            cx.notify();
-            return;
-        }
-
-        if primary_mod && keystroke.modifiers.shift && keystroke.key.as_str() == "f" {
-            self.sidebar_open = true;
-            self.set_sidebar_tab(git_panel::SidebarTab::Search, cx);
-            self.project_search_input
-                .update(cx, |state, cx| state.focus(window, cx));
-            cx.notify();
-            return;
-        }
-
-        if primary_mod && !keystroke.modifiers.shift && keystroke.key.as_str() == "f" {
-            if self.active_editor().is_some() {
-                self.find_open = true;
-                let query = self.find_input.read(cx).value().to_string();
-                if let Some(editor) = self.active_editor().cloned() {
-                    if !query.is_empty() {
-                        editor.update(cx, |ed, cx| ed.set_search_query(&query, cx));
-                    }
-                }
-                self.find_input
-                    .update(cx, |state, cx| state.focus(window, cx));
-                cx.notify();
-            }
-            return;
-        }
-
-        if primary_mod && keystroke.modifiers.shift && keystroke.key.as_str() == "g" {
-            if self.sidebar_open && self.sidebar_tab == git_panel::SidebarTab::Git {
-                self.sidebar_open = false;
-            } else {
-                self.sidebar_open = true;
-                self.set_sidebar_tab(git_panel::SidebarTab::Git, cx);
-            }
-            cx.notify();
-            return;
-        }
-
-        if primary_mod && matches!(keystroke.key.as_str(), "l" | "g") {
-            if self.active_editor().is_some() {
-                self.open_go_to_line(window, cx);
-            }
-            return;
-        }
-
-        if primary_mod && keystroke.key.as_str() == "b" {
-            self.sidebar_open = !self.sidebar_open;
-            cx.notify();
-            return;
-        }
-
-        if primary_mod && keystroke.key.as_str() == "j" {
-            self.terminal_open = !self.terminal_open;
-            cx.notify();
-            return;
-        }
-
-        if primary_mod && keystroke.modifiers.shift && keystroke.key.as_str() == "v" {
-            if let Some(tab) = self.tabs.get_mut(self.active_tab) {
-                if tab.is_markdown() {
-                    tab.md_mode = match tab.md_mode {
-                        MarkdownMode::Code => MarkdownMode::Split,
-                        MarkdownMode::Split => MarkdownMode::Preview,
-                        MarkdownMode::Preview => MarkdownMode::Code,
-                    };
-                    cx.notify();
-                    return;
-                }
             }
         }
 
@@ -1182,6 +1038,127 @@ impl DartIde {
         if keystroke.key.as_str() == "escape" && self.diff.is_some() {
             self.close_diff(cx);
         }
+    }
+}
+
+impl DartIde {
+    /// Run an app-level keymap command. Returns `false` when it isn't one
+    /// (editor commands, or a contextual one like `diff-next-change` with no
+    /// diff open), so the key can do its normal job.
+    fn run_shortcut(&mut self, command: &str, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        if editor_view::keymap::EDITOR_COMMANDS.contains(&command) {
+            return false;
+        }
+        match command {
+            "open-settings" => self.toggle_settings(cx),
+            "symbol-outline" => self.open_symbol_outline(window, cx),
+            "diff-next-change" | "diff-prev-change" | "diff-next-file" | "diff-prev-file"
+            | "diff-toggle-reviewed" => {
+                if self.diff.is_none() {
+                    return false;
+                }
+                match command {
+                    "diff-next-change" => self.diff_goto_change(1, cx),
+                    "diff-prev-change" => self.diff_goto_change(-1, cx),
+                    "diff-next-file" => self.diff_goto_file(1, cx),
+                    "diff-prev-file" => self.diff_goto_file(-1, cx),
+                    _ => self.diff_toggle_reviewed(cx),
+                }
+            }
+            "save-all" => self.save_all(cx),
+            "send-to-agent" => self.attach_editor_context(window, cx),
+            "workspace-symbols" => self.open_workspace_symbols(window, cx),
+            "open-folder" => self.open_folder(window, cx),
+            "new-file" => self.new_scratch_tab(window, cx),
+            "close-tab" => {
+                if !self.tabs.is_empty() {
+                    self.request_close_tab(self.active_tab, cx);
+                }
+            }
+            "go-to-file" => self.open_palette(false, window, cx),
+            "command-palette" => self.open_palette(true, window, cx),
+            "toggle-problems" => {
+                if self.terminal_open && self.dock_tab == DockTab::Problems {
+                    self.terminal_open = false;
+                } else {
+                    self.terminal_open = true;
+                    self.dock_tab = DockTab::Problems;
+                }
+                cx.notify();
+            }
+            "project-search" => {
+                self.sidebar_open = true;
+                self.set_sidebar_tab(git_panel::SidebarTab::Search, cx);
+                self.project_search_input.update(cx, |state, cx| state.focus(window, cx));
+                cx.notify();
+            }
+            "find-in-file" => {
+                if self.active_editor().is_some() {
+                    self.find_open = true;
+                    let query = self.find_input.read(cx).value().to_string();
+                    if let Some(editor) = self.active_editor().cloned() {
+                        if !query.is_empty() {
+                            editor.update(cx, |ed, cx| ed.set_search_query(&query, cx));
+                        }
+                    }
+                    self.find_input.update(cx, |state, cx| state.focus(window, cx));
+                    cx.notify();
+                }
+            }
+            // From the keyboard, the Git shortcut toggles the panel.
+            "open-git" => {
+                if self.sidebar_open && self.sidebar_tab == git_panel::SidebarTab::Git {
+                    self.sidebar_open = false;
+                } else {
+                    self.sidebar_open = true;
+                    self.set_sidebar_tab(git_panel::SidebarTab::Git, cx);
+                }
+                cx.notify();
+            }
+            "go-to-line" => {
+                if self.active_editor().is_some() {
+                    self.open_go_to_line(window, cx);
+                }
+            }
+            "toggle-sidebar" => {
+                self.sidebar_open = !self.sidebar_open;
+                cx.notify();
+            }
+            "toggle-terminal" => {
+                self.terminal_open = !self.terminal_open;
+                cx.notify();
+            }
+            "markdown-cycle-view" => {
+                let Some(tab) = self.tabs.get_mut(self.active_tab).filter(|t| t.is_markdown()) else {
+                    return false;
+                };
+                tab.md_mode = match tab.md_mode {
+                    MarkdownMode::Code => MarkdownMode::Split,
+                    MarkdownMode::Split => MarkdownMode::Preview,
+                    MarkdownMode::Preview => MarkdownMode::Code,
+                };
+                cx.notify();
+            }
+            // Anything else is a command-palette command bound by the user.
+            id if IDE_COMMANDS.iter().any(|c| c.id == id) => self.execute_ide_command(id, window, cx),
+            _ => return false,
+        }
+        true
+    }
+
+    /// Open the palette on files, or on commands (`> `).
+    fn open_palette(&mut self, commands: bool, window: &mut Window, cx: &mut Context<Self>) {
+        self.palette_open = true;
+        self.palette_selected = 0;
+        self.palette_input.update(cx, |state, cx| {
+            if commands {
+                state.set_value("> ", window, cx);
+            } else if state.value().trim_start().starts_with('>') {
+                state.set_value("", window, cx);
+            }
+            state.focus(window, cx);
+        });
+        cx.notify();
     }
 }
 
@@ -1330,6 +1307,29 @@ impl Render for DartIde {
     }
 }
 
+/// Menu-item shortcuts, from the keymap so menus show the user's keys.
+/// GPUI can't remove single bindings without also dropping the text-input
+/// ones, so these are read once at launch; everything else reloads live.
+fn menu_key_bindings(keymap: &editor_view::keymap::Keymap) -> Vec<KeyBinding> {
+    let mut bindings = vec![KeyBinding::new("cmd-q", QuitShame, None)];
+    for spec in keymap.keystrokes_for("open-settings") {
+        bindings.push(KeyBinding::new(&spec, OpenSettings, None));
+    }
+    for spec in keymap.keystrokes_for("open-folder") {
+        bindings.push(KeyBinding::new(&spec, MenuOpenFolder, None));
+    }
+    for spec in keymap.keystrokes_for("new-file") {
+        bindings.push(KeyBinding::new(&spec, MenuNewFile, None));
+    }
+    for spec in keymap.keystrokes_for("save") {
+        bindings.push(KeyBinding::new(&spec, MenuSaveFile, None));
+    }
+    for spec in keymap.keystrokes_for("close-tab") {
+        bindings.push(KeyBinding::new(&spec, MenuCloseTab, None));
+    }
+    bindings
+}
+
 fn main() {
     let app = gpui_kit::application().with_assets(AllAssets);
 
@@ -1338,14 +1338,14 @@ fn main() {
         gpui_kit::component::Theme::change(gpui_kit::component::ThemeMode::Dark, None, cx);
         theme::apply(cx);
 
-        cx.bind_keys([
-            KeyBinding::new("cmd-,", OpenSettings, None),
-            KeyBinding::new("cmd-q", QuitShame, None),
-            KeyBinding::new("cmd-o", MenuOpenFolder, None),
-            KeyBinding::new("cmd-n", MenuNewFile, None),
-            KeyBinding::new("cmd-s", MenuSaveFile, None),
-            KeyBinding::new("cmd-w", MenuCloseTab, None),
-        ]);
+        // Palette commands are bindable too, so register them before reading
+        // the user's keymap.
+        editor_view::keymap::register_commands(IDE_COMMANDS.iter().map(|c| c.id));
+        let keymap = editor_view::keymap::Keymap::user_path()
+            .map(|path| editor_view::keymap::Keymap::load(&path))
+            .unwrap_or_default();
+        cx.bind_keys(menu_key_bindings(&keymap));
+        cx.set_global(keymap);
 
         cx.set_menus(vec![
             Menu {
