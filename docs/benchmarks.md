@@ -39,6 +39,11 @@ column is a stress test of the algorithms, not a size the app parses today.
 | language: `closing_labels` | 0.38 | 3.6 |
 | LSP `didChange` JSON (full document) | 0.05 | 0.47 |
 | syntax: highlights, ~60 visible lines | 0.21 | 0.21 |
+| syntax: `matching_bracket` (cursor on `{`) | 1.42 | — |
+
+`matching_bracket` ran on every `render()` (hover, drag, cursor blink), up
+to twice per frame. `EditorView` now caches the pair per cursor position
+and text revision, so it only runs when the cursor moves or the text edits.
 
 Sum of the per-edit rows: about 1.5 ms at 100 KB and about 14 ms at 1000 KB.
 

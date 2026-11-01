@@ -197,6 +197,10 @@ pub struct EditorView {
     /// [`InputEdit`] rather than reparsing from scratch every frame.
     synced_text: String,
     synced_revision: u64,
+    /// `(cursor head, matching bracket pair)` for `synced_text`. Bracket
+    /// matching runs a highlights query over a 24 KB window (~1.4 ms), so
+    /// `render` reuses this until the cursor moves or the text changes.
+    bracket_pair_cache: Option<(usize, Option<(usize, usize)>)>,
     indent_width: usize,
     line_changes: std::collections::HashMap<u32, LineChange>,
     line_blame: std::collections::HashMap<u32, String>,
@@ -272,6 +276,7 @@ impl EditorView {
             syntax_tree,
             synced_text,
             synced_revision,
+            bracket_pair_cache: None,
             indent_width,
             line_changes: std::collections::HashMap::new(),
             line_blame: std::collections::HashMap::new(),
@@ -335,6 +340,7 @@ impl EditorView {
             return;
         }
         self.synced_revision = self.buffer.revision();
+        self.bracket_pair_cache = None;
         self.indent_width = self.buffer.detect_indent_width();
         if !self.search_query.is_empty() {
             self.recompute_search_matches();
@@ -520,6 +526,7 @@ impl EditorView {
         self.folded_starts.clear();
         self.visible_lines.clear();
         self.synced_revision = self.buffer.revision();
+        self.bracket_pair_cache = None;
         self.indent_width = self.buffer.detect_indent_width();
         self.line_changes.clear();
         self.lsp = None;
@@ -873,7 +880,11 @@ impl EditorView {
         if needle_len == 0 {
             return;
         }
-        let hay = text.to_lowercase();
+        // ASCII folding keeps byte offsets identical between `hay` and
+        // `text`; full Unicode `to_lowercase` can change lengths (e.g. `İ`)
+        // and shift every later match off its real position.
+        let needle = needle.to_ascii_lowercase();
+        let hay = text.to_ascii_lowercase();
         let mut from = 0;
         while let Some(pos) = hay[from..].find(&needle) {
             let start = from + pos;
@@ -924,10 +935,15 @@ impl EditorView {
     /// Move the head to `offset`, keeping the current anchor fixed —
     /// i.e. extend (or shrink) the selection rather than collapsing it.
     fn extend_to(&mut self, offset: usize, cx: &mut Context<Self>) {
-        let anchor = self.buffer.selections().primary().anchor;
+        let primary = self.buffer.selections().primary();
+        // Drag fires on every mouse-move; skip the re-render while the
+        // pointer stays within the same column.
+        if primary.head == offset {
+            return;
+        }
         self.buffer
             .selections_mut()
-            .set_primary(Selection::new(anchor, offset));
+            .set_primary(Selection::new(primary.anchor, offset));
         cx.notify();
     }
 
@@ -2094,10 +2110,12 @@ impl EditorView {
 
         let line_end = line_start + display_text.len();
         let active_search_range = self.search_matches.get(self.active_search_match).cloned();
-        let local_search_matches: Vec<(Range<usize>, bool)> = self
-            .search_matches
+        // `search_matches` is sorted and non-overlapping: binary-search to this
+        // line instead of scanning every match in the file for every row.
+        let first_match = self.search_matches.partition_point(|m| m.end <= line_start);
+        let local_search_matches: Vec<(Range<usize>, bool)> = self.search_matches[first_match..]
             .iter()
-            .filter(|m| m.end > line_start && m.start < line_end)
+            .take_while(|m| m.start < line_end)
             .map(|m| {
                 let is_active_match = active_search_range.as_ref() == Some(m);
                 let start = m.start.max(line_start) - line_start;
@@ -3336,16 +3354,23 @@ impl Render for EditorView {
         let diagnostics_by_line = self.diagnostics_by_line();
         let diagnostic_messages = self.diagnostic_messages_by_line();
         let indent_width = self.indent_width;
-        let bracket_pair = self.syntax_tree.as_ref().and_then(|tree| {
-            tree.matching_bracket(&self.synced_text, head)
-                .map(|other| (head, other))
-                .or_else(|| {
-                    (head > 0).then(|| {
-                        tree.matching_bracket(&self.synced_text, head - 1)
-                            .map(|other| (head - 1, other))
-                    })?
-                })
-        });
+        let bracket_pair = match self.bracket_pair_cache {
+            Some((cached_head, pair)) if cached_head == head => pair,
+            _ => {
+                let pair = self.syntax_tree.as_ref().and_then(|tree| {
+                    tree.matching_bracket(&self.synced_text, head)
+                        .map(|other| (head, other))
+                        .or_else(|| {
+                            (head > 0).then(|| {
+                                tree.matching_bracket(&self.synced_text, head - 1)
+                                    .map(|other| (head - 1, other))
+                            })?
+                        })
+                });
+                self.bracket_pair_cache = Some((head, pair));
+                pair
+            }
+        };
 
         let line_count = if self.folded_starts.is_empty() {
             self.buffer.line_count().max(1)

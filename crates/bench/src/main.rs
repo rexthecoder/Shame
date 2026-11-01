@@ -159,6 +159,11 @@ fn bench_size(kb: usize) {
     row("syntax: highlights for ~60 visible lines", median(21, || {
         std::hint::black_box(tree.highlights_in_range(&before, view_start..view_end));
     }));
+    // `render()` asks for the bracket pair at the cursor on every frame.
+    let brace = before[mid..].find('{').map_or(mid, |i| mid + i);
+    row("syntax: matching_bracket (cursor on `{`)", median(21, || {
+        std::hint::black_box(tree.matching_bracket(&before, brace));
+    }));
 }
 
 fn main() {
