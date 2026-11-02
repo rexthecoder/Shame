@@ -1621,35 +1621,43 @@ impl DartIde {
                                 )
                             }),
                     )
-                    .when_some(row_stat, |el, (added, removed)| {
-                        el.child(crate::diff_view::stat_chip(added, removed, cx))
-                    })
-                    .when(reviewed, |el| {
-                        el.child(
-                            Icon::new(IconName::Check)
-                                .with_size(px(11.))
-                                .text_color(cx.theme().green.opacity(0.8)),
-                        )
-                    })
+                    // Stats sit right against the status letter; the slot keeps
+                    // at least the width the hover actions need, and they cover
+                    // it on hover.
                     .child(
                         div()
                             .relative()
                             .flex_shrink_0()
-                            .w(px(slot_width))
+                            .min_w(px(slot_width))
                             .h_full()
                             .child(
-                                div()
-                                    .absolute()
-                                    .inset_0()
-                                    .flex()
+                                h_flex()
+                                    .h_full()
                                     .items_center()
                                     .justify_end()
+                                    .gap(px(tokens::SPACE_2))
                                     .pr(px(tokens::SPACE_2))
-                                    .text_size(px(10.))
-                                    .font_medium()
-                                    .text_color(color)
                                     .group_hover(group.clone(), |s| s.invisible())
-                                    .child(file.kind.letter().to_string()),
+                                    .when_some(row_stat, |el, (added, removed)| {
+                                        el.child(crate::diff_view::stat_chip(added, removed, cx))
+                                    })
+                                    .when(reviewed, |el| {
+                                        el.child(
+                                            Icon::new(IconName::Check)
+                                                .with_size(px(11.))
+                                                .text_color(cx.theme().green.opacity(0.8)),
+                                        )
+                                    })
+                                    .child(
+                                        div()
+                                            .w(px(8.))
+                                            .flex()
+                                            .justify_center()
+                                            .text_size(px(10.))
+                                            .font_medium()
+                                            .text_color(color)
+                                            .child(file.kind.letter().to_string()),
+                                    ),
                             )
                             .when(section != Section::Conflicts, |el| {
                                 el.child(
