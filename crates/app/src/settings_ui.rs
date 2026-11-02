@@ -341,6 +341,46 @@ impl DartIde {
                 .into_any_element(),
             );
         }
+        if show_cat(2, "editor indent guides lines nesting") {
+            let on = self.editor_options.indent_guides;
+            let v1 = view.clone();
+            let ctrl = toggle_switch("settings-indent-guides", on)
+                .on_click(move |_e, _w, cx| {
+                    v1.update(cx, |this, cx| {
+                        this.update_editor_options(|o| o.indent_guides = !o.indent_guides, cx)
+                    });
+                })
+                .into_any_element();
+            rows.push(
+                setting_row(
+                    "Indent Guides",
+                    "Faint vertical lines at each indent level, with the block around the cursor lit."
+                        .to_string(),
+                    ctrl,
+                )
+                .into_any_element(),
+            );
+        }
+        if show_cat(2, "editor bracket pair colors colorization nesting") {
+            let on = self.editor_options.bracket_colors;
+            let v1 = view.clone();
+            let ctrl = toggle_switch("settings-bracket-colors", on)
+                .on_click(move |_e, _w, cx| {
+                    v1.update(cx, |this, cx| {
+                        this.update_editor_options(|o| o.bracket_colors = !o.bracket_colors, cx)
+                    });
+                })
+                .into_any_element();
+            rows.push(
+                setting_row(
+                    "Bracket Pair Colors",
+                    "Color (), [] and {} by how deeply they're nested, so matching pairs share a color."
+                        .to_string(),
+                    ctrl,
+                )
+                .into_any_element(),
+            );
+        }
         if show_cat(2, "editor split pane side by side") {
             let is_split = self.split_tab.is_some();
             let v1 = view.clone();

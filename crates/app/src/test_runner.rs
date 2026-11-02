@@ -2,7 +2,7 @@
 //! watch the results arrive as a tree of files, groups and tests, with failures
 //! expandable in place, click-to-jump to the source, and re-run of failures.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -216,7 +216,55 @@ impl DartIde {
         if state.log.len() > 400 {
             state.log.drain(..state.log.len() - 400);
         }
+        self.sync_test_marks(cx);
         cx.notify();
+    }
+
+    /// Show the last run's result next to each test declaration in the open
+    /// editors: a gutter mark, and a margin note with the failure.
+    pub(crate) fn sync_test_marks(&self, cx: &mut Context<Self>) {
+        let mut by_file: HashMap<PathBuf, BTreeMap<usize, (editor_view::TestMark, Option<String>)>> =
+            HashMap::new();
+        if let Some(state) = &self.test_run {
+            for test in state.run.tests.values() {
+                if test.line == 0 {
+                    continue;
+                }
+                let path = self.test_path(state, test);
+                let path = std::fs::canonicalize(&path).unwrap_or(path);
+                let mark = match test.status {
+                    TestStatus::Running => editor_view::TestMark::Running,
+                    TestStatus::Passed => editor_view::TestMark::Passed,
+                    TestStatus::Failed | TestStatus::Errored => editor_view::TestMark::Failed,
+                    TestStatus::Skipped => editor_view::TestMark::Skipped,
+                };
+                let error = test.failure_summary();
+                let slot = by_file.entry(path).or_default();
+                let line = test.line as usize - 1;
+                // Several tests on one line (a loop): the worst one shows.
+                let keep = match slot.get(&line) {
+                    Some((existing, _)) => mark_rank(mark) > mark_rank(*existing),
+                    None => true,
+                };
+                if keep {
+                    slot.insert(line, (mark, error));
+                }
+            }
+        }
+        for tab in &self.tabs {
+            let Some(path) = &tab.path else { continue };
+            let path = std::fs::canonicalize(path).unwrap_or_else(|_| path.clone());
+            let marks: Vec<_> = by_file
+                .get(&path)
+                .map(|lines| {
+                    lines
+                        .iter()
+                        .map(|(line, (mark, error))| (*line, *mark, error.clone()))
+                        .collect()
+                })
+                .unwrap_or_default();
+            tab.editor.update(cx, |editor, cx| editor.set_test_marks(marks, cx));
+        }
     }
 
     pub(crate) fn stop_test_run(&mut self, cx: &mut Context<Self>) {
@@ -594,6 +642,16 @@ impl DartIde {
                         )
                     }),
             )
+    }
+}
+
+/// Which result wins when several tests share a line.
+fn mark_rank(mark: editor_view::TestMark) -> u8 {
+    match mark {
+        editor_view::TestMark::Skipped => 0,
+        editor_view::TestMark::Passed => 1,
+        editor_view::TestMark::Running => 2,
+        editor_view::TestMark::Failed => 3,
     }
 }
 

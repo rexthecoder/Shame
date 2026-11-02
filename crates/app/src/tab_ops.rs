@@ -9,6 +9,8 @@ impl DartIde {
 
     pub(crate) fn open_path(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
         self.open_path_with_mode(path, false, window, cx);
+        // A test file opened after a run still shows that run's results.
+        self.sync_test_marks(cx);
     }
 
     pub(crate) fn open_path_with_mode(

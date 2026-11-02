@@ -49,6 +49,41 @@ pub struct TestCase {
 }
 
 impl TestCase {
+    /// One line saying why the test failed, for a note in the editor.
+    /// Flutter's own error text is a generic "Test failed. See exception
+    /// logs above."; the reason is in the printed output, so look there
+    /// first: an `Expected:` / `Actual:` pair, or the line after "...was
+    /// thrown...".
+    pub fn failure_summary(&self) -> Option<String> {
+        if !self.status.is_bad() {
+            return None;
+        }
+        let text: Vec<&str> = self
+            .output
+            .iter()
+            .chain(self.error.iter())
+            .flat_map(|chunk| chunk.lines())
+            .map(str::trim)
+            .collect();
+        if let Some(ix) = text.iter().position(|l| l.starts_with("Expected:")) {
+            let actual = text[ix + 1..]
+                .iter()
+                .find(|l| l.starts_with("Actual:"))
+                .map(|l| format!(" \u{b7} {l}"))
+                .unwrap_or_default();
+            return Some(format!("{}{actual}", text[ix]));
+        }
+        if let Some(ix) = text.iter().position(|l| l.contains("was thrown")) {
+            if let Some(reason) = text[ix + 1..].iter().find(|l| !l.is_empty()) {
+                return Some(reason.to_string());
+            }
+        }
+        text.iter()
+            .find(|l| !l.is_empty() && !l.starts_with("Test failed. See exception logs"))
+            .map(|l| l.to_string())
+            .or_else(|| Some("Test failed".to_string()))
+    }
+
     /// The test's own name without its group prefix.
     pub fn short_name(&self) -> &str {
         self.name
@@ -158,11 +193,18 @@ impl TestRun {
             return false;
         }
         let suite_path = test["suiteID"].as_i64().and_then(|s| self.suites.get(&s)).cloned();
-        let path = test["url"]
-            .as_str()
-            .and_then(file_uri_to_path)
-            .or(suite_path)
-            .unwrap_or_default();
+        // Where the test is declared in *your* file. A test written through a
+        // wrapper (`testWidgets` calls `test` inside `flutter_test`) reports
+        // `url`/`line` inside the wrapper and puts your file in
+        // `root_url`/`root_line`, so those win when present.
+        let located = |url: &str, line: &str| {
+            let path = test[url].as_str().and_then(file_uri_to_path)?;
+            Some((path, test[line].as_u64().unwrap_or(0) as u32))
+        };
+        let (path, line) = located("root_url", "root_line")
+            .or_else(|| located("url", "line"))
+            // A `package:` url means the line is in someone else's code.
+            .unwrap_or_else(|| (suite_path.unwrap_or_default(), 0));
         // The test's own group is the last (innermost) group id.
         let group = test["groupIDs"]
             .as_array()
@@ -176,7 +218,7 @@ impl TestRun {
                 name: name.to_string(),
                 group,
                 path,
-                line: test["line"].as_u64().unwrap_or(0) as u32,
+                line,
                 status: TestStatus::Running,
                 error: None,
                 stack: None,
@@ -391,6 +433,41 @@ mod tests {
         assert_eq!(failed.output, vec!["counter is 1"]);
         assert_eq!(run.done, Some(false));
         assert!(run.tests.values().all(|t| !t.name.contains("loading") && !t.name.contains("All)")));
+    }
+
+    /// `testWidgets` reports the wrapper's location in `url`/`line` and the
+    /// test's own in `root_url`/`root_line`.
+    #[test]
+    fn widget_tests_are_located_in_your_file_not_flutter_test() {
+        let mut run = TestRun::new();
+        run.apply_line(r#"{"suite":{"id":0,"platform":"vm","path":"/app/test/home_test.dart"},"type":"suite","time":0}"#);
+        run.apply_line(r#"{"test":{"id":3,"name":"shows the title","suiteID":0,"groupIDs":[],"metadata":{"skip":false},"line":172,"column":5,"url":"package:flutter_test/src/widget_tester.dart","root_line":12,"root_column":3,"root_url":"file:///app/test/home_test.dart"},"type":"testStart","time":5}"#);
+        run.apply_line(r#"{"test":{"id":4,"name":"no location","suiteID":0,"groupIDs":[],"metadata":{"skip":false},"line":9,"url":"package:other/x.dart"},"type":"testStart","time":6}"#);
+        let test = &run.tests[&3];
+        assert_eq!(test.line, 12);
+        assert_eq!(test.path.to_str(), Some("/app/test/home_test.dart"));
+        let test = &run.tests[&4];
+        assert_eq!((test.path.to_str(), test.line), (Some("/app/test/home_test.dart"), 0));
+    }
+
+    #[test]
+    fn a_failure_is_summed_up_from_the_printed_output() {
+        let mut test = TestCase {
+            id: 1,
+            name: "t".into(),
+            group: String::new(),
+            path: PathBuf::new(),
+            line: 1,
+            status: TestStatus::Failed,
+            error: Some("Test failed. See exception logs above.\nThe test description was: t".into()),
+            stack: None,
+            output: vec!["══╡ EXCEPTION CAUGHT BY FLUTTER TEST FRAMEWORK ╞══\nThe following TestFailure was thrown running a test:\nExpected: <2>\n  Actual: <1>\n".into()],
+        };
+        assert_eq!(test.failure_summary().as_deref(), Some("Expected: <2> \u{b7} Actual: <1>"));
+        test.output = vec!["The following assertion was thrown building Foo:\nA RenderFlex overflowed by 12 pixels.".into()];
+        assert_eq!(test.failure_summary().as_deref(), Some("A RenderFlex overflowed by 12 pixels."));
+        test.status = TestStatus::Passed;
+        assert_eq!(test.failure_summary(), None);
     }
 
     #[test]

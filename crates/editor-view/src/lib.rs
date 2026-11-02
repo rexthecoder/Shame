@@ -26,6 +26,8 @@ mod code_actions;
 pub mod keymap;
 mod conflicts;
 mod inlay_hints;
+mod brackets;
+mod indent_guides;
 mod lsp_integration;
 mod margin_notes;
 mod multicursor;
@@ -65,6 +67,9 @@ const GUTTER_FONT_SIZE: f32 = 11.5;
 /// Enough breathing room to read as an editor without the file feeling
 /// sparse (the first pass tried 26px, which did).
 const LINE_HEIGHT: f32 = 22.;
+/// Bracket pairs by depth: gold, orchid, sky — distinct from the syntax
+/// colours and soft enough for dark backgrounds.
+const BRACKET_COLORS: [u32; 3] = [0xe5c07b, 0xc678dd, 0x61afef];
 /// Space above the first line.
 const LIST_TOP_PAD: f32 = 8.;
 /// Gap kept between an inlay hint pill and neighbouring text when the
@@ -159,13 +164,31 @@ impl Global for SaveOptions {}
 pub struct EditorOptions {
     /// Show language-server inlay hints (inferred types, parameter names).
     pub inlay_hints: bool,
+    /// Faint vertical lines at each indent level, the caret's block lit.
+    pub indent_guides: bool,
+    /// Colour `()`, `[]` and `{}` by nesting depth.
+    pub bracket_colors: bool,
 }
 
 impl Default for EditorOptions {
     fn default() -> Self {
-        // Off for now: both type and parameter-name hints read as clutter.
-        Self { inlay_hints: false }
+        // Inlay hints off for now: both type and parameter-name hints read as
+        // clutter.
+        Self {
+            inlay_hints: false,
+            indent_guides: true,
+            bracket_colors: true,
+        }
     }
+}
+
+/// How a test declared on a line did in the last run, shown in the gutter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TestMark {
+    Running,
+    Passed,
+    Failed,
+    Skipped,
 }
 
 impl Global for EditorOptions {}
@@ -249,6 +272,14 @@ pub struct EditorView {
     /// Logical line -> its row in the list (folds hide lines), rebuilt on
     /// every render so scrolling lands on the right row.
     display_line_index: Vec<usize>,
+    /// Last test run's result per 0-indexed line, with the failure message.
+    test_marks: std::collections::HashMap<usize, (TestMark, Option<String>)>,
+    /// Bracket depth at the start of each line, rebuilt per edit.
+    bracket_depths: Vec<u32>,
+    /// Indent guides per line, rebuilt per edit (see `indent_guides.rs`).
+    guide_counts: Vec<u16>,
+    /// `(guide level, first line, last line)` of the block holding the caret.
+    active_guide: Option<(u16, usize, usize)>,
     /// Width the margin-note column took last frame. The text area is
     /// measured after that reservation, so adding it back gives the editor's
     /// full width when deciding whether notes fit.
@@ -374,6 +405,10 @@ impl EditorView {
             h_drag: None,
             h_span: px(1.),
             display_line_index: Vec::new(),
+            test_marks: std::collections::HashMap::new(),
+            bracket_depths: Vec::new(),
+            guide_counts: Vec::new(),
+            active_guide: None,
             notes_reserved: 0.,
             language,
             syntax_tree,
@@ -413,6 +448,7 @@ impl EditorView {
             code_action_sequence: 0,
             code_action_scheduled: None,
         };
+        this.refresh_text_measures();
         this.maybe_start_lsp(cx);
         this.refresh_line_changes(cx);
         this
@@ -448,6 +484,14 @@ impl EditorView {
     /// Synchronize `synced_text`, `syntax_tree`, `closing_labels`, and LSP
     /// `didChange` at most once per `buffer.revision()`, avoiding duplicate
     /// full-buffer allocations across keystroke handlers and `render()`.
+    /// Bracket depths and indent guides for the whole buffer, rebuilt
+    /// whenever the text is (re)synced: on open, and after each edit.
+    fn refresh_text_measures(&mut self) {
+        let text = self.buffer.text();
+        self.bracket_depths = brackets::bracket_depths(&text);
+        self.guide_counts = indent_guides::guide_counts(&text, self.indent_width);
+    }
+
     pub(crate) fn sync_buffer_state(&mut self) {
         if self.buffer.revision() == self.synced_revision {
             return;
@@ -455,6 +499,7 @@ impl EditorView {
         self.synced_revision = self.buffer.revision();
         self.bracket_pair_cache = None;
         self.indent_width = self.buffer.detect_indent_width();
+        self.refresh_text_measures();
         if !self.search_query.is_empty() {
             self.recompute_search_matches();
         }
@@ -660,6 +705,7 @@ impl EditorView {
         self.synced_revision = self.buffer.revision();
         self.bracket_pair_cache = None;
         self.indent_width = self.buffer.detect_indent_width();
+        self.refresh_text_measures();
         self.line_changes.clear();
         self.inlay_hints.clear();
         self.inlay_scheduled_revision = None;
@@ -817,6 +863,23 @@ impl EditorView {
     /// go-to-definition in a newly-opened file landed. `column` is an LSP
     /// (UTF-16) column, which is also a plain character count for typical
     /// text; past the line's end it clamps to the end of that line.
+    /// Results of the last test run for tests declared in this file, by
+    /// 0-indexed line. Replaces whatever was shown before.
+    pub fn set_test_marks(
+        &mut self,
+        marks: Vec<(usize, TestMark, Option<String>)>,
+        cx: &mut Context<Self>,
+    ) {
+        let marks: std::collections::HashMap<usize, (TestMark, Option<String>)> = marks
+            .into_iter()
+            .map(|(line, mark, message)| (line, (mark, message)))
+            .collect();
+        if marks != self.test_marks {
+            self.test_marks = marks;
+            cx.notify();
+        }
+    }
+
     pub fn set_cursor_to_position(&mut self, line: u32, column: u32, cx: &mut Context<Self>) {
         let offset = self.buffer.offset_from_lsp(line, column);
         self.set_cursor(offset, cx);
@@ -2098,7 +2161,6 @@ impl EditorView {
             (lsp_types::DiagnosticSeverity, Range<usize>, String),
         >,
         line_changes: &std::collections::HashMap<u32, LineChange>,
-        indent_width: usize,
         current_word: Option<&str>,
         bracket_pair: Option<(usize, usize)>,
         scroll_x: Pixels,
@@ -2171,6 +2233,22 @@ impl EditorView {
                                 .text_size(px(9.5))
                                 .text_color(cx.theme().warning)
                                 .child("\u{25b6}"),
+                        )
+                    })
+                    .when_some(self.test_marks.get(&index).map(|(mark, _)| *mark), |el, mark| {
+                        let (icon, color) = match mark {
+                            TestMark::Passed => (gpui_kit::assets::IconName::CircleCheck, cx.theme().success),
+                            TestMark::Failed => (gpui_kit::assets::IconName::CircleX, cx.theme().danger),
+                            TestMark::Running => (gpui_kit::assets::IconName::LoaderCircle, cx.theme().primary),
+                            TestMark::Skipped => (
+                                gpui_kit::assets::IconName::CircleSlash,
+                                cx.theme().muted_foreground,
+                            ),
+                        };
+                        el.child(
+                            gpui_kit::component::Icon::new(icon)
+                                .with_size(px(10.))
+                                .text_color(color),
                         )
                     })
                     .child(div().child(line_1.to_string())),
@@ -2312,10 +2390,20 @@ impl EditorView {
         // the text and computes exact `x_for_index` positions for the cursor,
         // selection, and word-match highlights — guaranteeing 0.0px drift
         // between characters and the caret!
-        let text_runs: Vec<TextRun> = Self::line_runs(line_start, display_text, highlights)
+        let options = cx.try_global::<EditorOptions>().copied().unwrap_or_default();
+        let runs: Vec<_> = Self::line_runs(line_start, display_text, highlights)
             .into_iter()
             .filter(|(range, _)| !range.is_empty())
-            .map(|(range, kind)| {
+            .collect();
+        let runs = if options.bracket_colors {
+            let depth = self.bracket_depths.get(index).copied().unwrap_or(0);
+            brackets::split_bracket_runs(display_text, runs, depth)
+        } else {
+            runs.into_iter().map(|(range, kind)| (range, kind, None)).collect()
+        };
+        let text_runs: Vec<TextRun> = runs
+            .into_iter()
+            .map(|(range, kind, bracket)| {
                 let mut run_font = font(mono_family.clone());
                 if let Some(k) = kind {
                     if k == HighlightKind::Comment
@@ -2327,7 +2415,10 @@ impl EditorView {
                 TextRun {
                     len: range.len(),
                     font: run_font,
-                    color: kind.map(|k| highlight_color(k).into()).unwrap_or(default_fg),
+                    color: match bracket {
+                        Some(level) => rgb(BRACKET_COLORS[level as usize % BRACKET_COLORS.len()]).into(),
+                        None => kind.map(|k| highlight_color(k).into()).unwrap_or(default_fg),
+                    },
                     background_color: None,
                     underline: None,
                     strikethrough: None,
@@ -2386,13 +2477,30 @@ impl EditorView {
 
         // Single unified line canvas: shapes `display_text` ONCE with `text_runs`
         // and uses that exact `ShapedLine` for:
-        // 1. Indent guides (using actual shaped space width)
         // 2. Word-occurrence & matching-bracket background pills
         // 3. Selection highlight
         // 4. Token-level diagnostic underline + inline diagnostic badge right after the line's text
         // 5. Painting the syntax-highlighted line (`shaped.paint(...)`)
         // 6. Painting the vertical caret at `shaped.x_for_index(cursor_col)`
         // 7. Mouse click/drag/hover column hit-testing (`shaped.closest_index_for_x`)
+        // Guides for this line: columns `k * indent_width` for k ≥ 1 (none
+        // at the text's own edge), the caret's block drawn brighter.
+        let guide_columns: Vec<(usize, bool)> = if options.indent_guides {
+            let width = self.indent_width.max(1);
+            let count = self.guide_counts.get(index).copied().unwrap_or(0) as usize;
+            (1..count)
+                .map(|level| {
+                    let active = self.active_guide.is_some_and(|(g, first, last)| {
+                        g as usize == level && (first..=last).contains(&index)
+                    });
+                    (level * width, active)
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let guide_color = cx.theme().border.opacity(0.45);
+        let guide_active_color = cx.theme().muted_foreground.opacity(0.5);
         let line_shared: SharedString = display_text.to_string().into();
         let line_len = line_shared.len();
         let leading_spaces = display_text.as_bytes().iter().take_while(|&&b| b == b' ').count();
@@ -2528,14 +2636,24 @@ impl EditorView {
                 let xs = |col: usize| shaped.x_for_index(col.min(line_len)) + inlays.shift(col, true);
                 let xe = |col: usize| shaped.x_for_index(col.min(line_len)) + inlays.shift(col, false);
                 let text_w = shaped.width + inlays.total();
-                // 1. Faint vertical indent guides at exact shaped column offsets
-                for column in (indent_width..leading_spaces).step_by(indent_width).take(16) {
-                    let x = xs(column);
-                    let guide_rect = Bounds::new(
-                        point(bounds.origin.x + x, bounds.origin.y + px(3.)),
-                        size(px(1.), bounds.size.height - px(6.)),
+                // 1. Indent guides, at the shaped x of their column inside the
+                //    leading whitespace (and at whole cells past a short or
+                //    blank line), full height so they join up between lines.
+                let cell = (char_width as f32).max(1.);
+                for &(column, active) in &guide_columns {
+                    let x = if column <= leading_spaces {
+                        xs(column)
+                    } else {
+                        px(column as f32 * cell)
+                    };
+                    let rect = Bounds::new(
+                        point(bounds.origin.x + x, bounds.origin.y),
+                        size(px(1.), bounds.size.height),
                     );
-                    window.paint_quad(fill(guide_rect, cx.theme().border.opacity(0.35)));
+                    window.paint_quad(fill(
+                        rect,
+                        if active { guide_active_color } else { guide_color },
+                    ));
                 }
 
                 // 2. Word-occurrence, bracket, & search-match highlight pills
@@ -4181,7 +4299,11 @@ impl Render for EditorView {
 
         let diagnostics_by_line = self.diagnostics_by_line();
         let diagnostic_messages = self.diagnostic_messages_by_line();
-        let indent_width = self.indent_width;
+        self.active_guide = if options.indent_guides {
+            indent_guides::active_guide(&self.guide_counts, self.buffer.byte_to_line(head))
+        } else {
+            None
+        };
         let bracket_pair = match self.bracket_pair_cache {
             Some((cached_head, pair)) if cached_head == head => pair,
             _ => {
@@ -4343,7 +4465,6 @@ impl Render for EditorView {
                             &diagnostics_by_line,
                             &diagnostic_messages,
                             &this.line_changes,
-                            indent_width,
                             current_word.as_deref(),
                             bracket_pair,
                             scroll_x,

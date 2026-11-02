@@ -365,6 +365,8 @@ impl DartIde {
             "format_on_save": self.save_options.format_on_save,
             "trim_trailing_whitespace": self.save_options.trim_trailing_whitespace,
             "insert_final_newline": self.save_options.insert_final_newline,
+            "indent_guides": self.editor_options.indent_guides,
+            "bracket_colors": self.editor_options.bracket_colors,
         });
         if let Ok(json) = serde_json::to_vec_pretty(&val) {
             let _ = std::fs::write(path, json);
@@ -431,6 +433,12 @@ impl DartIde {
         }
         if let Some(v) = val.get("insert_final_newline").and_then(|v| v.as_bool()) {
             self.save_options.insert_final_newline = v;
+        }
+        if let Some(v) = val.get("indent_guides").and_then(|v| v.as_bool()) {
+            self.editor_options.indent_guides = v;
+        }
+        if let Some(v) = val.get("bracket_colors").and_then(|v| v.as_bool()) {
+            self.editor_options.bracket_colors = v;
         }
         self.apply_save_options(cx);
         self.apply_editor_options(cx);

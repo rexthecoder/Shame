@@ -12,6 +12,7 @@ use std::collections::HashMap;
 
 use core_lsp::lsp_types::DiagnosticSeverity;
 use gpui_kit::component::{ActiveTheme as _, h_flex, v_flex};
+use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 use crate::{EditorView, LINE_HEIGHT};
@@ -72,11 +73,31 @@ pub(crate) fn stack_notes(wanted: &[(f32, f32)], gap: f32) -> Vec<f32> {
 impl EditorView {
     /// Errors and warnings, one per line (the most severe), sorted by line.
     pub(crate) fn line_notes(&self) -> Vec<LineNote> {
-        let Some(lsp) = &self.lsp else {
-            return Vec::new();
-        };
         let mut by_line: HashMap<usize, LineNote> = HashMap::new();
-        for diagnostic in &lsp.diagnostics {
+        // A failed test reads like an error on the line that declares it.
+        for (&line, (mark, message)) in &self.test_marks {
+            if *mark != crate::TestMark::Failed {
+                continue;
+            }
+            let message = message
+                .as_deref()
+                .and_then(|m| m.lines().map(str::trim).find(|l| !l.is_empty()))
+                .unwrap_or("Test failed")
+                .to_string();
+            by_line.insert(
+                line,
+                LineNote {
+                    line,
+                    severity: DiagnosticSeverity::ERROR,
+                    column: 0,
+                    message,
+                    source: Some("test".to_string()),
+                    more: 0,
+                },
+            );
+        }
+        let diagnostics = self.lsp.as_ref().map(|lsp| lsp.diagnostics.as_slice()).unwrap_or(&[]);
+        for diagnostic in diagnostics {
             let severity = diagnostic.severity.unwrap_or(DiagnosticSeverity::INFORMATION);
             if severity != DiagnosticSeverity::ERROR && severity != DiagnosticSeverity::WARNING {
                 continue;
@@ -207,6 +228,9 @@ impl EditorView {
             curves.push((center, top + title_center, color));
             let active = note.line == cursor_line;
             let (line, column) = (note.line, note.column);
+            // Quick fixes come from the language server; a failed test has
+            // none to offer.
+            let has_fix = note.source.as_deref() != Some("test");
             let meta = match (&note.source, note.more) {
                 (Some(source), 0) => format!("{source} \u{b7} line {}", line + 1),
                 (Some(source), more) => format!("{source} \u{b7} line {} \u{b7} +{more}", line + 1),
@@ -265,7 +289,7 @@ impl EditorView {
                             .gap(px(6.))
                             .text_size(px(11.))
                             .child(div().min_w(px(0.)).truncate().text_color(muted).child(meta))
-                            .child(
+                            .when(has_fix, |row| row.child(
                                 div()
                                     .id(("margin-note-fix", line))
                                     .flex_shrink_0()
@@ -284,7 +308,7 @@ impl EditorView {
                                         this.go_to_note(line, column, window, cx);
                                         this.request_code_actions(cx);
                                     })),
-                            ),
+                            )),
                     )
                     .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                     .on_click(cx.listener(move |this, _e, window, cx| {
