@@ -76,10 +76,6 @@ impl SearchIndex {
         }))
     }
 
-    pub fn root(&self) -> &Path {
-        &self.root
-    }
-
     /// True once the initial walk is done and the index can answer for the
     /// whole workspace.
     pub fn is_ready(&self) -> bool {
@@ -114,6 +110,10 @@ impl SearchIndex {
                     casing: Some(Casing::Insensitive),
                     mode: GrepMode::PlainText,
                     page_limit: MAX_MATCHES,
+                    // One generated file with thousands of hits must not stop
+                    // the list at fff's per-file default (200) while the
+                    // header still says the search is complete.
+                    max_matches_per_file: MAX_MATCHES,
                     // Stop a pathological query (a single letter in a monorepo)
                     // from occupying the search thread indefinitely.
                     time_budget_ms: 5_000,

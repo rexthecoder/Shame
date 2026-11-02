@@ -62,6 +62,30 @@ Sum of the per-edit rows: about 1.5 ms at 100 KB and about 14 ms at 1000 KB.
   edited region, or debounce them.
 - Visible-range highlighting is flat in file size, as it should be.
 
+## Project search: warm index vs. disk walk
+
+Search is no longer measured on the edit path, so it gets its own numbers:
+
+```bash
+cargo run --release -p core-workspace --example search_bench -- ~/path/to/app
+```
+
+That opens `SearchIndex` for a real Flutter project, waits for the first
+scan, then runs the same query through fff and through the old per-file walk
+(one run per query; the walk re-reads every file each time):
+
+| Project | Files (`.dart`) | Query | fff index | Disk walk |
+|---|---:|---|---:|---:|
+| luna | 1,912 | `Widget build` (1,728 hits) | 7.1 ms | 53 ms |
+| luna | 1,912 | `text style` (17 hits) | 3.4 ms | 45 ms |
+| warlock | 5,233 | `Widget build` (3,438 hits) | 15.9 ms | 129 ms |
+| warlock | 5,233 | `text style` (1 hit) | 7.0 ms | 126 ms |
+
+First scan of 5,233 files: 336 ms. Quick Open (fzf-style fuzzy match over the
+whole index, ranked): 0.5 ms for an empty query and under 2 ms for a path
+query, on both projects. The first grep after a scan pays for warming the
+content cache (roughly a disk-walk's cost); every later query runs against it.
+
 ## Not measured yet
 
 Startup time to first paint, keystroke-to-paint latency, scroll frame time,
