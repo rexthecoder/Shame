@@ -485,6 +485,42 @@ impl DartIde {
         self.insert_mention(attachment, window, cx);
     }
 
+    /// "Ask" on a margin note: open the agent with the problem's code
+    /// attached and a question about it in the composer, ready to edit and
+    /// send (it is not sent for you).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn ask_agent_about_problem(
+        &mut self,
+        path: std::path::PathBuf,
+        line: usize,
+        start_line: usize,
+        end_line: usize,
+        code: String,
+        message: String,
+        is_test: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let rel = self.rel_path(&path);
+        let question = if is_test {
+            format!("This test fails: {message}. Why, and how do I fix it?")
+        } else {
+            format!("Line {line}: {message}. What's wrong here and how do I fix it?")
+        };
+        self.set_agent_open(true);
+        self.agent.input.update(cx, |state, cx| state.set_value("", window, cx));
+        self.insert_mention(
+            Attachment::Selection { rel, start_line, end_line, text: code },
+            window,
+            cx,
+        );
+        self.agent.input.update(cx, |state, cx| {
+            state.insert(&question, window, cx);
+            state.focus(window, cx);
+        });
+        cx.notify();
+    }
+
     pub(crate) fn open_model_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.agent.model_picker_open = true;
         self.agent.tool_picker_open = false;

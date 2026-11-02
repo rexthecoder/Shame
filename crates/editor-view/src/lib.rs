@@ -119,6 +119,17 @@ pub enum EditorEvent {
         extra_args: Vec<String>,
         label: String,
     },
+    /// "Ask" on a margin note: hand the problem and its code to the agent.
+    /// Lines are 1-based; `code` is the text of `start_line..=end_line`.
+    AskAboutProblem {
+        path: PathBuf,
+        line: usize,
+        start_line: usize,
+        end_line: usize,
+        code: String,
+        message: String,
+        is_test: bool,
+    },
 }
 
 /// Maximum file size (256 KiB) for tree-sitter parsing and syntax queries.

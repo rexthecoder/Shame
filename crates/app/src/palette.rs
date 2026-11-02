@@ -408,7 +408,14 @@ impl DartIde {
                 matches.push(path.clone());
             }
         }
-        std::mem::take(matches)
+        let mut matches = std::mem::take(matches);
+        // The index scores the whole path fuzzily, so "pal" can rank
+        // `core-workspace/src/lib.rs` (p…a…l) above `palette.rs`. Sort into
+        // tiers by how the file *name* matches; the index's own order (match
+        // quality, recency) still decides within a tier.
+        let query = raw.trim().to_lowercase();
+        matches.sort_by_cached_key(|path| quick_open_tier(path, &query));
+        matches
     }
 
     pub(crate) fn open_palette_selection(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -1231,4 +1238,57 @@ fn merge_ranges(ranges: &mut Vec<Range<usize>>) {
         }
     }
     *ranges = merged;
+}
+
+/// How well `path` answers a Quick Open query, best first: the file name is
+/// the query, starts with it, contains it, or has its letters in order;
+/// then the path contains it; then anything else the index offered.
+fn quick_open_tier(path: &std::path::Path, query: &str) -> u8 {
+    let name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or_default()
+        .to_lowercase();
+    let stem = name.split('.').next().unwrap_or(&name);
+    let query = query.trim();
+    if query.is_empty() {
+        return 0;
+    }
+    if name == query || stem == query {
+        0
+    } else if name.starts_with(query) {
+        1
+    } else if name.contains(query) {
+        2
+    } else if is_subsequence(&name, query) {
+        3
+    } else if path.to_string_lossy().to_lowercase().contains(query) {
+        4
+    } else {
+        5
+    }
+}
+
+fn is_subsequence(text: &str, query: &str) -> bool {
+    let mut chars = text.chars();
+    query
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .all(|q| chars.any(|c| c == q))
+}
+
+#[cfg(test)]
+mod quick_open_tests {
+    use super::quick_open_tier;
+    use std::path::Path;
+
+    #[core::prelude::v1::test]
+    fn file_names_that_match_rank_above_scattered_letters() {
+        let tier = |p: &str| quick_open_tier(Path::new(p), "pal");
+        assert_eq!(tier("crates/app/src/palette.rs"), 1);
+        assert_eq!(tier("crates/app/src/git_panel.rs"), 3, "p…a…l in the name");
+        assert_eq!(tier("crates/core-workspace/src/lib.rs"), 5);
+        assert_eq!(quick_open_tier(Path::new("x/Makefile"), "makefile"), 0);
+        assert_eq!(quick_open_tier(Path::new("docs/pal/a.md"), "pal"), 4);
+    }
 }

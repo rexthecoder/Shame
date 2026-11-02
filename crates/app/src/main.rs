@@ -1043,6 +1043,20 @@ impl DartIde {
                     }
                     cx.notify();
                 }
+                EditorEvent::AskAboutProblem {
+                    path,
+                    line,
+                    start_line,
+                    end_line,
+                    code,
+                    message,
+                    is_test,
+                } => {
+                    this.ask_agent_about_problem(
+                        path.clone(), *line, *start_line, *end_line, code.clone(), message.clone(), *is_test,
+                        window, cx,
+                    );
+                }
                 EditorEvent::RunTest {
                     path,
                     test_name,

@@ -11,7 +11,7 @@
 use std::collections::HashMap;
 
 use core_lsp::lsp_types::DiagnosticSeverity;
-use gpui_kit::component::{ActiveTheme as _, h_flex, v_flex};
+use gpui_kit::component::{ActiveTheme as _, Sizable as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
@@ -146,6 +146,29 @@ impl EditorView {
         self.notes_reserved
     }
 
+    /// The code to send with a question about the note on `line`: a failed
+    /// test's whole body, or for anything else the lines around it.
+    fn ask_about_note(&mut self, line: usize, message: String, is_test: bool, cx: &mut Context<Self>) {
+        let Some(path) = self.buffer.path().map(std::path::Path::to_path_buf) else {
+            return;
+        };
+        let last = self.buffer.line_count().saturating_sub(1);
+        let (start, end) = match self.fold_range_at(line).filter(|_| is_test) {
+            Some(block) => (block.start_line, block.end_line.min(last)),
+            None => (line.saturating_sub(6), (line + 6).min(last)),
+        };
+        let code: String = (start..=end).map(|ix| self.buffer.line(ix)).collect();
+        cx.emit(crate::EditorEvent::AskAboutProblem {
+            path,
+            line: line + 1,
+            start_line: start + 1,
+            end_line: end + 1,
+            code,
+            message,
+            is_test,
+        });
+    }
+
     /// Jump the caret to where a note's diagnostic starts.
     fn go_to_note(&mut self, line: usize, column: usize, window: &mut Window, cx: &mut Context<Self>) {
         let line_start = self.buffer.line_to_byte(line);
@@ -230,7 +253,9 @@ impl EditorView {
             let (line, column) = (note.line, note.column);
             // Quick fixes come from the language server; a failed test has
             // none to offer.
-            let has_fix = note.source.as_deref() != Some("test");
+            let is_test = note.source.as_deref() == Some("test");
+            let has_fix = !is_test;
+            let ask_message = note.message.clone();
             let meta = match (&note.source, note.more) {
                 (Some(source), 0) => format!("{source} \u{b7} line {}", line + 1),
                 (Some(source), more) => format!("{source} \u{b7} line {} \u{b7} +{more}", line + 1),
@@ -289,6 +314,35 @@ impl EditorView {
                             .gap(px(6.))
                             .text_size(px(11.))
                             .child(div().min_w(px(0.)).truncate().text_color(muted).child(meta))
+                            .child(
+                                h_flex()
+                                    .id(("margin-note-ask", line))
+                                    .flex_shrink_0()
+                                    .px(px(7.))
+                                    .h(px(18.))
+                                    .gap(px(4.))
+                                    .items_center()
+                                    .rounded(px(5.))
+                                    .bg(chip)
+                                    .text_color(fg)
+                                    .hover(move |b| b.bg(chip_hover))
+                                    .child(
+                                        gpui_kit::component::Icon::new(gpui_kit::assets::IconName::Sparkles)
+                                            .with_size(px(10.)),
+                                    )
+                                    .child("Ask")
+                                    .tooltip(|window, cx| {
+                                        gpui_kit::component::tooltip::Tooltip::new(
+                                            "Ask the agent about this",
+                                        )
+                                        .build(window, cx)
+                                    })
+                                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                                    .on_click(cx.listener(move |this, _e, _window, cx| {
+                                        cx.stop_propagation();
+                                        this.ask_about_note(line, ask_message.clone(), is_test, cx);
+                                    })),
+                            )
                             .when(has_fix, |row| row.child(
                                 div()
                                     .id(("margin-note-fix", line))
