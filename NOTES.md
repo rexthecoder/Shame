@@ -30,8 +30,12 @@ when a line is wider than the pane.
   End, search jumps): the caret is panned into view with a two-character
   margin, but scrolling by hand is not undone on the next frame.
 - Widths are measured in monospace cells (tabs count as four, full-width
-  characters as two), cached per buffer revision; the scrollbar extent is an
-  estimate, while painting and hit-testing use the real shaped line.
+  characters as two). The widest line is scanned once when a file opens, then
+  only the caret's line is folded in while typing; a full rescan happens after
+  a large deletion/undo, reload or formatter edit. (Rescanning every line on
+  every keystroke starved rendering under key repeat — holding `w` froze the
+  editor.) The scrollbar extent is an estimate; painting and hit-testing use
+  the real shaped line.
 
 ## Thread history: one thread per workspace became a list
 

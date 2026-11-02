@@ -232,6 +232,9 @@ pub struct EditorView {
     /// Widest line in display columns, cached by buffer revision.
     content_cols: usize,
     content_revision: Option<u64>,
+    /// Buffer length at the last full width scan, so a large deletion (undo,
+    /// select-all delete) triggers one instead of leaving a stale wide bar.
+    content_scan_len: usize,
     /// The cursor head the view last scrolled to reveal. Panning by hand must
     /// not be undone on the next frame, so only a moved cursor re-centres.
     revealed_head: Option<usize>,
@@ -338,6 +341,14 @@ impl EditorView {
         };
         let synced_revision = buffer.revision();
         let indent_width = buffer.detect_indent_width();
+        // Once per opened file: the widest line decides the horizontal extent.
+        // Typing updates this from the edited line only (see `render`), so a
+        // held key never rescans the whole buffer.
+        let content_cols = (0..buffer.line_count())
+            .map(|ix| display_columns(buffer.line(ix).trim_end_matches(['\n', '\r'])))
+            .max()
+            .unwrap_or(0);
+        let content_len = buffer.len_bytes();
         let mut this = Self {
             buffer,
             focus_handle: cx.focus_handle(),
@@ -345,8 +356,9 @@ impl EditorView {
             text_area_width: std::rc::Rc::new(std::cell::Cell::new(px(800.))),
             scroll_x: px(0.),
             max_scroll_x: px(0.),
-            content_cols: 0,
-            content_revision: None,
+            content_cols,
+            content_revision: Some(synced_revision),
+            content_scan_len: content_len,
             revealed_head: None,
             h_drag: None,
             h_span: px(1.),
@@ -654,6 +666,7 @@ impl EditorView {
         let len = self.buffer.len_bytes();
         self.buffer.edit(0..len, text);
         self.set_cursor(0, cx);
+        self.recompute_content_cols();
         cx.notify();
     }
 
@@ -727,6 +740,7 @@ impl EditorView {
     /// Replace the text with the file's current contents (dropping local edits).
     pub fn reload_from_disk(&mut self, cx: &mut Context<Self>) -> io::Result<()> {
         self.buffer.reload_from_disk()?;
+        self.recompute_content_cols();
         self.refresh_line_changes(cx);
         cx.notify();
         Ok(())
@@ -763,6 +777,18 @@ impl EditorView {
         }
         let next = (self.scroll_x.to_f64() - delta).clamp(0.0, max);
         self.scroll_x = px(next as f32);
+    }
+
+    /// Width of the widest line, recomputed over the whole buffer. Used after
+    /// wholesale changes (reload, format, undo of a paste); ordinary typing
+    /// only widens the edited line, which `render` folds in incrementally.
+    pub(crate) fn recompute_content_cols(&mut self) {
+        self.content_cols = (0..self.buffer.line_count())
+            .map(|ix| display_columns(self.buffer.line(ix).trim_end_matches(['\n', '\r'])))
+            .max()
+            .unwrap_or(0);
+        self.content_revision = Some(self.buffer.revision());
+        self.content_scan_len = self.buffer.len_bytes();
     }
 
     /// Move the cursor to a 0-indexed (line, column) — e.g. where a
@@ -3616,7 +3642,11 @@ fn char_columns(ch: char) -> usize {
 }
 
 fn display_columns(text: &str) -> usize {
-    text.chars().map(char_columns).sum()
+    if text.is_ascii() && !text.as_bytes().contains(&b'\t') {
+        text.len()
+    } else {
+        text.chars().map(char_columns).sum()
+    }
 }
 
 /// The pan that keeps `caret_x` visible in a `viewport`-wide column, without
@@ -4105,14 +4135,24 @@ impl Render for EditorView {
                 / 10.0)
                 .to_f64()
         };
+        let head = self.buffer.selections().primary().head;
         if self.content_revision != Some(self.buffer.revision()) {
-            self.content_cols = (0..self.buffer.line_count())
-                .map(|ix| {
-                    display_columns(self.buffer.line(ix).trim_end_matches(['\n', '\r']))
-                })
-                .max()
-                .unwrap_or(0);
-            self.content_revision = Some(self.buffer.revision());
+            let length = self.buffer.len_bytes();
+            if length + 64 < self.content_scan_len {
+                // A big deletion or undo can remove the widest line: rescan
+                // once rather than showing a bar for text that is gone.
+                self.recompute_content_cols();
+            } else {
+                // Ordinary typing only changes the caret's line. Fold its
+                // width into the cached maximum instead of walking every line
+                // on every keystroke, which stalls big files under key repeat.
+                let line = self.buffer.byte_to_line(head);
+                let display = self.buffer.line(line);
+                let cols = display_columns(display.trim_end_matches(['\n', '\r']));
+                self.content_cols = self.content_cols.max(cols);
+                self.content_revision = Some(self.buffer.revision());
+                self.content_scan_len = length;
+            }
         }
         let viewport = self.text_area_width.get().to_f64();
         let content_width = self.content_cols as f64 * char_width + 24.0;
@@ -4121,7 +4161,6 @@ impl Render for EditorView {
 
         // Follow the cursor only when it moves, so panning by hand sticks
         // until the next edit or cursor movement.
-        let head = self.buffer.selections().primary().head;
         if self.revealed_head != Some(head) {
             let line = self.buffer.byte_to_line(head);
             let line_start = self.buffer.line_to_byte(line);

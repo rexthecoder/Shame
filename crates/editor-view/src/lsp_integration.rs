@@ -1178,6 +1178,9 @@ impl EditorView {
             let end = self.buffer.offset_from_lsp(edit.range.end.line, edit.range.end.character);
             self.buffer.edit(start.min(end)..end, &edit.new_text);
         }
+        // Formatting/import edits can change any line, so the horizontal
+        // extent is recomputed here rather than inferred from the caret line.
+        self.recompute_content_cols();
         cx.notify();
     }
 
