@@ -563,16 +563,18 @@ pub fn push(root: &Path, status: &RepoStatus) -> Result<String, String> {
     let Some(branch) = status.branch.as_deref() else {
         return Err("HEAD is detached; switch to a branch to push".to_string());
     };
-    if status.upstream.is_some() {
+    let destination = if let Some(upstream) = &status.upstream {
         git(root, &["push"], None)?;
+        upstream.clone()
     } else {
         let remotes = git(root, &["remote"], None)?;
         let Some(remote) = remotes.lines().find(|r| !r.trim().is_empty()) else {
             return Err("No remote configured for this repository".to_string());
         };
         git(root, &["push", "-u", remote.trim(), branch], None)?;
-    }
-    Ok("Pushed".to_string())
+        format!("{}/{}", remote.trim(), branch)
+    };
+    Ok(format!("Pushed to {destination}"))
 }
 
 /// Local branches (most recently committed first), followed by remote branches (`origin/...`)

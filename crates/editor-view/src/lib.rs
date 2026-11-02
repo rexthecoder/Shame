@@ -210,6 +210,19 @@ pub(crate) fn minimal_replacement<'a>(old: &str, new: &'a str) -> Option<(Range<
     Some((prefix..a.len() - suffix, &new[prefix..b.len() - suffix]))
 }
 
+/// One row in the editor's virtual list: a code line, or the message row
+/// shown above a line with a diagnostic.
+#[derive(Clone)]
+enum DisplayItem {
+    Line(usize),
+    Diagnostic {
+        line: usize,
+        severity: lsp_types::DiagnosticSeverity,
+        text: String,
+        range: Range<usize>,
+    },
+}
+
 /// A horizontal scrollbar thumb being dragged: where the pointer and the
 /// scroll offset started, and the travel available to each.
 struct HorizontalDrag {
@@ -242,6 +255,9 @@ pub struct EditorView {
     h_drag: Option<HorizontalDrag>,
     /// Track width minus thumb width, from the last painted scrollbar.
     h_span: Pixels,
+    /// Logical line -> its row in the list (diagnostic rows shift code lines
+    /// down), rebuilt on every render so scrolling lands on the right row.
+    display_line_index: Vec<usize>,
     language: Arc<dyn LanguageAdapter>,
     syntax_tree: Option<SyntaxTree>,
     /// The text `syntax_tree` was last parsed/reparsed from, so `render`
@@ -362,6 +378,7 @@ impl EditorView {
             revealed_head: None,
             h_drag: None,
             h_span: px(1.),
+            display_line_index: Vec::new(),
             language,
             syntax_tree,
             synced_text,
@@ -551,8 +568,7 @@ impl EditorView {
         if self.active_debug_line != line {
             self.active_debug_line = line;
             if let Some(l1) = line {
-                self.scroll_handle
-                    .scroll_to_item(l1.saturating_sub(1) as usize, ScrollStrategy::Center);
+                self.scroll_to_line(l1.saturating_sub(1) as usize, ScrollStrategy::Center);
             }
             cx.notify();
         }
@@ -760,11 +776,21 @@ impl EditorView {
         cx.notify();
     }
 
+    /// Scroll a logical line into view. Diagnostic rows sit above their line,
+    /// so the list index is not the line number.
+    fn scroll_to_line(&self, line: usize, strategy: ScrollStrategy) {
+        let row = self
+            .display_line_index
+            .get(line)
+            .copied()
+            .unwrap_or(line);
+        self.scroll_handle.scroll_to_item(row, strategy);
+    }
+
     fn ensure_cursor_visible(&mut self) {
         let head = self.buffer.selections().primary().head;
         let line = self.buffer.byte_to_line(head);
-        self.scroll_handle
-            .scroll_to_item(line, ScrollStrategy::Nearest);
+        self.scroll_to_line(line, ScrollStrategy::Nearest);
     }
 
     /// Pan the text column by `delta` points; negative moves the code left
@@ -798,8 +824,7 @@ impl EditorView {
     pub fn set_cursor_to_position(&mut self, line: u32, column: u32, cx: &mut Context<Self>) {
         let offset = self.buffer.offset_from_lsp(line, column);
         self.set_cursor(offset, cx);
-        self.scroll_handle
-            .scroll_to_item(line as usize, ScrollStrategy::Center);
+        self.scroll_to_line(line as usize, ScrollStrategy::Center);
     }
 
     /// Update the active in-file search query (`⌘F`), recomputing all
@@ -845,8 +870,7 @@ impl EditorView {
                 .selections_mut()
                 .set_primary(Selection::cursor(target.start));
             let line = self.buffer.byte_to_line(target.start);
-            self.scroll_handle
-                .scroll_to_item(line, ScrollStrategy::Center);
+            self.scroll_to_line(line, ScrollStrategy::Center);
         }
     }
 
@@ -881,8 +905,7 @@ impl EditorView {
             .selections_mut()
             .set_primary(Selection::cursor(target.start));
         let line = self.buffer.byte_to_line(target.start);
-        self.scroll_handle
-            .scroll_to_item(line, ScrollStrategy::Center);
+        self.scroll_to_line(line, ScrollStrategy::Center);
         cx.notify();
     }
 
@@ -900,8 +923,7 @@ impl EditorView {
             .selections_mut()
             .set_primary(Selection::cursor(target.start));
         let line = self.buffer.byte_to_line(target.start);
-        self.scroll_handle
-            .scroll_to_item(line, ScrollStrategy::Center);
+        self.scroll_to_line(line, ScrollStrategy::Center);
         cx.notify();
     }
 
@@ -922,8 +944,7 @@ impl EditorView {
                 .selections_mut()
                 .set_primary(Selection::cursor(next_target.start));
             let line = self.buffer.byte_to_line(next_target.start);
-            self.scroll_handle
-                .scroll_to_item(line, ScrollStrategy::Center);
+            self.scroll_to_line(line, ScrollStrategy::Center);
         }
         cx.notify();
     }
@@ -2051,6 +2072,65 @@ impl EditorView {
         ranges
     }
 
+    /// The message row shown above a line with a diagnostic. It is a normal
+    /// list row, so it stacks with the code without an inline pill covering it.
+    fn render_diagnostic_row(
+        &self,
+        line: usize,
+        severity: lsp_types::DiagnosticSeverity,
+        text: &str,
+        range: &Range<usize>,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let (color, icon) = match severity {
+            lsp_types::DiagnosticSeverity::ERROR => (
+                cx.theme().danger,
+                gpui_kit::assets::IconName::CircleAlert,
+            ),
+            lsp_types::DiagnosticSeverity::WARNING => (
+                cx.theme().warning,
+                gpui_kit::assets::IconName::TriangleAlert,
+            ),
+            _ => (cx.theme().info, gpui_kit::assets::IconName::Info),
+        };
+        h_flex()
+            .id(("editor-diagnostic", line))
+            .debug_selector(move || format!("editor-diagnostic-{line}"))
+            .w_full()
+            .h(px(LINE_HEIGHT))
+            .flex_shrink_0()
+            .items_center()
+            .gap(px(6.))
+            .pl(px(GUTTER_WIDTH + 4.))
+            .pr(px(8.))
+            .bg(color.opacity(0.08))
+            .text_size(px(LINE_FONT_SIZE - 1.5))
+            .text_color(color)
+            .cursor_pointer()
+            .hover(move |row| row.bg(color.opacity(0.14)))
+            .child(
+                gpui_kit::component::Icon::new(icon)
+                    .with_size(px(11.))
+                    .text_color(color),
+            )
+            .child(div().min_w(px(0.)).truncate().child(text.to_string()))
+            .on_click(cx.listener({
+                let range = range.clone();
+                move |this, _event, window, cx| {
+                    let line_start = this.buffer.line_to_byte(line);
+                    let line_len = this
+                        .buffer
+                        .line(line)
+                        .trim_end_matches(['\n', '\r'])
+                        .len();
+                    let column = range.start.min(line_len);
+                    this.set_cursor(line_start + column, cx);
+                    window.focus(&this.focus_handle, cx);
+                    cx.notify();
+                }
+            }))
+    }
+
     fn render_line(
         &self,
         index: usize,
@@ -2339,15 +2419,14 @@ impl EditorView {
             })
             .collect();
 
-        let diag_inline_spec: Option<(Hsla, Range<usize>, SharedString)> =
-            diagnostic_msg.map(|(sev, col_range, msg)| {
+        let diag_inline_spec: Option<(Hsla, Range<usize>)> =
+            diagnostic_msg.map(|(sev, col_range, _)| {
                 let diag_color = match *sev {
                     s if s == lsp_types::DiagnosticSeverity::ERROR => cx.theme().danger,
                     s if s == lsp_types::DiagnosticSeverity::WARNING => cx.theme().warning,
                     _ => cx.theme().info,
                 };
-                let label = SharedString::from(format!("\u{25cf} {msg}"));
-                (diag_color, col_range.clone(), label)
+                (diag_color, col_range.clone())
             });
 
         // Single unified line canvas: shapes `display_text` ONCE with `text_runs`
@@ -2390,7 +2469,6 @@ impl EditorView {
             f.style = FontStyle::Italic;
             f
         };
-        let diag_font = font(mono_family.clone());
         let closing_color: Hsla = cx.theme().muted_foreground.opacity(0.42);
         // Inlay hints on this line as `(column, label, pad_left, pad_right)`.
         let line_inlays: Vec<(usize, SharedString, bool, bool)> = if self.inlay_hints_enabled {
@@ -2476,30 +2554,10 @@ impl EditorView {
                         ))
                     }
                 });
-                let shaped_diag =
-                    diag_inline_spec
-                        .as_ref()
-                        .map(|(diag_color, col_range, diag_label)| {
-                            let run = TextRun {
-                                len: diag_label.len(),
-                                font: diag_font.clone(),
-                                color: *diag_color,
-                                background_color: None,
-                                underline: None,
-                                strikethrough: None,
-                            };
-                            let shaped_lbl = window.text_system().shape_line(
-                                diag_label.clone(),
-                                px(11.),
-                                &[run],
-                                None,
-                            );
-                            (*diag_color, col_range.clone(), shaped_lbl)
-                        });
                 let hitbox = window.insert_hitbox(bounds, HitboxBehavior::Normal);
-                (hitbox, shaped, shaped_closing, shaped_diag, inlays, shaped_inlays)
+                (hitbox, shaped, shaped_closing, inlays, shaped_inlays)
             },
-            move |bounds, (hitbox, shaped, shaped_closing, shaped_diag, inlays, shaped_inlays), window, cx| {
+            move |bounds, (hitbox, shaped, shaped_closing, inlays, shaped_inlays), window, cx| {
                 width_cell.set(bounds.size.width);
                 // The row itself stays where it is (clicks and the hitbox use
                 // `frame_bounds`); the text is painted and hit-tested shifted
@@ -2589,7 +2647,7 @@ impl EditorView {
                 }
 
                 // 3b. Token-level diagnostic underline & subtle background tint
-                if let Some((diag_color, col_range, _)) = &shaped_diag {
+                if let Some((diag_color, col_range)) = &diag_inline_spec {
                     let start_idx = col_range.start.clamp(leading_spaces, line_len);
                     let end_idx = col_range.end.clamp(start_idx, line_len);
                     let x1 = xs(start_idx);
@@ -2680,59 +2738,10 @@ impl EditorView {
                         );
                     }
                 }
-                let mut after_text_x = text_w;
                 if let Some(closing) = &shaped_closing {
-                    let closing_x = after_text_x + px(12.);
+                    let closing_x = text_w + px(12.);
                     let _ = closing.paint(
                         point(bounds.origin.x + closing_x, text_y),
-                        px(LINE_HEIGHT),
-                        TextAlign::Left,
-                        None,
-                        window,
-                        cx,
-                    );
-                    after_text_x = closing_x + closing.width;
-                }
-
-                // 4b. Paint inline diagnostic pill directly after the line's text. A
-                // long line can push it past the visible edge — pin it inside the
-                // row so the message is always readable — with a subtle connector.
-                if let Some((diag_color, _, diag_shaped)) = &shaped_diag {
-                    let pill_h = px(17.);
-                    let pill_w = diag_shaped.width + px(14.);
-                    let desired = bounds.origin.x + after_text_x + px(8.) + px(13.);
-                    let visible_left = frame_bounds.origin.x;
-                    let visible_right = frame_bounds.origin.x + frame_bounds.size.width;
-                    let pill_x = desired
-                        .min(visible_right - pill_w - px(6.))
-                        .max(visible_left + px(6.));
-                    let connector_x = (pill_x - px(12.)).max(visible_left + px(2.));
-                    let mid_y = bounds.origin.y + bounds.size.height * 0.5;
-                    let connector_rect =
-                        Bounds::new(point(connector_x, mid_y - px(0.5)), size(px(10.), px(1.)));
-                    window.paint_quad(fill(connector_rect, diag_color.opacity(0.35)));
-
-                    // When the pill has to sit on top of the code, give it a
-                    // solid surface: a tinted translucent fill let the text
-                    // underneath make the message unreadable.
-                    let pinned = desired > visible_right - pill_w - px(6.);
-                    let pill_bg = if pinned {
-                        cx.theme().popover
-                    } else {
-                        diag_color.opacity(0.11)
-                    };
-                    let pill_y = bounds.origin.y + (bounds.size.height - pill_h) * 0.5;
-                    let pill_rect = Bounds::new(point(pill_x, pill_y), size(pill_w, pill_h));
-                    window.paint_quad(gpui_kit::quad(
-                        pill_rect,
-                        px(4.),
-                        pill_bg,
-                        Edges::all(px(1.)),
-                        diag_color.opacity(if pinned { 0.5 } else { 0.28 }),
-                        BorderStyle::Solid,
-                    ));
-                    let _ = diag_shaped.paint(
-                        point(pill_x + px(7.), text_y),
                         px(LINE_HEIGHT),
                         TextAlign::Left,
                         None,
@@ -3729,6 +3738,43 @@ fn reveal_offset(current: f64, caret_x: f64, viewport: f64, margin: f64, max: f6
     x.clamp(0.0, max)
 }
 
+/// Rows for the editor list: a message row above each visible line that has
+/// a diagnostic, then the line itself. Also returns logical line -> row.
+fn display_rows(
+    visible: &[usize],
+    messages: &std::collections::HashMap<
+        u32,
+        (lsp_types::DiagnosticSeverity, Range<usize>, String),
+    >,
+    line_count: usize,
+) -> (Vec<DisplayItem>, Vec<usize>) {
+    let mut rows = Vec::with_capacity(visible.len() + messages.len());
+    let mut line_row = vec![0usize; line_count];
+    for &line in visible {
+        if let Some((severity, range, text)) = messages.get(&(line as u32))
+            && matches!(
+                severity,
+                &lsp_types::DiagnosticSeverity::ERROR | &lsp_types::DiagnosticSeverity::WARNING
+            )
+        {
+            rows.push(DisplayItem::Diagnostic {
+                line,
+                severity: *severity,
+                text: text.clone(),
+                range: range.clone(),
+            });
+        }
+        if let Some(slot) = line_row.get_mut(line) {
+            *slot = rows.len();
+        }
+        rows.push(DisplayItem::Line(line));
+    }
+    if rows.is_empty() {
+        rows.push(DisplayItem::Line(0));
+    }
+    (rows, line_row)
+}
+
 fn is_word_byte(b: u8) -> bool {
     b.is_ascii_alphanumeric() || b == b'_' || b >= 0x80
 }
@@ -4024,8 +4070,8 @@ mod tests {
     }
 
     use super::{
-        diff_as_edit, display_columns, find_matches, fit_label, lens_left_after_text,
-        minimal_replacement, normalize_for_save, reveal_offset,
+        DisplayItem, diff_as_edit, display_columns, display_rows, find_matches, fit_label,
+        lens_left_after_text, minimal_replacement, normalize_for_save, reveal_offset,
     };
 
     #[test]
@@ -4122,6 +4168,26 @@ mod tests {
         assert!(fitted.ends_with('\u{2026}'));
         assert!(fitted.chars().count() < 20, "fitted: {fitted}");
         assert_eq!(fit_label("anything", 100.0, 8.0), None, "no room for a label");
+    }
+
+    #[test]
+    fn diagnostic_rows_sit_above_their_line_and_shift_the_scroll_index() {
+        let mut messages = std::collections::HashMap::new();
+        messages.insert(
+            1u32,
+            (
+                core_lsp::lsp_types::DiagnosticSeverity::ERROR,
+                2..5,
+                "Undefined class 'X'.".to_string(),
+            ),
+        );
+        let (rows, line_row) = display_rows(&[0, 1, 2], &messages, 3);
+        assert_eq!(rows.len(), 4);
+        assert!(matches!(rows[0], DisplayItem::Line(0)));
+        assert!(matches!(rows[1], DisplayItem::Diagnostic { line: 1, .. }));
+        assert!(matches!(rows[2], DisplayItem::Line(1)));
+        assert!(matches!(rows[3], DisplayItem::Line(2)));
+        assert_eq!(line_row, vec![0, 2, 3], "line 1 moved down by its message row");
     }
 
     #[test]
@@ -4267,28 +4333,37 @@ impl Render for EditorView {
         self.scroll_x = self.scroll_x.clamp(px(0.), self.max_scroll_x);
         let scroll_x = self.scroll_x;
 
-        let line_count = if self.folded_starts.is_empty() {
-            self.buffer.line_count().max(1)
+        // One list row per code line, plus a message row above every line with
+        // a diagnostic. All rows are still LINE_HEIGHT, so the list stays
+        // uniform; only the line -> row mapping shifts.
+        let visible_lines: Vec<usize> = if self.folded_starts.is_empty() {
+            (0..self.buffer.line_count().max(1)).collect()
         } else {
-            self.visible_lines.len().max(1)
+            self.visible_lines.clone()
         };
+        let (display_items, display_line_index) =
+            display_rows(&visible_lines, &diagnostic_messages, self.buffer.line_count());
+        self.display_line_index = display_line_index;
+
         let list = uniform_list(
             "editor-lines",
-            line_count,
+            display_items.len(),
             cx.processor(move |this, visible_range: Range<usize>, window, cx| {
                 if visible_range.is_empty() {
                     return Vec::new();
                 }
-                let map_line = |disp_ix: usize| -> usize {
-                    if this.folded_starts.is_empty() {
-                        disp_ix
-                    } else {
-                        this.visible_lines.get(disp_ix).copied().unwrap_or(disp_ix)
+                let mut first_line = None;
+                let mut end_line = 0usize;
+                for item in &display_items[visible_range.clone()] {
+                    if let DisplayItem::Line(line) = item {
+                        first_line.get_or_insert(*line);
+                        end_line = *line + 1;
                     }
+                }
+                let (start_line, end_line) = match first_line {
+                    Some(line) => (line, end_line.min(this.buffer.line_count())),
+                    None => (0, 0),
                 };
-                let start_line = map_line(visible_range.start);
-                let end_line = (map_line(visible_range.end.saturating_sub(1)) + 1)
-                    .min(this.buffer.line_count());
                 let start_byte = this.buffer.line_to_byte(start_line);
                 let end_byte = if end_line < this.buffer.line_count() {
                     this.buffer.line_to_byte(end_line)
@@ -4311,37 +4386,43 @@ impl Render for EditorView {
                 };
 
                 visible_range
-                    .map(|disp_ix| {
-                        let ix = if this.folded_starts.is_empty() {
-                            disp_ix
-                        } else {
-                            this.visible_lines.get(disp_ix).copied().unwrap_or(disp_ix)
-                        };
-                        let line = if this.buffer.is_empty() && ix == 0 {
-                            String::new()
-                        } else if ix < this.buffer.line_count() {
-                            this.buffer.line(ix)
-                        } else {
-                            String::new()
-                        };
-                        this.render_line(
-                            ix,
-                            &line,
-                            cursor_line,
-                            &highlights,
-                            selection_range.clone(),
-                            &diagnostics_by_line,
-                            &diagnostic_messages,
-                            &this.line_changes,
-                            indent_width,
-                            current_word.as_deref(),
-                            bracket_pair,
-                            scroll_x,
-                            char_width,
-                            window,
-                            cx,
-                        )
-                        .into_any_element()
+                    .map(|row| match &display_items[row] {
+                        DisplayItem::Line(ix) => {
+                            let ix = *ix;
+                            let line = if this.buffer.is_empty() && ix == 0 {
+                                String::new()
+                            } else if ix < this.buffer.line_count() {
+                                this.buffer.line(ix)
+                            } else {
+                                String::new()
+                            };
+                            this.render_line(
+                                ix,
+                                &line,
+                                cursor_line,
+                                &highlights,
+                                selection_range.clone(),
+                                &diagnostics_by_line,
+                                &diagnostic_messages,
+                                &this.line_changes,
+                                indent_width,
+                                current_word.as_deref(),
+                                bracket_pair,
+                                scroll_x,
+                                char_width,
+                                window,
+                                cx,
+                            )
+                            .into_any_element()
+                        }
+                        DisplayItem::Diagnostic {
+                            line,
+                            severity,
+                            text,
+                            range,
+                        } => this
+                            .render_diagnostic_row(*line, *severity, text, range, cx)
+                            .into_any_element(),
                     })
                     .collect()
             }),

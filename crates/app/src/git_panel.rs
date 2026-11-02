@@ -29,6 +29,17 @@ pub(crate) struct GitNotice {
     pub(crate) is_error: bool,
 }
 
+/// A git action waiting for dirty buffers to finish saving, so the index and
+/// the commit include exactly what the editor shows.
+#[derive(Clone)]
+pub(crate) enum PendingGit {
+    Stage(Vec<ChangedFile>),
+    StageAll,
+    Commit { message: String, amend: bool },
+    CommitAll { message: String },
+    Push,
+}
+
 pub(crate) struct GitState {
     /// `None` outside a repository.
     pub(crate) status: Option<RepoStatus>,
@@ -209,6 +220,39 @@ impl DartIde {
         cx.notify();
     }
 
+    /// Set the one-line notice under the commit box. A success clears itself after a few
+    /// seconds so the panel returns to its resting state; an error stays until dismissed.
+    pub(crate) fn set_git_notice(
+        &mut self,
+        text: impl Into<String>,
+        is_error: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let text = text.into();
+        if !is_error {
+            let expected = text.clone();
+            cx.spawn(async move |weak, cx| {
+                cx.background_executor()
+                    .timer(std::time::Duration::from_secs(4))
+                    .await;
+                let _ = weak.update(cx, |this, cx| {
+                    if this
+                        .git
+                        .notice
+                        .as_ref()
+                        .is_some_and(|n| !n.is_error && n.text == expected)
+                    {
+                        this.git.notice = None;
+                        cx.notify();
+                    }
+                });
+            })
+            .detach();
+        }
+        self.git.notice = Some(GitNotice { text, is_error });
+        cx.notify();
+    }
+
     /// Run `job` against the repository root off the UI thread, then refresh. `label` marks a
     /// long action ("Pushing…") as busy and reports `Ok` text as the notice; `None` runs quietly
     /// (stage / unstage), showing only errors.
@@ -255,17 +299,9 @@ impl DartIde {
                             this.git.reviewed.clear();
                             this.git.commit_types = None;
                         }
-                        this.git.notice = Some(GitNotice {
-                            text,
-                            is_error: false,
-                        });
+                        this.set_git_notice(text, false, cx);
                     }
-                    Err(text) => {
-                        this.git.notice = Some(GitNotice {
-                            text,
-                            is_error: true,
-                        })
-                    }
+                    Err(text) => this.set_git_notice(text, true, cx),
                     Ok(_) => {}
                 }
                 this.refresh_git(cx);
@@ -293,6 +329,10 @@ impl DartIde {
         window: &Window,
         cx: &mut Context<Self>,
     ) {
+        self.defer_git(PendingGit::Stage(files.to_vec()), window, cx);
+    }
+
+    fn git_stage_now(&mut self, files: &[ChangedFile], window: &Window, cx: &mut Context<Self>) {
         let paths: Vec<String> = files.iter().map(|f| f.path.clone()).collect();
         self.git_run(window, None, false, cx, move |root, _| {
             core_workspace::stage(root, &paths).map(|_| String::new())
@@ -316,6 +356,10 @@ impl DartIde {
     }
 
     pub(crate) fn git_stage_all(&mut self, window: &Window, cx: &mut Context<Self>) {
+        self.defer_git(PendingGit::StageAll, window, cx);
+    }
+
+    fn git_stage_all_now(&mut self, window: &Window, cx: &mut Context<Self>) {
         self.git_run(window, None, false, cx, |root, _| {
             core_workspace::stage_all(root).map(|_| String::new())
         });
@@ -466,17 +510,9 @@ impl DartIde {
                         }
                         this.git.expanded_commit = None;
                         this.git.expanded_commit_files.clear();
-                        this.git.notice = Some(GitNotice {
-                            text: "Undid last commit (changes kept staged)".to_string(),
-                            is_error: false,
-                        });
+                        this.set_git_notice("Undid last commit (changes kept staged)", false, cx);
                     }
-                    Err(text) => {
-                        this.git.notice = Some(GitNotice {
-                            text,
-                            is_error: true,
-                        });
-                    }
+                    Err(text) => this.set_git_notice(text, true, cx),
                 }
                 this.refresh_git(cx);
                 cx.notify();
@@ -533,10 +569,7 @@ impl DartIde {
             let Ok(result) = rx.recv().await else { return };
             let _ = weak.update(cx, |this, cx| {
                 if let Err(text) = result {
-                    this.git.notice = Some(GitNotice {
-                        text,
-                        is_error: true,
-                    });
+                    this.set_git_notice(text, true, cx);
                 }
                 this.refresh_git(cx);
                 cx.notify();
@@ -600,6 +633,10 @@ impl DartIde {
     /// Stage everything, then commit it.
     fn git_commit_all(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let message = self.git.message.read(cx).value().to_string();
+        self.defer_git(PendingGit::CommitAll { message }, window, cx);
+    }
+
+    fn git_commit_all_now(&mut self, message: String, window: &Window, cx: &mut Context<Self>) {
         self.git_run(
             window,
             Some("Committing\u{2026}"),
@@ -616,6 +653,16 @@ impl DartIde {
     pub(crate) fn git_commit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let message = self.git.message.read(cx).value().to_string();
         let amend = self.git.amend;
+        self.defer_git(PendingGit::Commit { message, amend }, window, cx);
+    }
+
+    fn git_commit_now(
+        &mut self,
+        message: String,
+        amend: bool,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) {
         self.git_run(window, Some("Committing…"), true, cx, move |root, _| {
             core_workspace::commit(root, &message, amend)
         });
@@ -634,9 +681,70 @@ impl DartIde {
     }
 
     pub(crate) fn git_push(&mut self, window: &Window, cx: &mut Context<Self>) {
+        self.defer_git(PendingGit::Push, window, cx);
+    }
+
+    fn git_push_now(&mut self, window: &Window, cx: &mut Context<Self>) {
         self.git_run(window, Some("Pushing…"), false, cx, |root, status| {
             core_workspace::push(root, status)
         });
+    }
+
+    /// Save every dirty buffer, then run the git action. Format-on-save is
+    /// asynchronous, so running git immediately could commit the old disk
+    /// content while the save landed a moment later — the change then looked
+    /// new again right after the push.
+    pub(crate) fn defer_git(
+        &mut self,
+        action: PendingGit,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) {
+        // One deferred action at a time; a second click while saving does not
+        // queue a duplicate commit.
+        if self.pending_git.is_some() {
+            return;
+        }
+        let waiting: std::collections::HashSet<EntityId> = self
+            .tabs
+            .iter()
+            .filter(|tab| {
+                let buffer = tab.editor.read(cx).buffer();
+                // An untitled buffer cannot be saved, and would never emit
+                // `Saved`, so it must not hold the action forever.
+                buffer.is_dirty() && buffer.path().is_some()
+            })
+            .map(|tab| tab.editor.entity_id())
+            .collect();
+        if waiting.is_empty() {
+            self.run_pending_git(action, window, cx);
+            return;
+        }
+        self.pending_git = Some((action, waiting.clone()));
+        self.set_git_notice("Saving your changes first\u{2026}", false, cx);
+        for tab in &self.tabs {
+            if waiting.contains(&tab.editor.entity_id()) {
+                tab.editor.update(cx, |editor, cx| editor.save(cx));
+            }
+        }
+        cx.notify();
+    }
+
+    pub(crate) fn run_pending_git(
+        &mut self,
+        action: PendingGit,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) {
+        match action {
+            PendingGit::Stage(files) => self.git_stage_now(&files, window, cx),
+            PendingGit::StageAll => self.git_stage_all_now(window, cx),
+            PendingGit::Commit { message, amend } => {
+                self.git_commit_now(message, amend, window, cx)
+            }
+            PendingGit::CommitAll { message } => self.git_commit_all_now(message, window, cx),
+            PendingGit::Push => self.git_push_now(window, cx),
+        }
     }
 
     pub(crate) fn git_toggle_branches(

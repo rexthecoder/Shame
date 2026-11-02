@@ -540,6 +540,11 @@ pub struct DartIde {
     pub(crate) edit_marks: HashMap<EntityId, (u64, std::time::Instant)>,
     /// Things worth telling the user about each file (changed on disk, save failed).
     pub(crate) file_notices: HashMap<PathBuf, file_state::FileNotice>,
+    /// A git action waiting for the dirty editors it depends on to finish saving.
+    pub(crate) pending_git: Option<(
+        git_panel::PendingGit,
+        std::collections::HashSet<EntityId>,
+    )>,
     pub(crate) unsaved_prompt: Option<file_state::UnsavedPrompt>,
     pub(crate) disk_tick: u32,
     /// Modification time of `keymap.json` when last loaded, to reload on save.
@@ -757,6 +762,7 @@ impl DartIde {
             editor_options: editor_view::EditorOptions::default(),
             edit_marks: HashMap::new(),
             file_notices: HashMap::new(),
+            pending_git: None,
             unsaved_prompt: None,
             disk_tick: 0,
             keymap_mtime: None,
@@ -957,11 +963,33 @@ impl DartIde {
                         path.clone(),
                         file_state::FileNotice::SaveFailed(message.clone()),
                     );
+                    // The git action was waiting for this save; it must not
+                    // run against a file the user could not save.
+                    if this.pending_git.take().is_some() {
+                        let name = path
+                            .file_name()
+                            .and_then(|n| n.to_str())
+                            .unwrap_or("file");
+                        this.git.notice = Some(git_panel::GitNotice {
+                            text: format!("Not continuing: {name} could not be saved."),
+                            is_error: true,
+                        });
+                    }
                     cx.notify();
                 }
                 EditorEvent::Saved { path } => {
                     this.file_notices.remove(path);
                     this.record_history_snapshot(path.clone());
+                    // A commit/push/stage was waiting for every dirty buffer
+                    // to land on disk; run it once the last one has.
+                    if let Some((_, waiting)) = this.pending_git.as_mut() {
+                        waiting.remove(&editor.entity_id());
+                    }
+                    if this.pending_git.as_ref().is_some_and(|(_, w)| w.is_empty())
+                        && let Some((action, _)) = this.pending_git.take()
+                    {
+                        this.run_pending_git(action, window, cx);
+                    }
                     this.refresh_git(cx);
                     if this.web_preview_open {
                         this.refresh_web_preview(cx);

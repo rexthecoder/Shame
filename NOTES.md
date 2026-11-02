@@ -1,5 +1,38 @@
 # Milestone notes
 
+## Diff header, save-before-git, and diagnostics above the line
+
+- **A clean Git panel looks like a finished state, not a void.** One compact
+  card, centred in the space: green check, "All changes committed", and a
+  one-line remote status ("Up to date with origin", "2 commits ahead of
+  origin", or "Not published yet"), followed by the one action that applies
+  (Publish/Push/Pull). "Edit last commit" and "Undo last commit" sit in a
+  quieter footer so history edits never compete with the next remote step.
+  Success notices are a single slim line that clears itself after a few
+  seconds instead of a second framed card ("Pushed" plus a clean card said
+  the same thing twice).
+- **Unified replaced blocks read as blocks.** A run of replaced lines used to
+  be interleaved (`-old`, `+new`, `-old`, `+new`) with the same number twice,
+  implying a line-for-line correspondence. Unified mode now lists every
+  removed line of the run first, then every added one, the way a unified diff
+  is meant to read.
+- **The diff header fits.** The file name/dir now take the space that is left
+  and truncate, so the stats and steppers can no longer overlap the status
+  badge. The secondary actions are icon-only with tooltips (Unified/Split,
+  reviewed, reject, open file); Accept and Stage keep their labels.
+- **Git actions wait for saves.** Format-on-save is asynchronous, so a commit
+  or push clicked right after Command-S could run against the old file and
+  the save landed afterwards, making the same change appear again. Stage,
+  stage-all, commit, commit-all and push now save every dirty buffer first,
+  wait for the last `Saved` event, and only then run. A failed save cancels
+  the action with a notice.
+- **Diagnostics sit above the offending line.** Each error/warning gets a
+  normal list row (icon + message) directly above the code, instead of a pill
+  painted over the line's end. All rows stay 22px so the editor list remains
+  uniform; a logical line -> row map keeps scrolling and cursor reveal
+  correct. Clicking the message jumps to the diagnostic's column. The old
+  inline pill is gone; the token underline remains.
+
 ## Terminal: chained `cd`, and output that wraps
 
 - **`cd` is only a built-in when it stands alone.** The terminal intercepted

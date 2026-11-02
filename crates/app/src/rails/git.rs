@@ -1133,9 +1133,17 @@ impl DartIde {
             .size_full()
             .min_h(px(0.))
             .overflow_y_scroll()
-            .pb(px(tokens::SPACE_2));
+            .pb(px(tokens::SPACE_2))
+            // A clean tree is one card, not a column of top-aligned text with
+            // a large void underneath.
+            .when(status.is_clean(), |el| el.justify_center());
         let list = if status.is_clean() {
-            list.child(self.render_git_clean_state(status, cx))
+            list.child(
+                v_flex()
+                    .w_full()
+                    .px(px(tokens::SPACE_4))
+                    .child(self.render_git_clean_state(status, cx)),
+            )
         } else {
             list.when(!status.conflicts.is_empty(), |el| {
                 el.child(self.render_git_section(
@@ -1202,69 +1210,138 @@ impl DartIde {
     /// Nothing to commit: say so, and offer the one sensible next step (push, pull or publish).
     fn render_git_clean_state(&self, status: &RepoStatus, cx: &mut Context<Self>) -> Div {
         let muted = cx.theme().muted_foreground;
+        let fg = cx.theme().foreground;
+        let green = cx.theme().green;
+        let border = cx.theme().border;
         let busy = self.git.busy.is_some();
-        let (text, cta): (String, Option<(&'static str, String, bool)>) =
-            if status.upstream.is_none() && status.head.is_some() {
-                (
-                    "This branch isn't published yet.".to_string(),
-                    Some(("git-cta-publish", "Publish branch".to_string(), true)),
-                )
-            } else if status.ahead > 0 {
-                (
-                    format!(
-                        "{} commit{} to push.",
-                        status.ahead,
-                        if status.ahead == 1 { "" } else { "s" }
-                    ),
-                    Some((
-                        "git-cta-push",
-                        format!(
-                            "Push {} commit{}",
-                            status.ahead,
-                            if status.ahead == 1 { "" } else { "s" }
-                        ),
-                        true,
-                    )),
-                )
+        let has_commit = status.head.is_some();
+        let plural = |n: u32| if n == 1 { "" } else { "s" };
+
+        let title = if has_commit {
+            "All changes committed"
+        } else {
+            "No commits yet"
+        };
+        let subtitle = if !has_commit {
+            "Add files and create the first commit".to_string()
+        } else if let Some(upstream) = &status.upstream {
+            // The branch itself is already in the bar above; the remote is what
+            // this line adds, and dropping the branch keeps it on one line.
+            let remote = upstream
+                .split_once('/')
+                .map(|(remote, _)| remote)
+                .unwrap_or(upstream);
+            match (status.ahead, status.behind) {
+                (ahead, behind) if ahead > 0 && behind > 0 => {
+                    format!("{ahead} ahead, {behind} behind {remote}")
+                }
+                (ahead, 0) if ahead > 0 => {
+                    format!("{ahead} commit{} ahead of {remote}", plural(ahead))
+                }
+                (0, behind) if behind > 0 => {
+                    format!("{behind} commit{} behind {remote}", plural(behind))
+                }
+                _ => format!("Up to date with {remote}"),
+            }
+        } else if status.branch.is_some() {
+            "Not published yet".to_string()
+        } else {
+            "Detached HEAD".to_string()
+        };
+
+        let cta: Option<(&'static str, String, bool)> =
+            if status.upstream.is_none() && has_commit && status.branch.is_some() {
+                Some(("git-cta-publish", "Publish branch".to_string(), true))
+            } else if status.ahead > 0 && status.behind == 0 {
+                Some((
+                    "git-cta-push",
+                    format!("Push {} commit{}", status.ahead, plural(status.ahead)),
+                    true,
+                ))
             } else if status.behind > 0 {
-                (
-                    format!(
-                        "{} new commit{} upstream.",
-                        status.behind,
-                        if status.behind == 1 { "" } else { "s" }
-                    ),
-                    Some(("git-cta-pull", format!("Pull {}", status.behind), false)),
-                )
+                Some((
+                    "git-cta-pull",
+                    format!("Pull {} commit{}", status.behind, plural(status.behind)),
+                    false,
+                ))
             } else {
-                ("Working tree clean".to_string(), None)
+                None
             };
+
+        let history_action = |id: &'static str,
+                              icon: IconName,
+                              label: &'static str,
+                              tooltip: &'static str,
+                              cx: &mut Context<Self>,
+                              action: fn(&mut DartIde, &mut Window, &mut Context<DartIde>)| {
+            Button::new(id)
+                .ghost()
+                .xsmall()
+                .disabled(busy)
+                .icon(Icon::new(icon).with_size(px(11.)).text_color(muted))
+                .label(label)
+                .tooltip(tooltip)
+                .on_click(cx.listener(move |this, _e, window, cx| action(this, window, cx)))
+        };
+
         v_flex()
             .w_full()
-            .items_center()
+            .max_w(px(360.))
+            .mx_auto()
+            .my(px(tokens::SPACE_3))
+            .p(px(tokens::SPACE_4))
             .gap(px(tokens::SPACE_3))
-            .py(px(tokens::SPACE_6))
-            .px(px(tokens::SPACE_5))
-            .border_b_1()
-            .border_color(cx.theme().border.opacity(0.6))
+            .rounded(px(tokens::RADIUS_CARD))
+            .border_1()
+            .border_color(border.opacity(0.7))
+            .bg(cx.theme().background)
             .child(
-                Icon::new(if cta.is_some() {
-                    IconName::GitBranch
-                } else {
-                    IconName::Check
-                })
-                .with_size(px(18.))
-                .text_color(if cta.is_some() {
-                    muted
-                } else {
-                    cx.theme().green
-                }),
-            )
-            .child(
-                div()
-                    .text_center()
-                    .text_size(px(tokens::UI_SM))
-                    .text_color(muted)
-                    .child(text),
+                h_flex()
+                    .w_full()
+                    .items_start()
+                    .gap(px(tokens::SPACE_3))
+                    .child(
+                        div()
+                            .size(px(28.))
+                            .flex_shrink_0()
+                            .rounded(px(14.))
+                            .bg(if has_commit {
+                                green.opacity(0.14)
+                            } else {
+                                muted.opacity(0.12)
+                            })
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .child(
+                                Icon::new(if has_commit {
+                                    IconName::Check
+                                } else {
+                                    IconName::GitBranch
+                                })
+                                .with_size(px(14.))
+                                .text_color(if has_commit { green } else { muted }),
+                            ),
+                    )
+                    .child(
+                        v_flex()
+                            .flex_1()
+                            .min_w(px(0.))
+                            .gap(px(tokens::SPACE_1))
+                            .child(
+                                div()
+                                    .text_size(px(tokens::UI))
+                                    .font_medium()
+                                    .text_color(fg)
+                                    .child(title),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(tokens::UI_SM))
+                                    .text_color(muted)
+                                    .child(subtitle),
+                            ),
+                    ),
             )
             .when_some(cta, |el, (id, label, push)| {
                 el.child(
@@ -1282,42 +1359,33 @@ impl DartIde {
                         })),
                 )
             })
-            .when(status.head.is_some(), |el| {
+            .when(has_commit && !self.git.amend, |el| {
                 el.child(
                     h_flex()
+                        .w_full()
+                        .flex_wrap()
                         .items_center()
+                        .justify_between()
                         .gap(px(tokens::SPACE_2))
-                        .child(
-                            Button::new("git-amend-link")
-                                .ghost()
-                                .xsmall()
-                                .icon(
-                                    Icon::new(IconName::Undo2)
-                                        .with_size(px(11.))
-                                        .text_color(muted),
-                                )
-                                .label("Amend")
-                                .tooltip("Amend last commit")
-                                .on_click(cx.listener(|this, _e, window, cx| {
-                                    this.git_toggle_amend(window, cx)
-                                })),
-                        )
-                        .child(
-                            Button::new("git-uncommit-link")
-                                .ghost()
-                                .xsmall()
-                                .disabled(busy)
-                                .icon(
-                                    Icon::new(IconName::RotateCcwClock)
-                                        .with_size(px(11.))
-                                        .text_color(muted),
-                                )
-                                .label("Undo commit")
-                                .tooltip("Soft-reset HEAD~1 and keep changes staged")
-                                .on_click(cx.listener(|this, _e, window, cx| {
-                                    this.git_uncommit_last(window, cx)
-                                })),
-                        ),
+                        .pt(px(tokens::SPACE_3))
+                        .border_t_1()
+                        .border_color(border.opacity(0.6))
+                        .child(history_action(
+                            "git-amend-link",
+                            IconName::Pencil,
+                            "Edit last commit",
+                            "Open the composer to amend the last commit",
+                            cx,
+                            |this, window, cx| this.git_toggle_amend(window, cx),
+                        ))
+                        .child(history_action(
+                            "git-uncommit-link",
+                            IconName::RotateCcwClock,
+                            "Undo last commit",
+                            "Move HEAD back one commit; its changes stay staged",
+                            cx,
+                            |this, window, cx| this.git_uncommit_last(window, cx),
+                        )),
                 )
             })
     }
@@ -2139,11 +2207,11 @@ impl DartIde {
                                                 .on_click(cx.listener(move |this, _e, _w, cx| {
                                                     cx.stop_propagation();
                                                     cx.write_to_clipboard(ClipboardItem::new_string(copy_hash.clone()));
-                                                    this.git.notice = Some(crate::git_panel::GitNotice {
-                                                        text: format!("Copied commit {copy_hash}"),
-                                                        is_error: false,
-                                                    });
-                                                    cx.notify();
+                                                    this.set_git_notice(
+                                                        format!("Copied commit {copy_hash}"),
+                                                        false,
+                                                        cx,
+                                                    );
                                                 }))
                                         }),
                                 ),
@@ -2241,25 +2309,19 @@ impl DartIde {
     }
 
     /// What just happened (or is happening), right under the commit box where the eye already is.
+    /// One quiet line rather than a second card: the clean state below is the persistent message.
     fn render_git_notice(&self, cx: &mut Context<Self>) -> AnyElement {
         let muted = cx.theme().muted_foreground;
         let card = h_flex()
             .w_full()
             .flex_shrink_0()
-            .items_start()
-            .gap(px(tokens::SPACE_3))
-            .mx(px(tokens::SPACE_4))
-            .mb(px(tokens::SPACE_4))
+            .items_center()
+            .gap(px(tokens::SPACE_2))
             .px(px(tokens::SPACE_4))
-            .py(px(tokens::SPACE_3))
-            .rounded(px(tokens::RADIUS_SM))
-            .text_size(px(tokens::UI_XS))
-            .w(relative(1.));
-        // `mx` on a full-width child would overflow; size against the padded column instead.
-        let card = card.w_auto();
+            .py(px(tokens::SPACE_2))
+            .text_size(px(tokens::UI_XS));
         if let Some(label) = self.git.busy {
             return card
-                .bg(cx.theme().list_hover)
                 .text_color(muted)
                 .child(Icon::new(IconName::RefreshCw).xsmall())
                 .child(label)
@@ -2274,10 +2336,7 @@ impl DartIde {
                 };
                 card.id("git-notice")
                     .cursor_pointer()
-                    .bg(tone.opacity(0.12))
-                    .border_1()
-                    .border_color(tone.opacity(0.3))
-                    .text_color(cx.theme().foreground)
+                    .hover(|s| s.bg(cx.theme().list_hover))
                     .child(
                         Icon::new(if notice.is_error {
                             IconName::X
@@ -2287,7 +2346,14 @@ impl DartIde {
                         .xsmall()
                         .text_color(tone),
                     )
-                    .child(div().flex_1().min_w(px(0.)).child(notice.text))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.))
+                            .text_color(cx.theme().foreground)
+                            .child(notice.text),
+                    )
+                    .child(Icon::new(IconName::X).with_size(px(10.)).text_color(muted))
                     .on_click(cx.listener(|this, _event, _window, cx| {
                         this.git.notice = None;
                         cx.notify();

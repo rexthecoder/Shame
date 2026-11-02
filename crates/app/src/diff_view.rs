@@ -94,8 +94,25 @@ impl DiffState {
         let mut i = 0;
         while i < n {
             if near_change[i] {
-                push_row(&mut display, i, &self.diff.rows);
-                i += 1;
+                if unified && self.diff.rows[i].kind == RowKind::Changed {
+                    // A replaced run reads as one block in a unified diff:
+                    // every removed line first, then every added one. Pairing
+                    // them row by row made the same line number appear twice
+                    // and implied a correspondence that is not there.
+                    let start = i;
+                    while i < n && self.diff.rows[i].kind == RowKind::Changed {
+                        i += 1;
+                    }
+                    for row in start..i {
+                        display.push(DisplayItem::UnifiedLeft(row));
+                    }
+                    for row in start..i {
+                        display.push(DisplayItem::UnifiedRight(row));
+                    }
+                } else {
+                    push_row(&mut display, i, &self.diff.rows);
+                    i += 1;
+                }
                 continue;
             }
             let start = i;
@@ -673,13 +690,15 @@ impl DartIde {
             .border_color(cx.theme().border)
             .child(
                 h_flex()
+                    .flex_1()
                     .min_w(px(0.))
                     .items_center()
                     .gap(px(tokens::SPACE_3))
                     .child(crate::rails::files::render_file_icon(&name))
                     .child(
                         div()
-                            .flex_shrink_0()
+                            .min_w(px(0.))
+                            .truncate()
                             .text_size(px(tokens::UI))
                             .font_medium()
                             .text_color(cx.theme().foreground)
@@ -688,6 +707,7 @@ impl DartIde {
                     .when_some(dir, |el, dir| {
                         el.child(
                             div()
+                                .min_w(px(0.))
                                 .truncate()
                                 .text_size(px(tokens::UI_SM))
                                 .text_color(muted)
@@ -763,8 +783,11 @@ impl DartIde {
                                         muted
                                     }),
                             )
-                            .label(if unified { "Unified" } else { "Split" })
-                            .tooltip("Toggle between Split (side-by-side) and Unified diff views")
+                            .tooltip(if unified {
+                                "Show split (side-by-side) diff"
+                            } else {
+                                "Show unified diff"
+                            })
                             .on_click(
                                 cx.listener(|this, _e, _w, cx| this.toggle_diff_unified(cx)),
                             ),
@@ -783,20 +806,19 @@ impl DartIde {
                                             muted
                                         }),
                                 )
-                                .label(if reviewed {
-                                    "Reviewed"
+                                .tooltip(if reviewed {
+                                    "Mark this file unreviewed"
                                 } else {
-                                    "Mark reviewed"
+                                    "Mark this file reviewed and move to the next one"
                                 })
-                                .tooltip("Mark this file reviewed and move to the next one")
                                 .on_click(cx.listener(|this, _e, _w, cx| {
                                     this.diff_toggle_reviewed(cx)
                                 })),
                         )
                     })
                     .when(ai_pending, |el| {
-                        el.child(
-                            Button::new("diff-ai-reject")
+                        el.child({
+                            let button = Button::new("diff-ai-reject")
                                 .ghost()
                                 .small()
                                 .icon(
@@ -804,12 +826,16 @@ impl DartIde {
                                         .with_size(px(13.))
                                         .text_color(cx.theme().red),
                                 )
-                                .label(if reject_armed { "Discard?" } else { "Reject" })
                                 .tooltip("Discard the agent's changes to this file")
                                 .on_click(cx.listener(|this, _e, window, cx| {
                                     this.diff_ai_reject(window, cx)
-                                })),
-                        )
+                                }));
+                            if reject_armed {
+                                button.label("Discard?")
+                            } else {
+                                button
+                            }
+                        })
                         .child(
                             Button::new("diff-ai-accept")
                                 .small()
@@ -825,7 +851,12 @@ impl DartIde {
                             Button::new("diff-open-file")
                                 .ghost()
                                 .small()
-                                .label("Open file")
+                                .icon(
+                                    Icon::new(IconName::FileCode)
+                                        .with_size(px(13.))
+                                        .text_color(muted),
+                                )
+                                .tooltip("Open this file in the editor")
                                 .on_click(cx.listener(move |this, _event, window, cx| {
                                     this.open_path(open_path.clone(), window, cx);
                                 })),
