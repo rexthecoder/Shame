@@ -15,43 +15,147 @@ use gpui_kit::*;
 use crate::{DartIde, IGNORED_NAMES, tokens};
 
 pub(crate) fn build_tree_items(dir: &Path, show_hidden: bool) -> Vec<TreeItem> {
-    build_tree_items_bounded(dir, show_hidden, 0)
+    to_tree_items(scan_tree(dir, show_hidden))
 }
 
-fn build_tree_items_bounded(dir: &Path, show_hidden: bool, depth: usize) -> Vec<TreeItem> {
-    let mut items = Vec::new();
+/// One file or folder from a disk scan. Unlike `TreeItem` (which holds
+/// `Rc` state) this is `Send`, so the scan can run off the UI thread.
+pub(crate) struct FsNode {
+    id: String,
+    name: String,
+    /// `Some` for folders, even empty ones.
+    children: Option<Vec<FsNode>>,
+}
+
+/// Walk `dir` (six levels deep, skipping ignored names and, unless
+/// `show_hidden`, dotfiles), folders first, then by name.
+pub(crate) fn scan_tree(dir: &Path, show_hidden: bool) -> Vec<FsNode> {
+    scan_tree_bounded(dir, show_hidden, 0)
+}
+
+fn scan_tree_bounded(dir: &Path, show_hidden: bool, depth: usize) -> Vec<FsNode> {
+    let mut nodes = Vec::new();
     if depth > 6 {
-        return items;
+        return nodes;
     }
-
     let Ok(entries) = std::fs::read_dir(dir) else {
-        return items;
+        return nodes;
     };
-
     for entry in entries.flatten() {
         let path = entry.path();
         let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
             continue;
         };
-
         if name == ".git" || IGNORED_NAMES.contains(&name) {
             continue;
         }
         if !show_hidden && name.starts_with('.') {
             continue;
         }
+        let children = path.is_dir().then(|| scan_tree_bounded(&path, show_hidden, depth + 1));
+        nodes.push(FsNode { id: path.to_string_lossy().to_string(), name: name.to_string(), children });
+    }
+    nodes.sort_by(|a, b| b.children.is_some().cmp(&a.children.is_some()).then_with(|| a.name.cmp(&b.name)));
+    nodes
+}
 
-        let id = path.to_string_lossy().to_string();
-        if path.is_dir() {
-            let children = build_tree_items_bounded(&path, show_hidden, depth + 1);
-            items.push(TreeItem::new(id, name.to_string()).children(children));
-        } else {
-            items.push(TreeItem::new(id, name.to_string()));
+pub(crate) fn to_tree_items(nodes: Vec<FsNode>) -> Vec<TreeItem> {
+    nodes
+        .into_iter()
+        .map(|node| match node.children {
+            Some(children) => TreeItem::new(node.id, node.name).children(to_tree_items(children)),
+            None => TreeItem::new(node.id, node.name),
+        })
+        .collect()
+}
+
+/// Ids of every expanded folder in `items`, including ones inside
+/// collapsed parents (they reopen as they were when the parent does).
+fn expanded_ids(items: &[TreeItem], out: &mut std::collections::HashSet<SharedString>) {
+    for item in items {
+        // Not `is_folder()`: GPUI counts an empty folder as a leaf.
+        if item.is_expanded() {
+            out.insert(item.id.clone());
         }
+        expanded_ids(&item.children, out);
+    }
+}
+
+fn restore_expanded(items: &[TreeItem], ids: &std::collections::HashSet<SharedString>) {
+    for item in items {
+        if ids.contains(&item.id) {
+            // Clones share expansion state, so this marks the item itself.
+            let _ = item.clone().expanded(true);
+        }
+        restore_expanded(&item.children, ids);
+    }
+}
+
+fn collapse_all(items: &[TreeItem]) {
+    for item in items {
+        let _ = item.clone().expanded(false);
+        collapse_all(&item.children);
+    }
+}
+
+/// The tree's top-level items (shared with the state, not copies).
+fn root_items(state: &gpui_kit::component::tree::TreeState) -> Vec<TreeItem> {
+    (0..)
+        .map_while(|ix| state.entry(ix))
+        .filter(|entry| entry.depth() == 0)
+        .map(|entry| entry.item().clone())
+        .collect()
+}
+
+impl DartIde {
+    /// Replace the file tree's items, keeping open folders open and the
+    /// selected row selected (a plain `set_items` collapses everything).
+    pub(crate) fn set_tree_items(&mut self, items: Vec<TreeItem>, cx: &mut Context<Self>) {
+        self.tree_state.update(cx, |state, cx| {
+            let mut open = std::collections::HashSet::new();
+            expanded_ids(&root_items(state), &mut open);
+            let selected = state.selected_item().map(|item| item.id.clone());
+            restore_expanded(&items, &open);
+            state.set_items(items, cx);
+            if let Some(ix) = selected.and_then(|id| state.index_of(&id)) {
+                state.set_selected_index(Some(ix), cx);
+            }
+        });
     }
 
-    items.sort_by(|a, b| b.is_folder().cmp(&a.is_folder()).then(a.label.cmp(&b.label)));
-    items
+    /// Collapse every folder in place: no disk scan, so it's instant.
+    pub(crate) fn collapse_file_tree(&mut self, cx: &mut Context<Self>) {
+        self.tree_state.update(cx, |state, cx| {
+            let roots = root_items(state);
+            collapse_all(&roots);
+            state.set_items(roots, cx);
+        });
+    }
+
+    /// Rescan the tree on a background thread (e.g. after toggling
+    /// dotfiles) and swap it in, keeping open folders.
+    pub(crate) fn rescan_file_tree(&mut self, cx: &mut Context<Self>) {
+        let root = self.root.clone();
+        let show_hidden = self.show_hidden;
+        let (tx, rx) = async_channel::bounded(1);
+        std::thread::spawn(move || {
+            let _ = tx.send_blocking(scan_tree(&root, show_hidden));
+        });
+        cx.spawn(async move |weak, cx| {
+            let Ok(nodes) = rx.recv().await else {
+                return;
+            };
+            let _ = weak.update(cx, |this, cx| {
+                // Toggled again while scanning: that scan's result wins.
+                if this.show_hidden != show_hidden {
+                    return;
+                }
+                this.set_tree_items(to_tree_items(nodes), cx);
+                cx.notify();
+            });
+        })
+        .detach();
+    }
 }
 
 pub(crate) fn icon_for_file(name: &str) -> Icon {
@@ -402,10 +506,7 @@ impl DartIde {
                                     )
                                     .tooltip("Collapse all folders")
                                     .on_click(cx.listener(|this, _event, _window, cx| {
-                                        let items = build_tree_items(&this.root, this.show_hidden);
-                                        this.tree_state.update(cx, |state, cx| {
-                                            state.set_items(items, cx);
-                                        });
+                                        this.collapse_file_tree(cx);
                                         cx.notify();
                                     })),
                             )
@@ -429,10 +530,7 @@ impl DartIde {
                                     })
                                     .on_click(cx.listener(|this, _event, _window, cx| {
                                         this.show_hidden = !this.show_hidden;
-                                        let items = build_tree_items(&this.root, this.show_hidden);
-                                        this.tree_state.update(cx, |state, cx| {
-                                            state.set_items(items, cx);
-                                        });
+                                        this.rescan_file_tree(cx);
                                         cx.notify();
                                     })),
                             ),
@@ -744,5 +842,63 @@ impl DartIde {
                             .size_full(),
                     ),
             )
+    }
+}
+
+#[cfg(test)]
+mod tree_state_tests {
+    use super::*;
+
+    fn folder(id: &str, children: Vec<TreeItem>) -> TreeItem {
+        TreeItem::new(id.to_string(), id.to_string()).children(children)
+    }
+
+    fn file(id: &str) -> TreeItem {
+        TreeItem::new(id.to_string(), id.to_string())
+    }
+
+    #[core::prelude::v1::test]
+    fn open_folders_survive_a_rebuild_even_inside_collapsed_parents() {
+        let old = vec![folder("lib", vec![folder("lib/src", vec![file("lib/src/a.dart")])]), folder("test", vec![])];
+        // `lib/src` is open but `lib` itself is closed; `test` is open.
+        let _ = old[0].children[0].clone().expanded(true);
+        let _ = old[1].clone().expanded(true);
+
+        let mut open = std::collections::HashSet::new();
+        expanded_ids(&old, &mut open);
+        let fresh = vec![folder("lib", vec![folder("lib/src", vec![file("lib/src/a.dart")])]), folder("test", vec![])];
+        restore_expanded(&fresh, &open);
+
+        assert!(!fresh[0].is_expanded());
+        assert!(fresh[0].children[0].is_expanded());
+        assert!(fresh[1].is_expanded());
+    }
+
+    #[core::prelude::v1::test]
+    fn collapse_all_closes_every_level() {
+        let items = vec![folder("lib", vec![folder("lib/src", vec![])])];
+        let _ = items[0].clone().expanded(true);
+        let _ = items[0].children[0].clone().expanded(true);
+        collapse_all(&items);
+        assert!(!items[0].is_expanded());
+        assert!(!items[0].children[0].is_expanded());
+    }
+
+    #[core::prelude::v1::test]
+    fn scan_lists_folders_first_and_respects_dotfiles() {
+        let dir = std::env::temp_dir().join(format!("shame-scan-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("lib")).unwrap();
+        std::fs::write(dir.join("lib/main.dart"), "").unwrap();
+        std::fs::write(dir.join("a.txt"), "").unwrap();
+        std::fs::write(dir.join(".env"), "").unwrap();
+
+        let names = |nodes: &[FsNode]| nodes.iter().map(|n| n.name.clone()).collect::<Vec<_>>();
+        assert_eq!(names(&scan_tree(&dir, false)), vec!["lib", "a.txt"]);
+        assert_eq!(names(&scan_tree(&dir, true)), vec!["lib", ".env", "a.txt"]);
+        let items = to_tree_items(scan_tree(&dir, false));
+        assert!(items[0].is_folder());
+        assert_eq!(items[0].children[0].label.as_ref(), "main.dart");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

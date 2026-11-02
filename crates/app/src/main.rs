@@ -602,7 +602,7 @@ impl DartIde {
 
     fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         let (has_workspace, root, recent_workspaces) = resolve_initial_workspace();
-        let show_hidden = true;
+        let show_hidden = Self::saved_show_hidden().unwrap_or(true);
         let items = if has_workspace {
             build_tree_items(&root, show_hidden)
         } else {
@@ -1253,7 +1253,7 @@ impl Render for DartIde {
                 this.execute_ide_command("toggle-problems", window, cx);
             }))
             .on_action(cx.listener(|this, _: &MenuToggleAgent, _w, cx| {
-                this.agent_open = !this.agent_open;
+                this.set_agent_open(!this.agent_open);
                 cx.notify();
             }))
             .on_action(cx.listener(|this, _: &MenuToggleWebPreview, window, cx| {

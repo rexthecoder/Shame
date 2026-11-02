@@ -374,7 +374,7 @@ impl DartIde {
             "toggle-terminal" => self.terminal_open = !self.terminal_open,
             "toggle-sidebar" => self.sidebar_open = !self.sidebar_open,
             "toggle-web-preview" => self.toggle_web_preview(window, cx),
-            "toggle-agent" => self.agent_open = !self.agent_open,
+            "toggle-agent" => self.set_agent_open(!self.agent_open),
             "format-doc" => {
                 if let Some(ed) = self.active_editor().cloned() {
                     ed.update(cx, |editor, _cx| {

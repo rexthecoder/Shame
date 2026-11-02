@@ -498,7 +498,7 @@ impl DartIde {
             let ctrl = toggle_switch("settings-agent-open", agent_open)
                 .on_click(move |_e, _w, cx| {
                     v1.update(cx, |this, cx| {
-                        this.agent_open = !this.agent_open;
+                        this.set_agent_open(!this.agent_open);
                         cx.notify();
                     });
                 })

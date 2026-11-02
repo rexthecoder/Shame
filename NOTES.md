@@ -1,5 +1,55 @@
 # Milestone notes
 
+## Thread history: one thread per workspace became a list
+
+Persistence kept exactly one thread per workspace: starting a new one replaced
+it. Now each workspace keeps a folder of threads
+(`~/.config/shame/agent/<hash-of-root>/<thread-id>.json`) and the clock button
+in the rail header opens them as a list.
+
+- **Every thread has an identity.** The file carries a `thread_id`, the title
+  (first question, one line), and the prompts sent in it, so the history row
+  doesn't need the transcript and ↑ recall works again after reopening a
+  thread.
+- **Starting a new thread archives the old one** instead of deleting it. Rows
+  show title, how long ago, message count and harness; the one on screen is
+  marked and stays at the top.
+- **Switching is a save-then-load.** The thread being left is written first; a
+  run in progress is stopped because it belongs to the old thread (the panel
+  says so). The chosen thread is restored with the same banner as startup.
+- **Delete removes a file**, not the workspace's whole history; deleting the
+  thread on screen clears it and starts fresh.
+- **The old single file is migrated** on first read, so an existing install
+  opens with its thread already in the list, at the same timestamp.
+- History is capped at 50 threads per workspace; the oldest are pruned when a
+  new one is saved.
+
+## Agent rail: four things you couldn't see before
+
+Now that the thread survives a restart, the rail needed to show its own
+state better. Four small pieces, all in the rail or its icon:
+
+- **Queued messages are a list, not a teaser.** Enter while a run is active
+  shelves the prompt; the old strip showed only the first one, truncated, with
+  a single Clear. It now lists the next four queued prompts (then "and N more")
+  with file counts and their own remove buttons, under "N queued · sends when
+  this run ends". Removing one reveals the next; the queue itself is unchanged.
+- **Jump to latest.** Streaming stops following once you scroll up, which is
+  right, but there was no way back to the end. A floating pill appears over the
+  transcript whenever the reader is not pinned to the bottom; clicking it
+  scrolls there. `is_pinned_to_bottom` already knew the answer — the wheel
+  listener just re-renders so the pill can follow it.
+- **A thread title.** The rail header showed only the harness name. It now
+  appends the first thing you asked, one line, ellipsized (`thread_title`).
+- **Restored banner.** A restored transcript opens with a hairline
+  "Restored from your last session · 2h ago", so it is obvious the thread came
+  back rather than looking like a conversation that just started. The save
+  timestamp is a new (optional) field in the thread file.
+- **A dot on the titlebar agent icon.** With the rail closed there was no sign
+  of activity: accent while a run is going, green when a reply (or a pending
+  question) landed unseen. Opening the rail clears it (`set_agent_open`, now
+  the only way `agent_open` changes).
+
 ## The agent thread now survives a restart
 
 The agent rail was the one part of the app that threw its work away. Closing
@@ -18,8 +68,8 @@ bound. A version field means a file from a newer build is ignored rather than
 half-read.
 
 Saved when a message is sent (so quitting mid-run keeps the turn), when a
-turn finishes, on window close, on `New thread` (which deletes the file, so
-"forget it" is real), and when switching workspaces. Restored at startup and
+turn finishes, on window close, on `New thread` (which now keeps the old
+thread in history), and when switching workspaces. Restored at startup and
 in `set_root`, after `session.json`, so the saved harness/model win. Because
 the session id comes back too, Claude Code and Codex resume the same CLI
 conversation rather than only replaying text.

@@ -44,6 +44,15 @@ impl DartIde {
         let muted = cx.theme().muted_foreground;
         let green = cx.theme().green;
         let info = cx.theme().info;
+        // A dot on the agent icon: accent while a run is going, green when a
+        // reply (or a question) landed while the rail was closed.
+        let agent_dot = if self.agent.running_pid.is_some() {
+            Some(cx.theme().primary)
+        } else if self.agent.unread_reply && !self.agent_open {
+            Some(green)
+        } else {
+            None
+        };
 
         h_flex()
             .w_full()
@@ -102,7 +111,7 @@ impl DartIde {
                             )
                             .tooltip("Toggle agent rail")
                             .on_click(cx.listener(|this, _event, _window, cx| {
-                                this.agent_open = !this.agent_open;
+                                this.set_agent_open(!this.agent_open);
                                 cx.notify();
                             })),
                     ),
@@ -426,20 +435,36 @@ impl DartIde {
                         })),
                     )
                     .child(
-                        icon_button(
-                            "agent-wand",
-                            gpui_kit::assets::IconName::WandSparkles,
-                            Some(if self.agent_open {
-                                cx.theme().primary
-                            } else {
-                                info
+                        div()
+                            .relative()
+                            .flex_shrink_0()
+                            .child(
+                                icon_button(
+                                    "agent-wand",
+                                    gpui_kit::assets::IconName::WandSparkles,
+                                    Some(if self.agent_open {
+                                        cx.theme().primary
+                                    } else {
+                                        info
+                                    }),
+                                    "Toggle Agent rail",
+                                )
+                                .on_click(cx.listener(|this, _event, _window, cx| {
+                                    this.set_agent_open(!this.agent_open);
+                                    cx.notify();
+                                })),
+                            )
+                            .when_some(agent_dot, |el, color| {
+                                el.child(
+                                    div()
+                                        .absolute()
+                                        .top(px(4.))
+                                        .right(px(4.))
+                                        .size(px(5.))
+                                        .rounded(px(2.5))
+                                        .bg(color),
+                                )
                             }),
-                            "Toggle Agent rail",
-                        )
-                        .on_click(cx.listener(|this, _event, _window, cx| {
-                            this.agent_open = !this.agent_open;
-                            cx.notify();
-                        })),
                     )
                     .child(
                         Button::new("quick-open")

@@ -25,6 +25,9 @@ use crate::{DartIde, tokens};
 /// How many files the attach picker lists at once.
 const MAX_ATTACH_ROWS: usize = 12;
 
+/// How many queued prompts the composer lists before summarizing the rest.
+const MAX_QUEUED_ROWS: usize = 4;
+
 /// Workspace-relative paths matching `query`: filename matches first, then
 /// path matches. With an empty query, the open tabs (already relative) lead.
 pub(crate) fn attach_matches(
@@ -229,17 +232,13 @@ pub(crate) fn mention_candidates(
 }
 
 impl DartIde {
-    /// Start a fresh conversation (the `+` button and `/clear`).
+    /// Start a fresh conversation (the `+` button and `/clear`). The thread
+    /// being left stays in history rather than being deleted.
     pub(crate) fn agent_new_thread(&mut self, cx: &mut Context<Self>) {
         self.stop_agent_run(cx);
-        self.agent.tasks.clear();
-        self.agent.items.clear();
-        self.agent.ai_touched_paths.clear();
-        self.agent.attachments.clear();
-        self.agent.session_id = None;
-        self.agent.question_inputs.clear();
-        // An empty thread removes the saved one, so this is a real "forget it".
         self.save_agent_conversation();
+        self.clear_agent_conversation(cx);
+        self.agent.threads = crate::agent_store::list_threads(&self.root);
         cx.notify();
     }
 
@@ -327,7 +326,7 @@ impl DartIde {
                 add_attachment(&mut self.agent.attachments, attachment);
             }
         }
-        self.agent_open = true;
+        self.set_agent_open(true);
         cx.notify();
     }
 
@@ -482,7 +481,7 @@ impl DartIde {
             }
             None => Attachment::File { rel },
         };
-        self.agent_open = true;
+        self.set_agent_open(true);
         self.insert_mention(attachment, window, cx);
     }
 
@@ -950,37 +949,131 @@ impl DartIde {
             .when_some(self.render_agent_picker(cx), |col, panel| col.child(panel))
             .when(!self.agent.queue.is_empty(), |col| {
                 let count = self.agent.queue.len();
-                let first = crate::agent_ctx::notification_body(&self.agent.queue[0].prompt, 48);
+                let shown = count.min(MAX_QUEUED_ROWS);
+                let mut rows: Vec<AnyElement> = self
+                    .agent
+                    .queue
+                    .iter()
+                    .enumerate()
+                    .take(shown)
+                    .map(|(ix, queued)| {
+                        let text = crate::agent_ctx::notification_body(&queued.prompt, 90);
+                        let files = queued.shelf.len() + queued.mentions.len();
+                        h_flex()
+                            .id(("agent-queued-row", ix))
+                            .w_full()
+                            .min_w(px(0.))
+                            .items_center()
+                            .gap(px(tokens::SPACE_2))
+                            .px(px(tokens::SPACE_2))
+                            .py(px(2.))
+                            .rounded(px(tokens::RADIUS_SM))
+                            .child(
+                                div()
+                                    .flex_shrink_0()
+                                    .font_family(cx.theme().mono_font_family.clone())
+                                    .text_size(px(tokens::UI_XS))
+                                    .text_color(primary)
+                                    .child(format!("{}", ix + 1)),
+                            )
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w(px(0.))
+                                    .truncate()
+                                    .text_size(px(tokens::UI_XS))
+                                    .text_color(fg)
+                                    .child(text),
+                            )
+                            .when(files > 0, |row| {
+                                row.child(
+                                    div()
+                                        .flex_shrink_0()
+                                        .text_size(px(tokens::UI_XS))
+                                        .text_color(muted)
+                                        .child(format!(
+                                            "{files} file{}",
+                                            if files == 1 { "" } else { "s" }
+                                        )),
+                                )
+                            })
+                            .child(
+                                div()
+                                    .id(("agent-queued-remove", ix))
+                                    .size(px(14.))
+                                    .flex_shrink_0()
+                                    .rounded(px(tokens::RADIUS_PILL))
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .cursor_pointer()
+                                    .text_color(muted)
+                                    .hover(move |s| s.bg(rgba(0xffffff1f)).text_color(red))
+                                    .child(Icon::new(IconName::X).with_size(px(9.)))
+                                    .on_click(cx.listener(move |this, _e, _w, cx| {
+                                        if ix < this.agent.queue.len() {
+                                            this.agent.queue.remove(ix);
+                                        }
+                                        cx.notify();
+                                    })),
+                            )
+                            .into_any_element()
+                    })
+                    .collect();
+                // A long queue shows the first few; removing one reveals the next.
+                if count > shown {
+                    rows.push(
+                        div()
+                            .px(px(tokens::SPACE_2))
+                            .text_size(px(tokens::UI_XS))
+                            .text_color(muted)
+                            .child(format!("and {} more", count - shown))
+                            .into_any_element(),
+                    );
+                }
                 col.child(
-                    h_flex()
+                    v_flex()
                         .w_full()
+                        .min_w(px(0.))
                         .px(px(tokens::SPACE_2))
-                        .gap(px(tokens::SPACE_2))
-                        .items_center()
-                        .justify_between()
-                        .text_size(px(tokens::UI_XS))
-                        .text_color(muted)
+                        .py(px(tokens::SPACE_2))
+                        .gap(px(tokens::SPACE_1))
+                        .rounded(px(tokens::RADIUS_SM))
+                        .bg(cx.theme().muted)
+                        .border_1()
+                        .border_color(border)
                         .child(
-                            div()
-                                .min_w(px(0.))
-                                .truncate()
-                                .child(format!(
-                                    "Queued{} \u{b7} {first}",
-                                    if count > 1 { format!(" ({count})") } else { String::new() }
-                                )),
+                            h_flex()
+                                .w_full()
+                                .items_center()
+                                .justify_between()
+                                .gap(px(tokens::SPACE_2))
+                                .child(
+                                    div()
+                                        .min_w(px(0.))
+                                        .truncate()
+                                        .text_size(px(tokens::UI_XS))
+                                        .text_color(muted)
+                                        .child(format!(
+                                            "{count} queued \u{b7} sends when this run ends"
+                                        )),
+                                )
+                                .child(
+                                    div()
+                                        .id("agent-queue-clear")
+                                        .flex_shrink_0()
+                                        .cursor_pointer()
+                                        .text_size(px(tokens::UI_XS))
+                                        .text_color(muted)
+                                        .hover(move |s| s.text_color(fg))
+                                        .child("Clear")
+                                        .on_click(cx.listener(|this, _e, _w, cx| {
+                                            this.agent.queue.clear();
+                                            cx.notify();
+                                        })),
+                                ),
                         )
-                        .child(
-                            div()
-                                .id("agent-queue-clear")
-                                .flex_shrink_0()
-                                .cursor_pointer()
-                                .hover(move |s| s.text_color(fg))
-                                .child("Clear")
-                                .on_click(cx.listener(|this, _e, _w, cx| {
-                                    this.agent.queue.clear();
-                                    cx.notify();
-                                })),
-                        ),
+                        .children(rows),
                 )
             })
             .child(

@@ -5,6 +5,11 @@
 //! conversation too. Saving both means reopening a project picks the thread
 //! up where it stopped, and the next message resumes the same CLI session.
 //!
+//! Each workspace keeps a folder of threads (`~/.config/shame/agent/<hash>/`):
+//! starting a new one archives the old, and the rail's history panel switches
+//! between them. The single file earlier builds wrote is migrated on first
+//! read.
+//!
 //! Pending permission prompts and questions are deliberately not restored:
 //! they belong to a process that is no longer running.
 
@@ -31,9 +36,20 @@ const VERSION: u32 = 1;
 /// CLI still holds the full session; this bounds the file, not the memory.
 const MAX_ITEMS: usize = 400;
 
+/// How many threads a workspace keeps. Older ones are pruned when a new one
+/// is saved, so history stays a list you can scan rather than an archive.
+const MAX_THREADS: usize = 50;
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub(crate) struct StoredConversation {
     pub(crate) version: u32,
+    /// Identifies the thread inside the workspace's history folder. Empty in
+    /// files written before history existed; those get one when migrated.
+    #[serde(default)]
+    pub(crate) thread_id: String,
+    /// The first thing asked, so the history list doesn't need the transcript.
+    #[serde(default)]
+    pub(crate) title: String,
     #[serde(default)]
     pub(crate) workspace: String,
     pub(crate) harness: String,
@@ -47,6 +63,13 @@ pub(crate) struct StoredConversation {
     pub(crate) tasks: Vec<StoredTask>,
     #[serde(default)]
     pub(crate) touched_paths: Vec<String>,
+    /// Prompts sent in this thread, for ↑ recall after it is reopened.
+    #[serde(default)]
+    pub(crate) prompts: Vec<String>,
+    /// When this file was written (ms since the epoch), so the transcript can
+    /// say "restored · 2h ago".
+    #[serde(default)]
+    pub(crate) saved_at_ms: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -211,6 +234,8 @@ impl StoredConversation {
         cap_items(&mut items);
         Self {
             version: VERSION,
+            thread_id: agent.thread_id.clone().unwrap_or_default(),
+            title: crate::rails::agent::thread_title_from(&agent.items).unwrap_or_default(),
             workspace: root.to_string_lossy().to_string(),
             harness: harness_key(agent.harness).to_string(),
             model: agent.models.get(agent.model_ix).map(|m| m.id.clone()),
@@ -225,6 +250,8 @@ impl StoredConversation {
                 })
                 .collect(),
             touched_paths: agent.ai_touched_paths.clone(),
+            prompts: agent.history.clone(),
+            saved_at_ms: agent.last_activity_ms.unwrap_or_else(now_ms),
         }
     }
 
@@ -241,6 +268,28 @@ fn cap_items(items: &mut Vec<StoredItem>) {
     if items.len() > MAX_ITEMS {
         items.drain(..items.len() - MAX_ITEMS);
     }
+}
+
+pub(crate) fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// How long ago a thread was saved, in words: "just now", "12m ago", "3h ago".
+/// `None` when the time is unknown (files written before this field existed).
+pub(crate) fn format_ago(saved_ms: u64, now_ms: u64) -> Option<String> {
+    if saved_ms == 0 {
+        return None;
+    }
+    let secs = now_ms.saturating_sub(saved_ms) / 1000;
+    Some(match secs {
+        0..=59 => "just now".to_string(),
+        60..=3_599 => format!("{}m ago", secs / 60),
+        3_600..=86_399 => format!("{}h ago", secs / 3_600),
+        _ => format!("{}d ago", secs / 86_400),
+    })
 }
 
 /// Stable name for a harness in saved state.
@@ -261,64 +310,234 @@ pub(crate) fn harness_from_key(key: &str) -> Option<AgentHarness> {
     }
 }
 
-/// `~/.config/shame/agent/<hash>.json`, one file per workspace.
-pub(crate) fn conversation_path(root: &Path) -> Option<PathBuf> {
-    let home = std::env::var_os("HOME")?;
-    Some(conversation_path_in(Path::new(&home), root))
+/// One row in the rail's history list.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ThreadSummary {
+    pub(crate) id: String,
+    pub(crate) title: String,
+    pub(crate) saved_at_ms: u64,
+    pub(crate) messages: usize,
+    pub(crate) harness: Option<AgentHarness>,
 }
 
-fn conversation_path_in(home: &Path, root: &Path) -> PathBuf {
-    // Canonical when possible so `./app` and `/abs/app` share a thread.
+fn home_dir() -> Option<PathBuf> {
+    std::env::var_os("HOME").map(PathBuf::from)
+}
+
+/// `~/.config/shame/agent/<hash>/`, one folder of threads per workspace.
+pub(crate) fn threads_dir(root: &Path) -> Option<PathBuf> {
+    Some(threads_dir_in(&home_dir()?, root))
+}
+
+fn threads_dir_in(home: &Path, root: &Path) -> PathBuf {
+    // Canonical when possible so `./app` and `/abs/app` share a history.
     let root = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
     let mut hasher = DefaultHasher::new();
     root.to_string_lossy().hash(&mut hasher);
     home.join(".config")
         .join("shame")
         .join("agent")
-        .join(format!("{:016x}.json", hasher.finish()))
+        .join(format!("{:016x}", hasher.finish()))
+}
+
+/// The single file earlier builds wrote: `.../agent/<hash>.json`.
+fn legacy_path_in(home: &Path, root: &Path) -> PathBuf {
+    threads_dir_in(home, root).with_extension("json")
+}
+
+fn thread_path_in(home: &Path, root: &Path, id: &str) -> PathBuf {
+    threads_dir_in(home, root).join(format!("{id}.json"))
+}
+
+/// A fresh id for a thread. Milliseconds are enough: two threads cannot start
+/// in the same instant from the same workspace.
+pub(crate) fn new_thread_id() -> String {
+    format!("{:x}", now_ms())
+}
+
+fn stored_title(items: &[StoredItem]) -> Option<String> {
+    let text = items.iter().find_map(|item| match item {
+        StoredItem::Message { user: true, text } => Some(text),
+        _ => None,
+    })?;
+    let line = text.lines().map(str::trim).find(|l| !l.is_empty())?;
+    Some(crate::rails::agent::truncate_chars(line, 42))
+}
+
+fn read_threads_in(dir: &Path) -> Vec<(StoredConversation, PathBuf)> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    entries
+        .filter_map(|entry| {
+            let path = entry.ok()?.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("json") {
+                return None;
+            }
+            let bytes = std::fs::read(&path).ok()?;
+            Some((StoredConversation::from_bytes(&bytes)?, path))
+        })
+        .collect()
+}
+
+fn list_threads_in(dir: &Path) -> Vec<ThreadSummary> {
+    let mut threads: Vec<ThreadSummary> = read_threads_in(dir)
+        .into_iter()
+        .map(|(conv, path)| {
+            let id = if conv.thread_id.is_empty() {
+                path.file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or_default()
+                    .to_string()
+            } else {
+                conv.thread_id
+            };
+            let title = if conv.title.is_empty() {
+                stored_title(&conv.items).unwrap_or_default()
+            } else {
+                conv.title
+            };
+            ThreadSummary {
+                id,
+                title,
+                saved_at_ms: conv.saved_at_ms,
+                messages: conv
+                    .items
+                    .iter()
+                    .filter(|item| matches!(item, StoredItem::Message { .. }))
+                    .count(),
+                harness: harness_from_key(&conv.harness),
+            }
+        })
+        .collect();
+    threads.sort_by(|a, b| {
+        b.saved_at_ms
+            .cmp(&a.saved_at_ms)
+            .then_with(|| a.id.cmp(&b.id))
+    });
+    threads
+}
+
+pub(crate) fn list_threads(root: &Path) -> Vec<ThreadSummary> {
+    let Some(dir) = threads_dir(root) else {
+        return Vec::new();
+    };
+    list_threads_in(&dir)
+}
+
+/// Move the pre-history single file into the workspace's thread folder, once.
+fn migrate_legacy_in(home: &Path, root: &Path) {
+    let legacy = legacy_path_in(home, root);
+    if !legacy.is_file() {
+        return;
+    }
+    let Ok(bytes) = std::fs::read(&legacy) else {
+        return;
+    };
+    let Some(mut conv) = StoredConversation::from_bytes(&bytes) else {
+        return;
+    };
+    if conv.thread_id.is_empty() {
+        conv.thread_id = if conv.saved_at_ms > 0 {
+            format!("{:x}", conv.saved_at_ms)
+        } else {
+            new_thread_id()
+        };
+    }
+    let dir = threads_dir_in(home, root);
+    if std::fs::create_dir_all(&dir).is_err() {
+        return;
+    }
+    let path = dir.join(format!("{}.json", conv.thread_id));
+    if let Ok(json) = serde_json::to_vec_pretty(&conv)
+        && std::fs::write(&path, json).is_ok()
+    {
+        let _ = std::fs::remove_file(&legacy);
+    }
+}
+
+/// Keep the newest `max` threads, never the one just written.
+fn prune_threads_in(dir: &Path, keep_id: &str, max: usize) {
+    let mut threads = read_threads_in(dir);
+    if threads.len() <= max {
+        return;
+    }
+    threads.sort_by_key(|(conv, _)| conv.saved_at_ms);
+    let mut excess = threads.len() - max;
+    for (_, path) in threads {
+        if excess == 0 {
+            break;
+        }
+        if path.file_stem().and_then(|s| s.to_str()) == Some(keep_id) {
+            continue;
+        }
+        if std::fs::remove_file(path).is_ok() {
+            excess -= 1;
+        }
+    }
 }
 
 impl DartIde {
-    /// Write the current thread next to the workspace's other saved state.
-    /// An empty thread removes the file, so "New thread" really forgets it.
+    /// Write the current thread into the workspace's history folder. A thread
+    /// that never got a message (or a CLI session) has no file to write.
     pub(crate) fn save_agent_conversation(&self) {
         if !self.has_workspace {
             return;
         }
-        let Some(path) = conversation_path(&self.root) else {
+        let Some(id) = self.agent.thread_id.as_deref().filter(|id| !id.is_empty()) else {
             return;
         };
+        let Some(home) = home_dir() else {
+            return;
+        };
+        let path = thread_path_in(&home, &self.root, id);
         let conv = StoredConversation::from_state(&self.agent, &self.root);
         if conv.items.is_empty() && conv.session_id.is_none() {
             let _ = std::fs::remove_file(path);
             return;
         }
-        if let Some(parent) = path.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
+        let Some(dir) = path.parent().map(Path::to_path_buf) else {
+            return;
+        };
+        let _ = std::fs::create_dir_all(&dir);
         if let Ok(json) = serde_json::to_vec_pretty(&conv) {
             let _ = std::fs::write(path, json);
         }
+        prune_threads_in(&dir, id, MAX_THREADS);
     }
 
-    /// Bring back the thread saved for this workspace, if any. Called after
-    /// `restore_session_state`, so the saved harness and model win.
+    /// Bring back the most recently used thread for this workspace, if any.
+    /// Called after `restore_session_state`, so the saved harness and model win.
     pub(crate) fn restore_agent_conversation(&mut self, cx: &mut Context<Self>) {
         if !self.has_workspace {
             return;
         }
-        let Some(path) = conversation_path(&self.root) else {
+        let Some(home) = home_dir() else {
             return;
         };
-        let Ok(bytes) = std::fs::read(path) else {
+        migrate_legacy_in(&home, &self.root);
+        let Some(dir) = threads_dir(&self.root) else {
             return;
         };
-        let Some(conv) = StoredConversation::from_bytes(&bytes) else {
+        let mut threads = read_threads_in(&dir);
+        threads.sort_by_key(|(conv, _)| std::cmp::Reverse(conv.saved_at_ms));
+        let Some((conv, _)) = threads.into_iter().next() else {
             return;
         };
-        if conv.items.is_empty() {
+        if conv.items.is_empty() && conv.session_id.is_none() {
             return;
         }
+        self.apply_stored_conversation(conv, cx);
+    }
+
+    /// Replace the in-memory thread with a saved one. Shared by startup restore
+    /// and by picking a row in the history list.
+    pub(crate) fn apply_stored_conversation(
+        &mut self,
+        conv: StoredConversation,
+        cx: &mut Context<Self>,
+    ) {
+        let saved_at_ms = conv.saved_at_ms;
         if let Some(harness) = harness_from_key(&conv.harness) {
             self.agent.set_harness(harness);
         }
@@ -351,8 +570,72 @@ impl DartIde {
             .collect();
         self.agent.ai_touched_paths = conv.touched_paths;
         self.agent.session_id = conv.session_id;
+        self.agent.thread_id = (!conv.thread_id.is_empty()).then_some(conv.thread_id);
+        self.agent.history = conv.prompts;
+        self.agent.history_ix = None;
+        self.agent.restored_items = self.agent.items.len();
+        self.agent.restored_at_ms = (saved_at_ms > 0).then_some(saved_at_ms);
+        self.agent.last_activity_ms = self.agent.restored_at_ms;
+        self.agent.unread_reply = false;
         self.agent.question_inputs.clear();
         self.agent.scroll.scroll_to_bottom();
+        cx.notify();
+    }
+
+    /// Show the thread history, saving whatever is on screen first.
+    pub(crate) fn open_agent_history(&mut self, cx: &mut Context<Self>) {
+        self.save_agent_conversation();
+        self.agent.threads = list_threads(&self.root);
+        self.agent.history_open = true;
+        cx.notify();
+    }
+
+    pub(crate) fn close_agent_history(&mut self, cx: &mut Context<Self>) {
+        self.agent.history_open = false;
+        cx.notify();
+    }
+
+    /// Switch to a saved thread. The thread being left is written first, so
+    /// nothing is lost; a run in progress is stopped (it belongs to the old
+    /// thread).
+    pub(crate) fn load_agent_thread(&mut self, id: &str, cx: &mut Context<Self>) {
+        if self.agent.thread_id.as_deref() == Some(id) {
+            self.agent.history_open = false;
+            cx.notify();
+            return;
+        }
+        let Some(home) = home_dir() else {
+            return;
+        };
+        let Ok(bytes) = std::fs::read(thread_path_in(&home, &self.root, id)) else {
+            return;
+        };
+        let Some(conv) = StoredConversation::from_bytes(&bytes) else {
+            return;
+        };
+        if self.agent.running_pid.is_some() {
+            self.stop_agent_run(cx);
+        }
+        self.save_agent_conversation();
+        self.apply_stored_conversation(conv, cx);
+        self.agent.history_open = false;
+        self.agent.threads.clear();
+        cx.notify();
+    }
+
+    /// Remove a thread from disk. Deleting the one on screen also clears it.
+    pub(crate) fn delete_agent_thread(&mut self, id: &str, cx: &mut Context<Self>) {
+        let Some(home) = home_dir() else {
+            return;
+        };
+        let _ = std::fs::remove_file(thread_path_in(&home, &self.root, id));
+        if self.agent.thread_id.as_deref() == Some(id) {
+            if self.agent.running_pid.is_some() {
+                self.stop_agent_run(cx);
+            }
+            self.clear_agent_conversation(cx);
+        }
+        self.agent.threads.retain(|thread| thread.id != id);
         cx.notify();
     }
 
@@ -365,8 +648,17 @@ impl DartIde {
         self.agent.attachments.clear();
         self.agent.pending_mentions.clear();
         self.agent.session_id = None;
+        self.agent.thread_id = None;
         self.agent.question_inputs.clear();
         self.agent.turn_stats.clear();
+        self.agent.history.clear();
+        self.agent.history_ix = None;
+        self.agent.threads.clear();
+        self.agent.history_open = false;
+        self.agent.restored_items = 0;
+        self.agent.restored_at_ms = None;
+        self.agent.last_activity_ms = None;
+        self.agent.unread_reply = false;
         cx.notify();
     }
 }
@@ -378,6 +670,8 @@ mod tests {
     fn sample() -> StoredConversation {
         StoredConversation {
             version: VERSION,
+            thread_id: "t1".into(),
+            title: "add a dark mode".into(),
             workspace: "/tmp/app".into(),
             harness: "claude".into(),
             model: Some("claude-sonnet-4-5".into()),
@@ -415,6 +709,8 @@ mod tests {
                 done: true,
             }],
             touched_paths: vec!["lib/theme.dart".into()],
+            prompts: vec!["add a dark mode".into()],
+            saved_at_ms: 1_700_000_000_000,
         }
     }
 
@@ -504,13 +800,137 @@ mod tests {
     }
 
     #[test]
-    fn each_workspace_gets_its_own_file() {
+    fn a_file_without_the_saved_time_still_loads() {
+        let json = r#"{"version":1,"workspace":"/tmp/app","harness":"claude","items":[{"kind":"message","user":true,"text":"hi"}]}"#;
+        let conv = StoredConversation::from_bytes(json.as_bytes()).unwrap();
+        assert_eq!(conv.saved_at_ms, 0);
+        assert_eq!(format_ago(conv.saved_at_ms, 1_700_000_000_000), None);
+    }
+
+    #[test]
+    fn ages_are_short_and_relative() {
+        let now = 1_700_000_000_000;
+        assert_eq!(format_ago(0, now), None);
+        assert_eq!(format_ago(now, now).as_deref(), Some("just now"));
+        assert_eq!(
+            format_ago(now - 5 * 60_000, now).as_deref(),
+            Some("5m ago")
+        );
+        assert_eq!(
+            format_ago(now - 3 * 3_600_000, now).as_deref(),
+            Some("3h ago")
+        );
+        assert_eq!(
+            format_ago(now - 2 * 86_400_000, now).as_deref(),
+            Some("2d ago")
+        );
+    }
+
+    fn temp_home(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("shame-agent-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn write_thread(dir: &Path, conv: &StoredConversation) {
+        std::fs::create_dir_all(dir).unwrap();
+        let path = dir.join(format!("{}.json", conv.thread_id));
+        std::fs::write(path, serde_json::to_vec_pretty(conv).unwrap()).unwrap();
+    }
+
+    #[test]
+    fn each_workspace_gets_its_own_history_folder() {
         let home = Path::new("/home/me");
-        let a = conversation_path_in(home, Path::new("/projects/a"));
-        let b = conversation_path_in(home, Path::new("/projects/b"));
+        let a = threads_dir_in(home, Path::new("/projects/a"));
+        let b = threads_dir_in(home, Path::new("/projects/b"));
         assert_ne!(a, b);
-        assert_eq!(a, conversation_path_in(home, Path::new("/projects/a")));
+        assert_eq!(a, threads_dir_in(home, Path::new("/projects/a")));
         assert!(a.starts_with(home.join(".config/shame/agent")));
+        assert!(thread_path_in(home, Path::new("/projects/a"), "t1").starts_with(&a));
+        assert_eq!(
+            legacy_path_in(home, Path::new("/projects/a")),
+            a.with_extension("json")
+        );
+    }
+
+    #[test]
+    fn threads_are_listed_newest_first_with_titles() {
+        let home = temp_home("history");
+        let root = home.join("project");
+        let dir = threads_dir_in(&home, &root);
+
+        let mut older = sample();
+        older.thread_id = "older".into();
+        older.title = "Make the sidebar collapsible".into();
+        older.saved_at_ms = 1_700_000_000_000;
+        let mut newer = sample();
+        newer.thread_id = "newer".into();
+        newer.title = String::new(); // older files may not carry a title
+        newer.saved_at_ms = 1_700_000_100_000;
+        write_thread(&dir, &older);
+        write_thread(&dir, &newer);
+
+        let listed = list_threads_in(&dir);
+        assert_eq!(
+            listed.iter().map(|t| t.id.as_str()).collect::<Vec<_>>(),
+            ["newer", "older"]
+        );
+        assert_eq!(listed[0].title, "add a dark mode");
+        assert_eq!(listed[0].messages, 1);
+        assert_eq!(listed[0].harness, Some(AgentHarness::ClaudeCode));
+        assert_eq!(listed[1].title, "Make the sidebar collapsible");
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn a_single_legacy_file_becomes_a_thread() {
+        let home = temp_home("legacy");
+        let root = home.join("project");
+        let legacy = legacy_path_in(&home, &root);
+        std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+        let mut conv = sample();
+        conv.thread_id = String::new();
+        conv.title = String::new();
+        std::fs::write(&legacy, serde_json::to_vec_pretty(&conv).unwrap()).unwrap();
+
+        migrate_legacy_in(&home, &root);
+
+        assert!(!legacy.exists(), "the old file is moved, not copied");
+        let listed = list_threads_in(&threads_dir_in(&home, &root));
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].id, format!("{:x}", conv.saved_at_ms));
+        assert_eq!(listed[0].title, "add a dark mode");
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn only_the_newest_threads_are_kept() {
+        let home = temp_home("prune");
+        let root = home.join("project");
+        let dir = threads_dir_in(&home, &root);
+        for (ix, saved) in [
+            1_700_000_000_000u64,
+            1_700_000_100_000,
+            1_700_000_200_000,
+        ]
+        .iter()
+        .enumerate()
+        {
+            let mut conv = sample();
+            conv.thread_id = format!("t{ix}");
+            conv.saved_at_ms = *saved;
+            write_thread(&dir, &conv);
+        }
+
+        prune_threads_in(&dir, "t2", 2);
+
+        let listed = list_threads_in(&dir);
+        assert_eq!(listed.len(), 2);
+        assert!(listed.iter().any(|t| t.id == "t2"), "the newest survives");
+        assert!(listed.iter().any(|t| t.id == "t1"));
+        assert!(!listed.iter().any(|t| t.id == "t0"));
+        let _ = std::fs::remove_dir_all(home);
     }
 
     #[test]

@@ -612,6 +612,21 @@ pub(crate) struct AgentState {
     /// Previously sent prompts (oldest first) and the one being recalled with ↑.
     pub(crate) history: Vec<String>,
     pub(crate) history_ix: Option<usize>,
+    /// How many leading items came back from disk, and when that thread was
+    /// saved: the transcript shows a "restored" banner above them.
+    pub(crate) restored_items: usize,
+    pub(crate) restored_at_ms: Option<u64>,
+    /// When the thread last changed, so an idle quit doesn't make an old
+    /// conversation look new on the next launch.
+    pub(crate) last_activity_ms: Option<u64>,
+    /// A turn finished, or the agent needs an answer, while the rail was
+    /// closed; the titlebar icon shows a dot until it is opened.
+    pub(crate) unread_reply: bool,
+    /// The saved thread on screen, once it has a message (or a CLI session).
+    pub(crate) thread_id: Option<String>,
+    /// The history panel: whether it is open, and the rows last read from disk.
+    pub(crate) history_open: bool,
+    pub(crate) threads: Vec<crate::agent_store::ThreadSummary>,
 }
 
 impl AgentState {
@@ -669,6 +684,13 @@ impl AgentState {
             model_selected: 0,
             history: Vec::new(),
             history_ix: None,
+            restored_items: 0,
+            restored_at_ms: None,
+            last_activity_ms: None,
+            unread_reply: false,
+            thread_id: None,
+            history_open: false,
+            threads: Vec::new(),
         }
     }
 
@@ -714,6 +736,29 @@ impl AgentState {
             .map(|m| (m.id.as_str(), m.label.as_str()))
             .unwrap_or(("default", "Default"))
     }
+
+    /// A short title for the thread: the first thing you asked, one line.
+    pub(crate) fn thread_title(&self) -> Option<String> {
+        thread_title_from(&self.items)
+    }
+}
+
+pub(crate) fn thread_title_from(items: &[AgentItem]) -> Option<String> {
+    let text = items.iter().find_map(|item| match item {
+        AgentItem::Message { is_user: true, text } => Some(text),
+        _ => None,
+    })?;
+    let line = text.lines().map(str::trim).find(|l| !l.is_empty())?;
+    Some(truncate_chars(line, 42))
+}
+
+pub(crate) fn truncate_chars(text: &str, max: usize) -> String {
+    if text.chars().count() <= max {
+        return text.to_string();
+    }
+    let mut out: String = text.chars().take(max.saturating_sub(1)).collect();
+    out.push('\u{2026}');
+    out
 }
 
 /// Whether a scroll view is at (or within `slack` px of) its bottom. `offset_y`
@@ -769,6 +814,17 @@ fn notify_desktop(title: &str, body: &str) {
 }
 
 impl DartIde {
+    /// Open or close the agent rail. Opening it counts as reading whatever
+    /// the titlebar dot was pointing at.
+    pub(crate) fn set_agent_open(&mut self, open: bool) {
+        self.agent_open = open;
+        if open {
+            self.agent.unread_reply = false;
+            // Opening the rail shows the thread, not whichever panel was up.
+            self.agent.history_open = false;
+        }
+    }
+
     pub(crate) fn stop_agent_run(&mut self, cx: &mut Context<Self>) {
         // Stopping means "stop", not "go on to the next queued message".
         self.agent.queue.clear();
@@ -817,6 +873,8 @@ impl DartIde {
             self.run_slash_command(command, window, cx);
             return;
         }
+        // Sending means you are back in the conversation, not browsing it.
+        self.agent.history_open = false;
         if self.agent.history.last() != Some(&prompt) {
             self.agent.history.push(prompt.clone());
         }
@@ -952,6 +1010,12 @@ impl DartIde {
             text: shown_prompt,
         });
         self.agent.scroll.scroll_to_bottom();
+        self.agent.last_activity_ms = Some(crate::agent_store::now_ms());
+        // The first message gives the thread an identity in the history list.
+        if self.agent.thread_id.is_none() {
+            self.agent.thread_id = Some(crate::agent_store::new_thread_id());
+        }
+        self.agent.history_open = false;
         // Save the prompt now: if the app is quit mid-run, the turn is still
         // in the thread when it comes back.
         self.save_agent_conversation();
@@ -1309,6 +1373,9 @@ impl DartIde {
                                         this.agent
                                             .indicator
                                             .update(cx, |i, cx| i.set_label("Waiting for your answer", cx));
+                                        if !this.agent_open {
+                                            this.agent.unread_reply = true;
+                                        }
                                         if cx.active_window().is_none() {
                                             notify_desktop("Shame", &format!("Claude asks: {first}"));
                                         }
@@ -1324,6 +1391,9 @@ impl DartIde {
                                         this.agent
                                             .indicator
                                             .update(cx, |i, cx| i.set_label("Waiting for your approval", cx));
+                                        if !this.agent_open {
+                                            this.agent.unread_reply = true;
+                                        }
                                         if cx.active_window().is_none() {
                                             notify_desktop("Shame", &format!("Needs your approval: {title}"));
                                         }
@@ -1376,6 +1446,11 @@ impl DartIde {
                             },
                             AgentStreamEvent::Finished { error } => {
                                 this.agent.running_pid = None;
+                                this.agent.last_activity_ms = Some(crate::agent_store::now_ms());
+                                if !this.agent_open {
+                                    // A reply landed while the rail was hidden.
+                                    this.agent.unread_reply = true;
+                                }
                                 this.agent.indicator.update(cx, |i, cx| i.stop(cx));
                                 this.cancel_pending_permissions();
                                 this.agent.control_tx = None;
@@ -1492,6 +1567,19 @@ impl DartIde {
         let harness = self.agent.harness;
         let is_running = self.agent.running_pid.is_some();
         let bin_resolved = harness.resolve_binary();
+        let thread_title = self.agent.thread_title();
+        // A reader who scrolled up is not dragged along by streaming; this is
+        // the way back to the end of the thread.
+        let show_jump = !self.agent.items.is_empty() && !self.agent.is_pinned_to_bottom();
+        let restored_note = (self.agent.restored_items > 0).then(|| {
+            let ago = self
+                .agent
+                .restored_at_ms
+                .and_then(|ms| crate::agent_store::format_ago(ms, crate::agent_store::now_ms()))
+                .map(|ago| format!(" \u{b7} {ago}"))
+                .unwrap_or_default();
+            format!("Restored from your last session{ago}")
+        });
         let active_rel_file = self
             .active_editor()
             .and_then(|ed| ed.read(cx).buffer().path().map(Path::to_path_buf))
@@ -1544,11 +1632,15 @@ impl DartIde {
                     .border_color(border)
                     .child(
                         h_flex()
+                            .flex_1()
+                            .min_w(px(0.))
                             .items_center()
                             .gap(px(tokens::SPACE_2))
                             .child(
                                 h_flex()
                                     .id("rail-tab-agent")
+                                    .min_w(px(0.))
+                                    .overflow_hidden()
                                     .items_center()
                                     .gap(px(tokens::SPACE_2))
                                     .h(px(28.))
@@ -1562,6 +1654,16 @@ impl DartIde {
                                     .text_color(fg)
                                     .child(Icon::new(IconName::Bot).small().text_color(primary))
                                     .child(harness.label())
+                                    .when_some(thread_title, |el, title| {
+                                        el.child(
+                                            div()
+                                                .min_w(px(0.))
+                                                .truncate()
+                                                .text_size(px(tokens::UI_XS))
+                                                .text_color(muted)
+                                                .child(format!("\u{b7} {title}")),
+                                        )
+                                    })
                                     .when(is_running, |el| {
                                         el.child(
                                             div()
@@ -1570,6 +1672,24 @@ impl DartIde {
                                                 .bg(green),
                                         )
                                     }),
+                            )
+                            .child(
+                                Button::new("agent-history")
+                                    .ghost()
+                                    .small()
+                                    .icon(
+                                        Icon::new(IconName::Clock).xsmall().text_color(
+                                            if self.agent.history_open { primary } else { muted },
+                                        ),
+                                    )
+                                    .tooltip("Thread history")
+                                    .on_click(cx.listener(|this, _e, _w, cx| {
+                                        if this.agent.history_open {
+                                            this.close_agent_history(cx);
+                                        } else {
+                                            this.open_agent_history(cx);
+                                        }
+                                    })),
                             )
                             .child(
                                 Button::new("agent-new-thread")
@@ -1589,13 +1709,21 @@ impl DartIde {
                             .icon(Icon::new(IconName::X).xsmall().text_color(muted))
                             .tooltip("Close Agent panel")
                             .on_click(cx.listener(|this, _event, _window, cx| {
-                                this.agent_open = false;
+                                this.set_agent_open(false);
                                 cx.notify();
                             })),
                     ),
             )
-            // Scrollable conversation body
-            .child(
+            // History (when open) or the scrollable conversation body.
+            .child(if self.agent.history_open {
+                self.render_agent_history(cx).into_any_element()
+            } else {
+                v_flex()
+                    .relative()
+                    .flex_1()
+                    .w_full()
+                    .min_h(px(0.))
+                    .child(
                 v_flex()
                     .id("agent-scroll-body")
                     .flex_1()
@@ -1603,6 +1731,11 @@ impl DartIde {
                     .min_h(px(0.))
                     .overflow_y_scroll()
                     .track_scroll(&self.agent.scroll)
+                    .on_scroll_wheel(cx.listener(|_this, _e: &ScrollWheelEvent, _w, cx| {
+                        // The "Jump to latest" pill follows whether the reader
+                        // is at the end, which only changes while scrolling.
+                        cx.notify();
+                    }))
                     .p(px(tokens::SPACE_4))
                     .gap(px(tokens::SPACE_4))
                     // Live empty state when no messages have been sent yet
@@ -1858,6 +1991,23 @@ impl DartIde {
                         )
                     })
                     // 26–28. ToolCallCard, CollapsedGroup, MessageBubble
+                    .when_some(restored_note, |el, note| {
+                        el.child(
+                            h_flex()
+                                .w_full()
+                                .items_center()
+                                .gap(px(tokens::SPACE_2))
+                                .child(div().flex_1().h(px(1.)).bg(border))
+                                .child(
+                                    div()
+                                        .flex_shrink_0()
+                                        .text_size(px(tokens::UI_XS))
+                                        .text_color(muted)
+                                        .child(note),
+                                )
+                                .child(div().flex_1().h(px(1.)).bg(border)),
+                        )
+                    })
                     .children(self.agent.items.iter().enumerate().map(|(item_ix, item)| {
                         match item {
                             AgentItem::ToolGroup {
@@ -2070,7 +2220,47 @@ impl DartIde {
                         }
                     }))
                     .when(is_running, |el| el.child(self.agent.indicator.clone())),
-            )
+                )
+                // Shown only when the reader has scrolled away from the end.
+                .when(show_jump, |el| {
+                    el.child(
+                        div()
+                            .absolute()
+                            .left(px(0.))
+                            .right(px(0.))
+                            .bottom(px(tokens::SPACE_3))
+                            .flex()
+                            .justify_center()
+                            .child(
+                                h_flex()
+                                    .id("agent-jump-latest")
+                                    .h(px(24.))
+                                    .px(px(tokens::SPACE_3))
+                                    .gap(px(tokens::SPACE_1))
+                                    .items_center()
+                                    .rounded(px(tokens::RADIUS_PILL))
+                                    .bg(cx.theme().tab_active)
+                                    .border_1()
+                                    .border_color(border)
+                                    .text_size(px(tokens::UI_XS))
+                                    .text_color(fg)
+                                    .cursor_pointer()
+                                    .hover(move |s| s.bg(list_hover))
+                                    .child(
+                                        Icon::new(IconName::ArrowDown)
+                                            .with_size(px(10.))
+                                            .text_color(muted),
+                                    )
+                                    .child("Jump to latest")
+                                    .on_click(cx.listener(|this, _e, _w, cx| {
+                                        this.agent.scroll.scroll_to_bottom();
+                                        cx.notify();
+                                    })),
+                            ),
+                    )
+                })
+                    .into_any_element()
+            })
             // 29. PendingChanges card (strictly reflects files modified/created by the AI agent)
             .when(has_ai_changes, |el| {
                 let count = ai_unstaged.len();
@@ -2302,11 +2492,229 @@ impl DartIde {
             .child(self.render_agent_composer(cx))
             .into_any_element()
     }
+
+    /// Threads saved for this workspace, newest first. A row switches the
+    /// thread; the × removes it from disk.
+    fn render_agent_history(&self, cx: &mut Context<Self>) -> Div {
+        let fg = cx.theme().foreground;
+        let muted = cx.theme().muted_foreground;
+        let primary = cx.theme().primary;
+        let border = cx.theme().border;
+        let list_hover = cx.theme().list_hover;
+        let red = cx.theme().red;
+        let now = crate::agent_store::now_ms();
+        let running = self.agent.running_pid.is_some();
+
+        let rows: Vec<AnyElement> = self
+            .agent
+            .threads
+            .iter()
+            .enumerate()
+            .map(|(ix, thread)| {
+                let is_current = self.agent.thread_id.as_deref() == Some(thread.id.as_str());
+                let title = if thread.title.is_empty() {
+                    "Untitled thread".to_string()
+                } else {
+                    thread.title.clone()
+                };
+                let ago = crate::agent_store::format_ago(thread.saved_at_ms, now)
+                    .unwrap_or_else(|| "earlier".to_string());
+                let mut meta = format!(
+                    "{ago} \u{b7} {} message{}",
+                    thread.messages,
+                    if thread.messages == 1 { "" } else { "s" }
+                );
+                if let Some(harness) = thread.harness {
+                    meta.push_str(&format!(" \u{b7} {}", harness.label()));
+                }
+                let load_id = thread.id.clone();
+                let delete_id = thread.id.clone();
+                h_flex()
+                    .id(("agent-thread-row", ix))
+                    .w_full()
+                    .min_w(px(0.))
+                    .items_center()
+                    .gap(px(tokens::SPACE_2))
+                    .px(px(tokens::SPACE_2))
+                    .py(px(tokens::SPACE_2))
+                    .rounded(px(tokens::RADIUS_SM))
+                    .cursor_pointer()
+                    .when(is_current, |el| el.bg(cx.theme().tab_active))
+                    .when(!is_current, |el| el.hover(move |s| s.bg(list_hover)))
+                    .child(
+                        v_flex()
+                            .flex_1()
+                            .min_w(px(0.))
+                            .gap(px(1.))
+                            .child(
+                                h_flex()
+                                    .min_w(px(0.))
+                                    .items_center()
+                                    .gap(px(tokens::SPACE_1))
+                                    .child(
+                                        div()
+                                            .min_w(px(0.))
+                                            .truncate()
+                                            .text_size(px(tokens::UI_SM))
+                                            .text_color(fg)
+                                            .child(title),
+                                    )
+                                    .when(is_current, |el| {
+                                        el.child(
+                                            Icon::new(IconName::Check)
+                                                .with_size(px(10.))
+                                                .text_color(primary),
+                                        )
+                                    }),
+                            )
+                            .child(
+                                div()
+                                    .truncate()
+                                    .text_size(px(tokens::UI_XS))
+                                    .text_color(muted)
+                                    .child(meta),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .id(("agent-thread-delete", ix))
+                            .size(px(16.))
+                            .flex_shrink_0()
+                            .rounded(px(tokens::RADIUS_PILL))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .cursor_pointer()
+                            .text_color(muted)
+                            .hover(move |s| s.bg(rgba(0xffffff1f)).text_color(red))
+                            .child(Icon::new(IconName::Trash).with_size(px(10.)))
+                            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                            .on_click(cx.listener(move |this, _e, _w, cx| {
+                                this.delete_agent_thread(&delete_id, cx);
+                            })),
+                    )
+                    .on_click(cx.listener(move |this, _e, _w, cx| {
+                        this.load_agent_thread(&load_id, cx);
+                    }))
+                    .into_any_element()
+            })
+            .collect();
+
+        v_flex()
+            .flex_1()
+            .w_full()
+            .min_h(px(0.))
+            .child(
+                h_flex()
+                    .w_full()
+                    .flex_shrink_0()
+                    .items_center()
+                    .justify_between()
+                    .px(px(tokens::SPACE_3))
+                    .py(px(tokens::SPACE_2))
+                    .border_b_1()
+                    .border_color(border)
+                    .child(
+                        h_flex()
+                            .items_center()
+                            .gap(px(tokens::SPACE_2))
+                            .child(
+                                Icon::new(IconName::Clock)
+                                    .with_size(px(12.))
+                                    .text_color(primary),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(tokens::UI_SM))
+                                    .font_medium()
+                                    .text_color(fg)
+                                    .child("History"),
+                            ),
+                    )
+                    .child(
+                        Button::new("agent-history-close")
+                            .ghost()
+                            .small()
+                            .icon(Icon::new(IconName::X).xsmall().text_color(muted))
+                            .tooltip("Back to the thread")
+                            .on_click(cx.listener(|this, _e, _w, cx| {
+                                this.close_agent_history(cx);
+                            })),
+                    ),
+            )
+            .when(running, |el| {
+                el.child(
+                    div()
+                        .px(px(tokens::SPACE_3))
+                        .py(px(tokens::SPACE_1))
+                        .text_size(px(tokens::UI_XS))
+                        .text_color(muted)
+                        .child("Switching stops the current run"),
+                )
+            })
+            .child(
+                v_flex()
+                    .id("agent-history-list")
+                    .flex_1()
+                    .w_full()
+                    .min_h(px(0.))
+                    .overflow_y_scroll()
+                    .p(px(tokens::SPACE_3))
+                    .gap(px(tokens::SPACE_1))
+                    .when(rows.is_empty(), |el| {
+                        el.child(
+                            div()
+                                .w_full()
+                                .py(px(tokens::SPACE_6))
+                                .text_size(px(tokens::UI_SM))
+                                .text_color(muted)
+                                .child("No earlier threads yet."),
+                        )
+                    })
+                    .children(rows),
+            )
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[core::prelude::v1::test]
+    fn thread_title_comes_from_the_first_question() {
+        let items = vec![
+            AgentItem::ToolGroup {
+                id: 0,
+                header: "Agent used 1 tool".into(),
+                collapsed: false,
+                calls: vec![],
+            },
+            AgentItem::Message {
+                is_user: false,
+                text: "I looked at the tree.".into(),
+            },
+            AgentItem::Message {
+                is_user: true,
+                text: "\n  Make the sidebar collapsible and keep the tree state\nsecond line".into(),
+            },
+            AgentItem::Message {
+                is_user: true,
+                text: "a later question".into(),
+            },
+        ];
+        let title = thread_title_from(&items).expect("a title");
+        assert!(title.starts_with("Make the sidebar collapsible"));
+        assert!(title.ends_with('\u{2026}'));
+        assert_eq!(title.chars().count(), 42);
+        assert_eq!(thread_title_from(&[]), None);
+        assert_eq!(
+            thread_title_from(&[AgentItem::Message {
+                is_user: false,
+                text: "only a reply".into()
+            }]),
+            None
+        );
+    }
 
     #[core::prelude::v1::test]
     fn parses_claude_opencode_and_codex_stream_json_events() {

@@ -12,12 +12,14 @@ impl DartIde {
         self.syncing_files = true;
         let root = self.root.clone();
         let prev_hash = self.all_files_hash;
+        let show_hidden = self.show_hidden;
         let (tx, rx) = async_channel::bounded(1);
         std::thread::spawn(move || {
             let files = flatten_files(&root);
             let h = hash_paths(&files);
             if h != prev_hash {
-                let _ = tx.send_blocking(Some((files, h)));
+                let nodes = crate::rails::files::scan_tree(&root, show_hidden);
+                let _ = tx.send_blocking(Some((files, h, nodes)));
             } else {
                 let _ = tx.send_blocking(None);
             }
@@ -26,13 +28,11 @@ impl DartIde {
             let res = rx.recv().await;
             let _ = weak.update(cx, |this, cx| {
                 this.syncing_files = false;
-                if let Ok(Some((files, h))) = res {
-                    let items = build_tree_items(&this.root, this.show_hidden);
+                if let Ok(Some((files, h, nodes))) = res {
                     this.all_files = files;
                     this.all_files_hash = h;
-                    this.tree_state.update(cx, |state, cx| {
-                        state.set_items(items, cx);
-                    });
+                    // A file changed on disk: keep the folders the user has open.
+                    this.set_tree_items(crate::rails::files::to_tree_items(nodes), cx);
                     cx.notify();
                 }
             });
@@ -281,9 +281,7 @@ impl DartIde {
         let files = flatten_files(&self.root);
         self.all_files_hash = hash_paths(&files);
         self.all_files = files;
-        self.tree_state.update(cx, |state, cx| {
-            state.set_items(items, cx);
-        });
+        self.set_tree_items(items, cx);
     }
 
     pub(crate) fn save_session_state(&self) {
@@ -328,6 +326,14 @@ impl DartIde {
         }
     }
 
+    /// The saved "show dotfiles" choice, read before the first tree build so
+    /// startup shows the right files straight away.
+    pub(crate) fn saved_show_hidden() -> Option<bool> {
+        let home = std::env::var("HOME").ok()?;
+        let bytes = std::fs::read(Path::new(&home).join(".config/shame/session.json")).ok()?;
+        serde_json::from_slice::<serde_json::Value>(&bytes).ok()?.get("show_hidden")?.as_bool()
+    }
+
     pub(crate) fn restore_preferences_only(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Ok(home) = std::env::var("HOME") else {
             return;
@@ -349,7 +355,15 @@ impl DartIde {
         cx: &mut Context<Self>,
     ) {
         if let Some(sh) = val.get("show_hidden").and_then(|v| v.as_bool()) {
-            self.show_hidden = sh;
+            // The tree was built before preferences loaded: rebuild it if the
+            // saved choice differs, or it shows the wrong files and the eye
+            // button's first click appears to do nothing.
+            if self.show_hidden != sh {
+                self.show_hidden = sh;
+                if self.has_workspace {
+                    self.rescan_file_tree(cx);
+                }
+            }
         }
         if let Some(ud) = val.get("unified_diff").and_then(|v| v.as_bool()) {
             self.git.unified_diff = ud;
@@ -419,7 +433,7 @@ impl DartIde {
             self.terminal_open = tb;
         }
         if let Some(ab) = val.get("agent_open").and_then(|v| v.as_bool()) {
-            self.agent_open = ab;
+            self.set_agent_open(ab);
         }
         if let Some(arr) = val.get("open_tabs").and_then(|v| v.as_array()) {
             for item in arr.iter().take(12) {
