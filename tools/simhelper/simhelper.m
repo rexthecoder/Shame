@@ -180,39 +180,47 @@ static id msg0(id obj, const char *sel) {
   return ((id(*)(id, SEL))objc_msgSend)(obj, s);
 }
 
-// The main display's descriptor: an IO port whose descriptor vends an IOSurface.
+// The one real surface behind a display descriptor (nil while the display is still coming up).
+static IOSurfaceRef surfaceOf(id desc) {
+  @try {
+    id surf = msg0(desc, "framebufferSurface") ?: msg0(desc, "ioSurface");
+    if (surf) return (__bridge IOSurfaceRef)surf;
+  } @catch (NSException *e) {}
+  return NULL;
+}
+
+// The main display's descriptor: an IO port whose descriptor vends a *live* IOSurface.
+//
+// Do not pick the descriptor by `displayClass` (or by taking the first one that merely
+// responds to `framebufferSurface`): on current Xcode the port list holds several display and
+// screen-capture descriptors, and `state` is a ROCKImmutableProxy that is not key-value
+// coding-compliant, so asking it for `displayClass` throws. The only reliable test is whether
+// the descriptor actually returns a surface.
 static id mainDisplay(void) {
   id io = msg0(gDevice, "io");
   NSArray *ports = msg0(io, "ioPorts");
-  id fallback = nil;
   for (id port in ports) {
     id desc = msg0(port, "descriptor");
     if (!desc) continue;
     if (![desc respondsToSelector:sel_registerName("framebufferSurface")] &&
         ![desc respondsToSelector:sel_registerName("ioSurface")]) continue;
-    @try {
-      id state = msg0(desc, "state");
-      if (state && [[state valueForKey:@"displayClass"] intValue] == 0) return desc;
-    } @catch (NSException *e) {}
-    if (!fallback) fallback = desc;
+    if (surfaceOf(desc)) return desc;
   }
-  return fallback;
+  return nil;
 }
 
 static IOSurfaceRef currentSurface(id display) {
-  id surf = nil;
-  @try {
-    surf = msg0(display, "framebufferSurface") ?: msg0(display, "ioSurface");
-  } @catch (NSException *e) {}
-  return (__bridge IOSurfaceRef)surf;
+  return surfaceOf(display);
 }
 
 static dispatch_source_t gStreamTimer;
 
 static void startStream(void) {
-  id display = nil;
+  __block id display = nil;
   for (int i = 0; i < 50 && !(display = mainDisplay()); i++) usleep(100 * 1000);
-  if (!display) { fprintf(stderr, "shame-sim: no display surface (is the device booted?)\n"); return; }
+  // Not fatal: the timer below keeps looking, so a display that appears after the boot
+  // finishes still starts the stream.
+  if (!display) fprintf(stderr, "shame-sim: waiting for a display surface\n");
   dispatch_queue_t q = dispatch_queue_create("shame.sim.stream", DISPATCH_QUEUE_SERIAL);
   gStreamTimer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, q);
   // ~30 fps: every frame makes the editor repaint, and 60 is more than a phone mirror needs.
@@ -224,7 +232,13 @@ static void startStream(void) {
   dispatch_source_set_event_handler(gStreamTimer, ^{
     @autoreleasepool {
       IOSurfaceRef surf = currentSurface(display);
-      if (!surf) return;
+      if (!surf) {
+        // A display can be replaced (or appear late) across a boot; look it up again.
+        id again = mainDisplay();
+        if (again) display = again;
+        surf = currentSurface(display);
+        if (!surf) return;
+      }
       uint32_t seed = IOSurfaceGetSeed(surf);
       if (surf == lastSurface && seed == lastSeed) return;
       if (IOSurfaceLock(surf, kIOSurfaceLockReadOnly, NULL) != 0) return;

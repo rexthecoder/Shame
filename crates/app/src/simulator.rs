@@ -19,6 +19,11 @@ pub(crate) struct SimulatorState {
     pub(crate) touching: bool,
     /// The live framebuffer stream is running (otherwise `simctl` screenshots are the fallback).
     pub(crate) streaming: bool,
+    /// Whether the live stream has delivered a frame since it started. The helper only sends a
+    /// frame when the screen changes, so silence after the first one is normal; a stream that
+    /// never delivered any (e.g. no framebuffer surface on this Xcode/runtime) must not suppress
+    /// the `simctl` screenshot fallback.
+    pub(crate) stream_delivered_frame: bool,
     /// What the panel is waiting on ("Booting…", "Connecting…") until the first frame.
     pub(crate) status: Option<String>,
     pub(crate) stream_retry_at: Option<std::time::Instant>,
@@ -43,6 +48,7 @@ impl Default for SimulatorState {
             frame: None,
             touching: false,
             streaming: false,
+            stream_delivered_frame: false,
             status: None,
             stream_retry_at: None,
             last_hash: 0,
@@ -223,6 +229,7 @@ impl DartIde {
         self.sim.attached = false;
         self.sim.touching = false;
         self.sim.status = None;
+        self.sim.stream_delivered_frame = false;
         if let Some(old) = self.sim.frame.take() {
             cx.drop_image(old, None);
         }
@@ -243,6 +250,7 @@ impl DartIde {
             return;
         };
         self.sim.streaming = true;
+        self.sim.stream_delivered_frame = false;
         cx.spawn(async move |weak, cx| {
             while stream.ready.recv().await.is_ok() {
                 let frame = stream
@@ -262,6 +270,7 @@ impl DartIde {
                         if let Some(old) = this.sim.frame.replace(std::sync::Arc::new(frame)) {
                             cx.drop_image(old, None);
                         }
+                        this.sim.stream_delivered_frame = true;
                         this.sim.status = None;
                         cx.notify();
                     })
@@ -286,7 +295,11 @@ impl DartIde {
             return;
         }
         // The live stream already keeps the frame current; screenshots are only the fallback.
-        if self.sim.streaming {
+        // Require that the stream actually delivered a frame, not just that the helper process
+        // is running: a stream that never delivers one (no framebuffer surface, simulator still
+        // booting) must not leave the panel stuck on "Connecting…" with no picture.
+        let stream_current = self.sim.streaming && self.sim.stream_delivered_frame;
+        if stream_current {
             return;
         }
         if self
@@ -468,7 +481,7 @@ impl DartIde {
                         this.start_simulator_stream(cx);
                         this.refresh_simulator_screenshot(cx);
                     }
-                    Some(if this.sim.streaming {
+                    Some(if this.sim.streaming && this.sim.stream_delivered_frame {
                         std::time::Duration::from_secs(1)
                     } else {
                         std::time::Duration::from_millis(80)

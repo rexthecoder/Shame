@@ -56,6 +56,8 @@ dev-app: build
 	-pkill -f "$(APP_NAME) Dev.app/Contents/MacOS/$(BIN)"
 	@mkdir -p "$(DEV_APP)/Contents/MacOS"
 	@cp "target/debug/$(BIN)" "$(DEV_APP)/Contents/MacOS/$(BIN)"
+	@HELPER=$$(ls -t target/debug/build/*/out/shame-sim 2>/dev/null | head -1); \
+		if [ -n "$$HELPER" ]; then cp "$$HELPER" "$(DEV_APP)/Contents/MacOS/shame-sim"; fi
 	@printf '%s\n' \
 		'<?xml version="1.0" encoding="UTF-8"?>' \
 		'<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">' \
@@ -107,6 +109,8 @@ bundle: icon release-build
 	@rm -rf "$(APP_DIR)"
 	@mkdir -p "$(APP_DIR)/Contents/MacOS" "$(APP_DIR)/Contents/Resources"
 	@cp "target/release/$(BIN)" "$(APP_DIR)/Contents/MacOS/$(BIN)"
+	@HELPER=$$(ls -t target/release/build/*/out/shame-sim 2>/dev/null | head -1); \
+		if [ -n "$$HELPER" ]; then cp "$$HELPER" "$(APP_DIR)/Contents/MacOS/shame-sim"; fi
 	@cp "assets/icon.icns" "$(APP_DIR)/Contents/Resources/icon.icns"
 	@printf '%s\n' \
 		'<?xml version="1.0" encoding="UTF-8"?>' \
