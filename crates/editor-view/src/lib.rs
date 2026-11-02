@@ -27,6 +27,7 @@ pub mod keymap;
 mod conflicts;
 mod inlay_hints;
 mod lsp_integration;
+mod margin_notes;
 mod multicursor;
 mod snippet;
 
@@ -64,6 +65,8 @@ const GUTTER_FONT_SIZE: f32 = 11.5;
 /// Enough breathing room to read as an editor without the file feeling
 /// sparse (the first pass tried 26px, which did).
 const LINE_HEIGHT: f32 = 22.;
+/// Space above the first line.
+const LIST_TOP_PAD: f32 = 8.;
 /// Gap kept between an inlay hint pill and neighbouring text when the
 /// server asks for padding, and the pill's own inner horizontal padding.
 const INLAY_PAD: Pixels = px(4.);
@@ -210,18 +213,6 @@ pub(crate) fn minimal_replacement<'a>(old: &str, new: &'a str) -> Option<(Range<
     Some((prefix..a.len() - suffix, &new[prefix..b.len() - suffix]))
 }
 
-/// One row in the editor's virtual list: a code line, or the message row
-/// shown above a line with a diagnostic.
-#[derive(Clone)]
-enum DisplayItem {
-    Line(usize),
-    Diagnostic {
-        line: usize,
-        severity: lsp_types::DiagnosticSeverity,
-        text: String,
-        range: Range<usize>,
-    },
-}
 
 /// A horizontal scrollbar thumb being dragged: where the pointer and the
 /// scroll offset started, and the travel available to each.
@@ -255,9 +246,13 @@ pub struct EditorView {
     h_drag: Option<HorizontalDrag>,
     /// Track width minus thumb width, from the last painted scrollbar.
     h_span: Pixels,
-    /// Logical line -> its row in the list (diagnostic rows shift code lines
-    /// down), rebuilt on every render so scrolling lands on the right row.
+    /// Logical line -> its row in the list (folds hide lines), rebuilt on
+    /// every render so scrolling lands on the right row.
     display_line_index: Vec<usize>,
+    /// Width the margin-note column took last frame. The text area is
+    /// measured after that reservation, so adding it back gives the editor's
+    /// full width when deciding whether notes fit.
+    notes_reserved: f32,
     language: Arc<dyn LanguageAdapter>,
     syntax_tree: Option<SyntaxTree>,
     /// The text `syntax_tree` was last parsed/reparsed from, so `render`
@@ -379,6 +374,7 @@ impl EditorView {
             h_drag: None,
             h_span: px(1.),
             display_line_index: Vec::new(),
+            notes_reserved: 0.,
             language,
             syntax_tree,
             synced_text,
@@ -776,8 +772,8 @@ impl EditorView {
         cx.notify();
     }
 
-    /// Scroll a logical line into view. Diagnostic rows sit above their line,
-    /// so the list index is not the line number.
+    /// Scroll a logical line into view. Folded lines have no row, so the
+    /// list index is not the line number.
     fn scroll_to_line(&self, line: usize, strategy: ScrollStrategy) {
         let row = self
             .display_line_index
@@ -2070,65 +2066,6 @@ impl EditorView {
             }
         }
         ranges
-    }
-
-    /// The message row shown above a line with a diagnostic. It is a normal
-    /// list row, so it stacks with the code without an inline pill covering it.
-    fn render_diagnostic_row(
-        &self,
-        line: usize,
-        severity: lsp_types::DiagnosticSeverity,
-        text: &str,
-        range: &Range<usize>,
-        cx: &mut Context<Self>,
-    ) -> impl IntoElement {
-        let (color, icon) = match severity {
-            lsp_types::DiagnosticSeverity::ERROR => (
-                cx.theme().danger,
-                gpui_kit::assets::IconName::CircleAlert,
-            ),
-            lsp_types::DiagnosticSeverity::WARNING => (
-                cx.theme().warning,
-                gpui_kit::assets::IconName::TriangleAlert,
-            ),
-            _ => (cx.theme().info, gpui_kit::assets::IconName::Info),
-        };
-        h_flex()
-            .id(("editor-diagnostic", line))
-            .debug_selector(move || format!("editor-diagnostic-{line}"))
-            .w_full()
-            .h(px(LINE_HEIGHT))
-            .flex_shrink_0()
-            .items_center()
-            .gap(px(6.))
-            .pl(px(GUTTER_WIDTH + 4.))
-            .pr(px(8.))
-            .bg(color.opacity(0.08))
-            .text_size(px(LINE_FONT_SIZE - 1.5))
-            .text_color(color)
-            .cursor_pointer()
-            .hover(move |row| row.bg(color.opacity(0.14)))
-            .child(
-                gpui_kit::component::Icon::new(icon)
-                    .with_size(px(11.))
-                    .text_color(color),
-            )
-            .child(div().min_w(px(0.)).truncate().child(text.to_string()))
-            .on_click(cx.listener({
-                let range = range.clone();
-                move |this, _event, window, cx| {
-                    let line_start = this.buffer.line_to_byte(line);
-                    let line_len = this
-                        .buffer
-                        .line(line)
-                        .trim_end_matches(['\n', '\r'])
-                        .len();
-                    let column = range.start.min(line_len);
-                    this.set_cursor(line_start + column, cx);
-                    window.focus(&this.focus_handle, cx);
-                    cx.notify();
-                }
-            }))
     }
 
     fn render_line(
@@ -3738,40 +3675,16 @@ fn reveal_offset(current: f64, caret_x: f64, viewport: f64, margin: f64, max: f6
     x.clamp(0.0, max)
 }
 
-/// Rows for the editor list: a message row above each visible line that has
-/// a diagnostic, then the line itself. Also returns logical line -> row.
-fn display_rows(
-    visible: &[usize],
-    messages: &std::collections::HashMap<
-        u32,
-        (lsp_types::DiagnosticSeverity, Range<usize>, String),
-    >,
-    line_count: usize,
-) -> (Vec<DisplayItem>, Vec<usize>) {
-    let mut rows = Vec::with_capacity(visible.len() + messages.len());
+/// The editor's list rows: the visible (unfolded) lines in order, plus
+/// logical line -> row for scrolling.
+fn display_rows(visible: &[usize], line_count: usize) -> (Vec<usize>, Vec<usize>) {
     let mut line_row = vec![0usize; line_count];
-    for &line in visible {
-        if let Some((severity, range, text)) = messages.get(&(line as u32))
-            && matches!(
-                severity,
-                &lsp_types::DiagnosticSeverity::ERROR | &lsp_types::DiagnosticSeverity::WARNING
-            )
-        {
-            rows.push(DisplayItem::Diagnostic {
-                line,
-                severity: *severity,
-                text: text.clone(),
-                range: range.clone(),
-            });
-        }
+    for (row, &line) in visible.iter().enumerate() {
         if let Some(slot) = line_row.get_mut(line) {
-            *slot = rows.len();
+            *slot = row;
         }
-        rows.push(DisplayItem::Line(line));
     }
-    if rows.is_empty() {
-        rows.push(DisplayItem::Line(0));
-    }
+    let rows = if visible.is_empty() { vec![0] } else { visible.to_vec() };
     (rows, line_row)
 }
 
@@ -4070,9 +3983,16 @@ mod tests {
     }
 
     use super::{
-        DisplayItem, diff_as_edit, display_columns, display_rows, find_matches, fit_label,
+        diff_as_edit, display_columns, display_rows, find_matches, fit_label,
         lens_left_after_text, minimal_replacement, normalize_for_save, reveal_offset,
     };
+
+    #[test]
+    fn folded_lines_have_no_row_and_later_lines_move_up() {
+        let (rows, line_row) = display_rows(&[0, 1, 4], 5);
+        assert_eq!(rows, vec![0, 1, 4]);
+        assert_eq!(line_row[4], 2, "lines 2 and 3 are folded away");
+    }
 
     #[test]
     fn no_change_is_no_edit() {
@@ -4168,26 +4088,6 @@ mod tests {
         assert!(fitted.ends_with('\u{2026}'));
         assert!(fitted.chars().count() < 20, "fitted: {fitted}");
         assert_eq!(fit_label("anything", 100.0, 8.0), None, "no room for a label");
-    }
-
-    #[test]
-    fn diagnostic_rows_sit_above_their_line_and_shift_the_scroll_index() {
-        let mut messages = std::collections::HashMap::new();
-        messages.insert(
-            1u32,
-            (
-                core_lsp::lsp_types::DiagnosticSeverity::ERROR,
-                2..5,
-                "Undefined class 'X'.".to_string(),
-            ),
-        );
-        let (rows, line_row) = display_rows(&[0, 1, 2], &messages, 3);
-        assert_eq!(rows.len(), 4);
-        assert!(matches!(rows[0], DisplayItem::Line(0)));
-        assert!(matches!(rows[1], DisplayItem::Diagnostic { line: 1, .. }));
-        assert!(matches!(rows[2], DisplayItem::Line(1)));
-        assert!(matches!(rows[3], DisplayItem::Line(2)));
-        assert_eq!(line_row, vec![0, 2, 3], "line 1 moved down by its message row");
     }
 
     #[test]
@@ -4333,17 +4233,23 @@ impl Render for EditorView {
         self.scroll_x = self.scroll_x.clamp(px(0.), self.max_scroll_x);
         let scroll_x = self.scroll_x;
 
-        // One list row per code line, plus a message row above every line with
-        // a diagnostic. All rows are still LINE_HEIGHT, so the list stays
-        // uniform; only the line -> row mapping shifts.
+        // One list row per visible code line, all LINE_HEIGHT; folding is the
+        // only thing that shifts the line -> row mapping. Diagnostics live in
+        // the margin notes, not in the list.
         let visible_lines: Vec<usize> = if self.folded_starts.is_empty() {
             (0..self.buffer.line_count().max(1)).collect()
         } else {
             self.visible_lines.clone()
         };
         let (display_items, display_line_index) =
-            display_rows(&visible_lines, &diagnostic_messages, self.buffer.line_count());
+            display_rows(&visible_lines, self.buffer.line_count());
         self.display_line_index = display_line_index;
+        // The note column takes its width out of the text area, so long
+        // lines scroll under the code's own edge, never under a note.
+        let line_notes = self.line_notes();
+        let notes_width = self.margin_notes_width(!line_notes.is_empty());
+        let margin_notes =
+            self.render_margin_notes(line_notes, notes_width, LIST_TOP_PAD, window, cx);
 
         let list = uniform_list(
             "editor-lines",
@@ -4354,11 +4260,9 @@ impl Render for EditorView {
                 }
                 let mut first_line = None;
                 let mut end_line = 0usize;
-                for item in &display_items[visible_range.clone()] {
-                    if let DisplayItem::Line(line) = item {
-                        first_line.get_or_insert(*line);
-                        end_line = *line + 1;
-                    }
+                for &line in &display_items[visible_range.clone()] {
+                    first_line.get_or_insert(line);
+                    end_line = line + 1;
                 }
                 let (start_line, end_line) = match first_line {
                     Some(line) => (line, end_line.min(this.buffer.line_count())),
@@ -4386,43 +4290,33 @@ impl Render for EditorView {
                 };
 
                 visible_range
-                    .map(|row| match &display_items[row] {
-                        DisplayItem::Line(ix) => {
-                            let ix = *ix;
-                            let line = if this.buffer.is_empty() && ix == 0 {
-                                String::new()
-                            } else if ix < this.buffer.line_count() {
-                                this.buffer.line(ix)
-                            } else {
-                                String::new()
-                            };
-                            this.render_line(
-                                ix,
-                                &line,
-                                cursor_line,
-                                &highlights,
-                                selection_range.clone(),
-                                &diagnostics_by_line,
-                                &diagnostic_messages,
-                                &this.line_changes,
-                                indent_width,
-                                current_word.as_deref(),
-                                bracket_pair,
-                                scroll_x,
-                                char_width,
-                                window,
-                                cx,
-                            )
-                            .into_any_element()
-                        }
-                        DisplayItem::Diagnostic {
-                            line,
-                            severity,
-                            text,
-                            range,
-                        } => this
-                            .render_diagnostic_row(*line, *severity, text, range, cx)
-                            .into_any_element(),
+                    .map(|row| {
+                        let ix = display_items[row];
+                        let line = if this.buffer.is_empty() && ix == 0 {
+                            String::new()
+                        } else if ix < this.buffer.line_count() {
+                            this.buffer.line(ix)
+                        } else {
+                            String::new()
+                        };
+                        this.render_line(
+                            ix,
+                            &line,
+                            cursor_line,
+                            &highlights,
+                            selection_range.clone(),
+                            &diagnostics_by_line,
+                            &diagnostic_messages,
+                            &this.line_changes,
+                            indent_width,
+                            current_word.as_deref(),
+                            bracket_pair,
+                            scroll_x,
+                            char_width,
+                            window,
+                            cx,
+                        )
+                        .into_any_element()
                     })
                     .collect()
             }),
@@ -4559,9 +4453,10 @@ impl Render for EditorView {
             .size_full()
             .bg(cx.theme().background)
             .text_color(cx.theme().foreground)
-            .pt_2()
+            .pt(px(LIST_TOP_PAD))
             .child(drag_tracker)
-            .child(list)
+            .child(div().size_full().pr(px(notes_width)).child(list))
+            .children(margin_notes)
             .when(show_h_scroll, |el| {
                 el.child(
                     div()

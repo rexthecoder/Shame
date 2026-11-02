@@ -367,7 +367,7 @@ pub(crate) struct LspState {
     version: i32,
     last_synced_revision: u64,
     ready: bool,
-    diagnostics: Vec<Diagnostic>,
+    pub(crate) diagnostics: Vec<Diagnostic>,
     pending_hover_id: Option<i64>,
     pending_definition_id: Option<i64>,
     /// The next definition reply should open a peek, not jump.
