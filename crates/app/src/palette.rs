@@ -3,23 +3,59 @@
 use super::*;
 
 impl DartIde {
-    pub(crate) fn run_project_search(&mut self, query: String, cx: &mut Context<Self>) {
+    /// Wait for a pause in typing before scanning. Without this a fast typist
+    /// starts a whole-workspace scan for every intermediate query.
+    pub(crate) fn schedule_project_search(&mut self, query: String, cx: &mut Context<Self>) {
+        self.project_search_matches.clear();
+        self.project_search_truncated = false;
         if query.is_empty() {
-            self.project_search_matches.clear();
+            self.project_search_pending = false;
             cx.notify();
             return;
         }
+        self.project_search_pending = true;
+        cx.notify();
+        cx.spawn(async move |weak, cx| {
+            cx.background_executor()
+                .timer(std::time::Duration::from_millis(180))
+                .await;
+            let _ = weak.update(cx, |this, cx| {
+                // A newer keystroke replaced this query while we waited.
+                if this.project_search_input.read(cx).value().trim() == query {
+                    this.run_project_search(query, cx);
+                }
+            });
+        })
+        .detach();
+    }
+
+    pub(crate) fn run_project_search(&mut self, query: String, cx: &mut Context<Self>) {
+        if query.is_empty() {
+            self.project_search_matches.clear();
+            self.project_search_truncated = false;
+            self.project_search_pending = false;
+            cx.notify();
+            return;
+        }
+
         let root = self.root.clone();
+        self.project_search_pending = true;
+        self.project_search_matches.clear();
+        self.project_search_truncated = false;
+        cx.notify();
+
         let q = query.clone();
         let (tx, rx) = async_channel::bounded(1);
         std::thread::spawn(move || {
             let _ = tx.send_blocking(core_workspace::search_text(&root, &q));
         });
         cx.spawn(async move |weak, cx| {
-            let Ok(matches) = rx.recv().await else { return };
+            let Ok(results) = rx.recv().await else { return };
             let _ = weak.update(cx, |this, cx| {
                 if this.project_search_input.read(cx).value().trim() == query {
-                    this.project_search_matches = matches;
+                    this.project_search_matches = results.matches;
+                    this.project_search_truncated = results.truncated;
+                    this.project_search_pending = false;
                     cx.notify();
                 }
             });
@@ -60,7 +96,7 @@ impl DartIde {
                     changed.len(),
                     if changed.len() == 1 { "" } else { "s" },
                 ));
-                self.run_project_search(query, cx);
+                self.schedule_project_search(query, cx);
             }
             Err(err) => self.project_replace_status = Some(format!("Replace failed: {err}")),
         }

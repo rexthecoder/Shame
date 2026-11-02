@@ -1,5 +1,24 @@
 # Milestone notes
 
+## Global search: phrases, speed, and honest progress
+
+- **Pasted blocks survive the search box.** The single-line input deleted
+  newlines, gluing the next line's `///` onto the previous word
+  (`sends///`), which could never match. Paste now collapses a block into
+  words first, and multi-word queries are matched with whitespace collapsed,
+  so a phrase still matches when the file wraps or indents it differently.
+- **Search is a background scan, not a per-keystroke stampede.** Typing waits
+  180 ms for a pause, walks the tree once, spreads file reads over the
+  available cores, and shows "Searching across workspace…" until the result
+  is real instead of displaying a premature `0 matches`.
+- **The walk ignores build output.** `build`, `Pods`, `DerivedData`,
+  `.dart_tool`, `node_modules`, `target`, `dist` and dot-directories are
+  skipped, as are binary files and files over 2 MB. Results cap at 5,000,
+  with "first 150 shown" in the header.
+- **Multi-line Replace All says no.** Replace stays per-line and explains
+  that a multi-line block must be replaced one line at a time rather than
+  silently doing nothing.
+
 ## Diff header, save-before-git, and diagnostics above the line
 
 - **A clean Git panel looks like a finished state, not a void.** One compact
@@ -16,10 +35,15 @@
   implying a line-for-line correspondence. Unified mode now lists every
   removed line of the run first, then every added one, the way a unified diff
   is meant to read.
-- **The diff header fits.** The file name/dir now take the space that is left
-  and truncate, so the stats and steppers can no longer overlap the status
-  badge. The secondary actions are icon-only with tooltips (Unified/Split,
-  reviewed, reject, open file); Accept and Stage keep their labels.
+- **The diff header has room to breathe.** Two rows instead of one crowded
+  line: identity on top (file name, muted directory, status badge, +/− stats,
+  a segmented Split/Unified control, reviewed, close), actions below (the
+  change and file steppers on the left; open file, Reject and Accept/Stage on
+  the right). File name and directory truncate, the identity group clips its
+  overflow, and the action row wraps at very narrow widths, so no control can
+  paint over the badge again. Stage is the primary button while the file is
+  unstaged; for agent edits Accept replaces the Reject/Accept-plus-Stage trio
+  so there is one obvious primary action.
 - **Git actions wait for saves.** Format-on-save is asynchronous, so a commit
   or push clicked right after Command-S could run against the old file and
   the save landed afterwards, making the same change appear again. Stage,

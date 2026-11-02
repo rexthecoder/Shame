@@ -181,8 +181,26 @@ impl DartIde {
     pub(crate) fn render_search_rail(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let muted = cx.theme().muted_foreground;
         let fg = cx.theme().foreground;
+        let search_state = self.project_search_input.clone();
         let query = self.project_search_input.read(cx).value().trim().to_string();
         let count = self.project_search_matches.len();
+        let pending = self.project_search_pending;
+        let truncated = self.project_search_truncated;
+        let status = if pending {
+            "Searching across workspace\u{2026}".to_string()
+        } else if count == 0 {
+            "No matches across workspace".to_string()
+        } else {
+            let mut text = format!(
+                "{count}{} match{} across workspace",
+                if truncated { "+" } else { "" },
+                if count == 1 { "" } else { "es" }
+            );
+            if count > 150 {
+                text.push_str(" \u{b7} first 150 shown");
+            }
+            text
+        };
 
         v_flex()
             .size_full()
@@ -212,7 +230,25 @@ impl DartIde {
                                     .child(
                                         Input::new(&self.project_search_input)
                                             .appearance(false)
-                                            .small(),
+                                            .small()
+                                            // A single-line input drops pasted newlines,
+                                            // gluing `sends///` together. Keep a block as
+                                            // separate words so the multiline matcher sees
+                                            // the same text the file has.
+                                            .on_paste(move |item, window, cx| {
+                                                let Some(text) = item.text() else {
+                                                    return false;
+                                                };
+                                                if !text.contains(['\n', '\r']) {
+                                                    return false;
+                                                }
+                                                let cleaned =
+                                                    text.split_whitespace().collect::<Vec<_>>().join(" ");
+                                                search_state.update(cx, |state, cx| {
+                                                    state.replace(cleaned, window, cx)
+                                                });
+                                                true
+                                            }),
                                     ),
                             ),
                     )
@@ -260,11 +296,8 @@ impl DartIde {
                         el.child(
                             div()
                                 .text_size(px(tokens::UI_XS))
-                                .text_color(muted)
-                                .child(format!(
-                                    "{count} match{} across workspace",
-                                    if count == 1 { "" } else { "es" }
-                                )),
+                                .text_color(if pending { cx.theme().primary } else { muted })
+                                .child(status),
                         )
                     }),
             )
@@ -284,7 +317,7 @@ impl DartIde {
                                 .text_center()
                                 .text_size(px(tokens::UI_SM))
                                 .text_color(muted)
-                                .child("Type above to search across all files in the project (\u{2318}\u{21e7}F)."),
+                                .child("Type or paste above to search all files in the project (\u{2318}\u{21e7}F)."),
                         )
                     })
                     .children(
@@ -302,6 +335,8 @@ impl DartIde {
                                 let path = m.path.clone();
                                 let line_0 = m.line_number.saturating_sub(1) as u32;
                                 let preview = m.line_text.trim().to_string();
+                                let phrase = m.phrase;
+                                let line_text = m.line_text.clone();
                                 let q = query.clone();
 
                                 v_flex()
@@ -360,9 +395,20 @@ impl DartIde {
                                     .on_click(cx.listener(move |this, _e, window, cx| {
                                         this.open_path(path.clone(), window, cx);
                                         if let Some(ed) = this.active_editor().cloned() {
-                                            let q = q.clone();
+                                            // The editor's find bar is single-line.
+                                            // A pasted block is located by the start
+                                            // of the file line the match begins on.
+                                            let find_query = if phrase {
+                                                line_text
+                                                    .trim()
+                                                    .chars()
+                                                    .take(48)
+                                                    .collect::<String>()
+                                            } else {
+                                                q.lines().next().unwrap_or("").trim().to_string()
+                                            };
                                             ed.update(cx, |editor, cx| {
-                                                editor.set_search_query(&q, cx);
+                                                editor.set_search_query(&find_query, cx);
                                                 editor.set_cursor_to_position(line_0, 0, cx);
                                             });
                                         }

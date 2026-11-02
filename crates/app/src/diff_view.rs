@@ -14,7 +14,7 @@ use core_workspace::{Block, ChangeKind, ChangedFile, DiffCell, FileDiff, RowKind
 use gpui_kit::assets::IconName;
 use gpui_kit::base::StyledExt as _;
 use gpui_kit::component::{
-    ActiveTheme as _, Disableable as _, Icon, Sizable as _,
+    ActiveTheme as _, Disableable as _, Icon, Selectable as _, Sizable as _,
     button::{Button, ButtonVariants as _},
     h_flex, v_flex,
 };
@@ -678,219 +678,282 @@ impl DartIde {
                 )
         };
 
-        h_flex()
+        let view_button = |id: &'static str,
+                           icon: IconName,
+                           active: bool,
+                           tooltip: &'static str,
+                           target_unified: bool,
+                           cx: &mut Context<Self>| {
+            Button::new(id)
+                .ghost()
+                .xsmall()
+                .selected(active)
+                .icon(
+                    Icon::new(icon)
+                        .with_size(px(12.))
+                        .text_color(if active { cx.theme().primary } else { muted }),
+                )
+                .tooltip(tooltip)
+                .on_click(cx.listener(move |this, _e, _w, cx| {
+                    let current = this.diff.as_ref().is_some_and(|diff| diff.unified);
+                    if current != target_unified {
+                        this.toggle_diff_unified(cx);
+                    }
+                }))
+        };
+
+        let reviewed_button = Button::new("diff-reviewed")
+            .ghost()
+            .xsmall()
+            .icon(
+                Icon::new(IconName::Check)
+                    .with_size(px(13.))
+                    .text_color(if reviewed { cx.theme().green } else { muted }),
+            )
+            .tooltip(if reviewed {
+                "Mark this file unreviewed"
+            } else {
+                "Mark this file reviewed and move to the next one"
+            })
+            .on_click(cx.listener(|this, _e, _w, cx| this.diff_toggle_reviewed(cx)));
+
+        v_flex()
             .w_full()
-            .h(px(tokens::TABSTRIP_H))
             .flex_shrink_0()
-            .items_center()
-            .justify_between()
-            .gap(px(tokens::SPACE_4))
-            .px(px(tokens::SPACE_5))
             .border_b_1()
             .border_color(cx.theme().border)
+            // Identity row: the file, its state, and how the diff is shown.
             .child(
                 h_flex()
-                    .flex_1()
-                    .min_w(px(0.))
+                    .w_full()
+                    .h(px(32.))
                     .items_center()
-                    .gap(px(tokens::SPACE_3))
+                    .gap(px(tokens::SPACE_2))
+                    .px(px(tokens::SPACE_4))
                     .child(crate::rails::files::render_file_icon(&name))
                     .child(
-                        div()
+                        h_flex()
+                            .flex_1()
                             .min_w(px(0.))
-                            .truncate()
-                            .text_size(px(tokens::UI))
-                            .font_medium()
-                            .text_color(cx.theme().foreground)
-                            .child(name),
-                    )
-                    .when_some(dir, |el, dir| {
-                        el.child(
-                            div()
-                                .min_w(px(0.))
-                                .truncate()
-                                .text_size(px(tokens::UI_SM))
-                                .text_color(muted)
-                                .child(dir),
-                        )
-                    })
-                    .child(
-                        div()
-                            .flex_shrink_0()
-                            .px(px(6.))
-                            .rounded(px(tokens::RADIUS_PILL))
-                            .bg(tone.opacity(0.15))
-                            .text_size(px(tokens::UI_XS))
-                            .text_color(tone)
-                            .child(label),
+                            .overflow_hidden()
+                            .items_center()
+                            .gap(px(tokens::SPACE_2))
+                            .child(
+                                div()
+                                    .flex_shrink_1()
+                                    .min_w(px(0.))
+                                    .truncate()
+                                    .text_size(px(tokens::UI))
+                                    .font_medium()
+                                    .text_color(cx.theme().foreground)
+                                    .child(name),
+                            )
+                            .when_some(dir, |el, dir| {
+                                el.child(
+                                    div()
+                                        .flex_shrink(2.)
+                                        .min_w(px(0.))
+                                        .truncate()
+                                        .text_size(px(tokens::UI_XS))
+                                        .text_color(muted)
+                                        .child(dir),
+                                )
+                            })
+                            .child(
+                                div()
+                                    .flex_shrink_0()
+                                    .px(px(6.))
+                                    .py(px(1.))
+                                    .rounded(px(tokens::RADIUS_PILL))
+                                    .bg(tone.opacity(0.15))
+                                    .text_size(px(tokens::UI_XS))
+                                    .text_color(tone)
+                                    .child(label),
+                            )
+                            .child(
+                                h_flex()
+                                    .flex_shrink_0()
+                                    .gap(px(tokens::SPACE_3))
+                                    .font_family(cx.theme().mono_font_family.clone())
+                                    .text_size(px(tokens::UI_SM))
+                                    .child(
+                                        div()
+                                            .text_color(cx.theme().green)
+                                            .child(format!("+{}", state.diff.added)),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_color(cx.theme().red)
+                                            .child(format!("\u{2212}{}", state.diff.removed)),
+                                    ),
+                            ),
                     )
                     .child(
                         h_flex()
                             .flex_shrink_0()
-                            .gap(px(tokens::SPACE_3))
-                            .font_family(cx.theme().mono_font_family.clone())
-                            .text_size(px(tokens::UI_SM))
-                            .child(
-                                div()
-                                    .text_color(cx.theme().green)
-                                    .child(format!("+{}", state.diff.added)),
-                            )
-                            .child(
-                                div()
-                                    .text_color(cx.theme().red)
-                                    .child(format!("\u{2212}{}", state.diff.removed)),
-                            ),
-                    ),
-            )
-            .child(
-                h_flex()
-                    .flex_shrink_0()
-                    .items_center()
-                    .gap(px(tokens::SPACE_3))
-                    .child(stepper(
-                        "diff-change-nav",
-                        if change_count == 0 {
-                            "\u{2013}".to_string()
-                        } else {
-                            format!("{}/{}", state.current_change + 1, change_count)
-                        },
-                        "change",
-                        change_count > 1,
-                        DartIde::diff_goto_change,
-                        cx,
-                    ))
-                    .child(div().w(px(1.)).h(px(14.)).bg(cx.theme().border))
-                    .child(stepper(
-                        "diff-file-nav",
-                        file_pos.map_or("\u{2013}".to_string(), |i| {
-                            format!("{}/{}", i + 1, files.len())
-                        }),
-                        "file",
-                        files.len() > 1,
-                        DartIde::diff_goto_file,
-                        cx,
-                    ))
-                    .child(
-                        Button::new("diff-toggle-unified")
-                            .ghost()
-                            .small()
-                            .icon(
-                                Icon::new(IconName::Columns2)
-                                    .with_size(px(12.))
-                                    .text_color(if !unified {
-                                        cx.theme().primary
-                                    } else {
-                                        muted
-                                    }),
-                            )
-                            .tooltip(if unified {
-                                "Show split (side-by-side) diff"
-                            } else {
-                                "Show unified diff"
-                            })
-                            .on_click(
-                                cx.listener(|this, _e, _w, cx| this.toggle_diff_unified(cx)),
-                            ),
+                            .items_center()
+                            .rounded(px(tokens::RADIUS_SM))
+                            .border_1()
+                            .border_color(cx.theme().border)
+                            .overflow_hidden()
+                            .child(view_button(
+                                "diff-view-split",
+                                IconName::Columns2,
+                                !unified,
+                                "Split view",
+                                false,
+                                cx,
+                            ))
+                            .child(view_button(
+                                "diff-view-unified",
+                                IconName::Rows3,
+                                unified,
+                                "Unified view",
+                                true,
+                                cx,
+                            )),
                     )
-                    .when(!is_commit_diff, |el| {
-                        el.child(
-                            Button::new("diff-reviewed")
-                                .ghost()
-                                .small()
-                                .icon(
-                                    Icon::new(IconName::Check)
-                                        .with_size(px(13.))
-                                        .text_color(if reviewed {
-                                            cx.theme().green
-                                        } else {
-                                            muted
-                                        }),
-                                )
-                                .tooltip(if reviewed {
-                                    "Mark this file unreviewed"
-                                } else {
-                                    "Mark this file reviewed and move to the next one"
-                                })
-                                .on_click(cx.listener(|this, _e, _w, cx| {
-                                    this.diff_toggle_reviewed(cx)
-                                })),
-                        )
-                    })
-                    .when(ai_pending, |el| {
-                        el.child({
-                            let button = Button::new("diff-ai-reject")
-                                .ghost()
-                                .small()
-                                .icon(
-                                    Icon::new(IconName::X)
-                                        .with_size(px(13.))
-                                        .text_color(cx.theme().red),
-                                )
-                                .tooltip("Discard the agent's changes to this file")
-                                .on_click(cx.listener(|this, _e, window, cx| {
-                                    this.diff_ai_reject(window, cx)
-                                }));
-                            if reject_armed {
-                                button.label("Discard?")
-                            } else {
-                                button
-                            }
-                        })
-                        .child(
-                            Button::new("diff-ai-accept")
-                                .small()
-                                .primary()
-                                .icon(Icon::new(IconName::Check).with_size(px(13.)))
-                                .label("Accept")
-                                .tooltip("Keep the agent's changes to this file and go to the next one")
-                                .on_click(cx.listener(|this, _e, _w, cx| this.diff_ai_accept(cx))),
-                        )
-                    })
-                    .when(can_open, |el| {
-                        el.child(
-                            Button::new("diff-open-file")
-                                .ghost()
-                                .small()
-                                .icon(
-                                    Icon::new(IconName::FileCode)
-                                        .with_size(px(13.))
-                                        .text_color(muted),
-                                )
-                                .tooltip("Open this file in the editor")
-                                .on_click(cx.listener(move |this, _event, window, cx| {
-                                    this.open_path(open_path.clone(), window, cx);
-                                })),
-                        )
-                    })
-                    .when(!is_commit_diff, |el| {
-                        el.child(
-                            Button::new("diff-stage")
-                                .small()
-                                .label(if staged { "Unstage" } else { "Stage" })
-                                .on_click(cx.listener(move |this, _event, window, cx| {
-                                    if staged {
-                                        this.git_unstage(
-                                            std::slice::from_ref(&stage_file),
-                                            window,
-                                            cx,
-                                        );
-                                    } else {
-                                        this.git_stage(
-                                            std::slice::from_ref(&stage_file),
-                                            window,
-                                            cx,
-                                        );
-                                    }
-                                })),
-                        )
-                    })
+                    .when(!is_commit_diff, |el| el.child(reviewed_button))
                     .child(
                         Button::new("diff-close")
                             .ghost()
-                            .small()
-                            .icon(Icon::new(IconName::X).xsmall().text_color(muted))
+                            .xsmall()
+                            .icon(
+                                Icon::new(IconName::X)
+                                    .with_size(px(12.))
+                                    .text_color(muted),
+                            )
                             .tooltip("Close diff")
                             .on_click(cx.listener(|this, _event, _window, cx| this.close_diff(cx))),
+                    ),
+            )
+            // Action row: navigation on the left, file and agent actions on the right.
+            .child(
+                h_flex()
+                    .w_full()
+                    .min_h(px(34.))
+                    .flex_wrap()
+                    .items_center()
+                    .justify_between()
+                    .gap(px(tokens::SPACE_3))
+                    .px(px(tokens::SPACE_4))
+                    .py(px(2.))
+                    .border_t_1()
+                    .border_color(cx.theme().border.opacity(0.55))
+                    .child(
+                        h_flex()
+                            .min_w(px(0.))
+                            .items_center()
+                            .gap(px(tokens::SPACE_2))
+                            .child(stepper(
+                                "diff-change-nav",
+                                if change_count == 0 {
+                                    "\u{2013}".to_string()
+                                } else {
+                                    format!("{}/{}", state.current_change + 1, change_count)
+                                },
+                                "change",
+                                change_count > 1,
+                                DartIde::diff_goto_change,
+                                cx,
+                            ))
+                            .child(div().w(px(1.)).h(px(14.)).bg(cx.theme().border))
+                            .child(stepper(
+                                "diff-file-nav",
+                                file_pos.map_or("\u{2013}".to_string(), |i| {
+                                    format!("{}/{}", i + 1, files.len())
+                                }),
+                                "file",
+                                files.len() > 1,
+                                DartIde::diff_goto_file,
+                                cx,
+                            )),
+                    )
+                    .child(
+                        h_flex()
+                            .flex_shrink_0()
+                            .items_center()
+                            .gap(px(tokens::SPACE_2))
+                            .when(can_open, |el| {
+                                el.child(
+                                    Button::new("diff-open-file")
+                                        .ghost()
+                                        .xsmall()
+                                        .icon(
+                                            Icon::new(IconName::FileCode)
+                                                .with_size(px(13.))
+                                                .text_color(muted),
+                                        )
+                                        .tooltip("Open this file in the editor")
+                                        .on_click(cx.listener(
+                                            move |this, _event, window, cx| {
+                                                this.open_path(open_path.clone(), window, cx);
+                                            },
+                                        )),
+                                )
+                            })
+                            .when(can_open && !is_commit_diff, |el| {
+                                el.child(div().w(px(1.)).h(px(14.)).bg(cx.theme().border))
+                            })
+                            .when(ai_pending, |el| {
+                                el.child({
+                                    let button = Button::new("diff-ai-reject")
+                                        .ghost()
+                                        .small()
+                                        .icon(
+                                            Icon::new(IconName::X)
+                                                .with_size(px(13.))
+                                                .text_color(cx.theme().red),
+                                        )
+                                        .tooltip("Discard the agent's changes to this file")
+                                        .on_click(cx.listener(|this, _e, window, cx| {
+                                            this.diff_ai_reject(window, cx)
+                                        }));
+                                    if reject_armed {
+                                        button.label("Discard?")
+                                    } else {
+                                        button
+                                    }
+                                })
+                                .child(
+                                    Button::new("diff-ai-accept")
+                                        .small()
+                                        .primary()
+                                        .icon(Icon::new(IconName::Check).with_size(px(13.)))
+                                        .label("Accept")
+                                        .tooltip(
+                                            "Keep the agent's changes and move to the next file",
+                                        )
+                                        .on_click(cx.listener(|this, _e, _w, cx| {
+                                            this.diff_ai_accept(cx)
+                                        })),
+                                )
+                            })
+                            .when(!is_commit_diff && !ai_pending, |el| {
+                                let stage_button = Button::new("diff-stage")
+                                    .small()
+                                    .label(if staged { "Unstage" } else { "Stage" })
+                                    .on_click(cx.listener(move |this, _event, window, cx| {
+                                        if staged {
+                                            this.git_unstage(
+                                                std::slice::from_ref(&stage_file),
+                                                window,
+                                                cx,
+                                            );
+                                        } else {
+                                            this.git_stage(
+                                                std::slice::from_ref(&stage_file),
+                                                window,
+                                                cx,
+                                            );
+                                        }
+                                    }));
+                                el.child(if staged {
+                                    stage_button
+                                } else {
+                                    stage_button.primary()
+                                })
+                            }),
                     ),
             )
     }

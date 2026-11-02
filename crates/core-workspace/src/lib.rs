@@ -9,10 +9,9 @@
 //! uses for the `flutter`/`dart` CLIs; walk the filesystem for search,
 //! same pattern the file tree already uses) rather than a redesign of
 //! everything this crate's doc comment promises. The file tree, file
-//! watcher, and settings are still unbuilt — the app crate currently
-//! walks the filesystem directly for its tree/Quick Open list rather
-//! than through here, and nothing calls `search_text` yet (a results
-//! panel is UI work, staying deferred like everything else UI-shaped).
+//! watcher, and settings are still unbuilt — the app crate walks the
+//! filesystem directly for its tree/Quick Open list, while global search
+//! calls `search_text` here for its background scan.
 
 mod diff;
 mod git;
@@ -41,4 +40,4 @@ pub use repo::{
 pub use history::{Snapshot, list_snapshots, record_snapshot};
 pub use stats::{change_stats, parse_numstat};
 pub use symbols::{WorkspaceSymbol, filter_symbols, index_workspace_symbols, symbols_in_text};
-pub use search::{SearchMatch, replace_text, search_text};
+pub use search::{SearchMatch, SearchResults, replace_text, search_text};

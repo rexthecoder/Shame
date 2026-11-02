@@ -485,6 +485,8 @@ pub struct DartIde {
     pub(crate) agent: rails::agent::AgentState,
     pub(crate) project_search_input: Entity<InputState>,
     pub(crate) project_search_matches: Vec<core_workspace::SearchMatch>,
+    pub(crate) project_search_truncated: bool,
+    pub(crate) project_search_pending: bool,
     pub(crate) project_replace_input: Entity<InputState>,
     pub(crate) project_replace_status: Option<String>,
     pub(crate) dap_client: Option<std::sync::Arc<std::sync::Mutex<core_dap::DapClient>>>,
@@ -637,7 +639,7 @@ impl DartIde {
                 .placeholder("Package name (e.g. provider, http, dev:build_runner)...")
         });
         let project_search_input = cx.new(|cx| {
-            InputState::new(window, cx).placeholder("Search across files...")
+            InputState::new(window, cx).placeholder("Search text, or paste a code block\u{2026}")
         });
         let debug_prompt_input = cx.new(|cx| InputState::new(window, cx));
         let project_replace_input = cx.new(|cx| {
@@ -712,6 +714,8 @@ impl DartIde {
             agent,
             project_search_input,
             project_search_matches: Vec::new(),
+            project_search_truncated: false,
+            project_search_pending: false,
             project_replace_input,
             project_replace_status: None,
             dap_client: None,
@@ -847,7 +851,7 @@ impl DartIde {
             |this, state, event: &gpui_kit::component::input::InputEvent, cx| {
                 if matches!(event, gpui_kit::component::input::InputEvent::Change) {
                     let query = state.read(cx).value().trim().to_string();
-                    this.run_project_search(query, cx);
+                    this.schedule_project_search(query, cx);
                 }
             },
         );
@@ -915,6 +919,7 @@ impl DartIde {
                 }
             })
         });
+
         this
     }
 
