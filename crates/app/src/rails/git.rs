@@ -181,125 +181,463 @@ impl DartIde {
     pub(crate) fn render_search_rail(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let muted = cx.theme().muted_foreground;
         let fg = cx.theme().foreground;
-        let search_state = self.project_search_input.clone();
+        let border = cx.theme().border;
         let query = self.project_search_input.read(cx).value().trim().to_string();
-        let count = self.project_search_matches.len();
-        let pending = self.project_search_pending;
-        let truncated = self.project_search_truncated;
-        let status = if pending {
-            "Searching across workspace\u{2026}".to_string()
-        } else if count == 0 {
-            "No matches across workspace".to_string()
-        } else {
-            let mut text = format!(
-                "{count}{} match{} across workspace",
-                if truncated { "+" } else { "" },
-                if count == 1 { "" } else { "es" }
-            );
-            if count > 150 {
-                text.push_str(" \u{b7} first 150 shown");
-            }
-            text
+        let (_, filters) = core_workspace::split_query_filters(&query);
+        let options = self.project_search_options;
+        let replace_open = self.project_replace_open;
+
+        // A field: bordered row with a leading icon, the input, trailing bits.
+        let field_bg = cx.theme().background;
+        let field = |leading: IconName| {
+            h_flex()
+                .w_full()
+                .h(px(28.))
+                .pl(px(tokens::SPACE_2))
+                .pr(px(3.))
+                .gap(px(tokens::SPACE_2))
+                .items_center()
+                .rounded(px(tokens::RADIUS_SM))
+                .bg(field_bg)
+                .border_1()
+                .border_color(border)
+                .child(Icon::new(leading).with_size(px(13.)).text_color(muted))
+        };
+        let toggle = |id: &'static str,
+                      icon: IconName,
+                      tip: &'static str,
+                      on: bool,
+                      flip: fn(&mut core_workspace::SearchOptions),
+                      cx: &mut Context<Self>| {
+            div()
+                .id(id)
+                .size(px(20.))
+                .flex_shrink_0()
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded(px(tokens::RADIUS_SM))
+                .cursor_pointer()
+                .when(on, |el| {
+                    el.bg(tokens::accent_dim())
+                        .border_1()
+                        .border_color(cx.theme().primary.opacity(0.5))
+                })
+                .when(!on, |el| el.hover(|s| s.bg(cx.theme().list_hover)))
+                .child(
+                    Icon::new(icon)
+                        .with_size(px(13.))
+                        .text_color(if on { cx.theme().primary } else { muted }),
+                )
+                .tooltip(move |window, cx| {
+                    gpui_kit::component::tooltip::Tooltip::new(tip).build(window, cx)
+                })
+                .on_click(cx.listener(move |this, _e, _w, cx| {
+                    this.toggle_project_search_option(flip, cx)
+                }))
         };
 
+        let search_state = self.project_search_input.clone();
+        let search_field = field(IconName::Search)
+            .child(
+                div().flex_1().min_w(px(0.)).child(
+                    Input::new(&self.project_search_input)
+                        .appearance(false)
+                        .small()
+                        // A single-line input drops pasted newlines, gluing
+                        // `sends///` together. Keep a block as separate words so
+                        // the multiline matcher sees the same text the file has.
+                        .on_paste(move |item, window, cx| {
+                            let Some(text) = item.text() else {
+                                return false;
+                            };
+                            if !text.contains(['\n', '\r']) {
+                                return false;
+                            }
+                            let cleaned = text.split_whitespace().collect::<Vec<_>>().join(" ");
+                            search_state.update(cx, |state, cx| state.replace(cleaned, window, cx));
+                            true
+                        }),
+                ),
+            )
+            .child(toggle(
+                "search-opt-case",
+                IconName::CaseSensitive,
+                "Match case",
+                options.case_sensitive,
+                |o| o.case_sensitive = !o.case_sensitive,
+                cx,
+            ))
+            .child(toggle(
+                "search-opt-word",
+                IconName::WholeWord,
+                "Match whole word",
+                options.whole_word,
+                |o| o.whole_word = !o.whole_word,
+                cx,
+            ))
+            .child(toggle(
+                "search-opt-regex",
+                IconName::Regex,
+                "Use regular expression",
+                options.regex,
+                |o| o.regex = !o.regex,
+                cx,
+            ));
+
+        let replace_field = field(IconName::Replace)
+            .child(
+                div().flex_1().min_w(px(0.)).child(
+                    Input::new(&self.project_replace_input)
+                        .appearance(false)
+                        .small(),
+                ),
+            )
+            .child(
+                Button::new("project-replace-all")
+                    .ghost()
+                    .xsmall()
+                    .icon(Icon::new(IconName::ReplaceAll).with_size(px(13.)).text_color(fg))
+                    .tooltip("Replace all shown results")
+                    .on_click(cx.listener(|this, _e, _w, cx| this.replace_in_project(None, cx))),
+            );
+
+        let header = v_flex()
+            .w_full()
+            .p(px(tokens::SPACE_3))
+            .gap(px(tokens::SPACE_2))
+            .border_b_1()
+            .border_color(border)
+            .child(
+                h_flex()
+                    .w_full()
+                    .items_start()
+                    .gap(px(2.))
+                    .child(
+                        div()
+                            .id("project-replace-toggle")
+                            .w(px(18.))
+                            .h(px(if replace_open { 62. } else { 28. }))
+                            .flex_shrink_0()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded(px(tokens::RADIUS_SM))
+                            .cursor_pointer()
+                            .hover(|s| s.bg(cx.theme().list_hover))
+                            .child(
+                                Icon::new(if replace_open {
+                                    IconName::ChevronDown
+                                } else {
+                                    IconName::ChevronRight
+                                })
+                                .xsmall()
+                                .text_color(muted),
+                            )
+                            .tooltip(|window, cx| {
+                                gpui_kit::component::tooltip::Tooltip::new("Toggle replace")
+                                    .build(window, cx)
+                            })
+                            .on_click(cx.listener(|this, _e, window, cx| {
+                                this.project_replace_open = !this.project_replace_open;
+                                if this.project_replace_open {
+                                    this.project_replace_input
+                                        .update(cx, |state, cx| state.focus(window, cx));
+                                }
+                                cx.notify();
+                            })),
+                    )
+                    .child(
+                        v_flex()
+                            .flex_1()
+                            .min_w(px(0.))
+                            .gap(px(6.))
+                            .child(search_field)
+                            .when(replace_open, |el| el.child(replace_field)),
+                    ),
+            )
+            .when(!filters.is_empty(), |el| {
+                el.child(
+                    h_flex()
+                        .w_full()
+                        .pl(px(20.))
+                        .flex_wrap()
+                        .gap(px(tokens::SPACE_1))
+                        .children(filters.iter().enumerate().map(|(ix, token)| {
+                            let token = token.clone();
+                            let remove = token.clone();
+                            self.render_search_chip(("search-filter", ix), token, true, cx)
+                                .on_click(cx.listener(move |this, _e, window, cx| {
+                                    let query =
+                                        this.project_search_input.read(cx).value().to_string();
+                                    let mut removed = false;
+                                    let rest: Vec<&str> = query
+                                        .split_whitespace()
+                                        .filter(|t| {
+                                            let drop = !removed && *t == remove;
+                                            removed |= drop;
+                                            !drop
+                                        })
+                                        .collect();
+                                    this.set_project_search_query(rest.join(" "), window, cx);
+                                }))
+                        })),
+                )
+            })
+            .when_some(self.project_replace_status.clone(), |el, status| {
+                el.child(
+                    div()
+                        .pl(px(20.))
+                        .text_size(px(tokens::UI_XS))
+                        .text_color(muted)
+                        .child(status),
+                )
+            });
+
+        let body = if query.is_empty() {
+            self.render_search_empty(cx).into_any_element()
+        } else {
+            self.render_search_results(&query, cx).into_any_element()
+        };
+
+        v_flex().size_full().child(header).child(body)
+    }
+
+    /// A filter token as a small mono pill; removable ones carry an ×.
+    fn render_search_chip(
+        &self,
+        id: (&'static str, usize),
+        token: String,
+        removable: bool,
+        cx: &mut Context<Self>,
+    ) -> Stateful<Div> {
+        let muted = cx.theme().muted_foreground;
+        h_flex()
+            .id(id)
+            .h(px(20.))
+            .px(px(6.))
+            .gap(px(4.))
+            .items_center()
+            .rounded(px(tokens::RADIUS_SM))
+            .border_1()
+            .border_color(cx.theme().border)
+            .cursor_pointer()
+            .hover(|s| s.bg(cx.theme().list_hover))
+            .font_family(cx.theme().mono_font_family.clone())
+            .text_size(px(tokens::UI_XS))
+            .text_color(cx.theme().foreground)
+            .child(token)
+            .when(removable, |el| {
+                el.child(Icon::new(IconName::X).with_size(px(10.)).text_color(muted))
+            })
+    }
+
+    /// No query yet: recent searches to rerun, and the filter syntax as
+    /// chips that add themselves to the query.
+    fn render_search_empty(&self, cx: &mut Context<Self>) -> Div {
+        let muted = cx.theme().muted_foreground;
+        let label = |text: &'static str| {
+            div()
+                .px(px(tokens::SPACE_2))
+                .pb(px(tokens::SPACE_1))
+                .text_size(px(tokens::UI_XS))
+                .text_color(muted)
+                .child(text)
+        };
         v_flex()
-            .size_full()
+            .w_full()
+            .p(px(tokens::SPACE_3))
+            .gap(px(tokens::SPACE_4))
+            .when(!self.project_recent_searches.is_empty(), |el| {
+                el.child(
+                    v_flex().w_full().child(label("Recent")).children(
+                        self.project_recent_searches.iter().enumerate().map(|(ix, recent)| {
+                            let pick = recent.clone();
+                            h_flex()
+                                .id(("search-recent", ix))
+                                .w_full()
+                                .h(px(26.))
+                                .px(px(tokens::SPACE_2))
+                                .gap(px(tokens::SPACE_2))
+                                .items_center()
+                                .rounded(px(tokens::RADIUS_SM))
+                                .cursor_pointer()
+                                .hover(|s| s.bg(cx.theme().list_hover))
+                                .child(Icon::new(IconName::Clock).with_size(px(13.)).text_color(muted))
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .min_w(px(0.))
+                                        .truncate()
+                                        .text_size(px(tokens::UI_SM))
+                                        .text_color(cx.theme().foreground)
+                                        .child(recent.clone()),
+                                )
+                                .on_click(cx.listener(move |this, _e, window, cx| {
+                                    this.set_project_search_query(pick.clone(), window, cx);
+                                }))
+                        }),
+                    ),
+                )
+            })
             .child(
                 v_flex()
                     .w_full()
-                    .p(px(tokens::SPACE_4))
-                    .gap(px(tokens::SPACE_2))
-                    .border_b_1()
-                    .border_color(cx.theme().border)
+                    .child(label("Narrow it down"))
                     .child(
                         h_flex()
-                            .w_full()
-                            .h(px(28.))
-                            .px(px(tokens::SPACE_3))
-                            .gap(px(tokens::SPACE_2))
-                            .items_center()
-                            .rounded(px(tokens::RADIUS_SM))
-                            .bg(cx.theme().background)
-                            .border_1()
-                            .border_color(cx.theme().border)
-                            .child(Icon::new(IconName::Search).xsmall().text_color(muted))
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .min_w(px(0.))
-                                    .child(
-                                        Input::new(&self.project_search_input)
-                                            .appearance(false)
-                                            .small()
-                                            // A single-line input drops pasted newlines,
-                                            // gluing `sends///` together. Keep a block as
-                                            // separate words so the multiline matcher sees
-                                            // the same text the file has.
-                                            .on_paste(move |item, window, cx| {
-                                                let Some(text) = item.text() else {
-                                                    return false;
-                                                };
-                                                if !text.contains(['\n', '\r']) {
-                                                    return false;
-                                                }
-                                                let cleaned =
-                                                    text.split_whitespace().collect::<Vec<_>>().join(" ");
-                                                search_state.update(cx, |state, cx| {
-                                                    state.replace(cleaned, window, cx)
-                                                });
-                                                true
-                                            }),
-                                    ),
-                            ),
+                            .px(px(tokens::SPACE_2))
+                            .flex_wrap()
+                            .gap(px(tokens::SPACE_1))
+                            .children(["*.dart", "!test/", "lib/"].into_iter().enumerate().map(
+                                |(ix, token)| {
+                                    self.render_search_chip(("search-hint", ix), token.to_string(), false, cx)
+                                        .on_click(cx.listener(move |this, _e, window, cx| {
+                                            let query = this.project_search_input.read(cx).value().trim().to_string();
+                                            let next = if query.is_empty() {
+                                                format!("{token} ")
+                                            } else {
+                                                format!("{query} {token}")
+                                            };
+                                            this.set_project_search_query(next, window, cx);
+                                        }))
+                                },
+                            )),
                     )
                     .child(
-                        h_flex()
-                            .w_full()
-                            .h(px(28.))
-                            .px(px(tokens::SPACE_3))
-                            .gap(px(tokens::SPACE_2))
-                            .items_center()
-                            .rounded(px(tokens::RADIUS_SM))
-                            .bg(cx.theme().background)
-                            .border_1()
-                            .border_color(cx.theme().border)
-                            .child(
-                                div().flex_1().min_w(px(0.)).child(
-                                    Input::new(&self.project_replace_input)
-                                        .appearance(false)
-                                        .small(),
-                                ),
-                            )
-                            .child(
-                                div()
-                                    .id("project-replace-all")
-                                    .px(px(tokens::SPACE_2))
-                                    .text_size(px(tokens::UI_XS))
-                                    .cursor_pointer()
-                                    .text_color(fg)
-                                    .hover(|s| s.bg(cx.theme().list_hover))
-                                    .child("Replace all")
-                                    .on_click(cx.listener(|this, _event, _window, cx| {
-                                        this.replace_in_project(cx);
-                                    })),
-                            ),
-                    )
-                    .when_some(self.project_replace_status.clone(), |el, status| {
+                        div()
+                            .px(px(tokens::SPACE_2))
+                            .pt(px(tokens::SPACE_2))
+                            .text_size(px(tokens::UI_XS))
+                            .text_color(muted)
+                            .child("Add these to the query, or paste a whole code block to find where it lives (\u{2318}\u{21e7}F)."),
+                    ),
+            )
+    }
+
+    /// Results grouped by file: a header per file, then each matching line
+    /// with its number and the hits highlighted.
+    fn render_search_results(&self, query: &str, cx: &mut Context<Self>) -> impl IntoElement {
+        /// Lines drawn; the rest are still counted, opened and replaced.
+        const MAX_SHOWN: usize = 400;
+        let muted = cx.theme().muted_foreground;
+        let fg = cx.theme().foreground;
+        let pending = self.project_search_pending;
+
+        let mut groups: Vec<(&Path, Vec<&core_workspace::SearchMatch>)> = Vec::new();
+        for m in &self.project_search_matches {
+            if self.project_search_dismissed.contains(&(m.path.clone(), m.line_number)) {
+                continue;
+            }
+            match groups.last_mut() {
+                Some((path, lines)) if *path == m.path.as_path() => lines.push(m),
+                _ => groups.push((m.path.as_path(), vec![m])),
+            }
+        }
+        let total: usize = groups.iter().map(|(_, lines)| lines.len()).sum();
+        let all_collapsed = !groups.is_empty()
+            && groups.iter().all(|(path, _)| self.project_search_collapsed.contains(*path));
+
+        let summary = if let Some(error) = &self.project_search_error {
+            div().text_color(cx.theme().red).child(error.clone())
+        } else if pending {
+            div().text_color(cx.theme().primary).child("Searching\u{2026}")
+        } else if total == 0 {
+            div().child("No results")
+        } else {
+            let plus = if self.project_search_truncated { "+" } else { "" };
+            h_flex()
+                .gap(px(4.))
+                .child(
+                    div()
+                        .text_color(fg)
+                        .child(format!("{total}{plus} result{}", if total == 1 { "" } else { "s" })),
+                )
+                .child(format!(
+                    "in {} file{}",
+                    groups.len(),
+                    if groups.len() == 1 { "" } else { "s" }
+                ))
+        };
+
+        let literal = if self.project_search_literal.is_empty() {
+            query.to_string()
+        } else {
+            self.project_search_literal.clone()
+        };
+        let mut shown = 0usize;
+        let mut rows: Vec<AnyElement> = Vec::new();
+        for (group_ix, (path, lines)) in groups.iter().enumerate() {
+            if shown >= MAX_SHOWN {
+                break;
+            }
+            let collapsed = self.project_search_collapsed.contains(*path);
+            rows.push(self.render_search_file_header(group_ix, path, lines.len(), collapsed, cx).into_any_element());
+            if collapsed {
+                continue;
+            }
+            for m in lines {
+                if shown >= MAX_SHOWN {
+                    break;
+                }
+                rows.push(self.render_search_line(shown, m, &literal, cx).into_any_element());
+                shown += 1;
+            }
+        }
+
+        v_flex()
+            .flex_1()
+            .w_full()
+            .min_h(px(0.))
+            .child(
+                h_flex()
+                    .w_full()
+                    .h(px(30.))
+                    .flex_shrink_0()
+                    .pl(px(tokens::SPACE_4))
+                    .pr(px(tokens::SPACE_2))
+                    .gap(px(tokens::SPACE_1))
+                    .items_center()
+                    .text_size(px(tokens::UI_XS))
+                    .text_color(muted)
+                    .child(div().flex_1().min_w(px(0.)).truncate().child(summary))
+                    .when(!groups.is_empty(), |el| {
+                        let paths: Vec<std::path::PathBuf> = groups.iter().map(|(p, _)| p.to_path_buf()).collect();
                         el.child(
-                            div()
-                                .text_size(px(tokens::UI_XS))
-                                .text_color(muted)
-                                .child(status),
+                            Button::new("search-collapse-all")
+                                .ghost()
+                                .xsmall()
+                                .icon(
+                                    Icon::new(if all_collapsed {
+                                        IconName::ChevronsUpDown
+                                    } else {
+                                        IconName::ChevronsDownUp
+                                    })
+                                    .with_size(px(12.))
+                                    .text_color(muted),
+                                )
+                                .tooltip(if all_collapsed { "Expand all" } else { "Collapse all" })
+                                .on_click(cx.listener(move |this, _e, _w, cx| {
+                                    if all_collapsed {
+                                        this.project_search_collapsed.clear();
+                                    } else {
+                                        this.project_search_collapsed.extend(paths.iter().cloned());
+                                    }
+                                    cx.notify();
+                                })),
                         )
                     })
-                    .when(!query.is_empty(), |el| {
-                        el.child(
-                            div()
-                                .text_size(px(tokens::UI_XS))
-                                .text_color(if pending { cx.theme().primary } else { muted })
-                                .child(status),
-                        )
-                    }),
+                    .child(
+                        Button::new("search-clear")
+                            .ghost()
+                            .xsmall()
+                            .icon(Icon::new(IconName::X).with_size(px(12.)).text_color(muted))
+                            .tooltip("Clear search")
+                            .on_click(cx.listener(|this, _e, window, cx| {
+                                this.project_replace_status = None;
+                                this.set_project_search_query(String::new(), window, cx);
+                            })),
+                    ),
             )
             .child(
                 v_flex()
@@ -308,121 +646,209 @@ impl DartIde {
                     .w_full()
                     .min_h(px(0.))
                     .overflow_y_scroll()
-                    .p(px(tokens::SPACE_2))
-                    .gap(px(tokens::SPACE_1))
-                    .when(query.is_empty(), |el| {
+                    .pb(px(tokens::SPACE_4))
+                    .children(rows)
+                    .when(shown >= MAX_SHOWN, |el| {
                         el.child(
                             div()
-                                .p(px(tokens::SPACE_5))
-                                .text_center()
-                                .text_size(px(tokens::UI_SM))
+                                .px(px(tokens::SPACE_4))
+                                .py(px(tokens::SPACE_2))
+                                .text_size(px(tokens::UI_XS))
                                 .text_color(muted)
-                                .child("Type or paste above to search all files in the project (\u{2318}\u{21e7}F)."),
+                                .child(format!("First {MAX_SHOWN} shown \u{b7} narrow the search to see the rest")),
+                        )
+                    }),
+            )
+    }
+
+    fn render_search_file_header(
+        &self,
+        ix: usize,
+        path: &Path,
+        count: usize,
+        collapsed: bool,
+        cx: &mut Context<Self>,
+    ) -> Stateful<Div> {
+        let muted = cx.theme().muted_foreground;
+        let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("").to_string();
+        let dir = path
+            .parent()
+            .and_then(|p| p.strip_prefix(&self.root).ok())
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let toggle_path = path.to_path_buf();
+        h_flex()
+            .id(("search-file", ix))
+            .w_full()
+            .h(px(26.))
+            .pl(px(tokens::SPACE_2))
+            .pr(px(tokens::SPACE_3))
+            .gap(px(6.))
+            .items_center()
+            .cursor_pointer()
+            .hover(|s| s.bg(cx.theme().list_hover))
+            .child(
+                Icon::new(if collapsed {
+                    IconName::ChevronRight
+                } else {
+                    IconName::ChevronDown
+                })
+                .xsmall()
+                .text_color(muted),
+            )
+            .child(crate::rails::files::render_file_icon(&name))
+            .child(
+                div()
+                    .flex_shrink_0()
+                    .text_size(px(tokens::UI_SM))
+                    .text_color(cx.theme().foreground)
+                    .child(name),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w(px(0.))
+                    .truncate()
+                    .text_size(px(tokens::UI_XS))
+                    .text_color(muted.opacity(0.7))
+                    .child(dir),
+            )
+            .child(
+                div()
+                    .flex_shrink_0()
+                    .px(px(5.))
+                    .rounded(px(tokens::RADIUS_PILL))
+                    .bg(cx.theme().list_hover)
+                    .text_size(px(tokens::UI_XS))
+                    .text_color(muted)
+                    .child(count.to_string()),
+            )
+            .on_click(cx.listener(move |this, _e, _w, cx| {
+                if !this.project_search_collapsed.remove(&toggle_path) {
+                    this.project_search_collapsed.insert(toggle_path.clone());
+                }
+                cx.notify();
+            }))
+    }
+
+    /// One matching line: number, text with hits highlighted, and on hover
+    /// replace-this (when replace is open) and dismiss.
+    fn render_search_line(
+        &self,
+        ix: usize,
+        m: &core_workspace::SearchMatch,
+        literal: &str,
+        cx: &mut Context<Self>,
+    ) -> Stateful<Div> {
+        let muted = cx.theme().muted_foreground;
+        let group = format!("search-line-{ix}");
+        let (text, ranges) = search_preview(&m.line_text, &m.ranges);
+        let highlight = HighlightStyle {
+            color: Some(cx.theme().primary),
+            background_color: Some(cx.theme().primary.opacity(0.18)),
+            ..Default::default()
+        };
+        let highlights: Vec<(std::ops::Range<usize>, HighlightStyle)> =
+            ranges.into_iter().map(|(a, b)| (a..b, highlight)).collect();
+
+        let path = m.path.clone();
+        let line_0 = m.line_number.saturating_sub(1) as u32;
+        let phrase = m.phrase;
+        let line_text = m.line_text.clone();
+        let q = literal.to_string();
+        let key = (m.path.clone(), m.line_number);
+        let dismiss_key = key.clone();
+        let row_bg = cx.theme().list_hover;
+        let action = |id: (&'static str, usize), icon: IconName, tip: &'static str| {
+            Button::new(id)
+                .ghost()
+                .xsmall()
+                .icon(Icon::new(icon).with_size(px(12.)).text_color(muted))
+                .tooltip(tip)
+        };
+
+        h_flex()
+            .id(("search-line", ix))
+            .group(group.clone())
+            .relative()
+            .w_full()
+            .h(px(22.))
+            .pl(px(28.))
+            .pr(px(tokens::SPACE_3))
+            .gap(px(tokens::SPACE_2))
+            .items_center()
+            .cursor_pointer()
+            .hover(move |s| s.bg(row_bg))
+            .font_family(cx.theme().mono_font_family.clone())
+            .text_size(px(tokens::UI_XS))
+            .child(
+                div()
+                    .flex_shrink_0()
+                    .min_w(px(26.))
+                    .flex()
+                    .justify_end()
+                    .text_color(muted.opacity(0.6))
+                    .child(m.line_number.to_string()),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w(px(0.))
+                    .truncate()
+                    .text_color(cx.theme().foreground.opacity(0.85))
+                    .child(StyledText::new(text).with_highlights(highlights)),
+            )
+            .child(
+                h_flex()
+                    .absolute()
+                    .right(px(tokens::SPACE_2))
+                    .top_0()
+                    .bottom_0()
+                    .items_center()
+                    .gap(px(2.))
+                    .pl(px(tokens::SPACE_1))
+                    .bg(row_bg)
+                    .invisible()
+                    .group_hover(group, |s| s.visible())
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .when(self.project_replace_open, |el| {
+                        let only = key.clone();
+                        el.child(
+                            action(("search-replace-one", ix), IconName::Replace, "Replace")
+                                .on_click(cx.listener(move |this, _e, _w, cx| {
+                                    cx.stop_propagation();
+                                    this.replace_in_project(Some(only.clone()), cx);
+                                })),
                         )
                     })
-                    .children(
-                        self.project_search_matches
-                            .iter()
-                            .take(150)
-                            .enumerate()
-                            .map(|(ix, m)| {
-                                let name = m
-                                    .path
-                                    .file_name()
-                                    .and_then(|n| n.to_str())
-                                    .unwrap_or("")
-                                    .to_string();
-                                let path = m.path.clone();
-                                let line_0 = m.line_number.saturating_sub(1) as u32;
-                                let preview = m.line_text.trim().to_string();
-                                let phrase = m.phrase;
-                                let line_text = m.line_text.clone();
-                                // Constraints (`*.dart`, `!test/`) are not
-                                // text, so the find bar gets what fff actually
-                                // matched.
-                                let q = if self.project_search_literal.is_empty() {
-                                    query.clone()
-                                } else {
-                                    self.project_search_literal.clone()
-                                };
-
-                                v_flex()
-                                    .id(("proj-search-hit", ix))
-                                    .w_full()
-                                    .px(px(tokens::SPACE_3))
-                                    .py(px(tokens::SPACE_2))
-                                    .gap(px(2.))
-                                    .rounded(px(tokens::RADIUS_SM))
-                                    .cursor_pointer()
-                                    .hover(|s| s.bg(cx.theme().list_hover))
-                                    .child(
-                                        h_flex()
-                                            .w_full()
-                                            .items_center()
-                                            .justify_between()
-                                            .gap(px(tokens::SPACE_2))
-                                            .child(
-                                                h_flex()
-                                                    .min_w(px(0.))
-                                                    .items_center()
-                                                    .gap(px(tokens::SPACE_2))
-                                                    .child(crate::rails::files::render_file_icon(
-                                                        &name,
-                                                    ))
-                                                    .child(
-                                                        div()
-                                                            .truncate()
-                                                            .text_size(px(tokens::UI_SM))
-                                                            .font_medium()
-                                                            .text_color(fg)
-                                                            .child(name),
-                                                    ),
-                                            )
-                                            .child(
-                                                div()
-                                                    .flex_shrink_0()
-                                                    .font_family(
-                                                        cx.theme().mono_font_family.clone(),
-                                                    )
-                                                    .text_size(px(tokens::UI_XS))
-                                                    .text_color(cx.theme().primary)
-                                                    .child(format!(":{}", m.line_number)),
-                                            ),
-                                    )
-                                    .child(
-                                        div()
-                                            .w_full()
-                                            .pl(px(20.))
-                                            .truncate()
-                                            .font_family(cx.theme().mono_font_family.clone())
-                                            .text_size(px(tokens::UI_XS))
-                                            .text_color(muted)
-                                            .child(preview),
-                                    )
-                                    .on_click(cx.listener(move |this, _e, window, cx| {
-                                        this.open_path(path.clone(), window, cx);
-                                        if let Some(ed) = this.active_editor().cloned() {
-                                            // The editor's find bar is single-line.
-                                            // A pasted block is located by the start
-                                            // of the file line the match begins on.
-                                            let find_query = if phrase {
-                                                line_text
-                                                    .trim()
-                                                    .chars()
-                                                    .take(48)
-                                                    .collect::<String>()
-                                            } else {
-                                                q.lines().next().unwrap_or("").trim().to_string()
-                                            };
-                                            ed.update(cx, |editor, cx| {
-                                                editor.set_search_query(&find_query, cx);
-                                                editor.set_cursor_to_position(line_0, 0, cx);
-                                            });
-                                        }
-                                    }))
-                            }),
+                    .child(
+                        action(("search-dismiss", ix), IconName::X, "Dismiss").on_click(cx.listener(
+                            move |this, _e, _w, cx| {
+                                cx.stop_propagation();
+                                this.project_search_dismissed.insert(dismiss_key.clone());
+                                cx.notify();
+                            },
+                        )),
                     ),
             )
+            .on_click(cx.listener(move |this, _e, window, cx| {
+                let query = this.project_search_input.read(cx).value().trim().to_string();
+                this.remember_project_search(&query);
+                this.open_path(path.clone(), window, cx);
+                if let Some(ed) = this.active_editor().cloned() {
+                    // The editor's find bar is single-line. A pasted block is
+                    // located by the start of the file line the match begins on.
+                    let find_query = if phrase {
+                        line_text.trim().chars().take(48).collect::<String>()
+                    } else {
+                        q.lines().next().unwrap_or("").trim().to_string()
+                    };
+                    ed.update(cx, |editor, cx| {
+                        editor.set_search_query(&find_query, cx);
+                        editor.set_cursor_to_position(line_0, 0, cx);
+                    });
+                }
+            }))
     }
 
     fn render_git_not_a_repo(&self, cx: &mut Context<Self>) -> Div {
@@ -2387,4 +2813,32 @@ impl DartIde {
             None => div().h(px(0.)).into_any_element(),
         }
     }
+}
+
+/// The line as the results list shows it: leading indentation dropped, and a
+/// long lead-in before the first hit cut to an ellipsis so the hit is visible
+/// in a narrow panel. Ranges are shifted to match.
+fn search_preview(line: &str, ranges: &[(usize, usize)]) -> (String, Vec<(usize, usize)>) {
+    const LEAD: usize = 24;
+    let trimmed = line.trim_start();
+    let mut cut = line.len() - trimmed.len();
+    let mut prefix = "";
+    if let Some(&(first, _)) = ranges.first()
+        && first > cut + LEAD * 2
+    {
+        let mut at = first - LEAD;
+        while !line.is_char_boundary(at) {
+            at -= 1;
+        }
+        cut = at;
+        prefix = "\u{2026}";
+    }
+    let text = format!("{prefix}{}", &line[cut..]);
+    let shift = |x: usize| x.saturating_sub(cut) + prefix.len();
+    let ranges = ranges
+        .iter()
+        .filter(|(a, b)| *a >= cut && *b <= line.len())
+        .map(|&(a, b)| (shift(a), shift(b)))
+        .collect();
+    (text, ranges)
 }

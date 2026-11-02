@@ -7,3 +7,4 @@ publish = false
 
 [dependencies]
 fff-search.workspace = true
+regex = "1"

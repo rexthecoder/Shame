@@ -15,12 +15,33 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use fff_search::{
-    Casing, FFFMode, FilePicker, FilePickerOptions, FrecencyTracker, FuzzySearchOptions, GrepMode,
-    GrepSearchOptions, PaginationArgs, QueryParser, QueryTracker, SharedFilePicker, SharedFrecency,
-    SharedQueryTracker, parse_grep_query,
+    Casing, FFFMode, FilePicker, FilePickerOptions, FrecencyTracker, FuzzyQuery,
+    FuzzySearchOptions, GrepMode, GrepSearchOptions, PaginationArgs, QueryParser, QueryTracker,
+    SharedFilePicker, SharedFrecency, SharedQueryTracker, parse_grep_query,
 };
 
-use crate::search::{MAX_MATCHES, SearchMatch, SearchResults, is_visible_path, sort_matches};
+use crate::search::{
+    MAX_MATCHES, SearchMatch, SearchOptions, SearchResults, build_matcher, is_visible_path,
+    match_ranges, sort_matches,
+};
+
+/// Split a query into the text to find and its filter tokens (`*.dart`,
+/// `!test/`, `src/`), using the same parser the index does, so the panel can
+/// show filters as chips.
+pub fn split_query_filters(query: &str) -> (String, Vec<String>) {
+    let parsed = parse_grep_query(query.trim());
+    let text = parsed.grep_text();
+    let mut text_words: Vec<&str> = text.split_whitespace().collect();
+    let mut filters = Vec::new();
+    for token in query.split_whitespace() {
+        if let Some(ix) = text_words.iter().position(|word| *word == token) {
+            text_words.remove(ix);
+        } else {
+            filters.push(token.to_string());
+        }
+    }
+    (text, filters)
+}
 
 /// A workspace indexed by fff.
 pub struct SearchIndex {
@@ -94,21 +115,52 @@ impl SearchIndex {
     /// constrained query that finds nothing is retried as plain text by fff
     /// itself, so a stray `*` in normal code never hides results.
     pub fn search_text(&self, query: &str) -> Option<SearchResults> {
+        self.search_text_with(query, SearchOptions::default())
+    }
+
+    /// [`Self::search_text`] with case, whole-word and regex options. Whole
+    /// word runs as a regex (`\b…\b`) around the escaped text.
+    pub fn search_text_with(&self, query: &str, options: SearchOptions) -> Option<SearchResults> {
         let query = query.trim();
         if query.is_empty() {
             return Some(SearchResults::default());
         }
+        let mut parsed = parse_grep_query(query);
+        let text = parsed.grep_text();
+        // Also the highlighter for every hit, so ranges match what the
+        // options mean even where fff's own offsets would differ.
+        let matcher = match build_matcher(&text, options) {
+            Ok(matcher) => matcher,
+            Err(error) => {
+                return Some(SearchResults {
+                    error: Some(error),
+                    ..Default::default()
+                });
+            }
+        };
+        let use_regex = options.regex || options.whole_word;
+        let pattern = matcher.as_str().to_string();
+        if use_regex && !text.is_empty() {
+            parsed.fuzzy_query = FuzzyQuery::Text(&pattern);
+        }
 
         self.with_picker(|picker| {
-            let parsed = parse_grep_query(query);
             let result = picker.grep(
                 &parsed,
                 &GrepSearchOptions {
-                    // Case-insensitive always, like the on-disk search it
-                    // replaces: a pasted identifier in the wrong case should
-                    // still be found.
-                    casing: Some(Casing::Insensitive),
-                    mode: GrepMode::PlainText,
+                    // Case-insensitive unless asked, like the on-disk search
+                    // it replaces: a pasted identifier in the wrong case
+                    // should still be found.
+                    casing: Some(if options.case_sensitive {
+                        Casing::Sensitive
+                    } else {
+                        Casing::Insensitive
+                    }),
+                    mode: if use_regex {
+                        GrepMode::Regex
+                    } else {
+                        GrepMode::PlainText
+                    },
                     page_limit: MAX_MATCHES,
                     // One generated file with thousands of hits must not stop
                     // the list at fff's per-file default (200) while the
@@ -134,6 +186,7 @@ impl SearchIndex {
                     Some(SearchMatch {
                         path,
                         line_number: hit.line_number as usize,
+                        ranges: match_ranges(&matcher, &hit.line_content),
                         line_text: hit.line_content.clone(),
                         phrase: false,
                     })
@@ -149,7 +202,8 @@ impl SearchIndex {
                 truncated,
                 // What fff actually matched, minus `*.dart`-style constraints,
                 // so the editor's find bar can highlight it.
-                query_text: parsed.grep_text(),
+                query_text: text.clone(),
+                error: None,
             }
         })
     }
@@ -252,11 +306,26 @@ impl SearchIndex {
 /// block that the file wraps differently, so when the index finds nothing the
 /// on-disk walk's whitespace-collapsed phrase match runs as a fallback. The
 /// same fallback keeps search working during the index's first scan.
-pub fn search_workspace(index: Option<&SearchIndex>, root: &Path, query: &str) -> SearchResults {
-    let from_index = index.and_then(|index| index.search_text(query));
+pub fn search_workspace(
+    index: Option<&SearchIndex>,
+    root: &Path,
+    query: &str,
+    options: SearchOptions,
+) -> SearchResults {
+    let from_index = index.and_then(|index| index.search_text_with(query, options));
     match from_index {
-        Some(results) if !results.matches.is_empty() || query.split_whitespace().count() <= 1 => {
+        Some(results)
+            if !results.matches.is_empty()
+                || results.error.is_some()
+                || !options.is_default()
+                || query.split_whitespace().count() <= 1 =>
+        {
             results
+        }
+        // The disk walk knows nothing of `*.dart`-style filters, so it is
+        // handed only the text.
+        _ if !options.is_default() => {
+            crate::search_text_with(root, &split_query_filters(query).0, options)
         }
         _ => crate::search_text(root, query),
     }
@@ -357,7 +426,8 @@ mod tests {
         let collapsed = pasted.split_whitespace().collect::<Vec<_>>().join(" ");
         assert!(index.search_text(&collapsed).unwrap().matches.is_empty());
 
-        let results = search_workspace(Some(index.as_ref()), &dir, &collapsed);
+        let results =
+            search_workspace(Some(index.as_ref()), &dir, &collapsed, SearchOptions::default());
         assert_eq!(results.matches.len(), 1);
         assert_eq!(results.matches[0].line_number, 2);
 

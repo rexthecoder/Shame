@@ -9,6 +9,9 @@ impl DartIde {
         self.project_search_matches.clear();
         self.project_search_truncated = false;
         self.project_search_literal.clear();
+        self.project_search_error = None;
+        self.project_search_collapsed.clear();
+        self.project_search_dismissed.clear();
         if query.is_empty() {
             self.project_search_pending = false;
             cx.notify();
@@ -48,18 +51,23 @@ impl DartIde {
         cx.notify();
 
         let q = query.clone();
+        let options = self.project_search_options;
         let (tx, rx) = async_channel::bounded(1);
         std::thread::spawn(move || {
             let _ = tx.send_blocking(core_workspace::search_workspace(
                 index.as_deref(),
                 &root,
                 &q,
+                options,
             ));
         });
         cx.spawn(async move |weak, cx| {
             let Ok(results) = rx.recv().await else { return };
             let _ = weak.update(cx, |this, cx| {
-                if this.project_search_input.read(cx).value().trim() == query {
+                if this.project_search_input.read(cx).value().trim() == query
+                    && this.project_search_options == options
+                {
+                    this.project_search_error = results.error;
                     this.project_search_matches = results.matches;
                     this.project_search_truncated = results.truncated;
                     this.project_search_literal = results.query_text;
@@ -71,10 +79,48 @@ impl DartIde {
         .detach();
     }
 
-    /// Replace the search query with the replace input's text across the
-    /// workspace, then reload any open tabs whose files changed. Refuses
-    /// while a tab has unsaved edits, so a replace can't clobber them.
-    pub(crate) fn replace_in_project(&mut self, cx: &mut Context<Self>) {
+    /// Flip one search option and search again.
+    pub(crate) fn toggle_project_search_option(
+        &mut self,
+        flip: fn(&mut core_workspace::SearchOptions),
+        cx: &mut Context<Self>,
+    ) {
+        flip(&mut self.project_search_options);
+        let query = self.project_search_input.read(cx).value().trim().to_string();
+        self.schedule_project_search(query, cx);
+    }
+
+    /// Remember a query that led somewhere, newest first.
+    pub(crate) fn remember_project_search(&mut self, query: &str) {
+        let query = query.trim();
+        if query.is_empty() {
+            return;
+        }
+        self.project_recent_searches.retain(|q| q != query);
+        self.project_recent_searches.insert(0, query.to_string());
+        self.project_recent_searches.truncate(6);
+    }
+
+    /// Put `query` in the search box (from a recent search or a filter
+    /// chip) and focus it.
+    pub(crate) fn set_project_search_query(
+        &mut self,
+        query: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.project_search_input.update(cx, |state, cx| {
+            state.set_value(query.clone(), window, cx);
+            state.focus(window, cx);
+        });
+        self.schedule_project_search(query.trim().to_string(), cx);
+    }
+
+    /// Replace matches on the listed result lines — every shown one when
+    /// `only` is `None`, or just that `(file, line)` — then reload any open
+    /// tabs whose files changed. Refuses while a tab has unsaved edits, so a
+    /// replace can't clobber them.
+    pub(crate) fn replace_in_project(&mut self, only: Option<(PathBuf, usize)>, cx: &mut Context<Self>) {
         let query = self.project_search_input.read(cx).value().trim().to_string();
         let replacement = self.project_replace_input.read(cx).value().to_string();
         if query.is_empty() {
@@ -86,7 +132,28 @@ impl DartIde {
             cx.notify();
             return;
         }
-        match core_workspace::replace_text(&self.root, &query, &replacement) {
+        let mut edits: Vec<(PathBuf, Vec<usize>)> = Vec::new();
+        for m in &self.project_search_matches {
+            let key = (m.path.clone(), m.line_number);
+            let wanted = match &only {
+                Some(only) => *only == key,
+                None => !self.project_search_dismissed.contains(&key),
+            };
+            if !wanted {
+                continue;
+            }
+            match edits.last_mut() {
+                Some((path, lines)) if *path == m.path => lines.push(m.line_number),
+                _ => edits.push((m.path.clone(), vec![m.line_number])),
+            }
+        }
+        let text = core_workspace::split_query_filters(&query).0;
+        match core_workspace::replace_in_lines(
+            &edits,
+            &text,
+            &replacement,
+            self.project_search_options,
+        ) {
             Ok(changed) => {
                 let total: usize = changed.iter().map(|(_, n)| n).sum();
                 for (path, _) in &changed {
@@ -98,15 +165,21 @@ impl DartIde {
                         }
                     }
                 }
-                self.project_replace_status = Some(format!(
-                    "Replaced {total} occurrence{} in {} file{}.",
-                    if total == 1 { "" } else { "s" },
-                    changed.len(),
-                    if changed.len() == 1 { "" } else { "s" },
-                ));
+                self.remember_project_search(&query);
+                self.project_replace_status = (only.is_none()).then(|| {
+                    let mut status = format!(
+                        "Replaced {total} in {} file{}",
+                        changed.len(),
+                        if changed.len() == 1 { "" } else { "s" },
+                    );
+                    if self.project_search_truncated {
+                        status.push_str(" \u{b7} results were capped, run again for the rest");
+                    }
+                    status
+                });
                 self.schedule_project_search(query, cx);
             }
-            Err(err) => self.project_replace_status = Some(format!("Replace failed: {err}")),
+            Err(err) => self.project_replace_status = Some(err),
         }
         cx.notify();
     }

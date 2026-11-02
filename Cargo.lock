@@ -1196,6 +1196,7 @@ name = "core-workspace"
 version = "0.1.0"
 dependencies = [
  "fff-search",
+ "regex",
 ]
 
 [[package]]

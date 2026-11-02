@@ -44,6 +44,57 @@ pub struct SearchMatch {
     /// The query was a multi-word phrase, so it was matched with whitespace
     /// collapsed; the editor's single-line find bar cannot use it directly.
     pub phrase: bool,
+    /// Byte ranges of each hit within `line_text`, for highlighting. Empty
+    /// for a phrase match, which may start on this line and run past it.
+    pub ranges: Vec<(usize, usize)>,
+}
+
+/// How the query text is matched. The default is what the panel always did:
+/// a case-insensitive literal substring.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub struct SearchOptions {
+    pub case_sensitive: bool,
+    pub whole_word: bool,
+    pub regex: bool,
+}
+
+impl SearchOptions {
+    pub fn is_default(self) -> bool {
+        self == Self::default()
+    }
+}
+
+/// The regex every option combination comes down to. Used for highlighting,
+/// for the on-disk search when an option is on, and for replace, so all three
+/// agree on what a match is.
+pub fn build_matcher(text: &str, options: SearchOptions) -> Result<regex::Regex, String> {
+    let body = if options.regex {
+        text.to_string()
+    } else {
+        regex::escape(text)
+    };
+    let body = if options.whole_word {
+        format!(r"\b(?:{body})\b")
+    } else {
+        body
+    };
+    regex::RegexBuilder::new(&body)
+        .case_insensitive(!options.case_sensitive)
+        .build()
+        .map_err(|err| match err {
+            regex::Error::Syntax(_) => "That regex doesn't parse.".to_string(),
+            _ => "That regex is too large.".to_string(),
+        })
+}
+
+/// Byte ranges of every match of `matcher` in `line`, skipping empty ones
+/// (`a*` would otherwise highlight every gap).
+pub fn match_ranges(matcher: &regex::Regex, line: &str) -> Vec<(usize, usize)> {
+    matcher
+        .find_iter(line)
+        .filter(|m| !m.is_empty())
+        .map(|m| (m.start(), m.end()))
+        .collect()
 }
 
 /// Everything one search found, plus whether the cap was reached.
@@ -56,6 +107,9 @@ pub struct SearchResults {
     /// nothing about that syntax, so it is given this instead of the raw
     /// query.
     pub query_text: String,
+    /// Why nothing was searched (an invalid regex), to show instead of
+    /// "no matches".
+    pub error: Option<String>,
 }
 
 /// Search every text file under `root` for `query`. Matching is a
@@ -71,6 +125,64 @@ pub fn search_text(root: &Path, query: &str) -> SearchResults {
     let mut results = search_files_with(&files, &parsed);
     results.query_text = query.to_string();
     results
+}
+
+/// [`search_text`] with options. The default options keep the
+/// whitespace-collapsing phrase match; any option switches to a per-line
+/// regex, since "whole word" or "case" mean nothing across a pasted block.
+pub fn search_text_with(root: &Path, query: &str, options: SearchOptions) -> SearchResults {
+    if options.is_default() {
+        return search_text(root, query);
+    }
+    let text = query.trim();
+    if text.is_empty() {
+        return SearchResults::default();
+    }
+    let matcher = match build_matcher(text, options) {
+        Ok(matcher) => matcher,
+        Err(error) => {
+            return SearchResults {
+                error: Some(error),
+                ..Default::default()
+            };
+        }
+    };
+    let mut files = Vec::new();
+    collect_files(root, &mut files);
+    let mut matches = Vec::new();
+    for path in &files {
+        if !is_searchable_file(path) {
+            continue;
+        }
+        let Ok(contents) = std::fs::read_to_string(path) else {
+            continue;
+        };
+        for (ix, line) in contents.lines().enumerate() {
+            let ranges = match_ranges(&matcher, line);
+            if ranges.is_empty() {
+                continue;
+            }
+            matches.push(SearchMatch {
+                path: path.clone(),
+                line_number: ix + 1,
+                line_text: line.to_string(),
+                phrase: false,
+                ranges,
+            });
+        }
+        if matches.len() >= MAX_MATCHES {
+            break;
+        }
+    }
+    let truncated = matches.len() >= MAX_MATCHES;
+    matches.truncate(MAX_MATCHES);
+    sort_matches(&mut matches);
+    SearchResults {
+        matches,
+        truncated,
+        query_text: text.to_string(),
+        error: None,
+    }
 }
 
 struct Query {
@@ -181,6 +293,7 @@ fn search_files_with(paths: &[PathBuf], query: &Query) -> SearchResults {
         matches,
         truncated,
         query_text: String::new(),
+        error: None,
     }
 }
 
@@ -199,6 +312,7 @@ fn search_files_sequential(paths: &[PathBuf], query: &Query) -> SearchResults {
         matches,
         truncated,
         query_text: String::new(),
+        error: None,
     }
 }
 
@@ -215,9 +329,29 @@ fn search_one_file(path: &Path, query: &Query) -> Vec<SearchMatch> {
         .map(|(line_ix, line_text)| SearchMatch {
             path: path.to_path_buf(),
             line_number: line_ix + 1,
+            ranges: query
+                .single_token
+                .as_deref()
+                .map(|needle| literal_ranges(&line_text, needle))
+                .unwrap_or_default(),
             line_text,
             phrase,
         })
+        .collect()
+}
+
+/// Case-insensitive ranges of `needle` (already lowercase) in `line`. Lines
+/// whose lowercase form changes length get no highlight rather than a wrong
+/// one.
+fn literal_ranges(line: &str, needle: &str) -> Vec<(usize, usize)> {
+    let lower = line.to_lowercase();
+    if lower.len() != line.len() || needle.is_empty() {
+        return Vec::new();
+    }
+    lower
+        .match_indices(needle)
+        .map(|(at, _)| (at, at + needle.len()))
+        .filter(|(start, end)| line.is_char_boundary(*start) && line.is_char_boundary(*end))
         .collect()
 }
 
@@ -406,6 +540,59 @@ pub fn replace_text(
         if count > 0 {
             std::fs::write(&path, updated)?;
             changed.push((path, count));
+        }
+    }
+    Ok(changed)
+}
+
+/// Replace matches of `text` only on the given 1-indexed lines of each file,
+/// so replace touches exactly what the results list shows (filters applied,
+/// dismissed lines left alone). In regex mode `$1`-style groups expand.
+/// Returns `(file, replacement_count)` for each file that changed.
+pub fn replace_in_lines(
+    edits: &[(PathBuf, Vec<usize>)],
+    text: &str,
+    replacement: &str,
+    options: SearchOptions,
+) -> Result<Vec<(PathBuf, usize)>, String> {
+    if text.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+    if text.contains(['\n', '\r']) {
+        return Err("Replace one line at a time, not a multi-line block.".to_string());
+    }
+    let matcher = build_matcher(text, options)?;
+    let mut changed = Vec::new();
+    for (path, lines) in edits {
+        let Ok(contents) = std::fs::read_to_string(path) else {
+            continue;
+        };
+        let mut count = 0;
+        let mut out = String::with_capacity(contents.len());
+        for (ix, line) in contents.split_inclusive('\n').enumerate() {
+            if !lines.contains(&(ix + 1)) {
+                out.push_str(line);
+                continue;
+            }
+            let (body, ending) = match line.strip_suffix("\r\n") {
+                Some(body) => (body, "\r\n"),
+                None => match line.strip_suffix('\n') {
+                    Some(body) => (body, "\n"),
+                    None => (line, ""),
+                },
+            };
+            count += match_ranges(&matcher, body).len();
+            let replaced = if options.regex {
+                matcher.replace_all(body, replacement)
+            } else {
+                matcher.replace_all(body, regex::NoExpand(replacement))
+            };
+            out.push_str(&replaced);
+            out.push_str(ending);
+        }
+        if count > 0 {
+            std::fs::write(path, out).map_err(|err| err.to_string())?;
+            changed.push((path.clone(), count));
         }
     }
     Ok(changed)
@@ -619,4 +806,56 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    #[test]
+    fn options_change_what_counts_as_a_match() {
+        let plain = build_matcher("Foo", SearchOptions::default()).unwrap();
+        assert_eq!(match_ranges(&plain, "foo food FOO"), vec![(0, 3), (4, 7), (9, 12)]);
+
+        let word = SearchOptions { whole_word: true, ..Default::default() };
+        let word = build_matcher("foo", word).unwrap();
+        assert_eq!(match_ranges(&word, "foo food FOO"), vec![(0, 3), (9, 12)]);
+
+        let case = SearchOptions { case_sensitive: true, ..Default::default() };
+        let case = build_matcher("foo", case).unwrap();
+        assert_eq!(match_ranges(&case, "foo food FOO"), vec![(0, 3), (4, 7)]);
+
+        // Without regex on, metacharacters are literal.
+        let dot = build_matcher("a.b", SearchOptions::default()).unwrap();
+        assert_eq!(match_ranges(&dot, "axb a.b"), vec![(4, 7)]);
+
+        let bad = SearchOptions { regex: true, ..Default::default() };
+        assert!(build_matcher("(", bad).is_err());
+    }
+
+    #[test]
+    fn replace_touches_only_the_listed_lines() {
+        let dir = std::env::temp_dir().join(format!(
+            "core-workspace-replace-lines-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("a.rs");
+        write(&dir, "a.rs", "let foo = 1;\r\nlet foo = foo;\nfoo\n");
+
+        let changed = replace_in_lines(
+            &[(file.clone(), vec![2])],
+            "foo",
+            "bar",
+            SearchOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(changed, vec![(file.clone(), 2)]);
+        assert_eq!(
+            std::fs::read_to_string(&file).unwrap(),
+            "let foo = 1;\r\nlet bar = bar;\nfoo\n"
+        );
+
+        let regex = SearchOptions { regex: true, ..Default::default() };
+        replace_in_lines(&[(file.clone(), vec![1])], r"let (\w+)", "const $1", regex).unwrap();
+        assert!(std::fs::read_to_string(&file).unwrap().starts_with("const foo = 1;\r\n"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
 }

@@ -41,5 +41,8 @@ pub use repo::{
 pub use history::{Snapshot, list_snapshots, record_snapshot};
 pub use stats::{change_stats, parse_numstat};
 pub use symbols::{WorkspaceSymbol, filter_symbols, index_workspace_symbols, symbols_in_text};
-pub use search::{SearchMatch, SearchResults, replace_text, search_text};
-pub use search_index::{SearchIndex, search_workspace};
+pub use search::{
+    SearchMatch, SearchOptions, SearchResults, build_matcher, match_ranges, replace_in_lines,
+    replace_text, search_text, search_text_with,
+};
+pub use search_index::{SearchIndex, search_workspace, split_query_filters};

@@ -492,6 +492,18 @@ pub struct DartIde {
     pub(crate) project_search_pending: bool,
     pub(crate) project_replace_input: Entity<InputState>,
     pub(crate) project_replace_status: Option<String>,
+    pub(crate) project_search_options: core_workspace::SearchOptions,
+    /// Why the last search could not run (an invalid regex).
+    pub(crate) project_search_error: Option<String>,
+    /// The replace field is folded away until asked for.
+    pub(crate) project_replace_open: bool,
+    /// Result groups folded shut, by file.
+    pub(crate) project_search_collapsed: std::collections::HashSet<PathBuf>,
+    /// Result lines dismissed from the list (and so from Replace all).
+    pub(crate) project_search_dismissed: std::collections::HashSet<(PathBuf, usize)>,
+    /// Queries that led somewhere (a result opened, a replace run), newest
+    /// first, for the empty panel.
+    pub(crate) project_recent_searches: Vec<String>,
     pub(crate) dap_client: Option<std::sync::Arc<std::sync::Mutex<core_dap::DapClient>>>,
     pub(crate) dap_breakpoints: HashMap<PathBuf, Vec<u32>>,
     pub(crate) dap_paused_thread: Option<i64>,
@@ -646,11 +658,11 @@ impl DartIde {
                 .placeholder("Package name (e.g. provider, http, dev:build_runner)...")
         });
         let project_search_input = cx.new(|cx| {
-            InputState::new(window, cx).placeholder("Search text, or paste a code block\u{2026}")
+            InputState::new(window, cx).placeholder("Search")
         });
         let debug_prompt_input = cx.new(|cx| InputState::new(window, cx));
         let project_replace_input = cx.new(|cx| {
-            InputState::new(window, cx).placeholder("Replace with...")
+            InputState::new(window, cx).placeholder("Replace")
         });
         let file_tree_input = cx.new(|cx| {
             InputState::new(window, cx).placeholder("path/to/file.dart\u{2026}")
@@ -726,6 +738,12 @@ impl DartIde {
             project_search_pending: false,
             project_replace_input,
             project_replace_status: None,
+            project_search_options: core_workspace::SearchOptions::default(),
+            project_search_error: None,
+            project_replace_open: false,
+            project_search_collapsed: std::collections::HashSet::new(),
+            project_search_dismissed: std::collections::HashSet::new(),
+            project_recent_searches: Vec::new(),
             dap_client: None,
             dap_breakpoints: HashMap::new(),
             dap_paused_thread: None,
