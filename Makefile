@@ -10,6 +10,11 @@
 #   make dmg             create distributable macOS disk image (dist/Dart-IDE-0.1.0-macos.dmg)
 #   make release         full v0.1.0 release pipeline (test + release-build + bundle + dmg)
 #   make install         install dist/Dart IDE.app into /Applications
+#   make dev-app         debug build wrapped as target/debug/Shame Dev.app and
+#                        opened on this repo (own bundle id, so it can be
+#                        screenshotted and driven like any app);
+#                        DEV_COMMAND="go-to-file, type:main" runs keymap
+#                        commands at startup to reach a state to look at
 
 CRATE     := app
 BIN       := dart-ide
@@ -21,7 +26,7 @@ APP_DIR   := $(DIST_DIR)/$(APP_NAME).app
 DMG_PATH  := $(DIST_DIR)/$(APP_NAME)-$(VERSION)-macos.dmg
 LOG       := /tmp/shame.log
 
-.PHONY: build run restart stop test check fmt clean icon release-build bundle dmg release install
+.PHONY: build run restart stop test check fmt clean icon release-build bundle dmg release install dev-app
 
 build:
 	cargo build -p $(CRATE)
@@ -40,6 +45,32 @@ restart:
 
 stop:
 	-pkill -f "target/debug/$(BIN)"
+
+DEV_APP := target/debug/$(APP_NAME) Dev.app
+DEV_DIR ?= $(CURDIR)
+
+# A debug build as a real .app with its own bundle id: it shows up as an
+# app of its own (not the installed Shame), so tools that work per
+# application, like screenshots, can find it. Opens DEV_DIR (default: here).
+dev-app: build
+	-pkill -f "$(APP_NAME) Dev.app/Contents/MacOS/$(BIN)"
+	@mkdir -p "$(DEV_APP)/Contents/MacOS"
+	@cp "target/debug/$(BIN)" "$(DEV_APP)/Contents/MacOS/$(BIN)"
+	@printf '%s\n' \
+		'<?xml version="1.0" encoding="UTF-8"?>' \
+		'<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">' \
+		'<plist version="1.0">' \
+		'<dict>' \
+		'  <key>CFBundleName</key><string>$(APP_NAME) Dev</string>' \
+		'  <key>CFBundleIdentifier</key><string>$(BUNDLE_ID).dev</string>' \
+		'  <key>CFBundlePackageType</key><string>APPL</string>' \
+		'  <key>CFBundleExecutable</key><string>$(BIN)</string>' \
+		'  <key>NSHighResolutionCapable</key><true/>' \
+		'</dict>' \
+		'</plist>' > "$(DEV_APP)/Contents/Info.plist"
+	@codesign --force --sign - "$(DEV_APP)" 2>/dev/null || true
+	@open -n "$(DEV_APP)" $(if $(DEV_COMMAND),--env SHAME_DEV_COMMAND="$(DEV_COMMAND)") --args "$(DEV_DIR)"
+	@echo "✓ Opened $(DEV_APP) on $(DEV_DIR)"
 
 test:
 	cargo test --workspace

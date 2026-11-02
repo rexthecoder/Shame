@@ -41,7 +41,7 @@ pub const MONO: f32 = 12.5;
 // ---- layout metrics -------------------------------------------------------
 
 pub const TITLEBAR_H: f32 = 44.;
-pub const STATUS_H: f32 = 26.;
+pub const STATUS_H: f32 = 30.;
 pub const TABSTRIP_H: f32 = 38.;
 pub const RAIL_LEFT: f32 = 236.;
 pub const RAIL_LEFT_MIN: f32 = 200.;

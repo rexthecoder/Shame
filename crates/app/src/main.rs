@@ -541,6 +541,9 @@ pub struct DartIde {
     pub(crate) palette_open: bool,
     pub(crate) palette_input: Entity<InputState>,
     pub(crate) palette_selected: usize,
+    /// Command ids run from anywhere, newest first, for the palette's
+    /// "Recent" section.
+    pub(crate) recent_commands: Vec<&'static str>,
     pub(crate) find_open: bool,
     pub(crate) find_input: Entity<InputState>,
     pub(crate) replace_input: Entity<InputState>,
@@ -775,6 +778,7 @@ impl DartIde {
             palette_open: false,
             palette_input,
             palette_selected: 0,
+            recent_commands: Vec::new(),
             find_open: false,
             find_input,
             replace_input,
@@ -844,6 +848,7 @@ impl DartIde {
         this.apply_save_options(cx);
         this.apply_editor_options(cx);
         this.start_git_refresh_loop(cx);
+        this.run_dev_commands(window, cx);
         // The Commit button depends on whether the message box is empty.
         cx.observe(&this.git.message, |_, _, cx| cx.notify()).detach();
         cx.observe(&this.git.branch_input, |_, _, cx| cx.notify())
@@ -1108,6 +1113,36 @@ impl DartIde {
     /// Run an app-level keymap command. Returns `false` when it isn't one
     /// (editor commands, or a contextual one like `diff-next-change` with no
     /// diff open), so the key can do its normal job.
+    /// Development aid: `SHAME_DEV_COMMAND="go-to-file, type:main"` runs
+    /// keymap commands once the window is up (`type:` fills the open
+    /// palette, `open:<path>` opens a file under the root), so a screenshot
+    /// can show a state without clicking into the window. Unset in normal
+    /// use.
+    fn run_dev_commands(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Ok(steps) = std::env::var("SHAME_DEV_COMMAND") else {
+            return;
+        };
+        cx.spawn_in(window, async move |weak, cx| {
+            cx.background_executor().timer(std::time::Duration::from_millis(800)).await;
+            let _ = weak.update_in(cx, |this, window, cx| {
+                for step in steps.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+                    if let Some(path) = step.strip_prefix("open:") {
+                        let path = this.root.join(path);
+                        this.open_path(path, window, cx);
+                    } else if let Some(text) = step.strip_prefix("type:") {
+                        let text = text.to_string();
+                        this.palette_input
+                            .update(cx, |state, cx| state.set_value(text, window, cx));
+                    } else if !this.run_shortcut(step, window, cx) {
+                        this.execute_ide_command(step, window, cx);
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
     fn run_shortcut(&mut self, command: &str, window: &mut Window, cx: &mut Context<Self>) -> bool {
         if editor_view::keymap::EDITOR_COMMANDS.contains(&command) {
             return false;

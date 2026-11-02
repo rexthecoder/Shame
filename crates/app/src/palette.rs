@@ -1,5 +1,10 @@
 //! Command palette, Quick Open, symbol outline and project search.
 
+use std::ops::Range;
+
+use gpui_kit::assets::IconName;
+use gpui_kit::component::Icon;
+
 use super::*;
 
 impl DartIde {
@@ -314,21 +319,60 @@ impl DartIde {
         cx.notify();
     }
 
-    pub(crate) fn palette_command_matches(&self, cx: &Context<Self>) -> Vec<IdeCommand> {
+    /// The text after the `>` that puts the palette in command mode.
+    pub(crate) fn palette_command_query(&self, cx: &Context<Self>) -> String {
         let raw = self.palette_input.read(cx).value().to_string();
-        let query = raw
-            .trim_start()
+        raw.trim_start()
             .strip_prefix('>')
             .unwrap_or(&raw)
             .trim()
-            .to_lowercase();
+            .to_lowercase()
+    }
+
+    /// Commands in the order the palette lists them. Every word of the query
+    /// must appear in the title ("git stage" finds "Git: Stage All
+    /// Changes"). With no query, recently run commands come first.
+    pub(crate) fn palette_command_matches(&self, cx: &Context<Self>) -> Vec<IdeCommand> {
+        let query = self.palette_command_query(cx);
+        let words: Vec<&str> = query.split_whitespace().collect();
         let is_flutter = self.is_flutter_or_dart_workspace();
+        let available = |cmd: &&IdeCommand| !cmd.flutter_only || is_flutter;
+        if words.is_empty() {
+            let recent: Vec<IdeCommand> = self
+                .recent_commands
+                .iter()
+                .filter_map(|id| IDE_COMMANDS.iter().filter(available).find(|c| c.id == *id))
+                .copied()
+                .collect();
+            let rest = IDE_COMMANDS
+                .iter()
+                .filter(available)
+                .filter(|cmd| !self.recent_commands.contains(&cmd.id))
+                .copied();
+            return recent.into_iter().chain(rest).collect();
+        }
         IDE_COMMANDS
             .iter()
-            .filter(|cmd| !cmd.flutter_only || is_flutter)
-            .filter(|cmd| query.is_empty() || contains_ascii_ci(cmd.title, &query))
+            .filter(available)
+            .filter(|cmd| words.iter().all(|word| contains_ascii_ci(cmd.title, word)))
             .copied()
             .collect()
+    }
+
+    /// How many leading entries of an empty-query command list are recent.
+    pub(crate) fn palette_recent_count(&self, cx: &Context<Self>) -> usize {
+        if !self.palette_command_query(cx).is_empty() {
+            return 0;
+        }
+        let is_flutter = self.is_flutter_or_dart_workspace();
+        self.recent_commands
+            .iter()
+            .filter(|id| {
+                IDE_COMMANDS
+                    .iter()
+                    .any(|c| c.id == **id && (!c.flutter_only || is_flutter))
+            })
+            .count()
     }
 
     pub(crate) fn palette_matches(&self, cx: &Context<Self>) -> Vec<PathBuf> {
@@ -417,6 +461,11 @@ impl DartIde {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if let Some(cmd) = IDE_COMMANDS.iter().find(|c| c.id == id) {
+            self.recent_commands.retain(|recent| *recent != cmd.id);
+            self.recent_commands.insert(0, cmd.id);
+            self.recent_commands.truncate(5);
+        }
         match id {
             "test-all" => self.start_test_run(crate::test_runner::TestTarget::All, None, None, cx),
             "test-file" => self.run_tests_in_active_file(cx),
@@ -794,183 +843,140 @@ impl DartIde {
                 })
                 .collect()
         } else if is_cmd_mode {
-            cmd_matches
-                .into_iter()
-                .enumerate()
-                .map(|(ix, cmd)| {
-                    let is_selected = ix == selected;
-                    let cmd_id = cmd.id;
-                    let view = view.clone();
-                    // The keymap's binding wins; the static label stays for
-                    // descriptive ones like Hot Reload's "on ⌘S".
-                    let shortcut: SharedString = cx
-                        .try_global::<editor_view::keymap::Keymap>()
-                        .and_then(|k| k.label_for(cmd.id))
-                        .map(SharedString::from)
-                        .unwrap_or_else(|| SharedString::from(cmd.shortcut));
-                    h_flex()
-                        .id(("palette-cmd", ix))
-                        .relative()
-                        .w_full()
-                        .h(px(34.))
-                        .items_center()
-                        .justify_between()
-                        .px(px(14.))
-                        .rounded(px(tokens::RADIUS_SM))
-                        .border_1()
-                        .border_color(gpui_kit::transparent_black())
-                        .cursor_pointer()
-                        .when(is_selected, |el| {
-                            el.bg(rgba(0xea7a3c16))
-                                .border_color(rgba(0xea7a3c36))
-                                .child(
-                                    div()
-                                        .absolute()
-                                        .left(px(2.))
-                                        .top(px(6.))
-                                        .bottom(px(6.))
-                                        .w(px(2.5))
-                                        .rounded(px(2.))
-                                        .bg(cx.theme().primary),
-                                )
-                        })
-                        .when(!is_selected, |el| el.hover(|s| s.bg(rgba(0xffffff08))))
+            let query = self.palette_command_query(cx);
+            let recent = self.palette_recent_count(cx);
+            let mut rows = Vec::new();
+            let mut last_section: Option<&str> = None;
+            for (ix, cmd) in cmd_matches.into_iter().enumerate() {
+                let (category, label) = cmd.title.split_once(": ").unwrap_or(("Other", cmd.title));
+                let section = if ix < recent { "Recent" } else { category };
+                if last_section != Some(section) {
+                    rows.push(palette_section(section, rows.is_empty(), cx).into_any_element());
+                    last_section = Some(section);
+                }
+                let cmd_id = cmd.id;
+                let view = view.clone();
+                // The keymap's binding wins; the static label stays for
+                // descriptive ones like Hot Reload's "on ⌘S".
+                let shortcut: SharedString = cx
+                    .try_global::<editor_view::keymap::Keymap>()
+                    .and_then(|k| k.label_for(cmd.id))
+                    .map(SharedString::from)
+                    .unwrap_or_else(|| SharedString::from(cmd.shortcut));
+                // Recent rows keep their category, since there's no header
+                // naming it.
+                let label = if ix < recent { cmd.title } else { label };
+                let highlights = word_highlights(label, &query, cx);
+                rows.push(
+                    palette_row(("palette-cmd", ix), ix == selected, cx)
                         .child(
-                            h_flex()
-                                .items_center()
-                                .gap_2()
-                                .min_w(px(0.))
-                                .child(
-                                    gpui_kit::component::Icon::new(
-                                        gpui_kit::assets::IconName::Sparkles,
-                                    )
-                                    .with_size(px(12.))
-                                    .text_color(cx.theme().primary),
-                                )
-                                .child(
-                                    div()
-                                        .text_size(px(tokens::UI))
-                                        .text_color(cx.theme().foreground)
-                                        .child(cmd.title),
-                                ),
+                            Icon::new(category_icon(category))
+                                .with_size(px(14.))
+                                .text_color(cx.theme().muted_foreground),
                         )
-                        .when(!shortcut.is_empty(), |el| {
-                            el.child(
-                                div()
-                                    .px_1p5()
-                                    .py_0p5()
-                                    .rounded(px(4.))
-                                    .bg(cx.theme().background)
-                                    .border_1()
-                                    .border_color(cx.theme().border)
-                                    .font_family("SF Mono")
-                                    .text_size(px(tokens::UI_XS))
-                                    .text_color(cx.theme().muted_foreground)
-                                    .child(shortcut),
-                            )
-                        })
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w(px(0.))
+                                .truncate()
+                                .text_size(px(tokens::UI))
+                                .text_color(cx.theme().foreground)
+                                .child(StyledText::new(label).with_highlights(highlights)),
+                        )
+                        .when(!shortcut.is_empty(), |el| el.child(key_hint(shortcut, cx)))
                         .on_click(move |_event, window, cx| {
                             view.update(cx, |this, cx| {
                                 this.palette_open = false;
                                 this.execute_ide_command(cmd_id, window, cx);
                             });
                         })
-                        .into_any_element()
-                })
-                .collect()
+                        .into_any_element(),
+                );
+            }
+            if rows.is_empty() {
+                rows.push(palette_empty("No matching commands", cx).into_any_element());
+            }
+            rows
         } else {
-            matches
-                .into_iter()
-                .enumerate()
-                .map(|(ix, path)| {
-                    let name = path
-                        .file_name()
-                        .and_then(|n| n.to_str())
-                        .unwrap_or_default()
-                        .to_string();
-                    let directory = path
-                        .parent()
-                        .and_then(|p| p.strip_prefix(&self.root).ok())
-                        .map(|p| p.to_string_lossy().to_string())
-                        .filter(|p| !p.is_empty())
-                        .unwrap_or_else(|| ".".to_string());
-                    let badge = self.git_status.get(&path).copied();
-                    let row_path = path.clone();
-                    let is_selected = ix == selected;
-
-                    h_flex()
-                        .id(("palette-item", ix))
-                        .relative()
-                        .w_full()
-                        .h(px(34.))
-                        .items_center()
-                        .justify_between()
-                        .px(px(14.))
-                        .rounded(px(tokens::RADIUS_SM))
-                        .border_1()
-                        .border_color(gpui_kit::transparent_black())
-                        .cursor_pointer()
-                        .when(is_selected, |el| {
-                            el.bg(rgba(0xea7a3c16))
-                                .border_color(rgba(0xea7a3c36))
-                                .child(
-                                    div()
-                                        .absolute()
-                                        .left(px(2.))
-                                        .top(px(6.))
-                                        .bottom(px(6.))
-                                        .w(px(2.5))
-                                        .rounded(px(2.))
-                                        .bg(cx.theme().primary),
-                                )
-                        })
-                        .when(!is_selected, |el| el.hover(|s| s.bg(rgba(0xffffff08))))
+            let query = self.palette_input.read(cx).value().trim().to_string();
+            let mut rows = Vec::new();
+            if query.is_empty() && !matches.is_empty() {
+                rows.push(palette_section("Recently opened", true, cx).into_any_element());
+            }
+            for (ix, path) in matches.into_iter().enumerate() {
+                let name = path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or_default()
+                    .to_string();
+                let directory = path
+                    .parent()
+                    .and_then(|p| p.strip_prefix(&self.root).ok())
+                    .map(|p| p.to_string_lossy().to_string())
+                    .unwrap_or_default();
+                let badge = self.git_status.get(&path).copied();
+                let highlights = fuzzy_highlights(&name, &query, cx);
+                let row_path = path.clone();
+                let view = view.clone();
+                rows.push(
+                    palette_row(("palette-item", ix), ix == selected, cx)
+                        .child(render_file_icon(&name))
                         .child(
                             h_flex()
-                                .items_center()
-                                .gap_2()
+                                .flex_1()
                                 .min_w(px(0.))
-                                .child(render_file_icon(&name))
+                                .items_baseline()
+                                .gap(px(tokens::SPACE_4))
                                 .child(
                                     div()
+                                        .flex_shrink_0()
                                         .text_size(px(tokens::UI))
                                         .text_color(cx.theme().foreground)
-                                        .child(name),
-                                ),
-                        )
-                        .child(
-                            h_flex()
-                                .items_center()
-                                .gap_2()
+                                        .child(StyledText::new(name).with_highlights(highlights)),
+                                )
                                 .child(
                                     div()
+                                        .min_w(px(0.))
+                                        .truncate()
                                         .text_size(px(tokens::UI_SM))
                                         .text_color(cx.theme().muted_foreground)
                                         .child(directory),
-                                )
-                                .when_some(badge, |el, letter| {
-                                    el.child(
-                                        div()
-                                            .text_size(px(10.))
-                                            .font_medium()
-                                            .text_color(cx.theme().warning)
-                                            .child(letter.to_string()),
-                                    )
-                                }),
+                                ),
                         )
-                        .on_click({
-                            let view = view.clone();
-                            move |_event, window, cx| {
-                                view.update(cx, |this, cx| {
-                                    this.open_path(row_path.clone(), window, cx);
-                                    this.palette_open = false;
-                                    cx.notify();
-                                });
-                            }
+                        .when_some(badge, |el, letter| {
+                            el.child(
+                                div()
+                                    .flex_shrink_0()
+                                    .text_size(px(10.))
+                                    .font_medium()
+                                    .text_color(cx.theme().warning)
+                                    .child(letter.to_string()),
+                            )
                         })
-                        .into_any_element()
-                })
-                .collect()
+                        .on_click(move |_event, window, cx| {
+                            view.update(cx, |this, cx| {
+                                this.open_path(row_path.clone(), window, cx);
+                                this.palette_open = false;
+                                cx.notify();
+                            });
+                        })
+                        .into_any_element(),
+                );
+            }
+            if rows.is_empty() {
+                rows.push(palette_empty("No matching files", cx).into_any_element());
+            }
+            rows
+        };
+
+        let (mode_icon, mode) = if is_ws_mode {
+            (IconName::Hash, PaletteMode::Workspace)
+        } else if is_sym_mode {
+            (IconName::AtSign, PaletteMode::Symbols)
+        } else if is_cmd_mode {
+            (IconName::Command, PaletteMode::Commands)
+        } else {
+            (IconName::Search, PaletteMode::Files)
         };
 
         Some(
@@ -980,6 +986,9 @@ impl DartIde {
                 .inset_0()
                 .flex()
                 .justify_center()
+                // Without this the card stretches to its max height and a
+                // short list leaves a void under the footer.
+                .items_start()
                 .pt(px(80.))
                 .bg(rgba(0x00000066))
                 .child(
@@ -995,11 +1004,17 @@ impl DartIde {
                         .child(
                             h_flex()
                                 .h(px(48.))
+                                .flex_shrink_0()
                                 .px(px(16.))
-                                .gap_2()
+                                .gap(px(10.))
                                 .items_center()
                                 .border_b_1()
                                 .border_color(cx.theme().border)
+                                .child(
+                                    Icon::new(mode_icon)
+                                        .with_size(px(15.))
+                                        .text_color(cx.theme().muted_foreground),
+                                )
                                 .child(
                                     div()
                                         .flex_1()
@@ -1012,26 +1027,208 @@ impl DartIde {
                         .child(
                             v_flex()
                                 .id("palette-list")
-                                .p_2()
-                                .gap(px(tokens::SPACE_1))
+                                // Only the list gives way when the card hits
+                                // its max height; header and footer keep
+                                // their size.
+                                .flex_1()
+                                .min_h(px(0.))
+                                .px(px(6.))
+                                .pb(px(6.))
+                                .gap(px(1.))
                                 .overflow_y_scroll()
                                 .children(rows),
                         )
                         .child(
                             h_flex()
-                                .px_3()
-                                .py_1p5()
-                                .gap_3()
+                                .h(px(40.))
+                                .flex_shrink_0()
+                                .px(px(12.))
+                                .gap(px(6.))
+                                .items_center()
                                 .border_t_1()
                                 .border_color(cx.theme().border)
                                 .text_size(px(tokens::UI_XS))
                                 .text_color(cx.theme().muted_foreground)
-                                .child("\u{2191}\u{2193} Navigate")
-                                .child("\u{21b5} Execute / Open")
-                                .child("> Commands (\u{2318}\u{21e7}P)")
-                                .child("Esc Dismiss"),
+                                .children(PaletteMode::ALL.iter().map(|m| mode_chip(*m, *m == mode, cx)))
+                                .child(div().flex_1())
+                                .child(key_hint("\u{2191}\u{2193}".into(), cx))
+                                .child(div().mr(px(6.)).child("move"))
+                                .child(key_hint("\u{21b5}".into(), cx))
+                                .child(div().mr(px(6.)).child("open"))
+                                .child(key_hint("esc".into(), cx))
+                                .child("close"),
                         ),
                 ),
         )
     }
+}
+
+/// The palette's modes, by the prefix that selects each.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PaletteMode {
+    Files,
+    Commands,
+    Symbols,
+    Workspace,
+}
+
+impl PaletteMode {
+    const ALL: [PaletteMode; 4] = [Self::Files, Self::Commands, Self::Symbols, Self::Workspace];
+
+    fn label(self) -> (&'static str, &'static str) {
+        match self {
+            Self::Files => ("", "Files"),
+            Self::Commands => (">", "Commands"),
+            Self::Symbols => ("@", "Symbols"),
+            Self::Workspace => ("#", "Workspace"),
+        }
+    }
+}
+
+/// A footer chip naming a mode and the prefix that opens it; the current
+/// mode is lit.
+fn mode_chip(mode: PaletteMode, active: bool, cx: &App) -> Div {
+    let (prefix, label) = mode.label();
+    h_flex()
+        .h(px(22.))
+        .px(px(8.))
+        .gap(px(4.))
+        .items_center()
+        .rounded(px(tokens::RADIUS_BADGE))
+        .when(active, |el| el.bg(cx.theme().list_hover).text_color(cx.theme().foreground))
+        .when(!prefix.is_empty(), |el| {
+            el.child(
+                div()
+                    .font_family(cx.theme().mono_font_family.clone())
+                    .text_color(cx.theme().primary)
+                    .child(prefix),
+            )
+        })
+        .child(label)
+}
+
+/// A small keycap.
+fn key_hint(text: SharedString, cx: &App) -> Div {
+    div()
+        .flex_shrink_0()
+        .px(px(5.))
+        .h(px(18.))
+        .flex()
+        .items_center()
+        .rounded(px(tokens::RADIUS_BADGE))
+        .border_1()
+        .border_color(cx.theme().border)
+        .bg(cx.theme().background)
+        .font_family(cx.theme().mono_font_family.clone())
+        .text_size(px(tokens::UI_XS))
+        .text_color(cx.theme().muted_foreground)
+        .child(text)
+}
+
+/// One selectable palette row; callers add icon, text and trailing bits.
+fn palette_row(id: (&'static str, usize), selected: bool, cx: &App) -> Stateful<Div> {
+    let hover = cx.theme().list_hover;
+    h_flex()
+        .id(id)
+        .w_full()
+        .h(px(32.))
+        .flex_shrink_0()
+        .px(px(10.))
+        .gap(px(10.))
+        .items_center()
+        .rounded(px(tokens::RADIUS_SM))
+        .cursor_pointer()
+        .when(selected, |el| el.bg(tokens::accent_dim()))
+        .when(!selected, move |el| el.hover(move |s| s.bg(hover)))
+}
+
+fn palette_section(label: &'static str, first: bool, cx: &App) -> Div {
+    div()
+        .px(px(10.))
+        .pt(px(if first { 8. } else { 12. }))
+        .pb(px(4.))
+        .text_size(px(tokens::UI_XS))
+        .font_medium()
+        .text_color(cx.theme().muted_foreground)
+        .child(label)
+}
+
+fn palette_empty(text: &'static str, cx: &App) -> Div {
+    div()
+        .px(px(10.))
+        .py(px(18.))
+        .text_size(px(tokens::UI_SM))
+        .text_color(cx.theme().muted_foreground)
+        .child(text)
+}
+
+fn category_icon(category: &str) -> IconName {
+    match category {
+        "Git" => IconName::GitBranch,
+        "Diff" => IconName::GitCompare,
+        "View" => IconName::PanelsTopLeft,
+        "Search" => IconName::Search,
+        "Editor" => IconName::Code,
+        "File" => IconName::File,
+        "Flutter" => IconName::Zap,
+        "Test" => IconName::FlaskConical,
+        "Debug" => IconName::Bug,
+        "Simulator" => IconName::Smartphone,
+        "Preferences" => IconName::Settings,
+        "Help" => IconName::Info,
+        _ => IconName::Command,
+    }
+}
+
+fn match_style(cx: &App) -> HighlightStyle {
+    HighlightStyle {
+        color: Some(cx.theme().primary),
+        font_weight: Some(FontWeight::MEDIUM),
+        ..Default::default()
+    }
+}
+
+/// Each query word's first case-insensitive occurrence in `text`, merged
+/// and sorted for `StyledText`.
+fn word_highlights(text: &str, query: &str, cx: &App) -> Vec<(Range<usize>, HighlightStyle)> {
+    let lower = text.to_lowercase();
+    if lower.len() != text.len() {
+        return Vec::new();
+    }
+    let mut ranges: Vec<Range<usize>> = query
+        .split_whitespace()
+        .filter_map(|word| lower.find(&word.to_lowercase()).map(|at| at..at + word.len()))
+        .collect();
+    merge_ranges(&mut ranges);
+    let style = match_style(cx);
+    ranges.into_iter().map(|r| (r, style)).collect()
+}
+
+/// The query's characters picked out of `text` in order (the way fuzzy file
+/// matching reads), or nothing when they don't all appear.
+fn fuzzy_highlights(text: &str, query: &str, cx: &App) -> Vec<(Range<usize>, HighlightStyle)> {
+    let mut ranges: Vec<Range<usize>> = Vec::new();
+    let mut chars = text.char_indices();
+    for q in query.chars().filter(|c| !c.is_whitespace()) {
+        let found = chars.by_ref().find(|(_, c)| c.eq_ignore_ascii_case(&q));
+        match found {
+            Some((at, c)) => ranges.push(at..at + c.len_utf8()),
+            None => return Vec::new(),
+        }
+    }
+    merge_ranges(&mut ranges);
+    let style = match_style(cx);
+    ranges.into_iter().map(|r| (r, style)).collect()
+}
+
+fn merge_ranges(ranges: &mut Vec<Range<usize>>) {
+    ranges.sort_by_key(|r| r.start);
+    let mut merged: Vec<Range<usize>> = Vec::with_capacity(ranges.len());
+    for r in ranges.drain(..) {
+        match merged.last_mut() {
+            Some(last) if r.start <= last.end => last.end = last.end.max(r.end),
+            _ => merged.push(r),
+        }
+    }
+    *ranges = merged;
 }
