@@ -18,6 +18,8 @@ image = { version = "0.25", default-features = false, features = ["png", "jpeg",
 async-channel.workspace = true
 alacritty_terminal.workspace = true
 libc = "0.2"
+base64 = "0.22"
+wry = { version = "0.57", default-features = false, features = ["devtools"] }
 core-buffer = { path = "../core-buffer" }
 core-flutter = { path = "../core-flutter" }
 core-syntax = { path = "../core-syntax" }

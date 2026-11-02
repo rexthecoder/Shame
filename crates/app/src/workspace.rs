@@ -366,6 +366,7 @@ impl DartIde {
             "trim_trailing_whitespace": self.save_options.trim_trailing_whitespace,
             "insert_final_newline": self.save_options.insert_final_newline,
             "indent_guides": self.editor_options.indent_guides,
+            "preview_keep_logins": self.web_preview_keep_logins,
             "bracket_colors": self.editor_options.bracket_colors,
         });
         if let Ok(json) = serde_json::to_vec_pretty(&val) {
@@ -433,6 +434,9 @@ impl DartIde {
         }
         if let Some(v) = val.get("insert_final_newline").and_then(|v| v.as_bool()) {
             self.save_options.insert_final_newline = v;
+        }
+        if let Some(v) = val.get("preview_keep_logins").and_then(|v| v.as_bool()) {
+            self.web_preview_keep_logins = v;
         }
         if let Some(v) = val.get("indent_guides").and_then(|v| v.as_bool()) {
             self.editor_options.indent_guides = v;

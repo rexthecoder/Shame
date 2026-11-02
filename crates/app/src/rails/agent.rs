@@ -1530,7 +1530,7 @@ impl DartIde {
                                 this.refresh_git(cx);
                                 this.sync_workspace_files_if_changed(cx);
                                 if this.web_preview_open {
-                                    this.refresh_web_preview(cx);
+                                    this.web_preview_after_save(cx);
                                 }
                                 this.save_agent_conversation();
                                 if failed {

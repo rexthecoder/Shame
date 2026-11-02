@@ -14,6 +14,7 @@ mod agent_indicator;
 mod agent_permission;
 mod agent_plan;
 mod agent_store;
+mod browser;
 mod chrome;
 mod diff_view;
 mod editor;
@@ -477,10 +478,11 @@ pub struct DartIde {
     pub(crate) sim: crate::simulator::SimulatorState,
     pub(crate) web_preview_open: bool,
     pub(crate) web_preview_url: Entity<InputState>,
-    pub(crate) web_preview_image: Option<std::sync::Arc<ImagePreview>>,
     pub(crate) web_preview_viewport: rails::web_preview::WebViewport,
-    pub(crate) web_preview_loading: bool,
-    pub(crate) web_preview_error: Option<String>,
+    /// The live preview's Chrome, frame and page state.
+    pub(crate) web: rails::web_preview::WebPreviewState,
+    /// Keep the preview's Chrome profile (and so its sign-ins) between runs.
+    pub(crate) web_preview_keep_logins: bool,
     pub(crate) agent_open: bool,
     pub(crate) agent: rails::agent::AgentState,
     pub(crate) project_search_input: Entity<InputState>,
@@ -728,10 +730,9 @@ impl DartIde {
             sim: Default::default(),
             web_preview_open: false,
             web_preview_url,
-            web_preview_image: None,
             web_preview_viewport: rails::web_preview::WebViewport::Desktop,
-            web_preview_loading: false,
-            web_preview_error: None,
+            web: Default::default(),
+            web_preview_keep_logins: false,
             agent_open: false,
             agent,
             project_search_input,
@@ -1030,7 +1031,7 @@ impl DartIde {
                     }
                     this.refresh_git(cx);
                     if this.web_preview_open {
-                        this.refresh_web_preview(cx);
+                        this.web_preview_after_save(cx);
                     }
                     let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
                     let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
@@ -1284,6 +1285,7 @@ impl Render for DartIde {
         if window.focused(cx).is_none() {
             window.focus(&self.root_focus, cx);
         }
+        self.web_preview_frame_check(window);
 
         v_flex()
             .size_full()

@@ -482,6 +482,29 @@ impl DartIde {
                 .into_any_element(),
             );
         }
+        if show_cat(4, "web preview browser logins cookies profile sign in") {
+            let on = self.web_preview_keep_logins;
+            let v1 = view.clone();
+            let ctrl = toggle_switch("settings-preview-logins", on)
+                .on_click(move |_e, _w, cx| {
+                    v1.update(cx, |this, cx| {
+                        this.web_preview_keep_logins = !this.web_preview_keep_logins;
+                        this.save_session_state();
+                        // Takes effect when the preview's browser next starts.
+                        this.stop_web_preview(cx);
+                    });
+                })
+                .into_any_element();
+            rows.push(
+                setting_row(
+                    "Keep Preview Sign-ins",
+                    "Remember cookies and logins in the web preview between sessions. Off, every session starts clean."
+                        .to_string(),
+                    ctrl,
+                )
+                .into_any_element(),
+            );
+        }
 
         // Category 5: AI
         if show_cat(5, "ai agent harness claude code opencode codex tool") {
