@@ -20,6 +20,9 @@ license = "MIT"
 gpui-kit = "0.8.0"
 anyhow = "1"
 ropey = "2.0.0-beta.1"
+# File search + content grep for the workspace: one memory-resident index per
+# project instead of a full filesystem walk per keystroke.
+fff-search = "0.11"
 tree-sitter = "0.27.1"
 tree-sitter-dart = "0.2.0"
 lsp-types = "0.97.0"

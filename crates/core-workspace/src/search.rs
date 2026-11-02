@@ -26,7 +26,7 @@ const MAX_FILE_BYTES: u64 = 2 * 1024 * 1024;
 /// Stop after this many hits. The panel only shows the first 150, but a
 /// common query in a monorepo can otherwise produce a million matches and
 /// stall the UI.
-const MAX_MATCHES: usize = 5_000;
+pub(crate) const MAX_MATCHES: usize = 5_000;
 
 const BINARY_EXTENSIONS: &[&str] = &[
     "png", "jpg", "jpeg", "gif", "webp", "ico", "bmp", "tiff", "psd", "mp3", "mp4", "mov", "avi",
@@ -51,6 +51,11 @@ pub struct SearchMatch {
 pub struct SearchResults {
     pub matches: Vec<SearchMatch>,
     pub truncated: bool,
+    /// The text that was literally searched, with query syntax (`*.dart`,
+    /// `!test/`) parsed out. The editor's find bar is single-line and knows
+    /// nothing about that syntax, so it is given this instead of the raw
+    /// query.
+    pub query_text: String,
 }
 
 /// Search every text file under `root` for `query`. Matching is a
@@ -58,12 +63,14 @@ pub struct SearchResults {
 /// those lines in order — pasting a block of code or a doc comment works the
 /// way people expect.
 pub fn search_text(root: &Path, query: &str) -> SearchResults {
-    let Some(query) = Query::new(query) else {
+    let Some(parsed) = Query::new(query) else {
         return SearchResults::default();
     };
     let mut files = Vec::new();
     collect_files(root, &mut files);
-    search_files_with(&files, &query)
+    let mut results = search_files_with(&files, &parsed);
+    results.query_text = query.to_string();
+    results
 }
 
 struct Query {
@@ -101,6 +108,23 @@ impl Query {
             longest_word,
         })
     }
+}
+
+/// True when `path` is one the rest of the IDE shows: no hidden or
+/// generated directory on the way down. fff's own walk applies `.gitignore`
+/// and hides dotfiles inside a git repository, but a plain folder has no
+/// `.gitignore` to read, so `build/`, `.dart_tool/` and friends come back
+/// from it — filter them here so search and Quick Open agree with the tree.
+pub(crate) fn is_visible_path(root: &Path, path: &Path) -> bool {
+    let Ok(relative) = path.strip_prefix(root) else {
+        return false;
+    };
+    relative.components().all(|component| match component {
+        std::path::Component::Normal(name) => name.to_str().is_some_and(|name| {
+            !name.starts_with('.') && !IGNORED_NAMES.contains(&name)
+        }),
+        _ => true,
+    })
 }
 
 fn search_files_with(paths: &[PathBuf], query: &Query) -> SearchResults {
@@ -153,7 +177,11 @@ fn search_files_with(paths: &[PathBuf], query: &Query) -> SearchResults {
     let truncated = matches.len() >= MAX_MATCHES;
     matches.truncate(MAX_MATCHES);
     sort_matches(&mut matches);
-    SearchResults { matches, truncated }
+    SearchResults {
+        matches,
+        truncated,
+        query_text: String::new(),
+    }
 }
 
 fn search_files_sequential(paths: &[PathBuf], query: &Query) -> SearchResults {
@@ -167,7 +195,11 @@ fn search_files_sequential(paths: &[PathBuf], query: &Query) -> SearchResults {
     let truncated = matches.len() >= MAX_MATCHES;
     matches.truncate(MAX_MATCHES);
     sort_matches(&mut matches);
-    SearchResults { matches, truncated }
+    SearchResults {
+        matches,
+        truncated,
+        query_text: String::new(),
+    }
 }
 
 fn search_one_file(path: &Path, query: &Query) -> Vec<SearchMatch> {
@@ -189,7 +221,7 @@ fn search_one_file(path: &Path, query: &Query) -> Vec<SearchMatch> {
         .collect()
 }
 
-fn sort_matches(matches: &mut [SearchMatch]) {
+pub(crate) fn sort_matches(matches: &mut [SearchMatch]) {
     matches.sort_by(|a, b| {
         a.path
             .cmp(&b.path)

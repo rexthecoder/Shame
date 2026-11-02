@@ -8,6 +8,7 @@ impl DartIde {
     pub(crate) fn schedule_project_search(&mut self, query: String, cx: &mut Context<Self>) {
         self.project_search_matches.clear();
         self.project_search_truncated = false;
+        self.project_search_literal.clear();
         if query.is_empty() {
             self.project_search_pending = false;
             cx.notify();
@@ -39,15 +40,21 @@ impl DartIde {
         }
 
         let root = self.root.clone();
+        let index = self.search_index.clone();
         self.project_search_pending = true;
         self.project_search_matches.clear();
         self.project_search_truncated = false;
+        self.project_search_literal.clear();
         cx.notify();
 
         let q = query.clone();
         let (tx, rx) = async_channel::bounded(1);
         std::thread::spawn(move || {
-            let _ = tx.send_blocking(core_workspace::search_text(&root, &q));
+            let _ = tx.send_blocking(core_workspace::search_workspace(
+                index.as_deref(),
+                &root,
+                &q,
+            ));
         });
         cx.spawn(async move |weak, cx| {
             let Ok(results) = rx.recv().await else { return };
@@ -55,6 +62,7 @@ impl DartIde {
                 if this.project_search_input.read(cx).value().trim() == query {
                     this.project_search_matches = results.matches;
                     this.project_search_truncated = results.truncated;
+                    this.project_search_literal = results.query_text;
                     this.project_search_pending = false;
                     cx.notify();
                 }
@@ -251,7 +259,18 @@ impl DartIde {
     }
 
     pub(crate) fn palette_matches(&self, cx: &Context<Self>) -> Vec<PathBuf> {
-        let query = self.palette_input.read(cx).value().to_lowercase();
+        let raw = self.palette_input.read(cx).value();
+        // fff ranks by match quality, recency and query history; an empty
+        // query opens on the files used most.
+        if let Some(index) = &self.search_index
+            && let Some(paths) = index.find_files(&raw, 20)
+            && !paths.is_empty()
+        {
+            return paths;
+        }
+        // Until the index has finished its first scan, filter the tree's file
+        // list the cheap way instead.
+        let query = raw.to_lowercase();
         self.all_files
             .iter()
             .filter(|path| {
@@ -300,7 +319,11 @@ impl DartIde {
         let Some(path) = matches.get(self.palette_selected).cloned() else {
             return;
         };
-        self.open_path(path, window, cx);
+        let query = self.palette_input.read(cx).value().to_string();
+        self.open_path(path.clone(), window, cx);
+        if let Some(index) = &self.search_index {
+            index.note_query_pick(&query, &path);
+        }
         self.palette_open = false;
         cx.notify();
     }

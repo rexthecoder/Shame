@@ -1,8 +1,56 @@
 //! Workspace lifecycle: open/close folders, file tree, session persistence.
 
+use std::hash::{Hash, Hasher};
+
 use super::*;
 
 impl DartIde {
+    /// One config directory per workspace root, for the search index's
+    /// frecency databases. Losing it only costs warm ranking, never results.
+    fn search_index_state_dir(root: &Path) -> Option<PathBuf> {
+        let home = std::env::var("HOME").ok()?;
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        root.hash(&mut hasher);
+        Some(
+            Path::new(&home)
+                .join(".config/shame/index")
+                .join(format!("{:016x}", hasher.finish())),
+        )
+    }
+
+    /// Start the warm search index for the open folder (or restart it after
+    /// switching folders). fff walks the tree and watches it on its own
+    /// threads; until it is ready `search_index` stays `None` and project
+    /// search falls back to reading files from disk.
+    pub(crate) fn start_search_index(&mut self, cx: &mut Context<Self>) {
+        self.search_index = None;
+        if !self.has_workspace {
+            return;
+        }
+        let root = self.root.clone();
+        let Some(state_dir) = Self::search_index_state_dir(&root) else {
+            return;
+        };
+        let (tx, rx) = async_channel::bounded(1);
+        let index_root = root.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send_blocking(core_workspace::SearchIndex::open(&index_root, &state_dir));
+        });
+        cx.spawn(async move |weak, cx| {
+            let Ok(index) = rx.recv().await else { return };
+            let Some(index) = index else { return };
+            let _ = weak.update(cx, |this, cx| {
+                // A different folder may have been opened while this one was
+                // being set up; never attach an index to the wrong root.
+                if this.has_workspace && this.root == root {
+                    this.search_index = Some(index);
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
     /// Background check: if files were added, renamed, or deleted on disk outside the editor,
     /// refresh `all_files` and `tree_state` automatically without cloning `all_files` on the UI thread.
     pub(crate) fn sync_workspace_files_if_changed(&mut self, cx: &mut Context<Self>) {
@@ -140,6 +188,7 @@ impl DartIde {
         self.diff = None;
         self.refresh_git(cx);
         self.reload_launch_configs(cx);
+        self.start_search_index(cx);
         if self.is_flutter_or_dart_workspace() {
             self.refresh_devices(cx);
         }
@@ -161,6 +210,7 @@ impl DartIde {
         self.diff = None;
         self.all_files.clear();
         self.all_files_hash = 0;
+        self.search_index = None;
         self.git.status = None;
         self.git.stats.clear();
         self.git.branches.clear();

@@ -1,5 +1,31 @@
 # Milestone notes
 
+## Search: one warm index per workspace
+
+- **Project search stopped re-reading the project.** ⇧⌘F used to walk every
+  file on every paused keystroke. It now asks [fff](https://github.com/dmtrKovalenko/fff)
+  (`fff-search`) — one index per open folder, built once in the background,
+  kept current by its file watcher, and answering content queries from
+  memory. Added as a `core-workspace` dependency so the UI layer only sees
+  `SearchIndex`, not fff's API.
+- **Quick Open ranks instead of filters.** ⌘P used to substring-filter the
+  tree's file list in alphabetical order. It now fuzzy-matches (typo
+  tolerant, so `mainscreen` finds `main_screen.dart`) and ranks by match
+  quality plus frecency: files you open feed a per-workspace database, and
+  re-picking a file for the same query boosts it next time. An empty ⌘P
+  opens on the files used most.
+- **The old scan is still the fallback, deliberately.** Before the first
+  walk finishes there is no index, and fff matches inside a single line, so
+  a pasted block that the file wraps differently still needs the
+  whitespace-collapsed phrase scan. `search_workspace` tries the index first
+  and falls back only when it cannot answer. Quick Open keeps the tree's
+  substring filter for the same window, and for paths the walker hides
+  (dot-directories) that fff does not index.
+- **Index state is disposable.** Frecency and query history live in
+  `~/.config/shame/index/<hash of the root>/`, one folder per workspace.
+  Deleting it loses warm ranking, never results; the picker is dropped when
+  the folder closes, which stops its watcher.
+
 ## Global search: phrases, speed, and honest progress
 
 - **Pasted blocks survive the search box.** The single-line input deleted

@@ -486,6 +486,9 @@ pub struct DartIde {
     pub(crate) project_search_input: Entity<InputState>,
     pub(crate) project_search_matches: Vec<core_workspace::SearchMatch>,
     pub(crate) project_search_truncated: bool,
+    /// The literal text the results matched (query syntax like `*.dart`
+    /// parsed out), handed to the editor's find bar when a result is opened.
+    pub(crate) project_search_literal: String,
     pub(crate) project_search_pending: bool,
     pub(crate) project_replace_input: Entity<InputState>,
     pub(crate) project_replace_status: Option<String>,
@@ -518,6 +521,10 @@ pub struct DartIde {
     pub(crate) tab_overflow_open: bool,
     pub(crate) all_files: Vec<PathBuf>,
     pub(crate) all_files_hash: u64,
+    /// Warm search index for this workspace (fff). `None` until the first
+    /// scan finishes and after closing the folder; everything falls back to
+    /// walking the disk while it is missing.
+    pub(crate) search_index: Option<std::sync::Arc<core_workspace::SearchIndex>>,
     pub(crate) syncing_files: bool,
     pub(crate) palette_open: bool,
     pub(crate) palette_input: Entity<InputState>,
@@ -715,6 +722,7 @@ impl DartIde {
             project_search_input,
             project_search_matches: Vec::new(),
             project_search_truncated: false,
+            project_search_literal: String::new(),
             project_search_pending: false,
             project_replace_input,
             project_replace_status: None,
@@ -744,6 +752,7 @@ impl DartIde {
             tab_overflow_open: false,
             all_files_hash: hash_paths(&all_files),
             all_files,
+            search_index: None,
             syncing_files: false,
             palette_open: false,
             palette_input,
@@ -810,6 +819,7 @@ impl DartIde {
                 this.refresh_devices(cx);
             }
             this.refresh_git(cx);
+            this.start_search_index(cx);
         } else {
             this.restore_preferences_only(window, cx);
         }

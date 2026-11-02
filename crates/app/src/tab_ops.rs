@@ -115,6 +115,14 @@ impl DartIde {
         self.tab_overflow_open = false;
         self.tab_scroll.scroll_to_item(self.active_tab);
 
+        // Opening a file feeds the search index's frecency ranking, so the
+        // files used most come first in Quick Open.
+        if let Some(index) = &self.search_index
+            && let Some(path) = self.tabs.get(self.active_tab).and_then(|t| t.path.as_ref())
+        {
+            index.note_opened(path);
+        }
+
         if let Some(editor) = self.active_editor() {
             let focus_handle = editor.read(cx).focus_handle(cx);
             window.focus(&focus_handle, cx);

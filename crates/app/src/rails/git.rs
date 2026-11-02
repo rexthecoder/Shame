@@ -337,7 +337,14 @@ impl DartIde {
                                 let preview = m.line_text.trim().to_string();
                                 let phrase = m.phrase;
                                 let line_text = m.line_text.clone();
-                                let q = query.clone();
+                                // Constraints (`*.dart`, `!test/`) are not
+                                // text, so the find bar gets what fff actually
+                                // matched.
+                                let q = if self.project_search_literal.is_empty() {
+                                    query.clone()
+                                } else {
+                                    self.project_search_literal.clone()
+                                };
 
                                 v_flex()
                                     .id(("proj-search-hit", ix))
