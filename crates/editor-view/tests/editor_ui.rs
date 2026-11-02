@@ -219,3 +219,20 @@ fn search_toggles_narrow_the_matches(cx: &mut TestAppContext) {
     cx.update(|_, cx| editor.update(cx, |e, cx| e.set_search_options(true, true, cx)));
     assert_eq!(status(cx), 1, "whole word also drops `food`");
 }
+
+#[gpui::test]
+fn shift_types_uppercase(cx: &mut TestAppContext) {
+    let (editor, cx) = open_editor(cx, "");
+    cx.simulate_keystrokes("shift-h i");
+    assert_eq!(text(&editor, cx), "Hi");
+}
+
+#[gpui::test]
+fn commenting_many_lines_undoes_in_one_step(cx: &mut TestAppContext) {
+    let original = "void a() {}\nvoid b() {}\nvoid c() {}\nvoid d() {}\n";
+    let (editor, cx) = open_editor(cx, original);
+    cx.simulate_keystrokes("cmd-a cmd-/");
+    assert_ne!(text(&editor, cx), original);
+    cx.simulate_keystrokes("cmd-z");
+    assert_eq!(text(&editor, cx), original);
+}

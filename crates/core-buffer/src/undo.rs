@@ -24,6 +24,8 @@ struct Node {
     children: Vec<usize>,
     /// The edit that transforms `parent`'s text into this node's text.
     edit: EditOp,
+    /// Edits made inside one transaction share a group and undo together.
+    group: Option<u64>,
 }
 
 /// An undo **tree**, not a stack: undoing and then making a new edit opens a
@@ -33,6 +35,10 @@ struct Node {
 pub struct UndoTree {
     nodes: Vec<Node>,
     current: usize,
+    /// Nesting depth of open transactions; only the outermost one counts.
+    group_depth: usize,
+    open_group: Option<u64>,
+    next_group: u64,
 }
 
 impl Default for UndoTree {
@@ -46,8 +52,12 @@ impl Default for UndoTree {
                     removed: String::new(),
                     inserted: String::new(),
                 },
+                group: None,
             }],
             current: 0,
+            group_depth: 0,
+            open_group: None,
+            next_group: 0,
         }
     }
 }
@@ -60,23 +70,62 @@ impl UndoTree {
             parent: Some(parent),
             children: Vec::new(),
             edit,
+            group: self.open_group,
         });
         self.nodes[parent].children.push(idx);
         self.current = idx;
     }
 
-    pub(crate) fn undo(&mut self) -> Option<EditOp> {
-        let parent = self.nodes[self.current].parent?;
-        let inverse = self.nodes[self.current].edit.inverse();
-        self.current = parent;
-        Some(inverse)
+    /// Start a transaction: every edit recorded until the matching
+    /// [`Self::end_group`] undoes and redoes as one step. Nests.
+    pub(crate) fn begin_group(&mut self) {
+        if self.group_depth == 0 {
+            self.open_group = Some(self.next_group);
+            self.next_group += 1;
+        }
+        self.group_depth += 1;
     }
 
-    pub(crate) fn redo(&mut self) -> Option<EditOp> {
-        let child = *self.nodes[self.current].children.last()?;
-        let edit = self.nodes[child].edit.clone();
-        self.current = child;
-        Some(edit)
+    pub(crate) fn end_group(&mut self) {
+        self.group_depth = self.group_depth.saturating_sub(1);
+        if self.group_depth == 0 {
+            self.open_group = None;
+        }
+    }
+
+    /// The inverses of the current node's whole group, newest first, in the
+    /// order they must be applied.
+    pub(crate) fn undo(&mut self) -> Vec<EditOp> {
+        let mut ops = Vec::new();
+        let Some(group) = self.nodes[self.current].parent.map(|_| self.nodes[self.current].group)
+        else {
+            return ops;
+        };
+        while let Some(parent) = self.nodes[self.current].parent {
+            ops.push(self.nodes[self.current].edit.inverse());
+            self.current = parent;
+            if group.is_none() || self.nodes[self.current].group != group {
+                break;
+            }
+        }
+        ops
+    }
+
+    /// The edits of the next group along the newest branch, oldest first.
+    pub(crate) fn redo(&mut self) -> Vec<EditOp> {
+        let mut ops = Vec::new();
+        let Some(&first) = self.nodes[self.current].children.last() else {
+            return ops;
+        };
+        let group = self.nodes[first].group;
+        while let Some(&child) = self.nodes[self.current].children.last() {
+            if !ops.is_empty() && (group.is_none() || self.nodes[child].group != group) {
+                break;
+            }
+            ops.push(self.nodes[child].edit.clone());
+            self.current = child;
+        }
+        ops
     }
 
     pub fn can_undo(&self) -> bool {
@@ -120,7 +169,7 @@ mod tests {
         tree.record(edit(0, "", "hi"));
 
         assert!(tree.can_undo());
-        let inverse = tree.undo().unwrap();
+        let inverse = tree.undo().pop().unwrap();
         assert_eq!(inverse.removed, "hi");
         assert_eq!(inverse.inserted, "");
         assert!(!tree.can_undo());
@@ -133,7 +182,7 @@ mod tests {
         tree.undo();
 
         assert!(tree.can_redo());
-        let replay = tree.redo().unwrap();
+        let replay = tree.redo().pop().unwrap();
         assert_eq!(replay.removed, "");
         assert_eq!(replay.inserted, "hi");
     }

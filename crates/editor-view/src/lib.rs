@@ -1654,6 +1654,8 @@ impl EditorView {
             !trimmed.is_empty() && trimmed.starts_with("//")
         });
 
+        // Every line's edit is one undo step, from a menu click too.
+        self.buffer.begin_transaction();
         for line_idx in (start_line..=end_line).rev() {
             let line_start = self.buffer.line_to_byte(line_idx);
             let line = self.buffer.line(line_idx);
@@ -1670,6 +1672,7 @@ impl EditorView {
                 self.buffer.insert(comment_at, "// ");
             }
         }
+        self.buffer.end_transaction();
         cx.notify();
     }
 
@@ -1782,7 +1785,15 @@ impl EditorView {
         self.insert_at_cursor(&text, cx);
     }
 
-    fn on_key_down(&mut self, event: &KeyDownEvent, _window: &mut Window, cx: &mut Context<Self>) {
+    fn on_key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        // Whatever one key press does (comment a block, type at every
+        // cursor, wrap a selection) undoes as one step.
+        self.buffer.begin_transaction();
+        self.handle_key_down(event, window, cx);
+        self.buffer.end_transaction();
+    }
+
+    fn handle_key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         self.clear_hover(cx);
         let keystroke = &event.keystroke;
         let primary_mod = keystroke.modifiers.platform || keystroke.modifiers.control;
@@ -1915,7 +1926,13 @@ impl EditorView {
             }
             _ => {
                 if let Some(text) = &keystroke.key_char {
-                    self.handle_char_input(text, cx);
+                    // GPUI builds `key_char` from the key and Shift/Option
+                    // only, so Caps Lock would otherwise type lowercase.
+                    if window.capslock().on && !keystroke.modifiers.shift {
+                        self.handle_char_input(&text.to_uppercase(), cx);
+                    } else {
+                        self.handle_char_input(text, cx);
+                    }
                 }
             }
         }

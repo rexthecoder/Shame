@@ -102,6 +102,46 @@ pub(crate) struct TerminalSession {
     /// ⌃C was pressed before the process had started; interrupt it as soon as it does.
     pub(crate) interrupt_pending: bool,
     pub(crate) scroll_handle: ScrollHandle,
+    /// Text selected with the mouse: `(anchor, head)` as `(line, byte)` in
+    /// each line's plain text. Order is the drag's, not the document's.
+    pub(crate) selection: Option<(TermPos, TermPos)>,
+    /// The left button went down on a line and has not come up yet.
+    pub(crate) selecting: bool,
+}
+
+/// A spot in the scrollback: line index and byte offset in its plain text.
+pub(crate) type TermPos = (usize, usize);
+
+impl TerminalLine {
+    /// The line as text, exactly as it is drawn (prompt included), so
+    /// selection offsets and copied text agree.
+    pub(crate) fn plain_text(&self) -> String {
+        match self {
+            TerminalLine::Command {
+                user_host,
+                dir,
+                command,
+            } => format!("{user_host}:{dir}$ {command}"),
+            TerminalLine::Output { spans, .. } => spans.iter().map(|s| s.text.as_str()).collect(),
+        }
+    }
+}
+
+/// The run of non-whitespace around byte `at` in `text`.
+fn word_bounds(text: &str, at: usize) -> (usize, usize) {
+    let is_word = |c: char| !c.is_whitespace();
+    let mut from = at.min(text.len());
+    while from > 0 && !text.is_char_boundary(from) {
+        from -= 1;
+    }
+    let mut to = from;
+    while let Some(c) = text[..from].chars().next_back().filter(|c| is_word(*c)) {
+        from -= c.len_utf8();
+    }
+    while let Some(c) = text[to..].chars().next().filter(|c| is_word(*c)) {
+        to += c.len_utf8();
+    }
+    (from, to)
 }
 
 impl TerminalSession {
@@ -141,6 +181,8 @@ impl TerminalSession {
             interrupt_sent: false,
             interrupt_pending: false,
             scroll_handle: ScrollHandle::new(),
+            selection: None,
+            selecting: false,
         };
 
         if seed_git_log {
@@ -152,6 +194,66 @@ impl TerminalSession {
     /// A command is running: the prompt is held until it finishes.
     pub(crate) fn is_busy(&self) -> bool {
         self.running_cmd.is_some()
+    }
+
+    /// The selection in document order, if it covers anything.
+    fn selection_span(&self) -> Option<(TermPos, TermPos)> {
+        let (a, b) = self.selection?;
+        let (start, end) = if a <= b { (a, b) } else { (b, a) };
+        (start != end).then_some((start, end))
+    }
+
+    /// The part of line `line` (of byte length `len`) that is selected.
+    pub(crate) fn selected_range_on(&self, line: usize, len: usize) -> Option<Range<usize>> {
+        let ((l0, c0), (l1, c1)) = self.selection_span()?;
+        if line < l0 || line > l1 {
+            return None;
+        }
+        let from = if line == l0 { c0.min(len) } else { 0 };
+        let to = if line == l1 { c1.min(len) } else { len };
+        (from < to).then_some(from..to)
+    }
+
+    /// The selected text, lines joined with newlines.
+    pub(crate) fn selected_text(&self) -> Option<String> {
+        let ((l0, _), (l1, _)) = self.selection_span()?;
+        let parts: Vec<String> = (l0..=l1.min(self.lines.len().saturating_sub(1)))
+            .filter_map(|ix| {
+                let text = self.lines.get(ix)?.plain_text();
+                let range = self.selected_range_on(ix, text.len()).unwrap_or(0..0);
+                let (mut from, mut to) = (range.start, range.end);
+                while from > 0 && !text.is_char_boundary(from) {
+                    from -= 1;
+                }
+                while to < text.len() && !text.is_char_boundary(to) {
+                    to += 1;
+                }
+                Some(text[from..to].to_string())
+            })
+            .collect();
+        Some(parts.join("\n"))
+    }
+
+    /// Start a selection where the button went down: a plain click starts a
+    /// drag, a double click takes the word, a triple click the line.
+    pub(crate) fn begin_selection(&mut self, line: usize, at: usize, clicks: usize) {
+        let text = self.lines.get(line).map(TerminalLine::plain_text).unwrap_or_default();
+        let at = at.min(text.len());
+        self.selection = Some(match clicks {
+            2 => {
+                let (from, to) = word_bounds(&text, at);
+                ((line, from), (line, to))
+            }
+            n if n >= 3 => ((line, 0), (line, text.len())),
+            _ => ((line, at), (line, at)),
+        });
+        self.selecting = clicks < 2;
+    }
+
+    pub(crate) fn select_all(&mut self) {
+        let last = self.lines.len().checked_sub(1);
+        self.selection = last.map(|last| ((0, 0), (last, self.lines[last].plain_text().len())));
+        self.selecting = false;
     }
 
     pub(crate) fn dir_label(&self) -> String {
@@ -695,6 +797,23 @@ impl DartIde {
         if (modifiers.platform && key == "k") || (modifiers.control && key == "l") {
             if let Some(session) = self.active_terminal_mut() {
                 session.lines.clear();
+                session.selection = None;
+                cx.notify();
+            }
+            return;
+        }
+
+        // `⌘C` copies the selection (`Ctrl+C` still interrupts, below);
+        // `⌘A` selects the whole scrollback. Both work while a command runs.
+        if modifiers.platform && key == "c" {
+            if let Some(text) = self.active_terminal().and_then(TerminalSession::selected_text) {
+                cx.write_to_clipboard(ClipboardItem::new_string(text));
+            }
+            return;
+        }
+        if modifiers.platform && key == "a" {
+            if let Some(session) = self.active_terminal_mut() {
+                session.select_all();
                 cx.notify();
             }
             return;
@@ -931,8 +1050,17 @@ impl DartIde {
                     let text_to_insert = keystroke
                         .key_char
                         .as_deref()
-                        .or_else(|| (key.chars().count() == 1).then_some(key));
-                    if let Some(ch_str) = text_to_insert {
+                        .or_else(|| (key.chars().count() == 1).then_some(key))
+                        // GPUI builds `key_char` from the key and Shift/Option
+                        // only, so Caps Lock would otherwise type lowercase.
+                        .map(|ch| {
+                            if window.capslock().on && !modifiers.shift {
+                                ch.to_uppercase()
+                            } else {
+                                ch.to_string()
+                            }
+                        });
+                    if let Some(ch_str) = text_to_insert.as_deref() {
                         if let Some(session) = self.active_terminal_mut() {
                             let idx = session.cursor.min(session.input.len());
                             session.input.insert_str(idx, ch_str);
@@ -962,6 +1090,7 @@ impl DartIde {
         let magenta = cx.theme().magenta;
         let cyan = cx.theme().cyan;
         let primary = cx.theme().primary;
+        let selection_bg = cx.theme().selection.opacity(0.45);
         let is_focused = self.terminal_focus.is_focused(window);
 
         let active_ix = self.active_terminal.min(self.terminals.len().saturating_sub(1));
@@ -1698,18 +1827,26 @@ impl DartIde {
                                 },
                             ));
                         }
-                        div()
-                            .w_full()
-                            .min_w(px(0.))
-                            .min_h(px(20.))
-                            .flex_shrink_0()
-                            .py(px(2.))
-                            .whitespace_normal()
-                            .font_family("SF Mono")
-                            .text_size(px(tokens::MONO))
-                            .text_color(fg)
-                            .child(StyledText::new(text).with_highlights(styles))
-                            .into_any_element()
+                        let (text_el, layout) =
+                            selectable_text(session, line_ix, text, styles, selection_bg);
+                        selectable_row(
+                            div()
+                                .id(("term-cmd", line_ix))
+                                .w_full()
+                                .min_w(px(0.))
+                                .min_h(px(20.))
+                                .flex_shrink_0()
+                                .py(px(2.))
+                                .whitespace_normal()
+                                .font_family("SF Mono")
+                                .text_size(px(tokens::MONO))
+                                .text_color(fg)
+                                .child(text_el),
+                            view,
+                            line_ix,
+                            layout,
+                        )
+                        .into_any_element()
                     }
                     TerminalLine::Output { spans, file_link } => {
                         let mut text = String::new();
@@ -1742,18 +1879,25 @@ impl DartIde {
                             ));
                         }
 
-                        let row = div()
-                            .id(("term-line", line_ix))
-                            .w_full()
-                            .min_w(px(0.))
-                            .min_h(px(20.))
-                            .flex_shrink_0()
-                            .py(px(2.))
-                            .whitespace_normal()
-                            .font_family("SF Mono")
-                            .text_size(px(tokens::MONO))
-                            .text_color(fg)
-                            .child(StyledText::new(text).with_highlights(styles));
+                        let (text_el, layout) =
+                            selectable_text(session, line_ix, text, styles, selection_bg);
+                        let row = selectable_row(
+                            div()
+                                .id(("term-line", line_ix))
+                                .w_full()
+                                .min_w(px(0.))
+                                .min_h(px(20.))
+                                .flex_shrink_0()
+                                .py(px(2.))
+                                .whitespace_normal()
+                                .font_family("SF Mono")
+                                .text_size(px(tokens::MONO))
+                                .text_color(fg)
+                                .child(text_el),
+                            view,
+                            line_ix,
+                            layout,
+                        );
 
                         if let Some((path, line_0, col_0)) = file_link.clone() {
                             let view = view.clone();
@@ -1826,8 +1970,25 @@ impl DartIde {
                 });
             let busy = session.is_busy();
 
+            let end_view = view.clone();
+            let end_selection = move |_: &MouseUpEvent, _: &mut Window, cx: &mut App| {
+                end_view.update(cx, |this, cx| {
+                    if let Some(session) = this.active_terminal_mut()
+                        && session.selecting
+                    {
+                        session.selecting = false;
+                        // A click without a drag selects nothing.
+                        if session.selection.is_some_and(|(a, b)| a == b) {
+                            session.selection = None;
+                        }
+                        cx.notify();
+                    }
+                });
+            };
             v_flex()
                 .id("terminal-scrollback")
+                .on_mouse_up(MouseButton::Left, end_selection.clone())
+                .on_mouse_up_out(MouseButton::Left, end_selection)
                 .flex_1()
                 .w_full()
                 .min_h(px(0.))
@@ -1969,15 +2130,118 @@ impl DartIde {
     }
 }
 
+/// A line's text with the selection painted over its colours, and the
+/// layout that maps a mouse position back to a byte in it.
+fn selectable_text(
+    session: &TerminalSession,
+    line_ix: usize,
+    text: String,
+    styles: Vec<(Range<usize>, HighlightStyle)>,
+    selection_bg: Hsla,
+) -> (StyledText, TextLayout) {
+    let selected = session.selected_range_on(line_ix, text.len()).map(|range| {
+        (
+            range,
+            HighlightStyle {
+                background_color: Some(selection_bg),
+                ..Default::default()
+            },
+        )
+    });
+    let styled = match selected {
+        Some(sel) => StyledText::new(text).with_highlights(combine_highlights(styles, [sel])),
+        None => StyledText::new(text).with_highlights(styles),
+    };
+    let layout = styled.layout().clone();
+    (styled, layout)
+}
+
+/// Mouse selection on one scrollback line: press starts (or, with two or
+/// three clicks, takes a word or the line), dragging over any line extends.
+fn selectable_row(
+    row: Stateful<Div>,
+    view: &Entity<DartIde>,
+    line_ix: usize,
+    layout: TextLayout,
+) -> Stateful<Div> {
+    let down_view = view.clone();
+    let down_layout = layout.clone();
+    let move_view = view.clone();
+    row.cursor_text()
+        .on_mouse_down(MouseButton::Left, move |event, _window, cx| {
+            let at = down_layout.index_for_position(event.position).unwrap_or_else(|ix| ix);
+            down_view.update(cx, |this, cx| {
+                if let Some(session) = this.active_terminal_mut() {
+                    session.begin_selection(line_ix, at, event.click_count);
+                    cx.notify();
+                }
+            });
+        })
+        .on_mouse_move(move |event, _window, cx| {
+            if event.pressed_button != Some(MouseButton::Left) {
+                return;
+            }
+            let at = layout.index_for_position(event.position).unwrap_or_else(|ix| ix);
+            move_view.update(cx, |this, cx| {
+                if let Some(session) = this.active_terminal_mut()
+                    && session.selecting
+                    && let Some((_, head)) = session.selection.as_mut()
+                {
+                    if *head != (line_ix, at) {
+                        *head = (line_ix, at);
+                        cx.notify();
+                    }
+                }
+            });
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        AnsiColor, interrupt_signal, is_plain_cd, kill_args, parse_ansi_line,
-        signal_process_group,
+        AnsiColor, AnsiSpan, TerminalLine, TerminalSession, interrupt_signal, is_plain_cd,
+        kill_args, parse_ansi_line, signal_process_group, word_bounds,
     };
     use std::os::unix::process::CommandExt as _;
     use std::process::Command;
     use std::time::{Duration, Instant};
+
+    fn output(text: &str) -> TerminalLine {
+        TerminalLine::Output {
+            spans: vec![AnsiSpan {
+                text: text.to_string(),
+                color: AnsiColor::Default,
+                bold: false,
+            }],
+            file_link: None,
+        }
+    }
+
+    #[core::prelude::v1::test]
+    fn a_drag_copies_across_lines_in_either_direction() {
+        let mut session = TerminalSession::new(0, std::env::temp_dir(), false);
+        session.lines = vec![output("hello world"), output("second line"), output("third")];
+        // Dragged upwards: from "thi|rd" back to "hello |world".
+        session.begin_selection(2, 3, 1);
+        session.selection.as_mut().unwrap().1 = (0, 6);
+        assert_eq!(session.selected_text().as_deref(), Some("world\nsecond line\nthi"));
+        assert_eq!(session.selected_range_on(1, 11), Some(0..11));
+    }
+
+    #[core::prelude::v1::test]
+    fn clicks_select_nothing_a_word_or_a_line() {
+        let mut session = TerminalSession::new(0, std::env::temp_dir(), false);
+        session.lines = vec![output("cargo build --release")];
+        session.begin_selection(0, 8, 1);
+        assert_eq!(session.selected_text(), None, "a click alone selects nothing");
+        session.begin_selection(0, 8, 2);
+        assert_eq!(session.selected_text().as_deref(), Some("build"));
+        session.begin_selection(0, 8, 3);
+        assert_eq!(session.selected_text().as_deref(), Some("cargo build --release"));
+        session.select_all();
+        assert_eq!(session.selected_text().as_deref(), Some("cargo build --release"));
+        assert_eq!(word_bounds("a  b", 2), (2, 2));
+    }
 
     #[core::prelude::v1::test]
     fn the_first_interrupt_is_polite_and_the_second_is_a_hard_kill() {

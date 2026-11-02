@@ -365,20 +365,41 @@ impl Buffer {
         self.undo_tree.can_redo()
     }
 
-    pub fn undo(&mut self) -> bool {
-        let Some(op) = self.undo_tree.undo() else {
-            return false;
-        };
-        self.apply(&op);
-        true
+    /// Group every edit until [`Self::end_transaction`] into one undo step
+    /// (commenting out a block, typing at several cursors, a formatter's
+    /// edits). Transactions nest; only the outermost one closes the group.
+    pub fn begin_transaction(&mut self) {
+        self.undo_tree.begin_group();
     }
 
+    pub fn end_transaction(&mut self) {
+        self.undo_tree.end_group();
+    }
+
+    /// Run `f` as one undo step.
+    pub fn transact<R>(&mut self, f: impl FnOnce(&mut Self) -> R) -> R {
+        self.begin_transaction();
+        let result = f(self);
+        self.end_transaction();
+        result
+    }
+
+    /// Undo the last step: one edit, or a whole transaction.
+    pub fn undo(&mut self) -> bool {
+        let ops = self.undo_tree.undo();
+        for op in &ops {
+            self.apply(op);
+        }
+        !ops.is_empty()
+    }
+
+    /// Redo the next step: one edit, or a whole transaction.
     pub fn redo(&mut self) -> bool {
-        let Some(op) = self.undo_tree.redo() else {
-            return false;
-        };
-        self.apply(&op);
-        true
+        let ops = self.undo_tree.redo();
+        for op in &ops {
+            self.apply(op);
+        }
+        !ops.is_empty()
     }
 
     fn apply(&mut self, op: &EditOp) {
@@ -651,5 +672,27 @@ mod tests {
         buffer.reload_from_disk().unwrap();
         assert_eq!(buffer.selections().primary().head, 4);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_transaction_undoes_and_redoes_as_one_step() {
+        let mut buffer = Buffer::from_str("a\nb\nc\n");
+        buffer.insert(0, "x");
+        buffer.transact(|b| {
+            b.insert(5, "// ");
+            b.insert(3, "// ");
+            b.insert(0, "// ");
+        });
+        assert_eq!(buffer.text(), "// xa\n// b\n// c\n");
+
+        assert!(buffer.undo());
+        assert_eq!(buffer.text(), "xa\nb\nc\n", "the whole block, not just one line");
+        assert!(buffer.redo());
+        assert_eq!(buffer.text(), "// xa\n// b\n// c\n");
+
+        // Edits outside a transaction stay single steps.
+        buffer.undo();
+        assert!(buffer.undo());
+        assert_eq!(buffer.text(), "a\nb\nc\n");
     }
 }

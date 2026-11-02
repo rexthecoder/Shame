@@ -1173,11 +1173,14 @@ impl EditorView {
 
     pub(crate) fn apply_text_edits(&mut self, mut edits: Vec<TextEdit>, cx: &mut Context<Self>) {
         edits.sort_by_key(|edit| (edit.range.start.line, edit.range.start.character));
+        // A format or quick fix is one undo step, however many edits it is.
+        self.buffer.begin_transaction();
         for edit in edits.into_iter().rev() {
             let start = self.buffer.offset_from_lsp(edit.range.start.line, edit.range.start.character);
             let end = self.buffer.offset_from_lsp(edit.range.end.line, edit.range.end.character);
             self.buffer.edit(start.min(end)..end, &edit.new_text);
         }
+        self.buffer.end_transaction();
         // Formatting/import edits can change any line, so the horizontal
         // extent is recomputed here rather than inferred from the caret line.
         self.recompute_content_cols();
