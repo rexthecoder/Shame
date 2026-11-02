@@ -262,26 +262,36 @@ impl DartIde {
         let raw = self.palette_input.read(cx).value();
         // fff ranks by match quality, recency and query history; an empty
         // query opens on the files used most.
-        if let Some(index) = &self.search_index
-            && let Some(paths) = index.find_files(&raw, 20)
-            && !paths.is_empty()
-        {
-            return paths;
+        let mut matches = self
+            .search_index
+            .as_ref()
+            .and_then(|index| index.find_files(&raw, 20))
+            .filter(|matches| !matches.is_empty());
+
+        if raw.trim().is_empty() {
+            return matches.unwrap_or_else(|| {
+                self.all_files.iter().take(20).cloned().collect()
+            });
         }
-        // Until the index has finished its first scan, filter the tree's file
-        // list the cheap way instead.
+
+        // Files fff does not index — dot-directories in a git repo, anything
+        // in a folder it skipped — are still reachable through the tree, so
+        // append the ones whose path matches instead of losing them.
+        let matches = matches.get_or_insert_with(Vec::new);
         let query = raw.to_lowercase();
-        self.all_files
-            .iter()
-            .filter(|path| {
-                query.is_empty()
-                    || path
-                        .to_str()
-                        .is_some_and(|s| contains_ascii_ci(s, &query))
-            })
-            .take(20)
-            .cloned()
-            .collect()
+        for path in &self.all_files {
+            if matches.len() >= 20 {
+                break;
+            }
+            if !matches.contains(path)
+                && path
+                    .to_str()
+                    .is_some_and(|s| contains_ascii_ci(s, &query))
+            {
+                matches.push(path.clone());
+            }
+        }
+        std::mem::take(matches)
     }
 
     pub(crate) fn open_palette_selection(&mut self, window: &mut Window, cx: &mut Context<Self>) {

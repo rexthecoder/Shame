@@ -171,7 +171,7 @@ impl SearchIndex {
                     // directories, which are dropped below.
                     pagination: PaginationArgs {
                         offset: 0,
-                        limit: limit.saturating_mul(4).max(limit + 8),
+                        limit: limit.saturating_mul(8).max(limit + 8).min(1_000),
                     },
                     project_path: Some(&self.root),
                     ..Default::default()

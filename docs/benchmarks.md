@@ -64,7 +64,7 @@ Sum of the per-edit rows: about 1.5 ms at 100 KB and about 14 ms at 1000 KB.
 
 ## Project search: warm index vs. disk walk
 
-Search is no longer measured on the edit path, so it gets its own numbers:
+Search is not part of the edit-path harness, so it gets its own numbers:
 
 ```bash
 cargo run --release -p core-workspace --example search_bench -- ~/path/to/app

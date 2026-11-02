@@ -1179,26 +1179,45 @@ impl DartIde {
     }
 
     /// Working changes on top, history (stashes and recent commits) below,
-    /// with a drag handle between them; each half scrolls on its own.
+    /// with a drag handle between them; each half scrolls on its own. A clean
+    /// tree has nothing to list, so it collapses to one status row and the
+    /// history takes the whole panel.
     fn render_git_changes(&self, status: &RepoStatus, cx: &mut Context<Self>) -> impl IntoElement {
+        let has_history = !(status.stashes.is_empty() && status.recent_commits.is_empty());
+        let history = v_flex()
+            .id("git-history")
+            .size_full()
+            .min_h(px(0.))
+            .overflow_y_scroll()
+            .pb(px(tokens::SPACE_4))
+            .when(!status.stashes.is_empty(), |el| {
+                el.child(self.render_git_stashes(&status.stashes, cx))
+            })
+            .when(!status.recent_commits.is_empty(), |el| {
+                el.child(self.render_git_commits(status, cx))
+            });
+        let frame = v_flex()
+            .flex_1()
+            .w_full()
+            .min_h(px(0.))
+            .border_t_1()
+            .border_color(cx.theme().border);
+
+        if status.is_clean() {
+            return frame
+                .child(self.render_git_clean_state(status, cx))
+                .when(has_history, |el| {
+                    el.child(div().flex_1().w_full().min_h(px(0.)).child(history))
+                });
+        }
+
         let list = v_flex()
             .id("git-changes")
             .size_full()
             .min_h(px(0.))
             .overflow_y_scroll()
             .pb(px(tokens::SPACE_2))
-            // A clean tree is one card, not a column of top-aligned text with
-            // a large void underneath.
-            .when(status.is_clean(), |el| el.justify_center());
-        let list = if status.is_clean() {
-            list.child(
-                v_flex()
-                    .w_full()
-                    .px(px(tokens::SPACE_4))
-                    .child(self.render_git_clean_state(status, cx)),
-            )
-        } else {
-            list.when(!status.conflicts.is_empty(), |el| {
+            .when(!status.conflicts.is_empty(), |el| {
                 el.child(self.render_git_section(
                     "Merge Conflicts",
                     Section::Conflicts,
@@ -1224,29 +1243,10 @@ impl DartIde {
                     self.git.changes_collapsed,
                     cx,
                 ))
-            })
-        };
-        let frame = div()
-            .flex_1()
-            .w_full()
-            .min_h(px(0.))
-            .border_t_1()
-            .border_color(cx.theme().border);
-        if status.stashes.is_empty() && status.recent_commits.is_empty() {
+            });
+        if !has_history {
             return frame.child(list);
         }
-        let history = v_flex()
-            .id("git-history")
-            .size_full()
-            .min_h(px(0.))
-            .overflow_y_scroll()
-            .pb(px(tokens::SPACE_4))
-            .when(!status.stashes.is_empty(), |el| {
-                el.child(self.render_git_stashes(&status.stashes, cx))
-            })
-            .when(!status.recent_commits.is_empty(), |el| {
-                el.child(self.render_git_commits(status, cx))
-            });
         frame.child(
             v_resizable("git-panel-split")
                 .child(resizable_panel().child(list))
@@ -1260,187 +1260,69 @@ impl DartIde {
         )
     }
 
-    /// Nothing to commit: say so, and offer the one sensible next step (push, pull or publish).
+    /// Nothing to commit: one row saying so and how the branch stands against
+    /// its remote. Push, pull and publish live in the branch bar above, and
+    /// amend/undo on the HEAD commit below.
     fn render_git_clean_state(&self, status: &RepoStatus, cx: &mut Context<Self>) -> Div {
         let muted = cx.theme().muted_foreground;
         let fg = cx.theme().foreground;
-        let green = cx.theme().green;
-        let border = cx.theme().border;
-        let busy = self.git.busy.is_some();
         let has_commit = status.head.is_some();
-        let plural = |n: u32| if n == 1 { "" } else { "s" };
-
-        let title = if has_commit {
-            "All changes committed"
-        } else {
-            "No commits yet"
-        };
-        let subtitle = if !has_commit {
-            "Add files and create the first commit".to_string()
+        let (title, detail) = if !has_commit {
+            ("No commits yet", "add files to start".to_string())
         } else if let Some(upstream) = &status.upstream {
-            // The branch itself is already in the bar above; the remote is what
-            // this line adds, and dropping the branch keeps it on one line.
             let remote = upstream
                 .split_once('/')
                 .map(|(remote, _)| remote)
                 .unwrap_or(upstream);
-            match (status.ahead, status.behind) {
+            let detail = match (status.ahead, status.behind) {
                 (ahead, behind) if ahead > 0 && behind > 0 => {
-                    format!("{ahead} ahead, {behind} behind {remote}")
+                    format!("{ahead} ahead, {behind} behind")
                 }
-                (ahead, 0) if ahead > 0 => {
-                    format!("{ahead} commit{} ahead of {remote}", plural(ahead))
-                }
-                (0, behind) if behind > 0 => {
-                    format!("{behind} commit{} behind {remote}", plural(behind))
-                }
-                _ => format!("Up to date with {remote}"),
-            }
-        } else if status.branch.is_some() {
-            "Not published yet".to_string()
-        } else {
-            "Detached HEAD".to_string()
-        };
-
-        let cta: Option<(&'static str, String, bool)> =
-            if status.upstream.is_none() && has_commit && status.branch.is_some() {
-                Some(("git-cta-publish", "Publish branch".to_string(), true))
-            } else if status.ahead > 0 && status.behind == 0 {
-                Some((
-                    "git-cta-push",
-                    format!("Push {} commit{}", status.ahead, plural(status.ahead)),
-                    true,
-                ))
-            } else if status.behind > 0 {
-                Some((
-                    "git-cta-pull",
-                    format!("Pull {} commit{}", status.behind, plural(status.behind)),
-                    false,
-                ))
-            } else {
-                None
+                (ahead, 0) if ahead > 0 => format!("{ahead} to push"),
+                (0, behind) if behind > 0 => format!("{behind} to pull"),
+                _ => format!("in sync with {remote}"),
             };
-
-        let history_action = |id: &'static str,
-                              icon: IconName,
-                              label: &'static str,
-                              tooltip: &'static str,
-                              cx: &mut Context<Self>,
-                              action: fn(&mut DartIde, &mut Window, &mut Context<DartIde>)| {
-            Button::new(id)
-                .ghost()
-                .xsmall()
-                .disabled(busy)
-                .icon(Icon::new(icon).with_size(px(11.)).text_color(muted))
-                .label(label)
-                .tooltip(tooltip)
-                .on_click(cx.listener(move |this, _e, window, cx| action(this, window, cx)))
+            ("No changes", detail)
+        } else if status.branch.is_some() {
+            ("No changes", "not published".to_string())
+        } else {
+            ("No changes", "detached HEAD".to_string())
         };
+        let in_sync = has_commit
+            && status.upstream.is_some()
+            && status.ahead == 0
+            && status.behind == 0;
 
-        v_flex()
+        h_flex()
             .w_full()
-            .max_w(px(360.))
-            .mx_auto()
-            .my(px(tokens::SPACE_3))
-            .p(px(tokens::SPACE_4))
-            .gap(px(tokens::SPACE_3))
-            .rounded(px(tokens::RADIUS_CARD))
-            .border_1()
-            .border_color(border.opacity(0.7))
-            .bg(cx.theme().background)
+            .h(px(32.))
+            .flex_shrink_0()
+            .items_center()
+            .gap(px(tokens::SPACE_2))
+            .px(px(tokens::SPACE_4))
+            .text_size(px(tokens::UI_SM))
             .child(
-                h_flex()
-                    .w_full()
-                    .items_start()
-                    .gap(px(tokens::SPACE_3))
-                    .child(
-                        div()
-                            .size(px(28.))
-                            .flex_shrink_0()
-                            .rounded(px(14.))
-                            .bg(if has_commit {
-                                green.opacity(0.14)
-                            } else {
-                                muted.opacity(0.12)
-                            })
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .child(
-                                Icon::new(if has_commit {
-                                    IconName::Check
-                                } else {
-                                    IconName::GitBranch
-                                })
-                                .with_size(px(14.))
-                                .text_color(if has_commit { green } else { muted }),
-                            ),
-                    )
-                    .child(
-                        v_flex()
-                            .flex_1()
-                            .min_w(px(0.))
-                            .gap(px(tokens::SPACE_1))
-                            .child(
-                                div()
-                                    .text_size(px(tokens::UI))
-                                    .font_medium()
-                                    .text_color(fg)
-                                    .child(title),
-                            )
-                            .child(
-                                div()
-                                    .text_size(px(tokens::UI_SM))
-                                    .text_color(muted)
-                                    .child(subtitle),
-                            ),
-                    ),
+                Icon::new(if has_commit {
+                    IconName::CircleCheck
+                } else {
+                    IconName::GitBranch
+                })
+                .with_size(px(13.))
+                .text_color(if has_commit { cx.theme().green } else { muted }),
             )
-            .when_some(cta, |el, (id, label, push)| {
-                el.child(
-                    Button::new(id)
-                        .small()
-                        .primary()
-                        .disabled(busy)
-                        .label(label)
-                        .on_click(cx.listener(move |this, _event, window, cx| {
-                            if push {
-                                this.git_push(window, cx);
-                            } else {
-                                this.git_pull(window, cx);
-                            }
-                        })),
-                )
-            })
-            .when(has_commit && !self.git.amend, |el| {
-                el.child(
-                    h_flex()
-                        .w_full()
-                        .flex_wrap()
-                        .items_center()
-                        .justify_between()
-                        .gap(px(tokens::SPACE_2))
-                        .pt(px(tokens::SPACE_3))
-                        .border_t_1()
-                        .border_color(border.opacity(0.6))
-                        .child(history_action(
-                            "git-amend-link",
-                            IconName::Pencil,
-                            "Edit last commit",
-                            "Open the composer to amend the last commit",
-                            cx,
-                            |this, window, cx| this.git_toggle_amend(window, cx),
-                        ))
-                        .child(history_action(
-                            "git-uncommit-link",
-                            IconName::RotateCcwClock,
-                            "Undo last commit",
-                            "Move HEAD back one commit; its changes stay staged",
-                            cx,
-                            |this, window, cx| this.git_uncommit_last(window, cx),
-                        )),
-                )
-            })
+            .child(div().flex_shrink_0().text_color(fg).child(title))
+            .child(div().text_color(muted.opacity(0.45)).child("\u{b7}"))
+            .child(
+                div()
+                    .min_w(px(0.))
+                    .truncate()
+                    .text_color(if in_sync || !has_commit {
+                        muted
+                    } else {
+                        cx.theme().primary
+                    })
+                    .child(detail),
+            )
     }
 
     fn render_git_section(
@@ -2031,7 +1913,6 @@ impl DartIde {
         let fg = cx.theme().foreground;
         let collapsed = self.git.commits_collapsed;
         let has_upstream = status.upstream.is_some();
-        let busy = self.git.busy.is_some();
 
         v_flex()
             .w_full()
@@ -2079,36 +1960,102 @@ impl DartIde {
                                 cx.notify();
                             })),
                     )
-                    .when(!status.recent_commits.is_empty(), |el| {
-                        el.child(
-                            Button::new("git-undo-last-commit")
-                                .ghost()
-                                .xsmall()
-                                .disabled(busy)
-                                .icon(
-                                    Icon::new(IconName::Undo2)
-                                        .with_size(px(12.))
-                                        .text_color(muted),
-                                )
-                                .tooltip("Undo last commit (keep changes staged)")
-                                .on_click(cx.listener(|this, _e, window, cx| {
-                                    this.git_uncommit_last(window, cx)
-                                })),
-                        )
-                    }),
             )
             .when(!collapsed, |el| {
-                el.children(
-                    status
-                        .recent_commits
-                        .iter()
-                        .enumerate()
-                        .map(|(ix, commit)| {
-                            let last = ix + 1 == status.recent_commits.len();
-                            self.render_git_commit_row(ix, last, commit, has_upstream, cx)
-                        }),
-                )
+                let commits = &status.recent_commits;
+                el.children(commits.iter().enumerate().flat_map(|(ix, commit)| {
+                    let last = ix + 1 == commits.len();
+                    // Where the remote branch sits: between the last unpushed
+                    // commit and the first pushed one.
+                    let divider = (has_upstream
+                        && ix > 0
+                        && commits[ix - 1].unpushed
+                        && !commit.unpushed)
+                        .then(|| self.render_git_upstream_divider(status, cx).into_any_element());
+                    divider.into_iter().chain(std::iter::once(
+                        self.render_git_commit_row(ix, last, commit, has_upstream, cx)
+                            .into_any_element(),
+                    ))
+                }))
             })
+    }
+
+    /// Amend and undo, on the HEAD row. Amend stays lit while the composer is
+    /// open for it.
+    fn render_git_head_actions(&self, cx: &mut Context<Self>) -> Div {
+        let muted = cx.theme().muted_foreground;
+        let busy = self.git.busy.is_some();
+        let amend = self.git.amend;
+        h_flex()
+            .flex_shrink_0()
+            .self_center()
+            .gap(px(2.))
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .child(
+                Button::new("git-head-amend")
+                    .ghost()
+                    .xsmall()
+                    .disabled(busy)
+                    .icon(Icon::new(IconName::Pencil).with_size(px(12.)).text_color(if amend {
+                        cx.theme().primary
+                    } else {
+                        muted
+                    }))
+                    .tooltip(if amend { "Cancel amend" } else { "Amend this commit" })
+                    .on_click(cx.listener(|this, _e, window, cx| {
+                        cx.stop_propagation();
+                        this.git_toggle_amend(window, cx)
+                    })),
+            )
+            .child(
+                Button::new("git-head-undo")
+                    .ghost()
+                    .xsmall()
+                    .disabled(busy)
+                    .icon(Icon::new(IconName::Undo2).with_size(px(12.)).text_color(muted))
+                    .tooltip("Undo this commit (keep changes staged)")
+                    .on_click(cx.listener(|this, _e, window, cx| {
+                        cx.stop_propagation();
+                        this.git_uncommit_last(window, cx)
+                    })),
+            )
+    }
+
+    /// A labelled break in the rail marking where the upstream branch points.
+    fn render_git_upstream_divider(&self, status: &RepoStatus, cx: &mut Context<Self>) -> Div {
+        let muted = cx.theme().muted_foreground;
+        let rule = cx.theme().border.opacity(0.6);
+        div().w_full().px(px(tokens::SPACE_3)).child(
+            h_flex()
+                .w_full()
+                .h(px(18.))
+                .pr(px(tokens::SPACE_3))
+                .gap(px(tokens::SPACE_2))
+                .items_center()
+                .child(
+                    div().relative().w(px(18.)).h_full().flex_shrink_0().child(
+                        div()
+                            .absolute()
+                            .left(px(8.5))
+                            .top_0()
+                            .bottom_0()
+                            .w(px(1.))
+                            .bg(cx.theme().border),
+                    ),
+                )
+                .child(div().flex_1().h(px(1.)).bg(rule))
+                .child(
+                    div()
+                        .flex_shrink_0()
+                        .max_w(px(180.))
+                        .truncate()
+                        .font_family(cx.theme().mono_font_family.clone())
+                        .text_size(px(tokens::UI_XS - 0.5))
+                        .text_color(muted.opacity(0.8))
+                        .child(status.upstream.clone().unwrap_or_default()),
+                )
+                .child(div().flex_1().h(px(1.)).bg(rule)),
+        )
     }
 
     /// One commit on the history rail: the plain subject first (type tag
@@ -2207,13 +2154,27 @@ impl DartIde {
                                         })
                                         .child(
                                             div()
-                                                .flex_1()
                                                 .min_w(px(0.))
                                                 .truncate()
                                                 .text_size(px(tokens::UI_SM))
                                                 .text_color(if subject.is_merge { muted } else { fg })
                                                 .child(subject.text.to_string()),
-                                        ),
+                                        )
+                                        .when(first, |row| {
+                                            let tint = if unpushed { cx.theme().primary } else { cx.theme().green };
+                                            row.child(
+                                                div()
+                                                    .flex_shrink_0()
+                                                    .px(px(4.))
+                                                    .rounded(px(tokens::RADIUS_SM))
+                                                    .border_1()
+                                                    .border_color(tint.opacity(0.45))
+                                                    .font_family(cx.theme().mono_font_family.clone())
+                                                    .text_size(px(tokens::UI_XS - 1.5))
+                                                    .text_color(tint)
+                                                    .child("HEAD"),
+                                            )
+                                        }),
                                 )
                                 .child(
                                     h_flex()
@@ -2269,6 +2230,8 @@ impl DartIde {
                                         }),
                                 ),
                         )
+                        // HEAD carries the actions that rewrite it.
+                        .when(first, |row| row.child(self.render_git_head_actions(cx)))
                         .on_click(cx.listener(move |this, _e, _w, cx| {
                             this.git_toggle_commit(hash.clone(), cx);
                         })),
