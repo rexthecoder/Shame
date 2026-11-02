@@ -1,5 +1,38 @@
 # Milestone notes
 
+## Long lines scroll sideways, but only when they need to
+
+Soft-wrapping the editor turned out to be the wrong trade: every line would
+change height, and cursor/selection/fold behaviour would follow it. Instead
+the text column now pans horizontally, and only in the one case that matters —
+when a line is wider than the pane.
+
+- **The gutter stays put.** Only the text canvas shifts, so line numbers,
+  breakpoints, folds and change markers keep their place while the code moves.
+- **Wheel and trackpad, without diagonal drift.** A mostly-horizontal gesture
+  pans and is consumed there, so it cannot also scroll the list vertically; a
+  vertical scroll with a little sideways drift leaves the code alone. Shift
+  turns a vertical wheel into horizontal movement. Both stop at the content
+  edges.
+- **A thin scrollbar appears at the bottom** of the text column only when the
+  widest line overflows. Its thumb can be dragged (and is tracked by the
+  window, so the pointer may leave the 7px bar mid-drag); it disappears again
+  when a shorter file is opened.
+- **Clicks and hovers follow the pan.** The row's hit area does not move, so
+  clicks near the right edge map to the text currently shown there instead of
+  the text that used to be there.
+- **Diagnostic messages stay readable.** The inline error/warning pill is
+  pinned inside the visible edge when a long line would push it off-screen,
+  so a red underline no longer hides what the analyzer is complaining about.
+  A pinned pill switches to a solid surface — the usual translucent tint let
+  the code underneath show through its text.
+- **The view follows the cursor only when the cursor moves** (typing, arrows,
+  End, search jumps): the caret is panned into view with a two-character
+  margin, but scrolling by hand is not undone on the next frame.
+- Widths are measured in monospace cells (tabs count as four, full-width
+  characters as two), cached per buffer revision; the scrollbar extent is an
+  estimate, while painting and hit-testing use the real shaped line.
+
 ## Thread history: one thread per workspace became a list
 
 Persistence kept exactly one thread per workspace: starting a new one replaced

@@ -7,7 +7,10 @@
 use core_buffer::Buffer;
 use editor_view::EditorView;
 use editor_view::keymap::Keymap;
-use gpui::{Entity, Focusable as _, Modifiers, TestAppContext, VisualTestContext};
+use gpui::{
+    Entity, Focusable as _, Modifiers, MouseButton, ScrollDelta, ScrollWheelEvent,
+    TestAppContext, VisualTestContext, point, px,
+};
 
 /// Open `text` in a focused editor (no file path, so no language server).
 fn open_editor<'a>(cx: &'a mut TestAppContext, text: &str) -> (Entity<EditorView>, &'a mut VisualTestContext) {
@@ -103,6 +106,71 @@ fn clicking_a_line_moves_the_cursor_there(cx: &mut TestAppContext) {
     // `cursor_position` is 1-based ("Ln 3"), like the status bar shows it.
     let (row, _col) = cx.update(|_, cx| editor.read(cx).cursor_position());
     assert_eq!(row, 3);
+}
+
+#[gpui::test]
+fn a_long_line_scrolls_horizontally(fx: &mut TestAppContext) {
+    let long = "x".repeat(400);
+    let (editor, cx) = open_editor(fx, &format!("{long}\nshort\n"));
+    let first = cx.debug_bounds("editor-line-0").expect("line 0 is rendered");
+    assert!(
+        cx.debug_bounds("editor-h-scrollbar").is_some(),
+        "the bar appears when a line is wider than the pane"
+    );
+
+    let at = point(px(500.), first.center().y);
+    cx.simulate_click(at, Modifiers::none());
+    let (_, before) = cx.update(|_, cx| editor.read(cx).cursor_position());
+
+    cx.simulate_event(ScrollWheelEvent {
+        position: at,
+        delta: ScrollDelta::Pixels(point(px(-300.), px(0.))),
+        ..Default::default()
+    });
+    cx.run_until_parked();
+
+    cx.simulate_click(at, Modifiers::none());
+    let (_, after) = cx.update(|_, cx| editor.read(cx).cursor_position());
+    assert!(
+        after > before + 20,
+        "the same x maps further along the line after panning: {before} -> {after}"
+    );
+}
+
+#[gpui::test]
+fn dragging_the_horizontal_bar_pans_the_text(cx: &mut TestAppContext) {
+    let long = "x".repeat(400);
+    let (editor, cx) = open_editor(cx, &long);
+    let thumb = cx.debug_bounds("editor-h-thumb").expect("the scrollbar thumb");
+    let start = thumb.center();
+    cx.simulate_mouse_down(start, MouseButton::Left, Modifiers::none());
+    let moved = point(start.x + px(40.), start.y);
+    cx.simulate_mouse_move(moved, Some(MouseButton::Left), Modifiers::none());
+    cx.simulate_mouse_up(moved, MouseButton::Left, Modifiers::none());
+
+    let scrolled = cx.update(|_, cx| editor.read(cx).horizontal_scroll());
+    assert!(scrolled > 10., "dragging the thumb pans the code, got {scrolled}");
+}
+
+#[gpui::test]
+fn a_short_file_has_no_horizontal_bar(cx: &mut TestAppContext) {
+    let (_editor, cx) = open_editor(cx, "void main() {}\n");
+    assert!(cx.debug_bounds("editor-h-scrollbar").is_none());
+}
+
+#[gpui::test]
+fn the_view_follows_the_cursor_to_the_end_of_a_long_line(cx: &mut TestAppContext) {
+    let long = "y".repeat(400);
+    let (editor, cx) = open_editor(cx, &long);
+    cx.simulate_keystrokes("end");
+
+    // End put the caret at the far right, so the pane has panned there: a
+    // click near the right edge must land near the end of the line, not in
+    // the middle of the text that used to be visible there.
+    let line = cx.debug_bounds("editor-line-0").expect("line 0 is rendered");
+    cx.simulate_click(point(px(1800.), line.center().y), Modifiers::none());
+    let (_, column) = cx.update(|_, cx| editor.read(cx).cursor_position());
+    assert!(column > 300, "the pane followed the cursor, got column {column}");
 }
 
 #[gpui::test]

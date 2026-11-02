@@ -210,6 +210,15 @@ pub(crate) fn minimal_replacement<'a>(old: &str, new: &'a str) -> Option<(Range<
     Some((prefix..a.len() - suffix, &new[prefix..b.len() - suffix]))
 }
 
+/// A horizontal scrollbar thumb being dragged: where the pointer and the
+/// scroll offset started, and the travel available to each.
+struct HorizontalDrag {
+    start_x: Pixels,
+    start_scroll: Pixels,
+    max_scroll: Pixels,
+    span: Pixels,
+}
+
 pub struct EditorView {
     buffer: Buffer,
     focus_handle: FocusHandle,
@@ -217,6 +226,19 @@ pub struct EditorView {
     /// Width of the text area (right of the gutter) as last painted, so
     /// popups can be kept from running off its right edge.
     text_area_width: std::rc::Rc<std::cell::Cell<Pixels>>,
+    /// How far the text column is panned right. The gutter never moves.
+    scroll_x: Pixels,
+    max_scroll_x: Pixels,
+    /// Widest line in display columns, cached by buffer revision.
+    content_cols: usize,
+    content_revision: Option<u64>,
+    /// The cursor head the view last scrolled to reveal. Panning by hand must
+    /// not be undone on the next frame, so only a moved cursor re-centres.
+    revealed_head: Option<usize>,
+    /// Horizontal scrollbar thumb drag in progress.
+    h_drag: Option<HorizontalDrag>,
+    /// Track width minus thumb width, from the last painted scrollbar.
+    h_span: Pixels,
     language: Arc<dyn LanguageAdapter>,
     syntax_tree: Option<SyntaxTree>,
     /// The text `syntax_tree` was last parsed/reparsed from, so `render`
@@ -321,6 +343,13 @@ impl EditorView {
             focus_handle: cx.focus_handle(),
             scroll_handle: UniformListScrollHandle::new(),
             text_area_width: std::rc::Rc::new(std::cell::Cell::new(px(800.))),
+            scroll_x: px(0.),
+            max_scroll_x: px(0.),
+            content_cols: 0,
+            content_revision: None,
+            revealed_head: None,
+            h_drag: None,
+            h_span: px(1.),
             language,
             syntax_tree,
             synced_text,
@@ -547,6 +576,12 @@ impl EditorView {
         (line as u32 + 1, column as u32 + 1)
     }
 
+    /// How far the text column is panned right, in points. Zero when the file
+    /// fits; the gutter never moves.
+    pub fn horizontal_scroll(&self) -> f32 {
+        self.scroll_x.to_f64() as f32
+    }
+
     /// 1-indexed inclusive line range of the primary selection, if non-empty.
     /// Cheap (no text copied), so UI can show it every frame.
     pub fn selection_line_range(&self) -> Option<(usize, usize)> {
@@ -716,6 +751,18 @@ impl EditorView {
         let line = self.buffer.byte_to_line(head);
         self.scroll_handle
             .scroll_to_item(line, ScrollStrategy::Nearest);
+    }
+
+    /// Pan the text column by `delta` points; negative moves the code left
+    /// (towards the end of the line). Clamped to the content. The caller is
+    /// responsible for `cx.notify()`.
+    pub(crate) fn pan_horizontally(&mut self, delta: f64) {
+        let max = self.max_scroll_x.to_f64();
+        if max <= 0.0 || delta == 0.0 {
+            return;
+        }
+        let next = (self.scroll_x.to_f64() - delta).clamp(0.0, max);
+        self.scroll_x = px(next as f32);
     }
 
     /// Move the cursor to a 0-indexed (line, column) — e.g. where a
@@ -1994,6 +2041,7 @@ impl EditorView {
         indent_width: usize,
         current_word: Option<&str>,
         bracket_pair: Option<(usize, usize)>,
+        scroll_x: Pixels,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
@@ -2332,8 +2380,10 @@ impl EditorView {
         let column_x: Option<Box<dyn Fn(usize) -> Pixels>> = has_popup.then(|| {
             let shaped = window.text_system().shape_line(line_shared.clone(), px(LINE_FONT_SIZE), &text_runs, None);
             let (_, inlays) = shape_inlays(window, &line_inlays, &inlay_font, inlay_color);
-            Box::new(move |col: usize| shaped.x_for_index(col.min(line_len)) + inlays.shift(col, true))
-                as Box<dyn Fn(usize) -> Pixels>
+            Box::new(move |col: usize| {
+                (shaped.x_for_index(col.min(line_len)) + inlays.shift(col, true) - scroll_x)
+                    .max(px(0.))
+            }) as Box<dyn Fn(usize) -> Pixels>
         });
         let text_area_width = self.text_area_width.get();
         // Keep a `width`-wide popup inside the text area.
@@ -2394,6 +2444,14 @@ impl EditorView {
             },
             move |bounds, (hitbox, shaped, shaped_closing, shaped_diag, inlays, shaped_inlays), window, cx| {
                 width_cell.set(bounds.size.width);
+                // The row itself stays where it is (clicks and the hitbox use
+                // `frame_bounds`); the text is painted and hit-tested shifted
+                // left by the horizontal pan.
+                let frame_bounds = bounds;
+                let bounds = Bounds::new(
+                    point(bounds.origin.x - scroll_x, bounds.origin.y),
+                    bounds.size,
+                );
                 // Buffer column -> x, past any inlay hints in front of it:
                 // `xs` for a character's left edge (caret, range start),
                 // `xe` for a range end, which stops before a hint there.
@@ -2579,25 +2637,41 @@ impl EditorView {
                     after_text_x = closing_x + closing.width;
                 }
 
-                // 4b. Paint inline diagnostic pill directly after the line's text (with a subtle connector)
+                // 4b. Paint inline diagnostic pill directly after the line's text. A
+                // long line can push it past the visible edge — pin it inside the
+                // row so the message is always readable — with a subtle connector.
                 if let Some((diag_color, _, diag_shaped)) = &shaped_diag {
-                    let connector_x = bounds.origin.x + after_text_x + px(8.);
+                    let pill_h = px(17.);
+                    let pill_w = diag_shaped.width + px(14.);
+                    let desired = bounds.origin.x + after_text_x + px(8.) + px(13.);
+                    let visible_left = frame_bounds.origin.x;
+                    let visible_right = frame_bounds.origin.x + frame_bounds.size.width;
+                    let pill_x = desired
+                        .min(visible_right - pill_w - px(6.))
+                        .max(visible_left + px(6.));
+                    let connector_x = (pill_x - px(12.)).max(visible_left + px(2.));
                     let mid_y = bounds.origin.y + bounds.size.height * 0.5;
                     let connector_rect =
                         Bounds::new(point(connector_x, mid_y - px(0.5)), size(px(10.), px(1.)));
                     window.paint_quad(fill(connector_rect, diag_color.opacity(0.35)));
 
-                    let pill_x = connector_x + px(13.);
-                    let pill_h = px(17.);
-                    let pill_w = diag_shaped.width + px(14.);
+                    // When the pill has to sit on top of the code, give it a
+                    // solid surface: a tinted translucent fill let the text
+                    // underneath make the message unreadable.
+                    let pinned = desired > visible_right - pill_w - px(6.);
+                    let pill_bg = if pinned {
+                        cx.theme().popover
+                    } else {
+                        diag_color.opacity(0.11)
+                    };
                     let pill_y = bounds.origin.y + (bounds.size.height - pill_h) * 0.5;
                     let pill_rect = Bounds::new(point(pill_x, pill_y), size(pill_w, pill_h));
                     window.paint_quad(gpui_kit::quad(
                         pill_rect,
                         px(4.),
-                        diag_color.opacity(0.11),
+                        pill_bg,
                         Edges::all(px(1.)),
-                        diag_color.opacity(0.28),
+                        diag_color.opacity(if pinned { 0.5 } else { 0.28 }),
                         BorderStyle::Solid,
                     ));
                     let _ = diag_shaped.paint(
@@ -2638,7 +2712,7 @@ impl EditorView {
                 window.on_mouse_event(move |event: &MouseDownEvent, phase, window, cx| {
                     if phase != DispatchPhase::Bubble
                         || event.button != MouseButton::Left
-                        || !bounds.contains(&event.position)
+                        || !frame_bounds.contains(&event.position)
                         || !down_hitbox.is_hovered(window)
                     {
                         return;
@@ -2676,7 +2750,7 @@ impl EditorView {
                 window.on_mouse_event(move |event: &MouseMoveEvent, phase, window, cx| {
                     if phase != DispatchPhase::Bubble
                         || event.pressed_button != Some(MouseButton::Left)
-                        || !bounds.contains(&event.position)
+                        || !frame_bounds.contains(&event.position)
                         || !move_hitbox.is_hovered(window)
                     {
                         return;
@@ -2688,8 +2762,48 @@ impl EditorView {
                         |x| move_shaped.closest_index_for_x(x),
                     );
                     move_view.update(cx, |this, cx| {
-                        this.extend_to(line_start + column, cx);
+                        // Dragging the horizontal scrollbar pans the code; it
+                        // must not also drag a text selection under it.
+                        if this.h_drag.is_none() {
+                            this.extend_to(line_start + column, cx);
+                        }
                     });
+                });
+
+                // Horizontal gestures pan the text and are stopped here so the
+                // vertical list does not also scroll under them. Vertical
+                // gestures fall through to the list as before.
+                let scroll_view = view.clone();
+                let scroll_hitbox = hitbox.clone();
+                window.on_mouse_event(move |event: &ScrollWheelEvent, phase, window, cx| {
+                    if phase != DispatchPhase::Capture
+                        || !frame_bounds.contains(&event.position)
+                        || !scroll_hitbox.is_hovered(window)
+                    {
+                        return;
+                    }
+                    let (dx, dy) = match event.delta {
+                        ScrollDelta::Pixels(p) => (p.x.to_f64(), p.y.to_f64()),
+                        ScrollDelta::Lines(p) => {
+                            (p.x as f64 * 24.0, p.y as f64 * 24.0)
+                        }
+                    };
+                    // Shift turns a horizontal wheel; otherwise only a
+                    // mostly-horizontal gesture pans, so a vertical scroll
+                    // with a little sideways drift does not move the code.
+                    let delta = if event.modifiers.shift && dy != 0.0 {
+                        dy
+                    } else if dx != 0.0 && dx.abs() > dy.abs() {
+                        dx
+                    } else {
+                        return;
+                    };
+                    scroll_view.update(cx, |this, cx| {
+                        this.clear_hover(cx);
+                        this.pan_horizontally(delta);
+                        cx.notify();
+                    });
+                    cx.stop_propagation();
                 });
 
                 let hover_shaped = shaped.clone();
@@ -2699,7 +2813,7 @@ impl EditorView {
                 window.on_mouse_event(move |event: &MouseMoveEvent, phase, window, cx| {
                     if phase != DispatchPhase::Bubble
                         || event.pressed_button.is_some()
-                        || !bounds.contains(&event.position)
+                        || !frame_bounds.contains(&event.position)
                         || !hover_hitbox.is_hovered(window)
                     {
                         return;
@@ -3479,6 +3593,50 @@ fn shape_inlays(
     (shaped, inlay_hints::InlayLayout { items })
 }
 
+/// One character's width in editor cells. The face is monospace, so ASCII is
+/// one cell; tabs are the editor's indent step, and full-width characters
+/// are two so long CJK lines scroll by the right amount.
+fn char_columns(ch: char) -> usize {
+    if ch == '\t' {
+        return 4;
+    }
+    if ch.is_ascii() {
+        return 1;
+    }
+    let c = ch as u32;
+    let wide = (0x1100..=0x115F).contains(&c)
+        || (0x2E80..=0xA4CF).contains(&c)
+        || (0xAC00..=0xD7A3).contains(&c)
+        || (0xF900..=0xFAFF).contains(&c)
+        || (0xFE30..=0xFE4F).contains(&c)
+        || (0xFF00..=0xFF60).contains(&c)
+        || (0xFFE0..=0xFFE6).contains(&c)
+        || (0x1F300..=0x1FAFF).contains(&c);
+    if wide { 2 } else { 1 }
+}
+
+fn display_columns(text: &str) -> usize {
+    text.chars().map(char_columns).sum()
+}
+
+/// The pan that keeps `caret_x` visible in a `viewport`-wide column, without
+/// moving it further than `max`. A cursor already on screen leaves the pan
+/// alone, so scrolling by hand is not undone until the cursor moves.
+fn reveal_offset(current: f64, caret_x: f64, viewport: f64, margin: f64, max: f64) -> f64 {
+    if viewport <= 0.0 {
+        return 0.0;
+    }
+    let max = max.max(0.0);
+    let mut x = current.clamp(0.0, max);
+    if caret_x + margin > x + viewport {
+        x = caret_x + margin - viewport;
+    }
+    if caret_x - margin < x {
+        x = caret_x - margin;
+    }
+    x.clamp(0.0, max)
+}
+
 fn is_word_byte(b: u8) -> bool {
     b.is_ascii_alphanumeric() || b == b'_' || b >= 0x80
 }
@@ -3773,7 +3931,10 @@ mod tests {
         assert_eq!(minimal_replacement("h\u{e9}llo", "h\u{e8}llo"), Some((1..3, "\u{e8}")));
     }
 
-    use super::{diff_as_edit, find_matches, minimal_replacement, normalize_for_save};
+    use super::{
+        diff_as_edit, display_columns, find_matches, minimal_replacement, normalize_for_save,
+        reveal_offset,
+    };
 
     #[test]
     fn no_change_is_no_edit() {
@@ -3840,6 +4001,33 @@ mod tests {
         assert_eq!(matches, vec![10..13]);
         assert_eq!(&text[matches[0].clone()], "foo");
     }
+
+    #[test]
+    fn revealing_the_cursor_only_moves_the_pan_when_needed() {
+        assert_eq!(reveal_offset(0.0, 10.0, 100.0, 5.0, 500.0), 0.0, "already visible");
+        assert_eq!(
+            reveal_offset(0.0, 120.0, 100.0, 5.0, 500.0),
+            25.0,
+            "caret past the right edge pulls the pan along"
+        );
+        assert_eq!(
+            reveal_offset(200.0, 10.0, 100.0, 5.0, 500.0),
+            5.0,
+            "caret before the left edge scrolls back"
+        );
+        assert_eq!(
+            reveal_offset(0.0, 1000.0, 100.0, 5.0, 500.0),
+            500.0,
+            "never past the content"
+        );
+    }
+
+    #[test]
+    fn tabs_and_wide_characters_count_as_cells() {
+        assert_eq!(display_columns("abc"), 3);
+        assert_eq!(display_columns("a\tb"), 6);
+        assert_eq!(display_columns("\u{4e2d}\u{6587}"), 4);
+    }
 }
 
 impl Focusable for EditorView {
@@ -3851,7 +4039,7 @@ impl Focusable for EditorView {
 impl EventEmitter<EditorEvent> for EditorView {}
 
 impl Render for EditorView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // Only touch the full buffer string or re-run tree-sitter when an edit
         // actually incremented `buffer.revision()`. Hovering, scrolling, or
         // moving the cursor does zero full-buffer work.
@@ -3897,6 +4085,65 @@ impl Render for EditorView {
                 pair
             }
         };
+
+        // Horizontal scrolling: the text column can be wider than the pane.
+        // Measure the monospace cell once, cache the widest line per revision,
+        // and pan only the text (the gutter stays put).
+        let char_width = {
+            let run = TextRun {
+                len: 10,
+                font: font(cx.theme().mono_font_family.clone()),
+                color: cx.theme().foreground,
+                background_color: None,
+                underline: None,
+                strikethrough: None,
+            };
+            (window
+                .text_system()
+                .shape_line("MMMMMMMMMM".into(), px(LINE_FONT_SIZE), &[run], None)
+                .width
+                / 10.0)
+                .to_f64()
+        };
+        if self.content_revision != Some(self.buffer.revision()) {
+            self.content_cols = (0..self.buffer.line_count())
+                .map(|ix| {
+                    display_columns(self.buffer.line(ix).trim_end_matches(['\n', '\r']))
+                })
+                .max()
+                .unwrap_or(0);
+            self.content_revision = Some(self.buffer.revision());
+        }
+        let viewport = self.text_area_width.get().to_f64();
+        let content_width = self.content_cols as f64 * char_width + 24.0;
+        let max_scroll = (content_width - viewport).max(0.0);
+        self.max_scroll_x = px(max_scroll as f32);
+
+        // Follow the cursor only when it moves, so panning by hand sticks
+        // until the next edit or cursor movement.
+        let head = self.buffer.selections().primary().head;
+        if self.revealed_head != Some(head) {
+            let line = self.buffer.byte_to_line(head);
+            let line_start = self.buffer.line_to_byte(line);
+            let text = self.buffer.line(line);
+            let display = text.trim_end_matches(['\n', '\r']);
+            let mut column = (head - line_start).min(display.len());
+            while column > 0 && !display.is_char_boundary(column) {
+                column -= 1;
+            }
+            let caret_x = display_columns(&display[..column]) as f64 * char_width;
+            let x = reveal_offset(
+                self.scroll_x.to_f64(),
+                caret_x,
+                viewport,
+                char_width * 2.0,
+                max_scroll,
+            );
+            self.scroll_x = px(x as f32);
+            self.revealed_head = Some(head);
+        }
+        self.scroll_x = self.scroll_x.clamp(px(0.), self.max_scroll_x);
+        let scroll_x = self.scroll_x;
 
         let line_count = if self.folded_starts.is_empty() {
             self.buffer.line_count().max(1)
@@ -3967,6 +4214,7 @@ impl Render for EditorView {
                             indent_width,
                             current_word.as_deref(),
                             bracket_pair,
+                            scroll_x,
                             window,
                             cx,
                         )
@@ -3978,15 +4226,115 @@ impl Render for EditorView {
         .track_scroll(&self.scroll_handle)
         .size_full();
 
+        let show_h_scroll = max_scroll > 0.5 && viewport > 1.0;
+        let viewport_f = viewport.max(1.0);
+        let thumb_w_f = if content_width > 0.0 {
+            (viewport_f * viewport_f / content_width).clamp(24.0, viewport_f)
+        } else {
+            viewport_f
+        };
+        let thumb_w = px(thumb_w_f as f32);
+        self.h_span = px((viewport_f - thumb_w_f).max(1.0) as f32);
+        let thumb_x = px(if max_scroll > 0.0 {
+            ((viewport_f - thumb_w_f) * (self.scroll_x.to_f64() / max_scroll)) as f32
+        } else {
+            0.0
+        });
+        let track_color = cx.theme().border.opacity(0.16);
+        let thumb_color = cx.theme().muted_foreground.opacity(0.5);
+        let thumb_hover = cx.theme().muted_foreground.opacity(0.85);
+        // A window-level mouse tracker for the thumb drag: moving over the
+        // thumb itself does not reach the editor root's hover handler.
+        let drag_view = cx.entity();
+        let drag_up_view = drag_view.clone();
+        let drag_tracker = canvas(
+            |_, _, _| (),
+            move |_, _, window, cx| {
+                let view = drag_view.clone();
+                window.on_mouse_event(move |event: &MouseMoveEvent, phase, _window, cx| {
+                    if phase != DispatchPhase::Bubble
+                        || event.pressed_button != Some(MouseButton::Left)
+                    {
+                        return;
+                    }
+                    view.update(cx, |this, cx| {
+                        if let Some(drag) = &this.h_drag {
+                            let per_pixel =
+                                drag.max_scroll.to_f64() / drag.span.to_f64().max(1.0);
+                            let moved = (event.position.x - drag.start_x).to_f64();
+                            let next = (drag.start_scroll.to_f64() + moved * per_pixel)
+                                .clamp(0.0, drag.max_scroll.to_f64());
+                            let next = px(next as f32);
+                            if next != this.scroll_x {
+                                this.scroll_x = next;
+                                cx.notify();
+                            }
+                        }
+                    });
+                });
+                let view = drag_up_view.clone();
+                window.on_mouse_event(move |event: &MouseUpEvent, phase, _window, cx| {
+                    if phase != DispatchPhase::Bubble || event.button != MouseButton::Left {
+                        return;
+                    }
+                    view.update(cx, |this, cx| {
+                        if this.h_drag.take().is_some() {
+                            cx.notify();
+                        }
+                    });
+                });
+            },
+        )
+        .absolute()
+        .left(px(0.))
+        .top(px(0.))
+        .w(px(1.))
+        .h(px(1.));
+
         div()
             .id("editor-view")
             .key_context("Editor")
             .track_focus(&self.focus_handle)
-            .on_scroll_wheel(cx.listener(|this, _event: &ScrollWheelEvent, _window, cx| {
+            .relative()
+            .on_scroll_wheel(cx.listener(|this, event: &ScrollWheelEvent, _window, cx| {
                 // Scrolling moves the code out from under the pointer: the
                 // hover card must not ride along with it.
                 this.clear_hover(cx);
+                // Same rule as the row-level capture: Shift means horizontal,
+                // otherwise only a mostly-horizontal gesture pans. This path
+                // handles the empty space below the last line.
+                let (dx, dy) = match event.delta {
+                    ScrollDelta::Pixels(p) => (p.x.to_f64(), p.y.to_f64()),
+                    ScrollDelta::Lines(p) => (p.x as f64 * 24.0, p.y as f64 * 24.0),
+                };
+                let delta = if event.modifiers.shift && dy != 0.0 {
+                    dy
+                } else if dx != 0.0 && dx.abs() > dy.abs() {
+                    dx
+                } else {
+                    return;
+                };
+                if this.max_scroll_x > px(0.) {
+                    this.pan_horizontally(delta);
+                    cx.notify();
+                }
             }))
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|this, _event, _window, cx| {
+                    if this.h_drag.take().is_some() {
+                        cx.notify();
+                    }
+                }),
+            )
+            .on_mouse_up_out(
+                MouseButton::Left,
+                cx.listener(|this, _event, _window, cx| {
+                    if this.h_drag.take().is_some() {
+                        cx.notify();
+                    }
+                }),
+            )
             .on_hover(cx.listener(|this, hovered: &bool, _window, cx| {
                 if !hovered {
                     this.clear_hover(cx);
@@ -3995,6 +4343,8 @@ impl Render for EditorView {
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this, _event, window, cx| {
+                    // A click anywhere in the editor ends a stale thumb drag.
+                    this.h_drag = None;
                     window.focus(&this.focus_handle, cx);
                     if this.code_action_menu.take().is_some() {
                         cx.notify();
@@ -4006,6 +4356,49 @@ impl Render for EditorView {
             .bg(cx.theme().background)
             .text_color(cx.theme().foreground)
             .pt_2()
+            .child(drag_tracker)
             .child(list)
+            .when(show_h_scroll, |el| {
+                el.child(
+                    div()
+                        .id("editor-h-scrollbar")
+                        .debug_selector(|| "editor-h-scrollbar".into())
+                        .absolute()
+                        .bottom(px(0.))
+                        .left(px(GUTTER_WIDTH))
+                        .w(px(viewport_f as f32))
+                        .h(px(7.))
+                        .bg(track_color)
+                        .occlude()
+                        .child(
+                            div()
+                                .id("editor-h-thumb")
+                                .debug_selector(|| "editor-h-thumb".into())
+                                .absolute()
+                                .top(px(1.))
+                                .bottom(px(1.))
+                                .left(thumb_x)
+                                .w(thumb_w)
+                                .rounded(px(2.5))
+                                .bg(thumb_color)
+                                .cursor_pointer()
+                                .hover(move |s| s.bg(thumb_hover))
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(|this, event: &MouseDownEvent, window, cx| {
+                                        cx.stop_propagation();
+                                        window.focus(&this.focus_handle, cx);
+                                        this.h_drag = Some(HorizontalDrag {
+                                            start_x: event.position.x,
+                                            start_scroll: this.scroll_x,
+                                            max_scroll: this.max_scroll_x,
+                                            span: this.h_span,
+                                        });
+                                        cx.notify();
+                                    }),
+                                ),
+                        ),
+                )
+            })
     }
 }
