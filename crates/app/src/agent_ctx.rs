@@ -288,19 +288,43 @@ pub(crate) fn clip_text(text: &str, max: usize) -> (&str, bool) {
     clip(text, max)
 }
 
-/// The last `max_lines` lines of a terminal session as plain text: commands as
-/// `$ command`, output without colors.
-pub(crate) fn terminal_text(lines: &[crate::editor::dock::TerminalLine], max_lines: usize) -> String {
-    use crate::editor::dock::TerminalLine;
-    let skip = lines.len().saturating_sub(max_lines);
-    lines[skip..]
-        .iter()
-        .map(|line| match line {
-            TerminalLine::Command { command, .. } => format!("$ {command}"),
-            TerminalLine::Output { spans, .. } => spans.iter().map(|s| s.text.as_str()).collect(),
-        })
-        .collect::<Vec<String>>()
-        .join("\n")
+/// Something that holds terminal output: the live terminal's screen and
+/// scrollback, or recorded lines.
+pub(crate) trait TerminalText {
+    /// The last `max_lines` lines as plain text.
+    fn recent_text(&self, max_lines: usize) -> String;
+}
+
+impl TerminalText for crate::editor::terminal::TermHandle {
+    fn recent_text(&self, max_lines: usize) -> String {
+        crate::editor::terminal::TermHandle::recent_text(self, max_lines)
+    }
+}
+
+/// Recorded lines (the Debug Console's), without colors.
+impl TerminalText for [crate::editor::dock::TerminalLine] {
+    fn recent_text(&self, max_lines: usize) -> String {
+        use crate::editor::dock::TerminalLine;
+        let skip = self.len().saturating_sub(max_lines);
+        self[skip..]
+            .iter()
+            .map(|line| match line {
+                TerminalLine::Output { spans, .. } => spans.iter().map(|s| s.text.as_str()).collect(),
+            })
+            .collect::<Vec<String>>()
+            .join("\n")
+    }
+}
+
+impl TerminalText for Vec<crate::editor::dock::TerminalLine> {
+    fn recent_text(&self, max_lines: usize) -> String {
+        self.as_slice().recent_text(max_lines)
+    }
+}
+
+/// The last `max_lines` lines of a terminal session as plain text.
+pub(crate) fn terminal_text<T: TerminalText + ?Sized>(lines: &T, max_lines: usize) -> String {
+    lines.recent_text(max_lines)
 }
 
 /// The "[Attached context]" block for the prompt: file contents and selected
@@ -709,14 +733,10 @@ mod tests {
             ],
             file_link: None,
         };
-        let lines = vec![
-            out("old"),
-            TerminalLine::Command { user_host: "u@h".into(), dir: "~".into(), command: "cargo test".into() },
-            out("ok"),
-        ];
-        assert_eq!(terminal_text(&lines, 2), "$ cargo test\nok!");
-        assert_eq!(terminal_text(&lines, 10), "old!\n$ cargo test\nok!");
-        assert_eq!(terminal_text(&[], 5), "");
+        let lines = vec![out("old"), out("new"), out("ok")];
+        assert_eq!(terminal_text(&lines, 2), "new!\nok!");
+        assert_eq!(terminal_text(&lines, 10), "old!\nnew!\nok!");
+        assert_eq!(terminal_text(&Vec::<TerminalLine>::new(), 5), "");
         assert_eq!(clip_text("héllo", 2), ("h", true), "cuts on a char boundary");
     }
 

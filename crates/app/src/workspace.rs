@@ -158,16 +158,11 @@ impl DartIde {
         self.rename_target = None;
         self.peek = None;
 
-        // Kill any running terminal child processes from the old project and
-        // start a fresh terminal session rooted at the new workspace
-        for session in &mut self.terminals {
-            if let Some(pid) = session.running_pid.take() {
-                crate::editor::dock::signal_process_group(pid, "-TERM");
-            }
-        }
-        let id = self.next_terminal_id;
-        self.next_terminal_id += 1;
-        self.terminals = vec![editor::dock::TerminalSession::new(id, root.clone(), true)];
+        // Hang up on the old project's shells (dropping a session does) and
+        // start a fresh one rooted at the new workspace
+        self.terminals.clear();
+        let session = self.spawn_terminal(root.clone());
+        self.terminals = vec![session];
         self.active_terminal = 0;
         self.debug_lines.clear();
         self.dock_tab = DockTab::Terminal;

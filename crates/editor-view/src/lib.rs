@@ -2287,6 +2287,7 @@ impl EditorView {
 
         let line_start = self.buffer.line_to_byte(index);
         let display_text = line_text.trim_end_matches(['\n', '\r']);
+        let row_group: SharedString = format!("editor-row-{index}").into();
         // A test declaration gets run actions after its text; the blame would
         // sit in the same place, so it yields to them on that line.
         let test_target = self
@@ -2854,6 +2855,7 @@ impl EditorView {
 
         div()
             .id(("editor-line", index))
+            .group(row_group.clone())
             // Lets UI tests find a row; compiled out of normal builds.
             .debug_selector(|| format!("editor-line-{index}"))
             .relative()
@@ -2887,20 +2889,20 @@ impl EditorView {
                                 .map(|p| (p.to_path_buf(), is_whole_file, test_name))
                         }),
                         |el, (file_path, is_whole_file, test_name)| {
+                            // Quiet text after the code: "▶ Run" in a muted
+                            // tone, the extra launch.json actions only while
+                            // the line is hovered or holds the caret. Colour
+                            // comes on hover, so the code stays the loudest
+                            // thing on the line.
                             let green = cx.theme().green;
-                            let info = cx.theme().info;
-                            let mut actions: Vec<(String, Vec<String>, Hsla)> = vec![(
-                                if is_whole_file {
-                                    "Run Test File".to_string()
-                                } else {
-                                    "Run".to_string()
-                                },
+                            let muted = cx.theme().muted_foreground;
+                            let mut actions: Vec<(String, Vec<String>)> = vec![(
+                                if is_whole_file { "Run file" } else { "Run" }.to_string(),
                                 Vec::new(),
-                                green,
                             )];
                             for tpl in &self.test_code_lenses {
                                 if (is_whole_file && tpl.for_file) || (!is_whole_file && tpl.for_test) {
-                                    actions.push((tpl.title.clone(), tpl.args.clone(), info));
+                                    actions.push((tpl.title.clone(), tpl.args.clone()));
                                 }
                             }
                             let view = cx.entity();
@@ -2908,7 +2910,8 @@ impl EditorView {
                                 display_columns(display_text),
                                 char_width,
                                 scroll_x.to_f64(),
-                            ) as f32);
+                            ) as f32 + 4.);
+                            let row_group = row_group.clone();
                             el.child(
                                 h_flex()
                                     .debug_selector(|| format!("test-lens-row-{index}"))
@@ -2917,28 +2920,43 @@ impl EditorView {
                                     .top_0()
                                     .bottom_0()
                                     .items_center()
-                                    .gap_1p5()
+                                    .gap(px(2.))
+                                    .font_family(cx.theme().font_family.clone())
+                                    .text_size(px(11.))
                                     .children(actions.into_iter().enumerate().map(
-                                        |(btn_ix, (label, extra_args, color))| {
+                                        |(btn_ix, (label, extra_args))| {
                                             let view = view.clone();
                                             let path = file_path.clone();
                                             let t_name = test_name.clone();
                                             let lbl = label.clone();
+                                            let primary = btn_ix == 0;
                                             h_flex()
                                                 .id(("test-lens", index * 16 + btn_ix))
                                                 .h(px(17.))
-                                                .px_2()
-                                                .gap_1()
+                                                .px(px(5.))
+                                                .gap(px(4.))
                                                 .items_center()
                                                 .rounded(px(4.))
-                                                .bg(color.opacity(0.14))
-                                                .border_1()
-                                                .border_color(color.opacity(0.34))
                                                 .cursor_pointer()
-                                                .hover(move |s| s.bg(color.opacity(0.24)))
-                                                .text_size(px(10.5))
-                                                .text_color(color)
-                                                .child("\u{25b6}")
+                                                .text_color(muted.opacity(0.75))
+                                                .hover(move |s| {
+                                                    s.bg(green.opacity(0.12)).text_color(green)
+                                                })
+                                                .when(!primary && !is_active_line, |b| {
+                                                    b.invisible()
+                                                        .group_hover(row_group.clone(), |s| s.visible())
+                                                })
+                                                .when(primary, |b| {
+                                                    b.child(
+                                                        gpui_kit::component::Icon::new(
+                                                            gpui_kit::assets::IconName::Play,
+                                                        )
+                                                        .with_size(px(9.)),
+                                                    )
+                                                })
+                                                .when(!primary, |b| {
+                                                    b.child(div().text_color(muted.opacity(0.35)).child("\u{b7}"))
+                                                })
                                                 .child(label)
                                                 .on_mouse_down(
                                                     MouseButton::Left,

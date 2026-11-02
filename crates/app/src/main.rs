@@ -682,7 +682,7 @@ impl DartIde {
         let git_status = HashMap::new();
         let (terminal_tx, terminal_rx) = async_channel::unbounded();
         let initial_terminal =
-            editor::dock::TerminalSession::new(0, root.clone(), has_workspace);
+            editor::dock::TerminalSession::new(0, root.clone(), terminal_tx.clone());
         let terminal_focus = cx.focus_handle();
         let root_focus = cx.focus_handle();
 

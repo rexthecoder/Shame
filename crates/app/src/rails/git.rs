@@ -304,7 +304,8 @@ impl DartIde {
 
         let header = v_flex()
             .w_full()
-            .p(px(tokens::SPACE_3))
+            .px(px(tokens::PANEL_INSET))
+            .py(px(tokens::SPACE_4))
             .gap(px(tokens::SPACE_2))
             .border_b_1()
             .border_color(border)
@@ -680,7 +681,7 @@ impl DartIde {
         h_flex()
             .id(("search-file", ix))
             .w_full()
-            .h(px(26.))
+            .h(px(tokens::TREE_ROW_H))
             .pl(px(tokens::SPACE_2))
             .pr(px(tokens::SPACE_3))
             .gap(px(6.))
@@ -713,16 +714,7 @@ impl DartIde {
                     .text_color(muted.opacity(0.7))
                     .child(dir),
             )
-            .child(
-                div()
-                    .flex_shrink_0()
-                    .px(px(5.))
-                    .rounded(px(tokens::RADIUS_PILL))
-                    .bg(cx.theme().list_hover)
-                    .text_size(px(tokens::UI_XS))
-                    .text_color(muted)
-                    .child(count.to_string()),
-            )
+            .child(crate::rails::count_pill(count, cx))
             .on_click(cx.listener(move |this, _e, _w, cx| {
                 if !this.project_search_collapsed.remove(&toggle_path) {
                     this.project_search_collapsed.insert(toggle_path.clone());
@@ -904,12 +896,12 @@ impl DartIde {
             status.upstream.is_none() && status.head.is_some() && status.branch.is_some();
         h_flex()
             .w_full()
-            .h(px(34.))
+            .h(px(tokens::PANEL_BAR_H))
             .flex_shrink_0()
             .items_center()
             .justify_between()
             .gap(px(tokens::SPACE_2))
-            .px(px(tokens::SPACE_4))
+            .px(px(tokens::PANEL_INSET))
             .border_b_1()
             .border_color(border.opacity(0.6))
             .child(
@@ -1645,7 +1637,7 @@ impl DartIde {
             .pb(px(tokens::SPACE_2))
             .when(!status.conflicts.is_empty(), |el| {
                 el.child(self.render_git_section(
-                    "Merge Conflicts",
+                    "Merge conflicts",
                     Section::Conflicts,
                     &status.conflicts,
                     false,
@@ -1654,7 +1646,7 @@ impl DartIde {
             })
             .when(!status.staged.is_empty(), |el| {
                 el.child(self.render_git_section(
-                    "Staged Changes",
+                    "Staged changes",
                     Section::Staged,
                     &status.staged,
                     self.git.staged_collapsed,
@@ -1721,11 +1713,11 @@ impl DartIde {
 
         h_flex()
             .w_full()
-            .h(px(32.))
+            .h(px(tokens::TREE_ROW_H))
             .flex_shrink_0()
             .items_center()
             .gap(px(tokens::SPACE_2))
-            .px(px(tokens::SPACE_4))
+            .px(px(tokens::PANEL_INSET + tokens::SPACE_2))
             .text_size(px(tokens::UI_SM))
             .child(
                 Icon::new(if has_commit {
@@ -1766,42 +1758,15 @@ impl DartIde {
         v_flex()
             .w_full()
             .child(
-                h_flex()
-                    .w_full()
-                    .h(px(28.))
-                    .items_center()
-                    .justify_between()
-                    .pl(px(tokens::SPACE_3))
-                    .pr(px(tokens::SPACE_2))
+                crate::rails::section_row()
                     .child(
-                        h_flex()
-                            .id(("git-section", section as usize))
-                            .flex_1()
-                            .h_full()
-                            .items_center()
-                            .gap(px(tokens::SPACE_2))
-                            .px(px(tokens::SPACE_2))
-                            .cursor_pointer()
-                            .text_size(px(tokens::UI_XS))
-                            .text_color(muted)
-                            .font_medium()
-                            .hover(|s| s.text_color(cx.theme().foreground))
-                            .child(
-                                Icon::new(if collapsed {
-                                    IconName::ChevronRight
-                                } else {
-                                    IconName::ChevronDown
-                                })
-                                .xsmall(),
-                            )
-                            .child(title)
-                            .child(
-                                div()
-                                    .px(px(5.))
-                                    .rounded(px(tokens::RADIUS_PILL))
-                                    .bg(cx.theme().list_hover)
-                                    .child(files.len().to_string()),
-                            )
+                        crate::rails::section_label(
+                            ("git-section", section as usize),
+                            title,
+                            Some(files.len()),
+                            collapsed,
+                            cx,
+                        )
                             .on_click(cx.listener(move |this, _event, _window, cx| {
                                 match section {
                                     Section::Staged => {
@@ -2196,39 +2161,19 @@ impl DartIde {
             .border_t_1()
             .border_color(cx.theme().border.opacity(0.6))
             .child(
-                h_flex()
-                    .id("git-section-stashes")
-                    .w_full()
-                    .h(px(28.))
-                    .items_center()
-                    .gap(px(tokens::SPACE_2))
-                    .pl(px(tokens::SPACE_3 + tokens::SPACE_2))
-                    .pr(px(tokens::SPACE_3))
-                    .cursor_pointer()
-                    .text_size(px(tokens::UI_XS))
-                    .text_color(muted)
-                    .font_medium()
-                    .hover(|s| s.text_color(fg))
-                    .child(
-                        Icon::new(if collapsed {
-                            IconName::ChevronRight
-                        } else {
-                            IconName::ChevronDown
-                        })
-                        .xsmall(),
-                    )
-                    .child("Stashes")
-                    .child(
-                        div()
-                            .px(px(5.))
-                            .rounded(px(tokens::RADIUS_PILL))
-                            .bg(cx.theme().list_hover)
-                            .child(stashes.len().to_string()),
+                crate::rails::section_row().child(
+                    crate::rails::section_label(
+                        "git-section-stashes",
+                        "Stashes",
+                        Some(stashes.len()),
+                        collapsed,
+                        cx,
                     )
                     .on_click(cx.listener(|this, _e, _w, cx| {
                         this.git.stashes_collapsed = !this.git.stashes_collapsed;
                         cx.notify();
                     })),
+                ),
             )
             .when(!collapsed, |el| {
                 el.children(stashes.iter().map(|stash| {
@@ -2343,8 +2288,6 @@ impl DartIde {
     }
 
     fn render_git_commits(&self, status: &RepoStatus, cx: &mut Context<Self>) -> Div {
-        let muted = cx.theme().muted_foreground;
-        let fg = cx.theme().foreground;
         let collapsed = self.git.commits_collapsed;
         let has_upstream = status.upstream.is_some();
 
@@ -2353,42 +2296,15 @@ impl DartIde {
             .border_t_1()
             .border_color(cx.theme().border.opacity(0.6))
             .child(
-                h_flex()
-                    .w_full()
-                    .h(px(28.))
-                    .items_center()
-                    .justify_between()
-                    .pl(px(tokens::SPACE_3))
-                    .pr(px(tokens::SPACE_2))
+                crate::rails::section_row()
                     .child(
-                        h_flex()
-                            .id("git-section-commits")
-                            .flex_1()
-                            .h_full()
-                            .items_center()
-                            .gap(px(tokens::SPACE_2))
-                            .px(px(tokens::SPACE_2))
-                            .cursor_pointer()
-                            .text_size(px(tokens::UI_XS))
-                            .text_color(muted)
-                            .font_medium()
-                            .hover(|s| s.text_color(fg))
-                            .child(
-                                Icon::new(if collapsed {
-                                    IconName::ChevronRight
-                                } else {
-                                    IconName::ChevronDown
-                                })
-                                .xsmall(),
-                            )
-                            .child("Recent Commits")
-                            .child(
-                                div()
-                                    .px(px(5.))
-                                    .rounded(px(tokens::RADIUS_PILL))
-                                    .bg(cx.theme().list_hover)
-                                    .child(status.recent_commits.len().to_string()),
-                            )
+                        crate::rails::section_label(
+                            "git-section-commits",
+                            "Recent commits",
+                            Some(status.recent_commits.len()),
+                            collapsed,
+                            cx,
+                        )
                             .on_click(cx.listener(|this, _e, _w, cx| {
                                 this.git.commits_collapsed = !this.git.commits_collapsed;
                                 cx.notify();

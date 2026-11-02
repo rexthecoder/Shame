@@ -54,6 +54,10 @@ pub const TERMINAL_H: f32 = 240.;
 pub const TERMINAL_MIN: f32 = 120.;
 pub const TERMINAL_MAX: f32 = 480.;
 pub const TREE_ROW_H: f32 = 28.;
+/// The bar under the Files / Search / Git tabs (folder name, branch, search
+/// fields): one height and inset so switching tabs does not jump.
+pub const PANEL_BAR_H: f32 = 34.;
+pub const PANEL_INSET: f32 = SPACE_4;
 pub const CODE_LINE_H: f32 = 22.;
 
 // ---- surfaces the gpui-kit Theme does not model ---------------------------

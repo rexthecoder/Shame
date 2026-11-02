@@ -430,12 +430,12 @@ impl DartIde {
             .child(
                 h_flex()
                     .w_full()
-                    .h(px(tokens::TREE_ROW_H))
+                    .h(px(tokens::PANEL_BAR_H))
                     .flex_shrink_0()
                     .items_center()
                     .justify_between()
                     .gap(px(tokens::SPACE_2))
-                    .px(px(tokens::SPACE_5))
+                    .px(px(tokens::PANEL_INSET))
                     .border_b_1()
                     .border_color(border)
                     .child(
