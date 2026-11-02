@@ -2068,6 +2068,7 @@ impl EditorView {
         current_word: Option<&str>,
         bracket_pair: Option<(usize, usize)>,
         scroll_x: Pixels,
+        char_width: f64,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
@@ -2252,6 +2253,11 @@ impl EditorView {
 
         let line_start = self.buffer.line_to_byte(index);
         let display_text = line_text.trim_end_matches(['\n', '\r']);
+        // A test declaration gets run actions after its text; the blame would
+        // sit in the same place, so it yields to them on that line.
+        let test_target = self
+            .language
+            .detect_test_target(self.buffer.path(), display_text);
         let cursor_col = (cursor_line == Some(index)).then(|| {
             let head = self.buffer.selections().primary().head;
             (head - line_start).min(display_text.len())
@@ -2372,7 +2378,7 @@ impl EditorView {
             .filter(|_| !display_text.contains("//"))
         {
             Some(SharedString::from(lbl.clone()))
-        } else if is_active_line && !display_text.trim().is_empty() {
+        } else if is_active_line && test_target.is_none() && !display_text.trim().is_empty() {
             self.line_blame
                 .get(&(index as u32))
                 .map(|b| SharedString::from(b.clone()))
@@ -2429,7 +2435,7 @@ impl EditorView {
                     None,
                 );
                 let (shaped_inlays, inlays) = shape_inlays(window, &line_inlays, &inlay_font, inlay_color);
-                let shaped_closing = closing_label_shared.as_ref().map(|lbl| {
+                let shaped_closing = closing_label_shared.as_ref().and_then(|lbl| {
                     let run = TextRun {
                         len: lbl.len(),
                         font: closing_font.clone(),
@@ -2438,12 +2444,37 @@ impl EditorView {
                         underline: None,
                         strikethrough: None,
                     };
-                    window.text_system().shape_line(
+                    let full = window.text_system().shape_line(
                         lbl.clone(),
                         px(LINE_FONT_SIZE - 1.),
                         &[run],
                         None,
-                    )
+                    );
+                    // Blame on the active line can be longer than the space
+                    // left after the code: shorten it with an ellipsis rather
+                    // than letting the viewport cut it mid-word.
+                    let available = bounds.size.width.to_f64() + scroll_x.to_f64()
+                        - (shaped.width + inlays.total()).to_f64()
+                        - 20.0;
+                    let fitted = fit_label(lbl, full.width.to_f64(), available)?;
+                    if fitted == lbl.as_ref() {
+                        Some(full)
+                    } else {
+                        let run = TextRun {
+                            len: fitted.len(),
+                            font: closing_font.clone(),
+                            color: closing_color,
+                            background_color: None,
+                            underline: None,
+                            strikethrough: None,
+                        };
+                        Some(window.text_system().shape_line(
+                            fitted.into(),
+                            px(LINE_FONT_SIZE - 1.),
+                            &[run],
+                            None,
+                        ))
+                    }
                 });
                 let shaped_diag =
                     diag_inline_spec
@@ -2887,13 +2918,11 @@ impl EditorView {
                     .overflow_hidden()
                     .child(div().relative().h_full().w_full().child(line_canvas))
                     .when_some(
-                        self.language
-                            .detect_test_target(self.buffer.path(), display_text)
-                            .and_then(|(is_whole_file, test_name)| {
-                                self.buffer
-                                    .path()
-                                    .map(|p| (p.to_path_buf(), is_whole_file, test_name))
-                            }),
+                        test_target.clone().and_then(|(is_whole_file, test_name)| {
+                            self.buffer
+                                .path()
+                                .map(|p| (p.to_path_buf(), is_whole_file, test_name))
+                        }),
                         |el, (file_path, is_whole_file, test_name)| {
                             let green = cx.theme().green;
                             let info = cx.theme().info;
@@ -2912,10 +2941,16 @@ impl EditorView {
                                 }
                             }
                             let view = cx.entity();
+                            let lens_left = px(lens_left_after_text(
+                                display_columns(display_text),
+                                char_width,
+                                scroll_x.to_f64(),
+                            ) as f32);
                             el.child(
                                 h_flex()
+                                    .debug_selector(|| format!("test-lens-row-{index}"))
                                     .absolute()
-                                    .right_4()
+                                    .left(lens_left)
                                     .top_0()
                                     .bottom_0()
                                     .items_center()
@@ -3649,6 +3684,33 @@ fn display_columns(text: &str) -> usize {
     }
 }
 
+/// Left edge of the inline test actions: just after the code, following the
+/// horizontal pan, and never before the row's own start.
+fn lens_left_after_text(columns: usize, char_width: f64, scroll_x: f64) -> f64 {
+    (columns as f64 * char_width - scroll_x).max(0.0) + 8.0
+}
+
+/// Shorten `label` to `available` pixels, given the width it takes whole.
+/// `None` when not even a few characters plus an ellipsis would fit.
+fn fit_label(label: &str, full_width: f64, available: f64) -> Option<String> {
+    if full_width <= available {
+        return Some(label.to_string());
+    }
+    let chars = label.chars().count();
+    if chars == 0 || full_width <= 0.0 || available <= 0.0 {
+        return None;
+    }
+    let per_char = full_width / chars as f64;
+    // Leave one character's worth for the ellipsis itself.
+    let keep = ((available / per_char).floor() as usize).saturating_sub(1);
+    if keep < 4 {
+        return None;
+    }
+    let mut out: String = label.chars().take(keep).collect();
+    out.push('\u{2026}');
+    Some(out)
+}
+
 /// The pan that keeps `caret_x` visible in a `viewport`-wide column, without
 /// moving it further than `max`. A cursor already on screen leaves the pan
 /// alone, so scrolling by hand is not undone until the cursor moves.
@@ -3962,8 +4024,8 @@ mod tests {
     }
 
     use super::{
-        diff_as_edit, display_columns, find_matches, minimal_replacement, normalize_for_save,
-        reveal_offset,
+        diff_as_edit, display_columns, find_matches, fit_label, lens_left_after_text,
+        minimal_replacement, normalize_for_save, reveal_offset,
     };
 
     #[test]
@@ -4049,6 +4111,27 @@ mod tests {
             reveal_offset(0.0, 1000.0, 100.0, 5.0, 500.0),
             500.0,
             "never past the content"
+        );
+    }
+
+    #[test]
+    fn a_long_blame_label_is_shortened_with_an_ellipsis() {
+        assert_eq!(fit_label("short", 40.0, 100.0).as_deref(), Some("short"));
+        let fitted = fit_label("Jeremiah Ogbomo \u{b7} build the feature", 240.0, 120.0)
+            .expect("a shortened label");
+        assert!(fitted.ends_with('\u{2026}'));
+        assert!(fitted.chars().count() < 20, "fitted: {fitted}");
+        assert_eq!(fit_label("anything", 100.0, 8.0), None, "no room for a label");
+    }
+
+    #[test]
+    fn test_actions_sit_after_the_code_and_follow_the_pan() {
+        assert_eq!(lens_left_after_text(30, 7.5, 0.0), 233.0);
+        assert_eq!(lens_left_after_text(30, 7.5, 100.0), 133.0);
+        assert_eq!(
+            lens_left_after_text(30, 7.5, 1000.0),
+            8.0,
+            "scrolled past the end, the actions stop at the row start"
         );
     }
 
@@ -4254,6 +4337,7 @@ impl Render for EditorView {
                             current_word.as_deref(),
                             bracket_pair,
                             scroll_x,
+                            char_width,
                             window,
                             cx,
                         )
@@ -4288,7 +4372,7 @@ impl Render for EditorView {
         let drag_up_view = drag_view.clone();
         let drag_tracker = canvas(
             |_, _, _| (),
-            move |_, _, window, cx| {
+            move |_, _, window, _cx| {
                 let view = drag_view.clone();
                 window.on_mouse_event(move |event: &MouseMoveEvent, phase, _window, cx| {
                     if phase != DispatchPhase::Bubble

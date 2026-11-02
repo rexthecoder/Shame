@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader};
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::os::unix::process::CommandExt as _;
 use std::process::{Command, Stdio};
@@ -16,6 +17,16 @@ use gpui_kit::*;
 use crate::{DartIde, DockTab, tokens};
 
 const MAX_SCROLLBACK_LINES: usize = 2_000;
+
+/// A lone `cd` (optionally with a quoted path); anything chained with a shell
+/// operator has to be run by the shell, not by the built-in.
+fn is_plain_cd(cmd: &str) -> bool {
+    (cmd == "cd" || cmd.starts_with("cd "))
+        && !cmd.contains("&&")
+        && !cmd.contains("||")
+        && !cmd.contains(';')
+        && !cmd.contains('|')
+}
 
 /// Arguments for `kill` that signal a command's whole process group (the
 /// shell and everything it started), not just the shell.
@@ -216,7 +227,10 @@ impl TerminalSession {
 /// Parse ANSI SGR escape sequences (`\x1b[...m`) into styled [`AnsiSpan`]s while
 /// stripping non-SGR control sequences.
 pub(crate) fn parse_ansi_line(raw: &str) -> Vec<AnsiSpan> {
-    let cleaned = raw.replace('\r', "");
+    // A progress line rewrites itself with `\r`; the reader splits on `\n`,
+    // so keep only the last rewrite instead of gluing every frame together.
+    let latest = raw.rsplit('\r').next().unwrap_or("");
+    let cleaned = latest.replace(['\r', '\u{0}'], "");
     let mut spans = Vec::new();
     let mut cur_color = AnsiColor::Default;
     let mut cur_bold = false;
@@ -513,9 +527,15 @@ impl DartIde {
             return;
         }
 
-        // Built-in: `cd [dir]`
-        if cmd == "cd" || cmd.starts_with("cd ") {
-            let arg = cmd.strip_prefix("cd").unwrap_or("").trim();
+        // Built-in: a plain `cd [dir]`. Compound commands (`cd x && …`) go to
+        // the shell; otherwise the whole tail became the path and failed with
+        // "no such file or directory" (that is what broke Update goldens).
+        if is_plain_cd(&cmd) {
+            let arg = cmd
+                .strip_prefix("cd")
+                .unwrap_or("")
+                .trim()
+                .trim_matches(['"', '\'']);
             let target = if arg.is_empty() || arg == "~" {
                 std::env::var("HOME")
                     .map(PathBuf::from)
@@ -1652,48 +1672,88 @@ impl DartIde {
                         user_host,
                         dir,
                         command,
-                    } => h_flex()
-                        .w_full()
-                        .min_h(px(20.))
-                        .items_center()
-                        .font_family("SF Mono")
-                        .text_size(px(tokens::MONO))
-                        .child(div().text_color(green).child(user_host.clone()))
-                        .child(div().text_color(muted).child(":"))
-                        .child(div().text_color(blue).child(dir.clone()))
-                        .child(div().text_color(fg).child("$ "))
-                        .child(div().text_color(fg).child(command.clone()))
-                        .into_any_element(),
-                    TerminalLine::Output { spans, file_link } => {
-                        let span_children: Vec<AnyElement> = spans
-                            .iter()
-                            .map(|span| {
-                                let color = match span.color {
-                                    AnsiColor::Default => fg,
-                                    AnsiColor::Muted => muted,
-                                    AnsiColor::Red => red,
-                                    AnsiColor::Green => green,
-                                    AnsiColor::Yellow => yellow,
-                                    AnsiColor::Blue => blue,
-                                    AnsiColor::Magenta => magenta,
-                                    AnsiColor::Cyan => cyan,
-                                };
-                                div()
-                                    .text_color(color)
-                                    .when(span.bold, |el| el.font_semibold())
-                                    .child(span.text.clone())
-                                    .into_any_element()
-                            })
-                            .collect();
-
-                        let row = h_flex()
-                            .id(("term-line", line_ix))
+                    } => {
+                        // One styled run instead of a row of child divs: a
+                        // long command then wraps at word boundaries instead
+                        // of running off the right edge.
+                        let mut text = String::new();
+                        let mut styles: Vec<(Range<usize>, HighlightStyle)> = Vec::new();
+                        for (part, color) in [
+                            (user_host.as_str(), green),
+                            (":", muted),
+                            (dir.as_str(), blue),
+                            ("$ ", fg),
+                            (command.as_str(), fg),
+                        ] {
+                            if part.is_empty() {
+                                continue;
+                            }
+                            let start = text.len();
+                            text.push_str(part);
+                            styles.push((
+                                start..text.len(),
+                                HighlightStyle {
+                                    color: Some(color),
+                                    ..Default::default()
+                                },
+                            ));
+                        }
+                        div()
                             .w_full()
+                            .min_w(px(0.))
                             .min_h(px(20.))
-                            .items_center()
+                            .flex_shrink_0()
+                            .py(px(2.))
+                            .whitespace_normal()
                             .font_family("SF Mono")
                             .text_size(px(tokens::MONO))
-                            .children(span_children);
+                            .text_color(fg)
+                            .child(StyledText::new(text).with_highlights(styles))
+                            .into_any_element()
+                    }
+                    TerminalLine::Output { spans, file_link } => {
+                        let mut text = String::new();
+                        let mut styles: Vec<(Range<usize>, HighlightStyle)> = Vec::new();
+                        for span in spans {
+                            if span.text.is_empty() {
+                                continue;
+                            }
+                            let color = match span.color {
+                                AnsiColor::Default => fg,
+                                AnsiColor::Muted => muted,
+                                AnsiColor::Red => red,
+                                AnsiColor::Green => green,
+                                AnsiColor::Yellow => yellow,
+                                AnsiColor::Blue => blue,
+                                AnsiColor::Magenta => magenta,
+                                AnsiColor::Cyan => cyan,
+                            };
+                            let start = text.len();
+                            text.push_str(&span.text);
+                            styles.push((
+                                start..text.len(),
+                                HighlightStyle {
+                                    color: Some(color),
+                                    font_weight: span
+                                        .bold
+                                        .then_some(gpui_kit::FontWeight::SEMIBOLD),
+                                    ..Default::default()
+                                },
+                            ));
+                        }
+
+                        let row = div()
+                            .id(("term-line", line_ix))
+                            .w_full()
+                            .min_w(px(0.))
+                            .min_h(px(20.))
+                            .flex_shrink_0()
+                            .py(px(2.))
+                            .whitespace_normal()
+                            .font_family("SF Mono")
+                            .text_size(px(tokens::MONO))
+                            .text_color(fg)
+                            .child(StyledText::new(text).with_highlights(styles));
 
                         if let Some((path, line_0, col_0)) = file_link.clone() {
                             let view = view.clone();
@@ -1911,7 +1971,10 @@ impl DartIde {
 
 #[cfg(test)]
 mod tests {
-    use super::{AnsiColor, interrupt_signal, kill_args, parse_ansi_line, signal_process_group};
+    use super::{
+        AnsiColor, interrupt_signal, is_plain_cd, kill_args, parse_ansi_line,
+        signal_process_group,
+    };
     use std::os::unix::process::CommandExt as _;
     use std::process::Command;
     use std::time::{Duration, Instant};
@@ -1938,6 +2001,27 @@ mod tests {
         let status = child.wait().expect("the shell should exit");
         assert!(!status.success(), "it was interrupted, not finished");
         assert!(started.elapsed() < Duration::from_secs(5), "it must stop promptly, not after 30s");
+    }
+
+    #[core::prelude::v1::test]
+    fn only_a_lone_cd_uses_the_builtin() {
+        assert!(is_plain_cd("cd"));
+        assert!(is_plain_cd("cd /tmp"));
+        assert!(is_plain_cd("cd '/tmp/with space'"));
+        assert!(!is_plain_cd("cd /tmp && ls"), "a chained command belongs to the shell");
+        assert!(!is_plain_cd("cd /tmp; ls"));
+        assert!(!is_plain_cd("cd /tmp || exit"));
+        assert!(!is_plain_cd("cd /tmp | wc -l"));
+        assert!(!is_plain_cd("cdx"), "not a cd at all");
+    }
+
+    #[core::prelude::v1::test]
+    fn carriage_returns_keep_only_the_latest_update() {
+        // Flutter test progress rewrites the same line with `\r`; gluing the
+        // rewrites together is what made the terminal look scrambled.
+        let spans = parse_ansi_line("00:00 +0: loading a.dart\r00:01 +0: loading b.dart");
+        let joined: String = spans.iter().map(|s| s.text.as_str()).collect();
+        assert_eq!(joined, "00:01 +0: loading b.dart");
     }
 
     #[core::prelude::v1::test]

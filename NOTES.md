@@ -1,5 +1,23 @@
 # Milestone notes
 
+## Terminal: chained `cd`, and output that wraps
+
+- **`cd` is only a built-in when it stands alone.** The terminal intercepted
+  every command starting with `cd ` and handed the rest to `cd` as a path, so
+  the test runner's `cd '<package>' && flutter test …` failed with
+  "no such file or directory" for the whole tail. Update goldens and Coverage
+  use that form; a lone `cd` (quoted or not) still changes the session folder,
+  while anything chained goes to the shell.
+- **Command and output lines wrap.** Each line is now one styled run with the
+  colour/bold ranges preserved, rather than a row of child divs, so a long
+  command, URL or error wraps at word boundaries and the scrollback row grows
+  instead of running off the panel. Wrapped rows are `flex_shrink_0`, so the
+  extra lines take their own height instead of painting over the next row.
+- **Carriage-return progress keeps its last frame.** `flutter test` rewrites
+  a progress line with `\r`; the reader splits on `\n`, so all the rewrites
+  used to be glued into one string. Only the final rewrite is shown now, which
+  is what the terminal would have ended up displaying.
+
 ## Long lines scroll sideways, but only when they need to
 
 Soft-wrapping the editor turned out to be the wrong trade: every line would
@@ -21,6 +39,15 @@ when a line is wider than the pane.
 - **Clicks and hovers follow the pan.** The row's hit area does not move, so
   clicks near the right edge map to the text currently shown there instead of
   the text that used to be there.
+- **Test actions sit after the code.** The inline Run / Update goldens /
+  Coverage pills used to be pinned to the right edge, so a narrow pane laid
+  them over the line. They now start just after the last glyph and follow the
+  horizontal pan (clipped at the edge instead of overlapping); on a test line
+  the blame label yields to them.
+- **Blame is fitted, not clipped.** The active line's blame/commit label
+  (and LSP closing labels) is shortened with an ellipsis to the space left
+  after the code, and hidden when the line's end is off-screen, instead of
+  being cut mid-word by the viewport.
 - **Diagnostic messages stay readable.** The inline error/warning pill is
   pinned inside the visible edge when a long line would push it off-screen,
   so a red underline no longer hides what the analyzer is complaining about.

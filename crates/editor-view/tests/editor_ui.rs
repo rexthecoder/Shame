@@ -153,6 +153,38 @@ fn dragging_the_horizontal_bar_pans_the_text(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+fn test_actions_follow_the_code_instead_of_covering_it(cx: &mut TestAppContext) {
+    let dir = std::env::temp_dir().join(format!("shame-lens-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("widget_test.dart");
+    std::fs::write(&path, "testWidgets('renders', (tester) async {\n});\n").unwrap();
+
+    cx.update(gpui_kit::init);
+    let (editor, cx) = cx.add_window_view(|_, cx| {
+        EditorView::from_buffer(Buffer::open(&path).unwrap(), cx)
+    });
+    cx.update(|window, cx| {
+        let handle = editor.read(cx).focus_handle(cx);
+        window.focus(&handle, cx);
+    });
+    cx.run_until_parked();
+
+    let row = cx.debug_bounds("editor-line-0").expect("line 0");
+    let lens = cx
+        .debug_bounds("test-lens-row-0")
+        .expect("the test actions are rendered");
+    assert!(
+        lens.origin.x > row.origin.x + px(100.),
+        "actions start after the code, not at the row's right edge: {lens:?}"
+    );
+    assert!(
+        lens.origin.x < row.origin.x + px(1000.),
+        "actions follow the text instead of being pinned to the edge: {lens:?}"
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[gpui::test]
 fn a_short_file_has_no_horizontal_bar(cx: &mut TestAppContext) {
     let (_editor, cx) = open_editor(cx, "void main() {}\n");
     assert!(cx.debug_bounds("editor-h-scrollbar").is_none());
