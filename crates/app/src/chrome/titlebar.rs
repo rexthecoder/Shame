@@ -3,6 +3,7 @@ use gpui_kit::component::{
     ActiveTheme as _, Icon, Sizable as _,
     button::{Button, ButtonVariants as _},
     h_flex,
+    spinner::Spinner,
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
@@ -20,6 +21,13 @@ fn icon_button(
         ic = ic.text_color(c);
     }
     Button::new(id).ghost().small().icon(ic).tooltip(tooltip)
+}
+
+/// A Flutter daemon exists from the moment `flutter run` is spawned, but the
+/// session is only ready once the CLI reports "Running". Everything in between
+/// (building, installing, hot reload, restart) is a loading state.
+fn flutter_session_busy(is_running: bool, status: Option<&str>) -> bool {
+    is_running && status != Some("Running")
 }
 
 impl DartIde {
@@ -196,6 +204,12 @@ impl DartIde {
                     // Only shown when the opened workspace is a Dart / Flutter project.
                     .when(self.is_flutter_or_dart_workspace(), |row| {
                         let is_running = self.flutter_daemon.is_some();
+                        // A daemon exists from the moment `flutter run` is spawned,
+                        // but the app is only ready when the CLI says "Running".
+                        // Until then the controls are a loading state, not hot
+                        // reload/restart buttons the user can press into a build.
+                        let flutter_busy =
+                            flutter_session_busy(is_running, self.flutter_status.as_deref());
                         let dev_name = self
                             .flutter_status
                             .clone()
@@ -242,6 +256,8 @@ impl DartIde {
                                 .border_1()
                                 .border_color(if is_open {
                                     cx.theme().primary
+                                } else if flutter_busy {
+                                    cx.theme().warning.opacity(0.45)
                                 } else if is_running {
                                     green.opacity(0.45)
                                 } else {
@@ -251,7 +267,12 @@ impl DartIde {
                                 .hover(|s| s.bg(cx.theme().list_hover))
                                 .text_size(px(tokens::UI_SM))
                                 .text_color(fg)
-                                .child(if is_running {
+                                .child(if flutter_busy {
+                                    Spinner::new()
+                                        .xsmall()
+                                        .color(cx.theme().warning)
+                                        .into_any_element()
+                                } else if is_running {
                                     div()
                                         .size(px(6.))
                                         .rounded(px(3.))
@@ -308,34 +329,56 @@ impl DartIde {
                                 .bg(cx.theme().sidebar)
                                 .border_1()
                                 .border_color(cx.theme().border)
-                                .child(
-                                    Button::new("fast")
-                                        .ghost()
-                                        .xsmall()
-                                        .icon(
-                                            Icon::new(gpui_kit::assets::IconName::Zap)
-                                                .with_size(px(12.))
-                                                .text_color(cx.theme().warning),
+                                .child(if flutter_busy {
+                                    // Building/launching (or mid reload): show that the
+                                    // session is busy instead of buttons that would
+                                    // queue a reload into an app that is not up yet.
+                                    div()
+                                        .w(px(50.))
+                                        .h(px(22.))
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .child(
+                                            Spinner::new()
+                                                .xsmall()
+                                                .color(cx.theme().warning),
                                         )
-                                        .tooltip("Hot reload (\u{2318}S)")
-                                        .on_click(cx.listener(|this, _event, _window, cx| {
-                                            this.trigger_hot_reload(cx);
-                                        })),
-                                )
-                                .child(
-                                    Button::new("hot-restart")
-                                        .ghost()
-                                        .xsmall()
-                                        .icon(
-                                            Icon::new(gpui_kit::assets::IconName::RotateCw)
-                                                .with_size(px(12.))
-                                                .text_color(info),
+                                        .into_any_element()
+                                } else {
+                                    h_flex()
+                                        .items_center()
+                                        .gap(px(2.))
+                                        .child(
+                                            Button::new("fast")
+                                                .ghost()
+                                                .xsmall()
+                                                .icon(
+                                                    Icon::new(gpui_kit::assets::IconName::Zap)
+                                                        .with_size(px(12.))
+                                                        .text_color(cx.theme().warning),
+                                                )
+                                                .tooltip("Hot reload (\u{2318}S)")
+                                                .on_click(cx.listener(|this, _event, _window, cx| {
+                                                    this.trigger_hot_reload(cx);
+                                                })),
                                         )
-                                        .tooltip("Hot restart Flutter app")
-                                        .on_click(cx.listener(|this, _event, _window, cx| {
-                                            this.trigger_hot_restart(cx);
-                                        })),
-                                )
+                                        .child(
+                                            Button::new("hot-restart")
+                                                .ghost()
+                                                .xsmall()
+                                                .icon(
+                                                    Icon::new(gpui_kit::assets::IconName::RotateCw)
+                                                        .with_size(px(12.))
+                                                        .text_color(info),
+                                                )
+                                                .tooltip("Hot restart Flutter app")
+                                                .on_click(cx.listener(|this, _event, _window, cx| {
+                                                    this.trigger_hot_restart(cx);
+                                                })),
+                                        )
+                                        .into_any_element()
+                                })
                                 .child(
                                     Button::new("stop-flutter")
                                         .ghost()
@@ -498,5 +541,22 @@ impl DartIde {
                         })),
                     ),
             )
+    }
+}
+
+#[cfg(test)]
+mod loading_tests {
+    use super::*;
+
+    #[core::prelude::v1::test]
+    fn the_flutter_controls_are_loading_until_the_cli_says_running() {
+        assert!(!flutter_session_busy(false, None));
+        // Spawned but not started yet.
+        assert!(flutter_session_busy(true, None));
+        assert!(flutter_session_busy(true, Some("Launching dev on iPhone 16\u{2026}")));
+        assert!(flutter_session_busy(true, Some("Building for iOS\u{2026}")));
+        assert!(flutter_session_busy(true, Some("Hot reloading\u{2026}")));
+        assert!(flutter_session_busy(true, Some("Restarting\u{2026}")));
+        assert!(!flutter_session_busy(true, Some("Running")));
     }
 }

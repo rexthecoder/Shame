@@ -85,6 +85,9 @@ pub struct Buffer {
     dirty: bool,
     revision: u64,
     disk_stamp: Option<DiskStamp>,
+    /// The file's text as this buffer last read or wrote it: the common
+    /// ancestor for merging in changes made on disk meanwhile.
+    base: Rope,
 }
 
 impl Default for Buffer {
@@ -97,6 +100,7 @@ impl Default for Buffer {
             dirty: false,
             revision: 0,
             disk_stamp: None,
+            base: Rope::new(),
         }
     }
 }
@@ -117,6 +121,7 @@ impl Buffer {
         let path = path.as_ref();
         let rope = Rope::from_reader(BufReader::new(File::open(path)?))?;
         Ok(Self {
+            base: rope.clone(),
             rope,
             path: Some(path.to_path_buf()),
             disk_stamp: stamp_of(path),
@@ -139,6 +144,7 @@ impl Buffer {
         write_atomic(&path, &self.rope)?;
         self.disk_stamp = stamp_of(&path);
         self.path = Some(path);
+        self.base = self.rope.clone();
         self.dirty = false;
         Ok(())
     }
@@ -161,6 +167,46 @@ impl Buffer {
     /// knowingly, and `disk_state` stops reporting the change.
     pub fn acknowledge_disk(&mut self) {
         self.disk_stamp = self.path.as_deref().and_then(stamp_of);
+        if let Some(rope) = self
+            .path
+            .as_deref()
+            .and_then(|p| File::open(p).ok())
+            .and_then(|f| Rope::from_reader(BufReader::new(f)).ok())
+        {
+            self.base = rope;
+        }
+    }
+
+    /// Fold changes made on disk (by an agent, git, another program) into the
+    /// buffer without losing unsaved edits: a line-based three-way merge
+    /// against the text last read or written. Applied as ordinary edits, so
+    /// cursors keep their place and undo still works. `Ok(Some(n))` is the number
+    /// of changed regions applied to the buffer; `Ok(None)` means the two sides
+    /// changed the same lines differently, leaving everything as it was.
+    pub fn merge_external(&mut self) -> io::Result<Option<usize>> {
+        let path = self
+            .path
+            .clone()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "buffer has no associated path"))?;
+        let theirs_rope = Rope::from_reader(BufReader::new(File::open(&path)?))?;
+        let theirs = theirs_rope.to_string();
+        let ours = self.rope.to_string();
+        let Some(merged) = crate::merge::merge3(&self.base.to_string(), &ours, &theirs) else {
+            return Ok(None);
+        };
+        let edits = crate::merge::line_edits(&ours, &merged);
+        let applied = edits.len();
+        if !edits.is_empty() {
+            self.begin_transaction();
+            for (range, text) in edits.into_iter().rev() {
+                self.edit(range, &text);
+            }
+            self.end_transaction();
+        }
+        self.base = theirs_rope;
+        self.disk_stamp = stamp_of(&path);
+        self.dirty = merged != theirs;
+        Ok(Some(applied))
     }
 
     /// Replace the text with what is on disk, dropping local edits and undo
@@ -172,6 +218,7 @@ impl Buffer {
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "buffer has no associated path"))?;
         let fresh = Rope::from_reader(BufReader::new(File::open(&path)?))?;
         let head = self.selections.primary().head;
+        self.base = fresh.clone();
         self.rope = fresh;
         self.undo_tree = UndoTree::default();
         self.dirty = false;
@@ -618,6 +665,30 @@ mod tests {
         assert!(std::fs::symlink_metadata(&link).unwrap().file_type().is_symlink(), "the link survives");
         assert_eq!(std::fs::read_to_string(&real).unwrap(), "#!/bin/sh\necho hi\n");
         assert_eq!(std::fs::metadata(&real).unwrap().permissions().mode() & 0o777, 0o755);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn merges_disk_changes_into_unsaved_edits_unless_they_clash() {
+        let dir = temp_dir("merge");
+        let file = dir.join("a.txt");
+        std::fs::write(&file, "a\nb\nc\nd\n").unwrap();
+        let mut buffer = Buffer::open(&file).unwrap();
+
+        buffer.edit(0..1, "A"); // unsaved edit on line 1
+        std::fs::write(&file, "a\nb\nc\nD\n").unwrap(); // agent edits line 4
+        assert_eq!(buffer.disk_state(), DiskState::Modified);
+        assert_eq!(buffer.merge_external().unwrap(), Some(1));
+        assert_eq!(buffer.text(), "A\nb\nc\nD\n");
+        assert!(buffer.is_dirty(), "our edit is still unsaved");
+        assert_eq!(buffer.disk_state(), DiskState::Unchanged);
+
+        // Same line changed on both sides: nothing is touched.
+        let mut buffer = Buffer::open(&file).unwrap();
+        buffer.edit(0..1, "mine");
+        std::fs::write(&file, "theirs\nb\nc\nD\n").unwrap();
+        assert_eq!(buffer.merge_external().unwrap(), None);
+        assert_eq!(buffer.text(), "mine\nb\nc\nD\n");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

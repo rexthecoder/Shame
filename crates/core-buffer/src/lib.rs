@@ -4,6 +4,7 @@
 //! `editor-view`) can be replaced later without touching this crate.
 
 mod buffer;
+mod merge;
 mod selection;
 mod undo;
 

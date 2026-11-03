@@ -89,7 +89,13 @@ pub(crate) enum FileNotice {
     ChangedOnDisk,
     DeletedOnDisk,
     SaveFailed(String),
+    /// Changes made on disk were folded into the unsaved buffer. `revision` is the
+    /// buffer revision right after the merge: while it still matches, the merge can be undone.
+    MergedFromDisk { changes: usize, revision: u64, at: Instant },
 }
+
+/// How long the "merged from disk" note stays up unless dismissed.
+const MERGE_NOTICE_TTL: Duration = Duration::from_secs(12);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum AfterUnsaved {
@@ -296,6 +302,12 @@ impl DartIde {
     pub(crate) fn check_disk_changes(&mut self, cx: &mut Context<Self>) {
         let editors: Vec<Entity<EditorView>> = self.tabs.iter().map(|t| t.editor.clone()).collect();
         let mut changed = false;
+        let before = self.file_notices.len();
+        self.file_notices.retain(|_, notice| match notice {
+            FileNotice::MergedFromDisk { at, .. } => at.elapsed() < MERGE_NOTICE_TTL,
+            _ => true,
+        });
+        changed |= self.file_notices.len() != before;
         for editor in editors {
             let (path, dirty, state) = {
                 let ed = editor.read(cx);
@@ -322,10 +334,28 @@ impl DartIde {
                     }
                 }
                 (DiskState::Modified, true) => {
-                    if self.file_notices.get(&path) != Some(&FileNotice::ChangedOnDisk) {
-                        self.file_notices.insert(path, FileNotice::ChangedOnDisk);
-                        changed = true;
+                    if self.file_notices.get(&path) == Some(&FileNotice::ChangedOnDisk) {
+                        continue;
                     }
+                    // Edits in different places (yours and an agent's) just combine;
+                    // only a clash on the same lines needs you to choose.
+                    let merged = editor.update(cx, |ed, cx| {
+                        let merged = ed.merge_disk_changes(cx).unwrap_or(None);
+                        (merged, ed.buffer().revision())
+                    });
+                    match merged {
+                        (Some(0), _) => {}
+                        (Some(changes), revision) => {
+                            self.file_notices.insert(
+                                path,
+                                FileNotice::MergedFromDisk { changes, revision, at: Instant::now() },
+                            );
+                        }
+                        (None, _) => {
+                            self.file_notices.insert(path, FileNotice::ChangedOnDisk);
+                        }
+                    }
+                    changed = true;
                 }
                 (DiskState::Deleted, _) => {
                     if self.file_notices.get(&path) != Some(&FileNotice::DeletedOnDisk) {
@@ -369,7 +399,7 @@ impl DartIde {
 
         let (message, tint, actions): (String, Hsla, Vec<AnyElement>) = match notice {
             FileNotice::ChangedOnDisk => (
-                format!("{name} changed on disk, and you have unsaved edits."),
+                format!("{name} changed on disk in the same lines you edited."),
                 warning,
                 vec![
                     button("notice-keep", "Keep mine", false)
@@ -410,6 +440,36 @@ impl DartIde {
                             cx.listener(move |this, _e, _w, cx| {
                                 if let Some(tab) = this.tabs.iter().find(|t| t.path.as_ref() == Some(&path)) {
                                     tab.editor.update(cx, |ed, cx| ed.save_without_format(cx));
+                                }
+                                this.file_notices.remove(&path);
+                                cx.notify();
+                            })
+                        })
+                        .into_any_element(),
+                ],
+            ),
+            FileNotice::MergedFromDisk { changes, revision, .. } => (
+                format!(
+                    "Merged {changes} change{} from disk into {name}.",
+                    if changes == 1 { "" } else { "s" }
+                ),
+                cx.theme().primary,
+                vec![
+                    button("notice-merge-dismiss", "Dismiss", false)
+                        .on_click({
+                            let path = path.clone();
+                            cx.listener(move |this, _e, _w, cx| {
+                                this.file_notices.remove(&path);
+                                cx.notify();
+                            })
+                        })
+                        .into_any_element(),
+                    button("notice-merge-undo", "Undo merge", true)
+                        .on_click({
+                            let path = path.clone();
+                            cx.listener(move |this, _e, _w, cx| {
+                                if let Some(tab) = this.tabs.iter().find(|t| t.path.as_ref() == Some(&path)) {
+                                    tab.editor.update(cx, |ed, cx| ed.undo_disk_merge(revision, cx));
                                 }
                                 this.file_notices.remove(&path);
                                 cx.notify();

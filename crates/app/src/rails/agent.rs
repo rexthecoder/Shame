@@ -604,6 +604,8 @@ pub(crate) struct AgentState {
     pub(crate) include_active_file: bool,
     /// Send current editor diagnostics as context.
     pub(crate) include_problems: bool,
+    /// Send the active selection automatically, without attaching it by hand.
+    pub(crate) include_selection: bool,
     pub(crate) attach_open: bool,
     pub(crate) attach_search: Entity<InputState>,
     pub(crate) attach_selected: usize,
@@ -677,6 +679,7 @@ impl AgentState {
             last_mention_query: String::new(),
             include_active_file: true,
             include_problems: true,
+            include_selection: true,
             attach_open: false,
             attach_search,
             attach_selected: 0,
@@ -833,9 +836,26 @@ impl DartIde {
             let _ = tx.send_blocking(AgentInput::Close);
         }
         if let Some(pid) = self.agent.running_pid.take() {
-            let _ = Command::new("kill")
-                .args(["-TERM", &pid.to_string()])
-                .status();
+            // The CLI runs in its own process group, so a stop reaches the
+            // commands it spawned (test runners, dev servers, MCP servers),
+            // not just the CLI itself.
+            #[cfg(unix)]
+            unsafe {
+                libc::kill(-(pid as i32), libc::SIGTERM);
+            }
+            #[cfg(not(unix))]
+            {
+                let _ = Command::new("kill")
+                    .args(["-TERM", &pid.to_string()])
+                    .status();
+            }
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(1200));
+                #[cfg(unix)]
+                unsafe {
+                    libc::kill(-(pid as i32), libc::SIGKILL);
+                }
+            });
             cx.notify();
         }
     }
@@ -1021,6 +1041,24 @@ impl DartIde {
         self.save_agent_conversation();
         let include_active_file = self.agent.include_active_file;
         let include_problems = self.agent.include_problems;
+        // The selection is the most specific thing the user is looking at, and asking
+        // for it by hand every turn is noise. Share it by default; the composer chip
+        // turns it off for the next message.
+        let auto_selection = if self.agent.include_selection && include_active_file {
+            self.active_editor().and_then(|editor| {
+                let ed = editor.read(cx);
+                let path = ed.buffer().path()?;
+                let (start_line, end_line, text) = ed.selection_for_context()?;
+                let rel = path
+                    .strip_prefix(&self.root)
+                    .unwrap_or(path)
+                    .to_string_lossy()
+                    .to_string();
+                Some(Attachment::Selection { rel, start_line, end_line, text })
+            })
+        } else {
+            None
+        };
 
         let harness = self.agent.harness;
         let (model_id, _) = self.agent.active_model();
@@ -1100,14 +1138,24 @@ impl DartIde {
             ctx_header.push_str("\n- Active LSP Diagnostics in open files:\n  ");
             ctx_header.push_str(&diag_lines.join("\n  "));
         }
+        let bridge_prompt = self.agent_bridge_prompt();
+        if !bridge_prompt.is_empty() {
+            ctx_header.push_str("\n\n");
+            ctx_header.push_str(&bridge_prompt);
+        }
 
         // Order: environment, mode rule, attachments, earlier turns, the request.
         let mut sections = vec![ctx_header];
         if let Some(rule) = mode.instruction(harness == AgentHarness::ClaudeCode) {
             sections.push(rule.to_string());
         }
-        let everything: Vec<Attachment> =
+        let mut everything: Vec<Attachment> =
             attachments.iter().chain(mentions.iter()).cloned().collect();
+        if let Some(selection) = auto_selection
+            && !everything.contains(&selection)
+        {
+            everything.push(selection);
+        }
         let mut attached = attachment_prompt(&self.root, &everything);
         // Live IDE state (`@problems`, `@diff`, `@terminal`) is read now, at send time.
         for attachment in &everything {
@@ -1177,6 +1225,7 @@ impl DartIde {
         let (in_tx, in_rx) = async_channel::unbounded::<AgentInput>();
         self.agent.control_tx = Some(in_tx.clone());
         let first_line = crate::agent_permission::user_message_line(&full_prompt);
+        let bridge_env = self.agent_bridge_env(&root);
         std::thread::spawn(move || {
             let mut cmd = Command::new(&bin_path);
             let home = std::env::var("HOME").unwrap_or_default();
@@ -1189,6 +1238,16 @@ impl DartIde {
                 .stdin(if harness == AgentHarness::ClaudeCode { Stdio::piped() } else { Stdio::null() })
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped());
+            for (key, value) in &bridge_env {
+                cmd.env(key, value);
+            }
+            // A CLI that spawns test runners or dev servers can only be stopped
+            // cleanly if it heads its own group (see `stop_agent_run`).
+            #[cfg(unix)]
+            {
+                use std::os::unix::process::CommandExt as _;
+                cmd.process_group(0);
+            }
 
             match harness {
                 AgentHarness::ClaudeCode => {
@@ -1526,6 +1585,18 @@ impl DartIde {
                                                 .record_ai_touched_path(&this.root, &f.path);
                                         }
                                     }
+                                    // The turn is over, so every tool effect has landed:
+                                    // anything no longer modified is a reverted/undone edit,
+                                    // not a pending AI change.
+                                    let pending: std::collections::HashSet<String> = post_status
+                                        .unstaged
+                                        .iter()
+                                        .map(|f| f.path.clone())
+                                        .collect();
+                                    crate::git_panel::retain_pending_ai_paths(
+                                        &mut this.agent.ai_touched_paths,
+                                        &pending,
+                                    );
                                 }
                                 this.refresh_git(cx);
                                 this.sync_workspace_files_if_changed(cx);

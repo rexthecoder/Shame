@@ -517,6 +517,10 @@ impl EditorView {
         }
 
         self.hover_point = Some((line, column));
+        // A reply to the previous position must not land on this one.
+        if let Some(lsp) = &mut self.lsp {
+            lsp.pending_hover_id = None;
+        }
         let had_result = self.hover_result.take().is_some();
         self.hover_sequence += 1;
         let sequence = self.hover_sequence;
@@ -539,6 +543,9 @@ impl EditorView {
     pub(crate) fn clear_hover(&mut self, cx: &mut Context<Self>) {
         self.hover_point = None;
         self.hover_sequence += 1;
+        if let Some(lsp) = &mut self.lsp {
+            lsp.pending_hover_id = None;
+        }
         if self.hover_result.take().is_some() {
             cx.notify();
         }
@@ -779,6 +786,38 @@ impl EditorView {
             pad_left: hint.padding_left.unwrap_or(false),
             pad_right: hint.padding_right.unwrap_or(false),
         })
+    }
+
+    /// Whether the cursor sits inside an unclosed `(` (scanning back a bounded
+    /// number of lines), i.e. whether a signature popup still has a call to describe.
+    fn cursor_inside_call(&self) -> bool {
+        let head = self.buffer.selections().primary().head;
+        let cur = self.buffer.byte_to_line(head);
+        let col = head - self.buffer.line_to_byte(cur);
+        let mut depth = 0i32;
+        for l in (cur.saturating_sub(80)..=cur).rev() {
+            let full = self.buffer.line(l);
+            let text = if l == cur { full.get(..col).unwrap_or(&full) } else { &full };
+            let text = text.find("//").map_or(text, |i| &text[..i]);
+            for ch in text.chars().rev() {
+                match ch {
+                    ')' => depth += 1,
+                    '(' if depth == 0 => return true,
+                    '(' => depth -= 1,
+                    _ => {}
+                }
+            }
+        }
+        false
+    }
+
+    /// Drop the signature popup once the cursor has left the call it described
+    /// (moved out with the mouse or arrows, deleted the `(`, a late reply, ...).
+    /// Cheap enough to call on every `render`.
+    pub(crate) fn dismiss_stale_signature_help(&mut self, cx: &mut Context<Self>) {
+        if self.signature_help.is_some() && !self.cursor_inside_call() {
+            self.clear_signature_help(cx);
+        }
     }
 
     /// Dismiss the signature-help popup (e.g. on `)` or Escape).

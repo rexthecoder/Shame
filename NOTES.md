@@ -1,5 +1,49 @@
 # Milestone notes
 
+## Flutter run: the titlebar shows loading, not a lie
+
+- **A daemon is not a running app.** The titlebar treated `flutter_daemon` as
+  "running", so the moment `flutter run` spawned, the green dot and the hot
+  reload / restart buttons appeared while the app was still building. The
+  controls now show a warning-coloured spinner (and the device chip a spinner
+  instead of the green dot) until the CLI reports `Running`; Stop stays live so
+  a stuck build can still be cancelled. The same state covers hot reload and
+  restart, not just first launch.
+
+## Agent rail: the editor became a tool, not just a prompt
+
+- **The agent can ask the live editor what it is looking at.** Every harness
+  now gets a private Unix socket (`SHAME_IDE_SOCKET`) and the editor binary
+  (`SHAME_IDE_BIN`) in its environment, and can run
+  `"$SHAME_IDE_BIN" --ide-bridge context` mid-turn. `context` returns the
+  active file, cursor, the exact selection text, open tabs (dirty and
+  diagnostics counts), every diagnostic, the preview URL and the selected
+  simulator. `diagnostics`, `read`, `diff`, `terminal` and `preview` cover
+  the rest; `open <path> [line]` makes the editor show the user the file the
+  agent is talking about. The UI thread answers requests, so the bridge sees
+  the same state as the window (not a stale snapshot), and text tools run off
+  the UI thread.
+- **The selection is shared without being attached.** The active selection
+  now goes into the prompt automatically (the `Ln 12–18` chip in the composer
+  header turns it off for the next message, like the file and problems
+  chips). Attaching the same lines by hand on every turn was the most common
+  missing context; the agent can still ask the bridge for the whole file.
+- **Stop means stop.** Agent CLIs now run in their own process group, so
+  Esc/Cancel sends SIGTERM to the group — test runners, `flutter run`, dev
+  servers and MCP children included — with SIGKILL after 1.2 s if something
+  ignores it. Previously only the top-level CLI was killed and the port or
+  simulator it held stayed busy.
+- **The send button queues instead of vanishing.** While a turn ran, the
+  stop button replaced send, so Enter queued a message but the mouse had no
+  way to. Both now sit side by side when there is text to queue; the queued
+  prompt keeps the clock icon until the run ends.
+- **AI Changes follows the working tree.** The card only refreshed while the
+  Git sidebar tab was on screen, so a file the agent changed and then
+  reverted could sit in the list as a ghost. Git now refreshes every 2 s while
+  any AI change is pending, and a path is dropped once it was modified and
+  is clean again (plus a hard prune when a turn ends and every tool effect has
+  landed).
+
 ## Search: one warm index per workspace
 
 - **Project search stopped re-reading the project.** ⇧⌘F used to walk every

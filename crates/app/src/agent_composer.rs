@@ -741,6 +741,27 @@ impl DartIde {
                     .into_any_element(),
             );
         }
+        // The active selection is shared automatically; this makes it visible and
+        // lets the next message leave it out.
+        if let Some((start, end)) =
+            self.active_editor().and_then(|ed| ed.read(cx).selection_line_range())
+        {
+            let on = self.agent.include_selection;
+            header_chips.push(
+                ghost("agent-ctx-selection".into())
+                    .when(!on, |c| c.opacity(0.45))
+                    .child(
+                        div()
+                            .when(!on, |d| d.line_through())
+                            .child(format!("Ln {start}\u{2013}{end}")),
+                    )
+                    .on_click(cx.listener(|this, _e, _w, cx| {
+                        this.agent.include_selection = !this.agent.include_selection;
+                        cx.notify();
+                    }))
+                    .into_any_element(),
+            );
+        }
 
         // What you attached from your Mac (dropped, pasted or chosen files and images),
         // at the top of the composer as plain inline items:
@@ -862,6 +883,48 @@ impl DartIde {
                 .text_size(px(tokens::UI_SM))
         };
 
+        let has_text = !self.agent.input.read(cx).value().trim().is_empty();
+        let stop_button = div()
+            .id("agent-stop-btn")
+            .size(px(26.))
+            .flex_shrink_0()
+            .rounded(px(tokens::RADIUS_PILL))
+            .bg(red.opacity(0.2))
+            .border_1()
+            .border_color(red)
+            .flex()
+            .items_center()
+            .justify_center()
+            .cursor_pointer()
+            .child(Icon::new(IconName::X).with_size(px(12.)).text_color(red))
+            .on_click(cx.listener(|this, _e, _w, cx| this.stop_agent_run(cx)));
+        let send_button = div()
+            .id("agent-send-btn")
+            .size(px(26.))
+            .flex_shrink_0()
+            .rounded(px(tokens::RADIUS_PILL))
+            .bg(if is_running { primary.opacity(0.75) } else { primary })
+            .flex()
+            .items_center()
+            .justify_center()
+            .cursor_pointer()
+            .hover(|s| s.opacity(0.9))
+            .child(
+                Icon::new(if is_running { IconName::Clock } else { IconName::ArrowUp })
+                    .with_size(px(12.5))
+                    .text_color(cx.theme().primary_foreground),
+            )
+            .on_click(cx.listener(|this, _e, window, cx| this.agent_send_message(window, cx)));
+        // While a turn runs the stop button used to replace send entirely, which
+        // left mouse users no way to queue the next message. Enter already queued
+        // it; now the button does too (clock icon = "sends when this run ends").
+        let mut actions = h_flex().flex_shrink_0().gap(px(6.));
+        if is_running {
+            actions = actions.child(stop_button);
+        }
+        if !is_running || has_text {
+            actions = actions.child(send_button);
+        }
         let footer = h_flex()
             .w_full()
             .px(px(tokens::SPACE_3))
@@ -936,40 +999,7 @@ impl DartIde {
                             })),
                     ),
             )
-            .child(if is_running {
-                div()
-                    .id("agent-stop-btn")
-                    .size(px(26.))
-                    .flex_shrink_0()
-                    .rounded(px(tokens::RADIUS_PILL))
-                    .bg(red.opacity(0.2))
-                    .border_1()
-                    .border_color(red)
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .cursor_pointer()
-                    .child(Icon::new(IconName::X).with_size(px(12.)).text_color(red))
-                    .on_click(cx.listener(|this, _e, _w, cx| this.stop_agent_run(cx)))
-            } else {
-                div()
-                    .id("agent-send-btn")
-                    .size(px(26.))
-                    .flex_shrink_0()
-                    .rounded(px(tokens::RADIUS_PILL))
-                    .bg(primary)
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .cursor_pointer()
-                    .hover(|s| s.opacity(0.9))
-                    .child(
-                        Icon::new(IconName::ArrowUp)
-                            .with_size(px(12.5))
-                            .text_color(cx.theme().primary_foreground),
-                    )
-                    .on_click(cx.listener(|this, _e, window, cx| this.agent_send_message(window, cx)))
-            });
+            .child(actions);
 
         v_flex()
             // Fill the panel but never push it wider: `w_auto` sized the

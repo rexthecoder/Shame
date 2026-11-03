@@ -14,6 +14,30 @@ use gpui_kit::*;
 
 use crate::DartIde;
 
+/// Drop AI-touched paths that had a working-tree change in `previous` and have
+/// none in `current`: the agent reverted them. A path that was never changed
+/// yet is kept, because tool calls stream just before they run.
+pub(crate) fn retain_reverted_ai_paths(
+    paths: &mut Vec<String>,
+    previous: &std::collections::HashSet<String>,
+    current: &std::collections::HashSet<String>,
+) -> bool {
+    let before = paths.len();
+    paths.retain(|p| !previous.contains(p) || current.contains(p));
+    paths.len() != before
+}
+
+/// Drop every tracked path that is not currently modified. Used at the end of
+/// a turn, once every tool effect has landed.
+pub(crate) fn retain_pending_ai_paths(
+    paths: &mut Vec<String>,
+    current: &std::collections::HashSet<String>,
+) -> bool {
+    let before = paths.len();
+    paths.retain(|p| current.contains(p));
+    paths.len() != before
+}
+
 /// Which view the left sidebar shows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SidebarTab {
@@ -162,7 +186,35 @@ impl DartIde {
                 if types.is_some() {
                     this.git.commit_types = types;
                 }
-                let changed = types_changed
+                // A file the agent touched and then reverted is no longer a pending
+                // change. Only prune paths that *were* changed in the previous status
+                // and are clean now: a tool call is streamed just before it runs, so
+                // a brand-new path may not be in git yet on the first refresh. The
+                // first successful read is different: everything in the restored
+                // thread is old, so a clean path there is a ghost.
+                let first_read = this.git.status.is_none();
+                let previous: std::collections::HashSet<String> = this
+                    .git
+                    .status
+                    .as_ref()
+                    .map(|s| s.unstaged.iter().map(|f| f.path.clone()).collect())
+                    .unwrap_or_default();
+                let mut pruned = false;
+                if let Some(status) = &status {
+                    let current: std::collections::HashSet<String> =
+                        status.unstaged.iter().map(|f| f.path.clone()).collect();
+                    pruned = if first_read {
+                        retain_pending_ai_paths(&mut this.agent.ai_touched_paths, &current)
+                    } else {
+                        retain_reverted_ai_paths(
+                            &mut this.agent.ai_touched_paths,
+                            &previous,
+                            &current,
+                        )
+                    };
+                }
+                let changed = pruned
+                    || types_changed
                     || this.git.stats != stats
                     || this.git.status != status
                     || this.git_branch != branch
@@ -197,9 +249,13 @@ impl DartIde {
                 let alive = weak
                     .update(cx, |this, cx| {
                         this.sync_workspace_files_if_changed(cx);
-                        if this.has_workspace
-                            && this.sidebar_open
-                            && this.sidebar_tab == SidebarTab::Git {
+                        // The Git panel needs a refresh while it is on screen; the
+                        // agent rail needs one too while it is showing AI Changes,
+                        // even when the sidebar is on Files or closed.
+                        let git_visible =
+                            this.sidebar_open && this.sidebar_tab == SidebarTab::Git;
+                        let ai_pending = !this.agent.ai_touched_paths.is_empty();
+                        if this.has_workspace && (git_visible || ai_pending) {
                             this.refresh_git(cx);
                         }
                     })
@@ -930,5 +986,40 @@ mod display_tests {
         assert_eq!(parse_stash_message("On main: tidy up"), (Some("main"), "tidy up"));
         assert_eq!(parse_stash_message("WIP on feat/x: 1a2b3c4 last"), (Some("feat/x"), "1a2b3c4 last"));
         assert_eq!(parse_stash_message("pro trade tab design"), (None, "pro trade tab design"));
+    }
+}
+
+#[cfg(test)]
+mod ai_path_tests {
+    use super::*;
+    use std::collections::HashSet;
+
+    #[core::prelude::v1::test]
+    fn a_reverted_file_leaves_the_pending_list() {
+        let mut paths = vec!["a.dart".to_string(), "b.dart".to_string()];
+        let previous = HashSet::from(["a.dart".to_string(), "b.dart".to_string()]);
+        let current = HashSet::from(["b.dart".to_string()]);
+        assert!(retain_reverted_ai_paths(&mut paths, &previous, &current));
+        assert_eq!(paths, vec!["b.dart"]);
+    }
+
+    #[core::prelude::v1::test]
+    fn a_path_not_modified_yet_is_kept() {
+        // The tool call is streamed before it runs, so a new path is not in the
+        // status read that immediately follows.
+        let mut paths = vec!["new.dart".to_string()];
+        let previous = HashSet::new();
+        let current = HashSet::new();
+        assert!(!retain_reverted_ai_paths(&mut paths, &previous, &current));
+        assert_eq!(paths, vec!["new.dart"]);
+    }
+
+    #[core::prelude::v1::test]
+    fn finishing_a_turn_keeps_only_what_is_still_modified() {
+        let mut paths = vec!["a.dart".to_string(), "b.dart".to_string()];
+        let current = HashSet::from(["b.dart".to_string()]);
+        assert!(retain_pending_ai_paths(&mut paths, &current));
+        assert_eq!(paths, vec!["b.dart"]);
+        assert!(!retain_pending_ai_paths(&mut paths, &current));
     }
 }

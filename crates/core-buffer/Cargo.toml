@@ -7,3 +7,4 @@ publish = false
 
 [dependencies]
 ropey.workspace = true
+similar = "2.7.0"

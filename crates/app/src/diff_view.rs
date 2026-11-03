@@ -42,6 +42,58 @@ enum DisplayItem {
     },
 }
 
+/// The two sides of an image diff; `None` on a side that has no image (added / deleted file).
+#[derive(Default, Clone)]
+pub(crate) struct DiffImages {
+    old: Option<crate::ImagePreview>,
+    new: Option<crate::ImagePreview>,
+}
+
+/// Raw bytes of `git show <spec>`, or `None` when the object doesn't exist.
+fn git_show_bytes(root: &std::path::Path, spec: &str) -> Option<Vec<u8>> {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["show", spec])
+        .output()
+        .ok()?;
+    out.status.success().then_some(out.stdout)
+}
+
+/// Decode both sides of an image diff: HEAD vs index when staged, index vs working tree
+/// otherwise, and parent vs commit when viewing a historical commit.
+fn load_diff_images(
+    root: &std::path::Path,
+    file: &ChangedFile,
+    staged: bool,
+    commit: Option<&str>,
+) -> DiffImages {
+    let label = std::path::Path::new(&file.path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("IMG")
+        .to_ascii_uppercase();
+    let old_path = file.orig_path.as_deref().unwrap_or(&file.path);
+    let (old_bytes, new_bytes) = match commit {
+        Some(hash) => (
+            git_show_bytes(root, &format!("{hash}^:{old_path}")),
+            git_show_bytes(root, &format!("{hash}:{}", file.path)),
+        ),
+        None if staged => (
+            git_show_bytes(root, &format!("HEAD:{old_path}")),
+            git_show_bytes(root, &format!(":{}", file.path)),
+        ),
+        None => (
+            git_show_bytes(root, &format!(":{old_path}")),
+            std::fs::read(root.join(&file.path)).ok(),
+        ),
+    };
+    DiffImages {
+        old: old_bytes.and_then(|b| crate::decode_image_preview(&b, label.clone())),
+        new: new_bytes.and_then(|b| crate::decode_image_preview(&b, label)),
+    }
+}
+
 pub(crate) struct DiffState {
     pub(crate) file: ChangedFile,
     pub(crate) staged: bool,
@@ -50,6 +102,8 @@ pub(crate) struct DiffState {
     pub(crate) unified: bool,
     pub(crate) split_ratio: f32,
     pub(crate) full_path: PathBuf,
+    /// Before / after versions of an image file (golden tests), decoded off the UI thread.
+    images: DiffImages,
     diff: FileDiff,
     /// Syntax spans per line (0-based) of the old / new text.
     old_spans: Vec<Spans>,
@@ -246,7 +300,12 @@ impl DartIde {
                         (!old.is_empty() || !new.is_empty()).then_some((i, (old, new)))
                     })
                     .collect();
-                (diff, old_spans, new_spans, intra)
+                let images = if diff.binary && crate::is_image_path(std::path::Path::new(&job_file.path)) {
+                    load_diff_images(&job_root, &job_file, staged, job_commit.as_deref())
+                } else {
+                    DiffImages::default()
+                };
+                (diff, old_spans, new_spans, intra, images)
             });
             let _ = tx.send_blocking(result);
         });
@@ -257,7 +316,7 @@ impl DartIde {
                     return; // a newer request superseded this one
                 }
                 match result {
-                    Ok((diff, old_spans, new_spans, intra)) => {
+                    Ok((diff, old_spans, new_spans, intra, images)) => {
                         let same_file = this
                             .diff
                             .as_ref()
@@ -276,6 +335,7 @@ impl DartIde {
                             .min(blocks.len().saturating_sub(1));
                         let mut state = DiffState {
                             full_path: root.join(&file.path),
+                            images,
                             file,
                             staged,
                             commit,
@@ -546,36 +606,26 @@ impl DartIde {
             .bg(cx.theme().background)
             .child(self.render_diff_header(state, cx))
             .child(if state.diff.binary {
-                if crate::is_image_path(&state.full_path) {
-                    if let Some(preview) = crate::load_image_preview(&state.full_path) {
-                        v_flex()
-                            .flex_1()
-                            .w_full()
-                            .min_h(px(0.))
-                            .p(px(tokens::SPACE_6))
-                            .gap(px(tokens::SPACE_3))
-                            .items_center()
-                            .justify_center()
-                            .child(
-                                img(preview.render_image)
-                                    .size_full()
-                                    .object_fit(ObjectFit::Contain),
-                            )
-                            .child(
-                                div()
-                                    .font_family("SF Mono")
-                                    .text_size(px(tokens::UI_XS))
-                                    .text_color(muted)
-                                    .child(format!(
-                                        "{} \u{00d7} {} px \u{00b7} {}",
-                                        preview.width,
-                                        preview.height,
-                                        crate::format_byte_size(preview.byte_size)
-                                    )),
-                            )
-                    } else {
-                        diff_message("Binary file not shown", muted)
-                    }
+                let images = &state.images;
+                if images.old.is_some() || images.new.is_some() {
+                    let (old_label, new_label) = match (&images.old, &images.new) {
+                        (None, Some(_)) => ("", "Added"),
+                        (Some(_), None) => ("Deleted", ""),
+                        _ => ("Before", "After"),
+                    };
+                    h_flex()
+                        .flex_1()
+                        .w_full()
+                        .min_h(px(0.))
+                        .p(px(tokens::SPACE_4))
+                        .gap(px(tokens::SPACE_4))
+                        .items_stretch()
+                        .when_some(images.old.as_ref(), |row, p| {
+                            row.child(image_pane(old_label, p, cx))
+                        })
+                        .when_some(images.new.as_ref(), |row, p| {
+                            row.child(image_pane(new_label, p, cx))
+                        })
                 } else {
                     diff_message("Binary file not shown", muted)
                 }
@@ -1153,6 +1203,49 @@ pub(crate) enum HunkAction {
     Accept,
 }
 
+/// One side of an image diff: a caption, the image fitted to the pane, and its size.
+fn image_pane(label: &'static str, preview: &crate::ImagePreview, cx: &App) -> Div {
+    let muted = cx.theme().muted_foreground;
+    v_flex()
+        .flex_1()
+        .min_w(px(0.))
+        .min_h(px(0.))
+        .gap(px(tokens::SPACE_3))
+        .items_center()
+        .child(
+            div()
+                .text_size(px(tokens::UI_XS))
+                .text_color(muted)
+                .child(label),
+        )
+        .child(
+            div()
+                .flex_1()
+                .w_full()
+                .min_h(px(0.))
+                .rounded(px(tokens::RADIUS_SM))
+                .border_1()
+                .border_color(cx.theme().border)
+                .child(
+                    img(preview.render_image.clone())
+                        .size_full()
+                        .object_fit(ObjectFit::Contain),
+                ),
+        )
+        .child(
+            div()
+                .font_family("SF Mono")
+                .text_size(px(tokens::UI_XS))
+                .text_color(muted)
+                .child(format!(
+                    "{} \u{00d7} {} px \u{00b7} {}",
+                    preview.width,
+                    preview.height,
+                    crate::format_byte_size(preview.byte_size)
+                )),
+        )
+}
+
 fn diff_message(text: &'static str, color: Hsla) -> Div {
     div()
         .flex_1()
@@ -1697,6 +1790,7 @@ mod tests {
             unified: false,
             split_ratio: 0.5,
             full_path: PathBuf::from("/a.dart"),
+            images: DiffImages::default(),
             diff: FileDiff {
                 rows,
                 ..Default::default()

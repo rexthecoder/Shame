@@ -815,6 +815,29 @@ impl EditorView {
         Ok(())
     }
 
+    /// Fold changes made on disk into the open buffer, keeping unsaved edits.
+    /// `Ok(Some(n))` is how many changed regions came in from disk; `Ok(None)` means
+    /// the same lines changed on both sides and nothing was touched.
+    pub fn merge_disk_changes(&mut self, cx: &mut Context<Self>) -> io::Result<Option<usize>> {
+        let merged = self.buffer.merge_external()?;
+        if merged.is_some() {
+            self.recompute_content_cols();
+            self.refresh_line_changes(cx);
+            cx.notify();
+        }
+        Ok(merged)
+    }
+
+    /// Take back the last step if it is still the disk merge made at `revision`
+    /// (any edit since then makes it no longer the last step, so nothing happens).
+    pub fn undo_disk_merge(&mut self, revision: u64, cx: &mut Context<Self>) {
+        if self.buffer.revision() == revision && self.buffer.undo() {
+            self.recompute_content_cols();
+            self.refresh_line_changes(cx);
+            cx.notify();
+        }
+    }
+
     /// Keep this editor's version: treat the file on disk as seen, so the next
     /// save overwrites it knowingly.
     pub fn keep_my_version(&mut self, cx: &mut Context<Self>) {
@@ -3168,8 +3191,9 @@ impl EditorView {
                         },
                     )
                     .when_some(
-                        self.hover_to_render()
-                            .filter(|(line, _)| *line == index && self.completions.is_empty()),
+                        self.hover_to_render().filter(|(line, _)| {
+                            *line == index && self.completions.is_empty() && window.is_window_active()
+                        }),
                         |el, (_, text)| {
                             let hover_col = self
                                 .hover_point
@@ -4290,6 +4314,7 @@ impl Render for EditorView {
         let options = cx.try_global::<EditorOptions>().copied().unwrap_or_default();
         self.set_inlay_hints_enabled(options.inlay_hints, cx);
         self.maybe_schedule_inlay_hints(cx);
+        self.dismiss_stale_signature_help(cx);
         self.maybe_prefetch_code_actions(cx);
 
         let primary = self.buffer.selections().primary();

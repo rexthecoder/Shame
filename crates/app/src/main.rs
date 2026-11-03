@@ -9,6 +9,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 mod agent_composer;
+mod agent_bridge;
 mod agent_ctx;
 mod agent_indicator;
 mod agent_permission;
@@ -366,13 +367,17 @@ pub(crate) fn is_image_path(path: &Path) -> bool {
 
 pub(crate) fn load_image_preview(path: &Path) -> Option<ImagePreview> {
     let bytes = std::fs::read(path).ok()?;
-    let byte_size = bytes.len() as u64;
     let format_label = path
         .extension()
         .and_then(|e| e.to_str())
         .unwrap_or("IMG")
         .to_ascii_uppercase();
-    let decoded = image::load_from_memory(&bytes).ok()?;
+    decode_image_preview(&bytes, format_label)
+}
+
+pub(crate) fn decode_image_preview(bytes: &[u8], format_label: String) -> Option<ImagePreview> {
+    let byte_size = bytes.len() as u64;
+    let decoded = image::load_from_memory(bytes).ok()?;
     let (width, height) = (decoded.width(), decoded.height());
     let mut rgba = decoded.into_rgba8();
     // GPUI renders BGRA channel order in `RenderImage`.
@@ -485,6 +490,7 @@ pub struct DartIde {
     pub(crate) web_preview_keep_logins: bool,
     pub(crate) agent_open: bool,
     pub(crate) agent: rails::agent::AgentState,
+    pub(crate) agent_bridge: Option<agent_bridge::AgentBridge>,
     pub(crate) project_search_input: Entity<InputState>,
     pub(crate) project_search_matches: Vec<core_workspace::SearchMatch>,
     pub(crate) project_search_truncated: bool,
@@ -735,6 +741,7 @@ impl DartIde {
             web_preview_keep_logins: false,
             agent_open: false,
             agent,
+            agent_bridge: None,
             project_search_input,
             project_search_matches: Vec::new(),
             project_search_truncated: false,
@@ -849,6 +856,7 @@ impl DartIde {
         this.apply_save_options(cx);
         this.apply_editor_options(cx);
         this.start_git_refresh_loop(cx);
+        this.start_agent_bridge(window, cx);
         this.run_dev_commands(window, cx);
         // The Commit button depends on whether the message box is empty.
         cx.observe(&this.git.message, |_, _, cx| cx.notify()).detach();
@@ -1445,6 +1453,9 @@ fn menu_key_bindings(keymap: &editor_view::keymap::Keymap) -> Vec<KeyBinding> {
 }
 
 fn main() {
+    if let Some(code) = agent_bridge::run_cli_if_requested() {
+        std::process::exit(code);
+    }
     let app = gpui_kit::application().with_assets(AllAssets);
 
     app.run(move |cx| {
