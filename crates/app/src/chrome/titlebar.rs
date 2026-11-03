@@ -210,12 +210,21 @@ impl DartIde {
                         // reload/restart buttons the user can press into a build.
                         let flutter_busy =
                             flutter_session_busy(is_running, self.flutter_status.as_deref());
+                        // The device name always stays; what the session is doing sits beside it.
                         let dev_name = self
-                            .flutter_status
-                            .clone()
-                            .filter(|s| s != "Running")
-                            .or_else(|| self.selected_device.as_ref().map(|d| d.name.clone()))
+                            .selected_device
+                            .as_ref()
+                            .map(|d| d.name.clone())
                             .unwrap_or_else(|| "macOS".to_string());
+                        let status_badge: Option<(String, Hsla)> = if flutter_busy {
+                            self.flutter_status
+                                .clone()
+                                .map(|s| (s, cx.theme().warning))
+                        } else if is_running {
+                            Some(("Running".to_string(), green))
+                        } else {
+                            None
+                        };
                         let dev_icon = self
                             .selected_device
                             .as_ref()
@@ -250,6 +259,8 @@ impl DartIde {
                                 .rounded(px(tokens::RADIUS_SM))
                                 .bg(if is_open {
                                     tokens::accent_dim()
+                                } else if is_running && !flutter_busy {
+                                    green.opacity(0.09)
                                 } else {
                                     cx.theme().sidebar
                                 })
@@ -273,10 +284,15 @@ impl DartIde {
                                         .color(cx.theme().warning)
                                         .into_any_element()
                                 } else if is_running {
+                                    // A dot with a soft halo, so "live" reads at a glance.
                                     div()
-                                        .size(px(6.))
-                                        .rounded(px(3.))
-                                        .bg(green)
+                                        .size(px(12.))
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .rounded(px(6.))
+                                        .bg(green.opacity(0.22))
+                                        .child(div().size(px(6.)).rounded(px(3.)).bg(green))
                                         .into_any_element()
                                 } else {
                                     Icon::new(dev_icon)
@@ -291,6 +307,20 @@ impl DartIde {
                                         .font_medium()
                                         .child(dev_name),
                                 )
+                                .when_some(status_badge, |el, (text, color)| {
+                                    el.child(
+                                        div()
+                                            .max_w(px(150.))
+                                            .truncate()
+                                            .px(px(5.))
+                                            .rounded(px(3.))
+                                            .bg(color.opacity(0.16))
+                                            .text_size(px(10.))
+                                            .font_medium()
+                                            .text_color(color)
+                                            .child(text),
+                                    )
+                                })
                                 .when_some(cfg_badge, |el, badge| {
                                     el.child(
                                         div()
