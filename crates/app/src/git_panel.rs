@@ -109,7 +109,7 @@ impl GitState {
             notice: None,
             message: cx.new(|cx| {
                 TextareaState::new(window, cx)
-                    .placeholder("Commit message\u{2026}")
+                    .placeholder("Describe your change\u{2026}")
                     .auto_grow(1, 5)
             }),
             branch_input: cx

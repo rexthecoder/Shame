@@ -34,6 +34,8 @@ pub const RADIUS_PILL: f32 = 999.;
 // ---- type -----------------------------------------------------------------
 
 pub const UI: f32 = 12.5;
+/// Headings inside empty states and quiet hero blocks.
+pub const UI_LG: f32 = 14.;
 pub const UI_SM: f32 = 11.5;
 pub const UI_XS: f32 = 10.5;
 pub const MONO: f32 = 12.5;
