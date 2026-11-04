@@ -813,6 +813,7 @@ impl DartIde {
             if let Some(root) = self.git.status.as_ref().map(|s| s.root.clone()) {
                 self.git.branches = core_workspace::branches(&root);
             }
+            // The current branch is sorted first by the switcher.
             self.git.branch_selected = 0;
             self.git.branch_input.update(cx, |s, cx| {
                 s.set_value("", window, cx);
@@ -835,6 +836,7 @@ impl DartIde {
             .map(|s| s.root.clone())
             .unwrap_or_else(|| self.root.clone());
         self.git.branches = core_workspace::branches(&root);
+        // The current branch is sorted first by the switcher.
         self.git.branch_selected = 0;
         self.git.branch_input.update(cx, |s, cx| {
             s.set_value("", window, cx);

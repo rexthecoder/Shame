@@ -11,7 +11,6 @@ use gpui_kit::component::{
     button::{Button, ButtonCustomVariant, ButtonVariants as _},
     h_flex,
     input::{Input, Textarea},
-    resizable::{resizable_panel, v_resizable},
     v_flex,
 };
 use gpui_kit::prelude::FluentBuilder as _;
@@ -52,11 +51,11 @@ fn neutral_pill(cx: &App) -> ButtonCustomVariant {
         .shadow(false)
 }
 
-/// Starting height of the history half (stashes + recent commits) of the
-/// git panel, and how far the divider can be dragged.
-const GIT_HISTORY_H: f32 = 300.;
-const GIT_HISTORY_MIN: f32 = 72.;
-const GIT_HISTORY_MAX: f32 = 900.;
+/// The history keeps at least this much room while a section is open, so a
+/// long change list can never bury stashes or recent commits.
+const GIT_HISTORY_MIN: f32 = 140.;
+/// Two collapsed section rows (Stashes, Recent commits).
+const GIT_HISTORY_HEADERS_H: f32 = 56.;
 
 impl DartIde {
     /// The "Files | Search | Git" tab strip at the top of the left sidebar, shared by all views.
@@ -289,7 +288,50 @@ impl DartIde {
                 options.regex,
                 |o| o.regex = !o.regex,
                 cx,
-            ));
+            ))
+            .child(
+                div()
+                    .w(px(1.))
+                    .h(px(14.))
+                    .flex_shrink_0()
+                    .bg(border),
+            )
+            .child(
+                div()
+                    .id("project-replace-toggle")
+                    .size(px(20.))
+                    .flex_shrink_0()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded(px(tokens::RADIUS_SM))
+                    .cursor_pointer()
+                    .when(replace_open, |el| {
+                        el.bg(tokens::accent_dim())
+                            .border_1()
+                            .border_color(cx.theme().primary.opacity(0.5))
+                    })
+                    .when(!replace_open, |el| el.hover(|s| s.bg(cx.theme().list_hover)))
+                    .child(Icon::new(IconName::Replace).with_size(px(12.)).text_color(
+                        if replace_open {
+                            cx.theme().primary
+                        } else {
+                            muted
+                        },
+                    ))
+                    .tooltip(|window, cx| {
+                        gpui_kit::component::tooltip::Tooltip::new("Toggle replace")
+                            .build(window, cx)
+                    })
+                    .on_click(cx.listener(|this, _e, window, cx| {
+                        this.project_replace_open = !this.project_replace_open;
+                        if this.project_replace_open {
+                            this.project_replace_input
+                                .update(cx, |state, cx| state.focus(window, cx));
+                        }
+                        cx.notify();
+                    })),
+            );
 
         let replace_field = field(IconName::Replace)
             .child(
@@ -320,52 +362,11 @@ impl DartIde {
             .border_b_1()
             .border_color(border)
             .child(
-                h_flex()
+                v_flex()
                     .w_full()
-                    .items_start()
-                    .gap(px(2.))
-                    .child(
-                        div()
-                            .id("project-replace-toggle")
-                            .w(px(18.))
-                            .h(px(if replace_open { 62. } else { 28. }))
-                            .flex_shrink_0()
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .rounded(px(tokens::RADIUS_SM))
-                            .cursor_pointer()
-                            .hover(|s| s.bg(cx.theme().list_hover))
-                            .child(
-                                Icon::new(if replace_open {
-                                    IconName::ChevronDown
-                                } else {
-                                    IconName::ChevronRight
-                                })
-                                .xsmall()
-                                .text_color(muted),
-                            )
-                            .tooltip(|window, cx| {
-                                gpui_kit::component::tooltip::Tooltip::new("Toggle replace")
-                                    .build(window, cx)
-                            })
-                            .on_click(cx.listener(|this, _e, window, cx| {
-                                this.project_replace_open = !this.project_replace_open;
-                                if this.project_replace_open {
-                                    this.project_replace_input
-                                        .update(cx, |state, cx| state.focus(window, cx));
-                                }
-                                cx.notify();
-                            })),
-                    )
-                    .child(
-                        v_flex()
-                            .flex_1()
-                            .min_w(px(0.))
-                            .gap(px(6.))
-                            .child(search_field)
-                            .when(replace_open, |el| el.child(replace_field)),
-                    ),
+                    .gap(px(tokens::SPACE_3))
+                    .child(search_field)
+                    .when(replace_open, |el| el.child(replace_field)),
             )
             .when(!filters.is_empty(), |el| {
                 el.child(
@@ -407,11 +408,25 @@ impl DartIde {
 
         let body = if query.is_empty() {
             self.render_search_empty(cx).into_any_element()
+        } else if !self.project_search_pending
+            && self.project_search_error.is_none()
+            && self.project_search_matches.is_empty()
+        {
+            self.render_search_no_results(&query, cx).into_any_element()
         } else {
             self.render_search_results(&query, cx).into_any_element()
         };
 
-        v_flex().size_full().child(header).child(body)
+        v_flex()
+            .size_full()
+            .child(header)
+            .child(
+                v_flex()
+                    .flex_1()
+                    .w_full()
+                    .min_h(px(0.))
+                    .child(body),
+            )
     }
 
     /// A filter token as a small mono pill; removable ones carry an ×.
@@ -423,17 +438,20 @@ impl DartIde {
         cx: &mut Context<Self>,
     ) -> Stateful<Div> {
         let muted = cx.theme().muted_foreground;
+        let hover = cx.theme().list_hover;
+        let accent = cx.theme().primary;
         h_flex()
             .id(id)
-            .h(px(20.))
-            .px(px(6.))
+            .h(px(22.))
+            .px(px(7.))
             .gap(px(4.))
             .items_center()
             .rounded(px(tokens::RADIUS_SM))
+            .bg(cx.theme().background)
             .border_1()
             .border_color(cx.theme().border)
             .cursor_pointer()
-            .hover(|s| s.bg(cx.theme().list_hover))
+            .hover(move |s| s.bg(hover).border_color(accent.opacity(0.4)))
             .font_family(cx.theme().mono_font_family.clone())
             .text_size(px(tokens::UI_XS))
             .text_color(cx.theme().foreground)
@@ -443,86 +461,237 @@ impl DartIde {
             })
     }
 
-    /// No query yet: recent searches to rerun, and the filter syntax as
-    /// chips that add themselves to the query.
+    /// No query yet: Zed-style landing page -- a centered heading, one
+    /// sentence, then the actions worth knowing before you type. No hero
+    /// icon, no filter-syntax lecture.
     fn render_search_empty(&self, cx: &mut Context<Self>) -> Div {
         let muted = cx.theme().muted_foreground;
-        let label = |text: &'static str| {
-            div()
-                .px(px(tokens::SPACE_2))
-                .pb(px(tokens::SPACE_1))
-                .text_size(px(tokens::UI_XS))
-                .text_color(muted)
-                .child(text)
-        };
-        v_flex()
-            .w_full()
-            .p(px(tokens::SPACE_3))
-            .gap(px(tokens::SPACE_4))
-            .when(!self.project_recent_searches.is_empty(), |el| {
-                el.child(
-                    v_flex().w_full().child(label("Recent")).children(
-                        self.project_recent_searches.iter().enumerate().map(|(ix, recent)| {
-                            let pick = recent.clone();
-                            h_flex()
-                                .id(("search-recent", ix))
-                                .w_full()
-                                .h(px(26.))
-                                .px(px(tokens::SPACE_2))
-                                .gap(px(tokens::SPACE_2))
-                                .items_center()
-                                .rounded(px(tokens::RADIUS_SM))
-                                .cursor_pointer()
-                                .hover(|s| s.bg(cx.theme().list_hover))
-                                .child(Icon::new(IconName::Clock).with_size(px(13.)).text_color(muted))
-                                .child(
-                                    div()
-                                        .flex_1()
-                                        .min_w(px(0.))
-                                        .truncate()
-                                        .text_size(px(tokens::UI_SM))
-                                        .text_color(cx.theme().foreground)
-                                        .child(recent.clone()),
-                                )
-                                .on_click(cx.listener(move |this, _e, window, cx| {
-                                    this.set_project_search_query(pick.clone(), window, cx);
-                                }))
-                        }),
-                    ),
+        let fg = cx.theme().foreground;
+        let options = self.project_search_options;
+        let replace_open = self.project_replace_open;
+        let option_row = |id: &'static str,
+                          icon: IconName,
+                          label: &'static str,
+                          on: bool,
+                          flip: fn(&mut core_workspace::SearchOptions),
+                          cx: &mut Context<Self>| {
+            let row = crate::rails::rail_action(id, icon, label, on, cx).on_click(cx.listener(
+                move |this, _e, _w, cx| this.toggle_project_search_option(flip, cx),
+            ));
+            if on {
+                row.child(div().flex_1()).child(
+                    Icon::new(IconName::Check)
+                        .with_size(px(12.))
+                        .text_color(cx.theme().primary),
                 )
-            })
+            } else {
+                row
+            }
+        };
+
+        let replace_row = crate::rails::rail_action(
+            "search-landing-replace",
+            IconName::Replace,
+            "Find and replace",
+            replace_open,
+            cx,
+        )
+        .on_click(cx.listener(|this, _e, window, cx| {
+            this.project_replace_open = !this.project_replace_open;
+            if this.project_replace_open {
+                this.project_replace_input
+                    .update(cx, |state, cx| state.focus(window, cx));
+            }
+            cx.notify();
+        }));
+        let replace_row = if replace_open {
+            replace_row.child(div().flex_1()).child(
+                Icon::new(IconName::Check)
+                    .with_size(px(12.))
+                    .text_color(cx.theme().primary),
+            )
+        } else {
+            replace_row
+        };
+        let mut actions = v_flex()
+            .w_full()
+            .gap(px(tokens::SPACE_1))
+            .child(replace_row)
+            .child(option_row(
+                "search-landing-case",
+                IconName::CaseSensitive,
+                "Match case",
+                options.case_sensitive,
+                |o| o.case_sensitive = !o.case_sensitive,
+                cx,
+            ))
+            .child(option_row(
+                "search-landing-word",
+                IconName::WholeWord,
+                "Match whole word",
+                options.whole_word,
+                |o| o.whole_word = !o.whole_word,
+                cx,
+            ))
+            .child(option_row(
+                "search-landing-regex",
+                IconName::Regex,
+                "Use regular expression",
+                options.regex,
+                |o| o.regex = !o.regex,
+                cx,
+            ));
+        actions = actions.when(!self.project_recent_searches.is_empty(), |el| {
+            el.child(
+                v_flex()
+                    .w_full()
+                    .pt(px(tokens::SPACE_5))
+                    .gap(px(tokens::SPACE_1))
+                    .child(
+                        div()
+                            .pb(px(tokens::SPACE_1))
+                            .text_size(px(tokens::UI_XS))
+                            .font_medium()
+                            .text_color(muted)
+                            .child("Recent"),
+                    )
+                    .children(self.project_recent_searches.iter().take(3).enumerate().map(
+                        |(ix, recent)| {
+                            let pick = recent.clone();
+                            crate::rails::rail_action(
+                                ("search-recent", ix),
+                                IconName::Clock,
+                                recent.clone(),
+                                false,
+                                cx,
+                            )
+                            .on_click(cx.listener(move |this, _e, window, cx| {
+                                this.set_project_search_query(pick.clone(), window, cx);
+                            }))
+                        },
+                    )),
+            )
+        });
+
+        v_flex()
+            .flex_1()
+            .w_full()
+            .min_h(px(0.))
+            .items_center()
+            .justify_center()
+            .p(px(tokens::SPACE_6))
             .child(
                 v_flex()
                     .w_full()
-                    .child(label("Narrow it down"))
+                    .max_w(px(280.))
+                    .gap(px(tokens::SPACE_1))
                     .child(
-                        h_flex()
-                            .px(px(tokens::SPACE_2))
-                            .flex_wrap()
-                            .gap(px(tokens::SPACE_1))
-                            .children(["*.dart", "!test/", "lib/"].into_iter().enumerate().map(
-                                |(ix, token)| {
-                                    self.render_search_chip(("search-hint", ix), token.to_string(), false, cx)
-                                        .on_click(cx.listener(move |this, _e, window, cx| {
-                                            let query = this.project_search_input.read(cx).value().trim().to_string();
-                                            let next = if query.is_empty() {
-                                                format!("{token} ")
-                                            } else {
-                                                format!("{query} {token}")
-                                            };
-                                            this.set_project_search_query(next, window, cx);
-                                        }))
-                                },
-                            )),
+                        div()
+                            .w_full()
+                            .text_center()
+                            .text_size(px(tokens::UI_LG))
+                            .font_semibold()
+                            .text_color(fg)
+                            .child("Search all files"),
                     )
                     .child(
                         div()
-                            .px(px(tokens::SPACE_2))
-                            .pt(px(tokens::SPACE_2))
-                            .text_size(px(tokens::UI_XS))
+                            .w_full()
+                            .pb(px(tokens::SPACE_4))
+                            .text_center()
+                            .text_size(px(tokens::UI_SM))
                             .text_color(muted)
-                            .child("Add these to the query, or paste a whole code block to find where it lives (\u{2318}\u{21e7}F)."),
-                    ),
+                            .child("Start typing to search. For more options:"),
+                    )
+                    .child(actions),
+            )
+    }
+
+    /// No results, in the same centered landing language: say what missed and
+    /// offer the two ways out, without turning it into an error panel.
+    fn render_search_no_results(&self, query: &str, cx: &mut Context<Self>) -> Div {
+        let muted = cx.theme().muted_foreground;
+        let (text, filters) = core_workspace::split_query_filters(query);
+        let needle = text.trim();
+        let shown = if needle.chars().count() > 32 {
+            format!("{}\u{2026}", needle.chars().take(32).collect::<String>())
+        } else {
+            needle.to_string()
+        };
+        let detail = if needle.is_empty() {
+            "The filters matched nothing. Remove one, or clear the search.".to_string()
+        } else {
+            format!(
+                "Nothing matched \u{201c}{shown}\u{201d}. Check the spelling, or remove a filter."
+            )
+        };
+        let mut actions = v_flex()
+            .w_full()
+            .gap(px(tokens::SPACE_1))
+            .child(
+                crate::rails::rail_action(
+                    "search-no-results-clear",
+                    IconName::X,
+                    "Clear search",
+                    false,
+                    cx,
+                )
+                .on_click(cx.listener(|this, _e, window, cx| {
+                    this.set_project_search_query(String::new(), window, cx);
+                })),
+            );
+        if !filters.is_empty() {
+            actions = actions.child(
+                crate::rails::rail_action(
+                    "search-no-results-filters",
+                    IconName::ListFilter,
+                    "Remove filters",
+                    true,
+                    cx,
+                )
+                .on_click(cx.listener(|this, _e, window, cx| {
+                    let query = this
+                        .project_search_input
+                        .read(cx)
+                        .value()
+                        .trim()
+                        .to_string();
+                    let (text, _) = core_workspace::split_query_filters(&query);
+                    this.set_project_search_query(text.trim().to_string(), window, cx);
+                })),
+            );
+        }
+        v_flex()
+            .flex_1()
+            .w_full()
+            .min_h(px(0.))
+            .items_center()
+            .justify_center()
+            .p(px(tokens::SPACE_6))
+            .child(
+                v_flex()
+                    .w_full()
+                    .max_w(px(280.))
+                    .gap(px(tokens::SPACE_1))
+                    .child(
+                        div()
+                            .w_full()
+                            .text_center()
+                            .text_size(px(tokens::UI_LG))
+                            .font_semibold()
+                            .text_color(cx.theme().foreground)
+                            .child("No results"),
+                    )
+                    .child(
+                        div()
+                            .w_full()
+                            .pb(px(tokens::SPACE_4))
+                            .text_center()
+                            .text_size(px(tokens::UI_SM))
+                            .text_color(muted)
+                            .child(detail),
+                    )
+                    .child(actions),
             )
     }
 
@@ -1008,6 +1177,7 @@ impl DartIde {
             .child(
                 h_flex()
                     .id("git-branch-toggle")
+                    .flex_1()
                     .min_w(px(0.))
                     .items_center()
                     .gap(px(tokens::SPACE_2))
@@ -1030,6 +1200,8 @@ impl DartIde {
                     )
                     .child(
                         div()
+                            .flex_1()
+                            .min_w(px(0.))
                             .truncate()
                             .text_size(px(tokens::UI_SM))
                             .font_medium()
@@ -1143,13 +1315,17 @@ impl DartIde {
 
         let raw_query = self.git.branch_input.read(cx).value().trim().to_string();
         let query = raw_query.to_lowercase();
-        let filtered: Vec<_> = self
+        let mut filtered: Vec<_> = self
             .git
             .branches
             .iter()
             .filter(|b| query.is_empty() || b.name.to_lowercase().contains(&query))
             .cloned()
             .collect();
+        // The current branch leads the list, so opening the switcher always
+        // shows where you are (and the selection is on screen) even in a repo
+        // with dozens of branches.
+        filtered.sort_by_key(|b| !b.current);
         let exact_exists = self
             .git
             .branches
@@ -1163,6 +1339,236 @@ impl DartIde {
         let filtered_count = filtered.len();
         let has_query = !raw_query.is_empty();
         let confirm_del = self.git.confirm_discard.clone();
+        let has_remote = filtered.iter().any(|b| b.name.starts_with("origin/"));
+        let local_count = filtered
+            .iter()
+            .filter(|b| !b.name.starts_with("origin/"))
+            .count();
+        let remote_count = filtered_count - local_count;
+
+        let keycap = |key: &'static str| {
+            h_flex()
+                .h(px(18.))
+                .min_w(px(18.))
+                .px(px(4.))
+                .items_center()
+                .justify_center()
+                .rounded(px(tokens::RADIUS_BADGE))
+                .bg(cx.theme().background)
+                .border_1()
+                .border_color(border)
+                .font_family(cx.theme().mono_font_family.clone())
+                .text_size(px(9.5))
+                .text_color(muted)
+                .child(key)
+        };
+
+        // Build the list with quiet group labels, so a remote branch is not
+        // just another row in a flat wall.
+        let mut list_rows: Vec<AnyElement> = Vec::new();
+        if has_query && !exact_exists {
+            let new_name = raw_query.clone();
+            list_rows.push(
+                h_flex()
+                    .id("git-create-branch")
+                    .w_full()
+                    .flex_shrink_0()
+                    .h(px(34.))
+                    .px(px(tokens::SPACE_3))
+                    .gap(px(tokens::SPACE_2))
+                    .items_center()
+                    .rounded(px(tokens::RADIUS_SM))
+                    .bg(tokens::accent_dim())
+                    .border_1()
+                    .border_color(primary.opacity(0.32))
+                    .cursor_pointer()
+                    .hover(move |s| s.bg(primary.opacity(0.22)))
+                    .child(Icon::new(IconName::Plus).with_size(px(12.)).text_color(primary))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.))
+                            .truncate()
+                            .text_size(px(tokens::UI_SM))
+                            .font_medium()
+                            .text_color(primary)
+                            .child(format!("Create branch \u{201c}{new_name}\u{201d}")),
+                    )
+                    .child(keycap("\u{21b5}"))
+                    .on_click(cx.listener(|this, _event, window, cx| {
+                        this.git_create_branch(window, cx)
+                    }))
+                    .into_any_element(),
+            );
+        }
+        let mut last_remote: Option<bool> = None;
+        for (ix, branch) in filtered.iter().enumerate() {
+            let name = branch.name.clone();
+            let del_name = branch.name.clone();
+            let current = branch.current;
+            let is_remote = name.starts_with("origin/");
+            let is_selected = ix == sel_ix;
+            let del_key = format!("branch-del:{name}");
+            let del_armed = confirm_del.as_deref() == Some(del_key.as_str());
+            let row_group = format!("git-branch-grp-{ix}");
+
+            if has_remote && last_remote != Some(is_remote) {
+                let label = if is_remote {
+                    format!("Remote {remote_count}")
+                } else {
+                    format!("Local {local_count}")
+                };
+                list_rows.push(
+                    h_flex()
+                        .w_full()
+                        .flex_shrink_0()
+                        .h(px(20.))
+                        .px(px(tokens::SPACE_3))
+                        .pt(px(tokens::SPACE_2))
+                        .items_center()
+                        .text_size(px(tokens::UI_XS))
+                        .font_medium()
+                        .text_color(muted)
+                        .child(label)
+                        .into_any_element(),
+                );
+            }
+            last_remote = Some(is_remote);
+
+            list_rows.push(
+                h_flex()
+                    .id(("git-branch", ix))
+                    .group(row_group.clone())
+                    .relative()
+                    .w_full()
+                    .flex_shrink_0()
+                    .h(px(34.))
+                    .px(px(tokens::SPACE_3))
+                    .gap(px(tokens::SPACE_2))
+                    .items_center()
+                    .justify_between()
+                    .rounded(px(tokens::RADIUS_SM))
+                    .border_1()
+                    .border_color(gpui_kit::transparent_black())
+                    .cursor_pointer()
+                    .when(is_selected, |s| {
+                        s.bg(tokens::accent_dim())
+                            .border_color(primary.opacity(0.28))
+                            .child(
+                                div()
+                                    .absolute()
+                                    .left(px(2.))
+                                    .top(px(6.))
+                                    .bottom(px(6.))
+                                    .w(px(2.5))
+                                    .rounded(px(2.))
+                                    .bg(primary),
+                            )
+                    })
+                    .when(!is_selected, |s| s.hover(move |h| h.bg(list_hover)))
+                    .text_size(px(tokens::UI_SM))
+                    .text_color(if is_remote { muted } else { fg })
+                    .child(
+                        h_flex()
+                            .flex_1()
+                            .min_w(px(0.))
+                            .items_center()
+                            .gap(px(tokens::SPACE_2))
+                            .child(
+                                Icon::new(if current {
+                                    IconName::Check
+                                } else {
+                                    IconName::GitBranch
+                                })
+                                .xsmall()
+                                .text_color(if current {
+                                    green
+                                } else if is_remote {
+                                    info
+                                } else {
+                                    muted
+                                }),
+                            )
+                            .child(
+                                div()
+                                    .truncate()
+                                    .when(current, |d| d.font_medium())
+                                    .child(branch.name.clone()),
+                            ),
+                    )
+                    .child(
+                        h_flex()
+                            .flex_shrink_0()
+                            .items_center()
+                            .gap(px(tokens::SPACE_2))
+                            .when(is_remote, |r| {
+                                r.child(
+                                    div()
+                                        .px(px(5.))
+                                        .py(px(1.))
+                                        .rounded(px(tokens::RADIUS_BADGE))
+                                        .bg(info.opacity(0.15))
+                                        .font_family(cx.theme().mono_font_family.clone())
+                                        .text_size(px(9.5))
+                                        .text_color(info)
+                                        .child("remote"),
+                                )
+                            })
+                            .when(current, |r| {
+                                r.child(
+                                    div()
+                                        .px(px(5.))
+                                        .py(px(1.))
+                                        .rounded(px(tokens::RADIUS_BADGE))
+                                        .bg(green.opacity(0.15))
+                                        .font_family(cx.theme().mono_font_family.clone())
+                                        .text_size(px(9.5))
+                                        .text_color(green)
+                                        .child("current"),
+                                )
+                            })
+                            .when(!current && !is_remote, |r| {
+                                r.child(
+                                    div()
+                                        .id(("git-del-branch", ix))
+                                        .when(!del_armed, |d| {
+                                            d.invisible()
+                                                .group_hover(row_group.clone(), |s| s.visible())
+                                        })
+                                        .text_size(px(9.5))
+                                        .text_color(if del_armed { red } else { muted })
+                                        .hover(move |s| s.text_color(red))
+                                        .child(if del_armed {
+                                            div().child("Del?").into_any_element()
+                                        } else {
+                                            Icon::new(IconName::X)
+                                                .with_size(px(11.))
+                                                .into_any_element()
+                                        })
+                                        .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                                            cx.stop_propagation()
+                                        })
+                                        .on_click(cx.listener(
+                                            move |this, _e, window, cx| {
+                                                cx.stop_propagation();
+                                                this.git_delete_branch_clicked(
+                                                    del_name.clone(),
+                                                    window,
+                                                    cx,
+                                                );
+                                            },
+                                        )),
+                                )
+                            }),
+                    )
+                    .when(!current, |el| {
+                        el.on_click(cx.listener(move |this, _event, window, cx| {
+                            this.git_checkout(name.clone(), window, cx)
+                        }))
+                    })
+                    .into_any_element(),
+            );
+        }
 
         Some(
             div()
@@ -1171,8 +1577,9 @@ impl DartIde {
                 .absolute()
                 .inset_0()
                 .flex()
+                .items_start()
                 .justify_center()
-                .pt(px(84.))
+                .pt(px(96.))
                 .bg(rgba(0x00000066))
                 .on_mouse_down(MouseButton::Left, {
                     let view = view.clone();
@@ -1186,8 +1593,8 @@ impl DartIde {
                 .child(
                     v_flex()
                         .id("branch-switcher-card")
-                        .w(px(580.))
-                        .max_h(px(440.))
+                        .w(px(560.))
+                        .max_h(px(480.))
                         .bg(cx.theme().popover)
                         .border_1()
                         .border_color(border)
@@ -1237,247 +1644,119 @@ impl DartIde {
                                 _ => {}
                             }
                         }))
-                        // Spacious Zed-style Input Header (48px tall, medium input text)
+                        // A real field, with room for the text and a visible exit.
                         .child(
                             h_flex()
-                                .h(px(48.))
-                                .px(px(16.))
-                                .gap(px(10.))
+                                .w_full()
+                                .h(px(54.))
+                                .flex_shrink_0()
+                                .px(px(tokens::SPACE_4))
+                                .gap(px(tokens::SPACE_3))
                                 .items_center()
                                 .border_b_1()
                                 .border_color(border)
                                 .child(
-                                    div()
+                                    h_flex()
                                         .flex_1()
                                         .min_w(px(0.))
+                                        .h(px(34.))
+                                        .px(px(tokens::SPACE_2))
+                                        .gap(px(tokens::SPACE_2))
+                                        .items_center()
+                                        .rounded(px(tokens::RADIUS_SM))
+                                        .bg(cx.theme().background)
+                                        .border_1()
+                                        .border_color(border)
                                         .child(
-                                            Input::new(&self.git.branch_input).appearance(false),
+                                            Icon::new(IconName::Search)
+                                                .with_size(px(13.))
+                                                .text_color(muted),
+                                        )
+                                        .child(
+                                            div().flex_1().min_w(px(0.)).child(
+                                                Input::new(&self.git.branch_input)
+                                                    .appearance(false)
+                                                    .small(),
+                                            ),
                                         ),
+                                )
+                                .child(
+                                    div()
+                                        .id("branch-switcher-close")
+                                        .size(px(26.))
+                                        .flex_shrink_0()
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .rounded(px(tokens::RADIUS_SM))
+                                        .cursor_pointer()
+                                        .hover(move |s| s.bg(list_hover))
+                                        .tooltip(|window, cx| {
+                                            gpui_kit::component::tooltip::Tooltip::new(
+                                                "Close branch switcher",
+                                            )
+                                            .build(window, cx)
+                                        })
+                                        .child(
+                                            Icon::new(IconName::X)
+                                                .with_size(px(12.))
+                                                .text_color(muted),
+                                        )
+                                        .on_click(cx.listener(|this, _e, _window, cx| {
+                                            this.git.branches_open = false;
+                                            cx.notify();
+                                        })),
                                 ),
                         )
-                        // Scrollable Body
                         .child(
                             v_flex()
                                 .id("git-branch-scroll")
-                                .p_1p5()
-                                .gap(px(tokens::SPACE_1))
+                                .flex_shrink_1()
+                                .min_h(px(0.))
+                                .max_h(px(360.))
+                                .p(px(tokens::SPACE_2))
+                                .gap(px(1.))
                                 .overflow_y_scroll()
-                                // Prominent "+ Create & switch to branch '<query>'" row when typing a new name
-                                .when(!raw_query.is_empty() && !exact_exists, |el| {
-                                    let new_name = raw_query.clone();
-                                    el.child(
-                                        h_flex()
-                                            .id("git-create-branch")
-                                            .w_full()
-                                            .h(px(30.))
-                                            .px_3()
-                                            .items_center()
-                                            .justify_between()
-                                            .gap(px(tokens::SPACE_2))
-                                            .rounded(px(tokens::RADIUS_SM))
-                                            .bg(primary.opacity(0.14))
-                                            .border_1()
-                                            .border_color(primary.opacity(0.35))
-                                            .cursor_pointer()
-                                            .hover(move |s| s.bg(primary.opacity(0.24)))
-                                            .text_size(px(tokens::UI))
-                                            .text_color(primary)
-                                            .child(
-                                                h_flex()
-                                                    .min_w(px(0.))
-                                                    .items_center()
-                                                    .gap(px(tokens::SPACE_2))
-                                                    .child(Icon::new(IconName::Plus).with_size(px(12.)))
-                                                    .child(
-                                                        div()
-                                                            .truncate()
-                                                            .font_medium()
-                                                            .child(format!(
-                                                                "Create & switch to branch \"{new_name}\""
-                                                            )),
-                                                    ),
-                                            )
-                                            .child(
-                                                div()
-                                                    .font_family(cx.theme().mono_font_family.clone())
-                                                    .text_size(px(tokens::UI_XS))
-                                                    .child("\u{21b5}"),
-                                            )
-                                            .on_click(cx.listener(|this, _event, window, cx| {
-                                                this.git_create_branch(window, cx)
-                                            })),
-                                    )
-                                })
-                                .children(filtered.into_iter().enumerate().map(|(ix, branch)| {
-                                    let name = branch.name.clone();
-                                    let del_name = branch.name.clone();
-                                    let current = branch.current;
-                                    let is_remote = name.starts_with("origin/");
-                                    let is_selected = ix == sel_ix;
-                                    let del_key = format!("branch-del:{name}");
-                                    let del_armed =
-                                        confirm_del.as_deref() == Some(del_key.as_str());
-                                    let row_group = format!("git-branch-grp-{ix}");
-
-                                    h_flex()
-                                        .id(("git-branch", ix))
-                                        .group(row_group.clone())
-                                        .relative()
-                                        .w_full()
-                                        .h(px(30.))
-                                        .px_3()
-                                        .items_center()
-                                        .justify_between()
-                                        .gap(px(tokens::SPACE_2))
-                                        .rounded(px(tokens::RADIUS_SM))
-                                        .border_1()
-                                        .border_color(gpui_kit::transparent_black())
-                                        .cursor_pointer()
-                                        .when(is_selected, |s| {
-                                            s.bg(rgba(0xea7a3c16))
-                                                .border_color(rgba(0xea7a3c36))
-                                                .child(
-                                                    div()
-                                                        .absolute()
-                                                        .left(px(2.))
-                                                        .top(px(6.))
-                                                        .bottom(px(6.))
-                                                        .w(px(2.5))
-                                                        .rounded(px(2.))
-                                                        .bg(primary),
-                                                )
-                                        })
-                                        .when(!is_selected, |s| s.hover(move |h| h.bg(list_hover)))
-                                        .text_size(px(tokens::UI))
-                                        .text_color(if current { fg } else { muted })
-                                        .child(
-                                            h_flex()
-                                                .flex_1()
-                                                .min_w(px(0.))
-                                                .items_center()
-                                                .gap(px(tokens::SPACE_2))
-                                                .child(
-                                                    Icon::new(if current {
-                                                        IconName::Check
-                                                    } else {
-                                                        IconName::GitBranch
-                                                    })
-                                                    .xsmall()
-                                                    .text_color(if current {
-                                                        green
-                                                    } else if is_remote {
-                                                        info
-                                                    } else {
-                                                        muted
-                                                    }),
-                                                )
-                                                .child(
-                                                    div()
-                                                        .truncate()
-                                                        .when(current, |d| d.font_medium())
-                                                        .child(branch.name),
-                                                ),
-                                        )
-                                        .child(
-                                            h_flex()
-                                                .flex_shrink_0()
-                                                .items_center()
-                                                .gap(px(tokens::SPACE_2))
-                                                .when(is_remote, |r| {
-                                                    r.child(
-                                                        div()
-                                                            .px(px(5.))
-                                                            .py(px(1.))
-                                                            .rounded(px(3.))
-                                                            .bg(info.opacity(0.15))
-                                                            .font_family(
-                                                                cx.theme().mono_font_family.clone(),
-                                                            )
-                                                            .text_size(px(9.5))
-                                                            .text_color(info)
-                                                            .child("remote"),
-                                                    )
-                                                })
-                                                .when(current, |r| {
-                                                    r.child(
-                                                        div()
-                                                            .px(px(5.))
-                                                            .py(px(1.))
-                                                            .rounded(px(3.))
-                                                            .bg(green.opacity(0.15))
-                                                            .font_family(
-                                                                cx.theme().mono_font_family.clone(),
-                                                            )
-                                                            .text_size(px(9.5))
-                                                            .text_color(green)
-                                                            .child("current"),
-                                                    )
-                                                })
-                                                .when(!current && !is_remote, |r| {
-                                                    r.child(
-                                                        div()
-                                                            .id(("git-del-branch", ix))
-                                                            .when(!del_armed, |d| {
-                                                                d.invisible().group_hover(
-                                                                    row_group.clone(),
-                                                                    |s| s.visible(),
-                                                                )
-                                                            })
-                                                            .text_size(px(9.5))
-                                                            .text_color(if del_armed {
-                                                                red
-                                                            } else {
-                                                                muted
-                                                            })
-                                                            .hover(move |s| s.text_color(red))
-                                                            .child(if del_armed {
-                                                                div()
-                                                                    .child("Del?")
-                                                                    .into_any_element()
-                                                            } else {
-                                                                Icon::new(IconName::X)
-                                                                    .with_size(px(11.))
-                                                                    .into_any_element()
-                                                            })
-                                                            .on_mouse_down(
-                                                                MouseButton::Left,
-                                                                |_, _, cx| cx.stop_propagation(),
-                                                            )
-                                                            .on_click(cx.listener(
-                                                                move |this, _e, window, cx| {
-                                                                    cx.stop_propagation();
-                                                                    this.git_delete_branch_clicked(
-                                                                        del_name.clone(),
-                                                                        window,
-                                                                        cx,
-                                                                    );
-                                                                },
-                                                            )),
-                                                    )
-                                                }),
-                                        )
-                                        .when(!current, |el| {
-                                            el.on_click(cx.listener(
-                                                move |this, _event, window, cx| {
-                                                    this.git_checkout(name.clone(), window, cx)
-                                                },
-                                            ))
-                                        })
-                                })),
+                                .children(list_rows),
                         )
-                        // Footer Hints
                         .child(
                             h_flex()
-                                .px_3()
-                                .py_1p5()
-                                .gap_3()
+                                .w_full()
+                                .h(px(32.))
+                                .flex_shrink_0()
+                                .px(px(tokens::SPACE_4))
+                                .gap(px(tokens::SPACE_3))
+                                .items_center()
                                 .border_t_1()
                                 .border_color(border)
                                 .text_size(px(tokens::UI_XS))
                                 .text_color(muted)
-                                .child("\u{2191}\u{2193} Navigate")
-                                .child("\u{21b5} Switch / Create")
-                                .child("Esc Dismiss"),
+                                .child(
+                                    h_flex()
+                                        .items_center()
+                                        .gap(px(tokens::SPACE_1))
+                                        .child(keycap("\u{2191}\u{2193}"))
+                                        .child("Navigate"),
+                                )
+                                .child(
+                                    h_flex()
+                                        .items_center()
+                                        .gap(px(tokens::SPACE_1))
+                                        .child(keycap("\u{21b5}"))
+                                        .child("Switch / create"),
+                                )
+                                .child(
+                                    h_flex()
+                                        .items_center()
+                                        .gap(px(tokens::SPACE_1))
+                                        .child(keycap("esc"))
+                                        .child("Dismiss"),
+                                )
+                                .child(div().flex_1())
+                                .child(div().child(format!(
+                                    "{filtered_count} branch{}",
+                                    if filtered_count == 1 { "" } else { "es" }
+                                ))),
                         ),
                 ),
         )
@@ -1746,12 +2025,20 @@ impl DartIde {
             )
     }
 
-    /// Working changes on top, history (stashes and recent commits) below,
-    /// with a drag handle between them; each half scrolls on its own. A clean
-    /// tree has nothing to list, so it shows a quiet status block and lets the
-    /// history take the rest of the panel.
+    /// Working changes on top, history (stashes and recent commits) below.
+    /// The list sizes to its content and the history takes the slack, so a
+    /// short change list does not leave a dead middle in the panel; both
+    /// halves still scroll on their own. A clean tree has nothing to list, so
+    /// it shows a quiet status block and lets the history take the rest.
     fn render_git_changes(&self, status: &RepoStatus, cx: &mut Context<Self>) -> impl IntoElement {
         let has_history = !(status.stashes.is_empty() && status.recent_commits.is_empty());
+        let history_open = (!status.stashes.is_empty() && !self.git.stashes_collapsed)
+            || (!status.recent_commits.is_empty() && !self.git.commits_collapsed);
+        let history_min = if history_open {
+            GIT_HISTORY_MIN
+        } else {
+            GIT_HISTORY_HEADERS_H
+        };
         let history = v_flex()
             .id("git-history")
             .size_full()
@@ -1775,13 +2062,20 @@ impl DartIde {
             return frame
                 .child(self.render_git_clean_state(status, cx))
                 .when(has_history, |el| {
-                    el.child(div().flex_1().w_full().min_h(px(0.)).child(history))
+                    el.child(
+                        div()
+                            .flex_1()
+                            .w_full()
+                            .min_h(px(history_min))
+                            .child(history),
+                    )
                 });
         }
 
         let list = v_flex()
             .id("git-changes")
-            .size_full()
+            .w_full()
+            .flex_shrink_1()
             .min_h(px(0.))
             .overflow_y_scroll()
             .pb(px(tokens::SPACE_2))
@@ -1815,16 +2109,12 @@ impl DartIde {
         if !has_history {
             return frame.child(list);
         }
-        frame.child(
-            v_resizable("git-panel-split")
-                .child(resizable_panel().child(list))
-                .child(
-                    resizable_panel()
-                        .size(px(GIT_HISTORY_H))
-                        .size_range(px(GIT_HISTORY_MIN)..px(GIT_HISTORY_MAX))
-                        .fixed()
-                        .child(history),
-                ),
+        frame.child(list).child(
+            div()
+                .w_full()
+                .flex_1()
+                .min_h(px(history_min))
+                .child(history),
         )
     }
 
@@ -1835,7 +2125,6 @@ impl DartIde {
     /// below.
     fn render_git_clean_state(&self, status: &RepoStatus, cx: &mut Context<Self>) -> Div {
         let muted = cx.theme().muted_foreground;
-        let fg = cx.theme().foreground;
         let green = cx.theme().green;
         let busy = self.git.busy.is_some();
         let has_commit = status.head.is_some();
@@ -1887,7 +2176,7 @@ impl DartIde {
         if has_commit && has_upstream {
             if behind > 0 {
                 actions.push(
-                    self.render_git_clean_action(
+                    crate::rails::rail_action(
                         "git-clean-pull",
                         IconName::ArrowDown,
                         format!("Pull {} commit{} from {remote}", behind, plural(behind)),
@@ -1897,13 +2186,14 @@ impl DartIde {
                     .when(!busy, |el| {
                         el.on_click(cx.listener(|this, _e, window, cx| this.git_pull(window, cx)))
                     })
+                    .when(busy, |el| el.opacity(0.5))
                     .into_any_element(),
                 );
             }
             if ahead > 0 {
                 // With a diverged branch, pulling first is the safer primary.
                 actions.push(
-                    self.render_git_clean_action(
+                    crate::rails::rail_action(
                         "git-clean-push",
                         IconName::ArrowUp,
                         format!("Push {} commit{} to {remote}", ahead, plural(ahead)),
@@ -1913,12 +2203,13 @@ impl DartIde {
                     .when(!busy, |el| {
                         el.on_click(cx.listener(|this, _e, window, cx| this.git_push(window, cx)))
                     })
+                    .when(busy, |el| el.opacity(0.5))
                     .into_any_element(),
                 );
             }
             if ahead == 0 && behind == 0 {
                 actions.push(
-                    self.render_git_clean_action(
+                    crate::rails::rail_action(
                         "git-clean-fetch",
                         IconName::RefreshCw,
                         format!("Fetch from {remote}"),
@@ -1928,6 +2219,7 @@ impl DartIde {
                     .when(!busy, |el| {
                         el.on_click(cx.listener(|this, _e, window, cx| this.git_fetch(window, cx)))
                     })
+                    .when(busy, |el| el.opacity(0.5))
                     .into_any_element(),
                 );
             }
@@ -1940,81 +2232,20 @@ impl DartIde {
             .pt(px(tokens::SPACE_6))
             .pb(px(tokens::SPACE_5))
             .gap(px(tokens::SPACE_4))
-            .child(
-                Icon::new(if has_commit {
+            .child(crate::rails::quiet_state(
+                if has_commit {
                     IconName::CircleCheck
                 } else {
                     IconName::GitBranch
-                })
-                .with_size(px(20.))
-                .text_color(if has_commit { green } else { muted }),
-            )
-            .child(
-                v_flex()
-                    .w_full()
-                    .gap(px(tokens::SPACE_1))
-                    .child(
-                        div()
-                            .text_size(px(tokens::UI_LG))
-                            .font_semibold()
-                            .text_color(fg)
-                            .child(title),
-                    )
-                    .child(
-                        div()
-                            .text_size(px(tokens::UI_SM))
-                            .text_color(muted)
-                            .child(detail),
-                    ),
-            )
+                },
+                if has_commit { green } else { muted },
+                title,
+                detail,
+                cx,
+            ))
             .when(!actions.is_empty(), |el| {
                 el.child(v_flex().w_full().pt(px(tokens::SPACE_2)).children(actions))
             })
-    }
-
-    /// One flat action row for the clean state: a glyph in a small keycap,
-    /// then its label. Fleet marks the affordance, not the whole row.
-    fn render_git_clean_action(
-        &self,
-        id: &'static str,
-        icon: IconName,
-        label: String,
-        accent: bool,
-        cx: &App,
-    ) -> Stateful<Div> {
-        let muted = cx.theme().muted_foreground;
-        let border = cx.theme().border;
-        let hover = cx.theme().list_hover;
-        let busy = self.git.busy.is_some();
-        let tone = if accent { cx.theme().primary } else { muted };
-        h_flex()
-            .id(id)
-            .w_full()
-            .h(px(28.))
-            .gap(px(tokens::SPACE_3))
-            .items_center()
-            .rounded(px(tokens::RADIUS_SM))
-            .when(!busy, |el| el.cursor_pointer().hover(move |s| s.bg(hover)))
-            .when(busy, |el| el.opacity(0.5))
-            .child(
-                div()
-                    .size(px(18.))
-                    .flex_shrink_0()
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .rounded(px(tokens::RADIUS_SM))
-                    .bg(cx.theme().background)
-                    .border_1()
-                    .border_color(border)
-                    .child(Icon::new(icon).with_size(px(11.)).text_color(tone)),
-            )
-            .child(
-                div()
-                    .text_size(px(tokens::UI_SM))
-                    .text_color(cx.theme().foreground)
-                    .child(label),
-            )
     }
 
     fn render_git_section(
@@ -2842,6 +3073,10 @@ impl DartIde {
                                                     )
                                                     .text_size(px(tokens::UI_XS - 1.5))
                                                     .text_color(tint)
+                                                    // The hover actions take its place.
+                                                    .group_hover("git-head-row", |s| {
+                                                        s.invisible()
+                                                    })
                                                     .child("HEAD"),
                                             )
                                         }),
@@ -2921,8 +3156,30 @@ impl DartIde {
                                         }),
                                 ),
                         )
-                        // HEAD carries the actions that rewrite it.
-                        .when(first, |row| row.child(self.render_git_head_actions(cx)))
+                        // HEAD carries the actions that rewrite it. They float
+                        // over the row on hover instead of permanently taking
+                        // width, which squeezed the subject and author to "…".
+                        .when(first, |row| {
+                            row.relative().group("git-head-row").child(
+                                // Opaque base + the row's hover tint on top, so
+                                // the subject underneath never shows through.
+                                div()
+                                    .absolute()
+                                    .right(px(tokens::SPACE_2))
+                                    .top(px(tokens::SPACE_1))
+                                    .rounded(px(tokens::RADIUS_SM))
+                                    .bg(cx.theme().sidebar)
+                                    .invisible()
+                                    .group_hover("git-head-row", |s| s.visible())
+                                    .child(
+                                        h_flex()
+                                            .pl(px(tokens::SPACE_2))
+                                            .rounded(px(tokens::RADIUS_SM))
+                                            .bg(cx.theme().list_hover)
+                                            .child(self.render_git_head_actions(cx)),
+                                    ),
+                            )
+                        })
                         .on_click(cx.listener(move |this, _e, _w, cx| {
                             this.git_toggle_commit(hash.clone(), cx);
                         })),

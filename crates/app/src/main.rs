@@ -227,8 +227,10 @@ fn contains_ascii_ci(haystack: &str, needle_lower: &str) -> bool {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum FileTreeOp {
-    NewFile,
-    NewFolder,
+    /// A new file typed into an inline row inside `parent` (VS Code style).
+    NewFile { parent: PathBuf },
+    NewFolder { parent: PathBuf },
+    /// Rename in place: the row's label becomes the input.
     Rename(PathBuf),
 }
 
@@ -532,6 +534,8 @@ pub struct DartIde {
     pub(crate) debug_prompt_input: Entity<InputState>,
     pub(crate) show_hidden: bool,
     pub(crate) file_tree_op: Option<FileTreeOp>,
+    /// Why the name typed into the inline create/rename row can't be used.
+    pub(crate) file_tree_error: Option<String>,
     pub(crate) file_tree_input: Entity<InputState>,
     pub(crate) tree_state: Entity<TreeState>,
     pub(crate) tabs: Vec<Tab>,
@@ -676,7 +680,7 @@ impl DartIde {
             InputState::new(window, cx).placeholder("Replace")
         });
         let file_tree_input = cx.new(|cx| {
-            InputState::new(window, cx).placeholder("path/to/file.dart\u{2026}")
+            InputState::new(window, cx)
         });
         let web_preview_url = cx.new(|cx| {
             InputState::new(window, cx)
@@ -772,6 +776,7 @@ impl DartIde {
             debug_prompt_input,
             show_hidden,
             file_tree_op: None,
+            file_tree_error: None,
             file_tree_input,
             tree_state,
             tabs: Vec::new(),
@@ -898,6 +903,22 @@ impl DartIde {
             },
         );
         this._subscriptions.push(search_changes);
+        // File tree inline create/rename: validate as you type, Enter
+        // commits, and clicking away commits a valid name (VS Code).
+        let tree_input_events = cx.subscribe_in(
+            &this.file_tree_input,
+            window,
+            |this, _state, event: &gpui_kit::component::input::InputEvent, window, cx| {
+                use gpui_kit::component::input::InputEvent;
+                match event {
+                    InputEvent::Change => this.validate_file_tree_input(cx),
+                    InputEvent::PressEnter { .. } => this.submit_file_tree_prompt(window, cx),
+                    InputEvent::Blur => this.commit_file_tree_on_blur(window, cx),
+                    _ => {}
+                }
+            },
+        );
+        this._subscriptions.push(tree_input_events);
         // Agent composer: typing `@name` opens a live file picker; picking one turns
         // the text into an inline pill. (Searching the picker resets its highlight below.)
         let mention_changes = cx.subscribe_in(
@@ -1152,6 +1173,12 @@ impl DartIde {
                     if let Some(path) = step.strip_prefix("open:") {
                         let path = this.root.join(path);
                         this.open_path(path, window, cx);
+                    } else if let Some(path) = step.strip_prefix("rename:") {
+                        let path = this.root.join(path);
+                        this.open_file_tree_prompt(FileTreeOp::Rename(path), window, cx);
+                    } else if let Some(dir) = step.strip_prefix("new-file:") {
+                        let parent = this.root.join(dir);
+                        this.open_file_tree_prompt(FileTreeOp::NewFile { parent }, window, cx);
                     } else if let Some(text) = step.strip_prefix("type:") {
                         let text = text.to_string();
                         this.palette_input

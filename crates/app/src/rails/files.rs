@@ -5,7 +5,8 @@ use gpui_kit::component::{
     ActiveTheme as _, Icon, IconName, Sizable as _,
     button::{Button, ButtonVariants as _},
     h_flex,
-    input::Input,
+    input::{Input, InputState},
+    menu::{ContextMenuExt as _, PopupMenu, PopupMenuItem},
     tree::TreeItem,
     v_flex,
 };
@@ -65,6 +66,31 @@ pub(crate) fn to_tree_items(nodes: Vec<FsNode>) -> Vec<TreeItem> {
         .map(|node| match node.children {
             Some(children) => TreeItem::new(node.id, node.name).children(to_tree_items(children)),
             None => TreeItem::new(node.id, node.name),
+        })
+        .collect()
+}
+
+/// Tree id of the editable row shown while naming a new file or folder.
+/// Not a path, so it can never collide with a real entry.
+pub(crate) const NEW_ENTRY_ID: &str = "\u{0}shame-new-entry";
+
+/// `items` with `child` inserted first under the folder `parent_id`, with
+/// that folder and its ancestors opened so the new row is visible.
+pub(crate) fn with_child_first(items: &[TreeItem], parent_id: &str, child: TreeItem) -> Vec<TreeItem> {
+    let parent = Path::new(parent_id);
+    items
+        .iter()
+        .map(|item| {
+            if item.id.as_ref() == parent_id {
+                let children = std::iter::once(child.clone()).chain(item.children.iter().cloned());
+                TreeItem::new(item.id.clone(), item.label.clone()).children(children).expanded(true)
+            } else if parent.starts_with(item.id.as_ref()) && !item.children.is_empty() {
+                TreeItem::new(item.id.clone(), item.label.clone())
+                    .children(with_child_first(&item.children, parent_id, child.clone()))
+                    .expanded(true)
+            } else {
+                item.clone()
+            }
         })
         .collect()
 }
@@ -408,6 +434,152 @@ fn status_badge(letter: char, cx: &App) -> Div {
         .child(letter.to_string())
 }
 
+/// The tree row while a name is being typed: same indent and icon as a
+/// real row, the label swapped for an input, and the reason a name can't be
+/// used shown just under it (VS Code's inline create/rename).
+#[allow(clippy::too_many_arguments)]
+fn render_tree_edit_row(
+    depth: usize,
+    is_new: bool,
+    is_folder: bool,
+    is_expanded: bool,
+    label: SharedString,
+    input: &Entity<InputState>,
+    error: Option<String>,
+    view: Entity<DartIde>,
+    cx: &mut App,
+) -> AnyElement {
+    let typed = input.read(cx).value().to_string();
+    let icon_name = if is_new { typed.trim().to_string() } else { label.to_string() };
+    let icon: AnyElement = if is_folder {
+        Icon::new(if is_expanded && !is_new { IconName::FolderOpen } else { IconName::Folder })
+            .text_color(folder_icon_color(&icon_name, cx))
+            .small()
+            .into_any_element()
+    } else {
+        // Follows the name as it's typed, like VS Code's icon.
+        render_file_icon(if icon_name.is_empty() { "file" } else { &icon_name }).into_any_element()
+    };
+    let accent = if error.is_some() { cx.theme().danger } else { cx.theme().primary };
+    let indent = depth as f32 * 16. + tokens::SPACE_3;
+    let cancel_view = view.clone();
+
+    div()
+        .w_full()
+        .h(px(tokens::TREE_ROW_H))
+        .px(px(tokens::SPACE_3))
+        .flex()
+        .items_center()
+        .child(
+            h_flex()
+                .relative()
+                .w_full()
+                .h(px(26.))
+                .pl(px(indent))
+                .pr(px(tokens::SPACE_1))
+                .items_center()
+                .gap(px(tokens::SPACE_2))
+                .child(div().w(px(12.)).flex_shrink_0())
+                .child(icon)
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w(px(0.))
+                        .h(px(22.))
+                        .px(px(tokens::SPACE_1))
+                        .flex()
+                        .items_center()
+                        .rounded(px(tokens::RADIUS_BADGE))
+                        .border_1()
+                        .border_color(accent)
+                        .bg(cx.theme().background)
+                        .text_size(px(tokens::UI))
+                        // Keep the tree from treating clicks in the box as row clicks.
+                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                        .on_key_down(move |event: &KeyDownEvent, _window, cx| {
+                            if event.keystroke.key == "escape" {
+                                cx.stop_propagation();
+                                cancel_view.update(cx, |this, cx| this.cancel_file_tree_prompt(cx));
+                            }
+                        })
+                        .child(Input::new(input).appearance(false).xsmall()),
+                )
+                .when_some(error, |el, error| {
+                    el.child(
+                        deferred(
+                            div()
+                                .absolute()
+                                .top(px(25.))
+                                .left(px(indent + 12. + 16. + tokens::SPACE_2 * 2.))
+                                .right(px(tokens::SPACE_1))
+                                .px(px(tokens::SPACE_3))
+                                .py(px(tokens::SPACE_2))
+                                .rounded_b(px(tokens::RADIUS_BADGE))
+                                .bg(cx.theme().background)
+                                .border_1()
+                                .border_color(cx.theme().danger)
+                                .text_size(px(tokens::UI_SM))
+                                .text_color(cx.theme().foreground)
+                                .child(error),
+                        )
+                        .with_priority(2),
+                    )
+                }),
+        )
+        .into_any_element()
+}
+
+/// Right-click menu on a tree row, as in VS Code's explorer.
+fn tree_context_menu(menu: PopupMenu, path: &Path, root: &Path, view: Entity<DartIde>) -> PopupMenu {
+    let dir = if path.is_dir() {
+        path.to_path_buf()
+    } else {
+        path.parent().map(Path::to_path_buf).unwrap_or_else(|| root.to_path_buf())
+    };
+    // Run after the menu closes, so its focus change can't end the edit.
+    let later = |view: Entity<DartIde>, op: crate::FileTreeOp| {
+        move |_: &ClickEvent, window: &mut Window, cx: &mut App| {
+            let view = view.clone();
+            let op = op.clone();
+            window.defer(cx, move |window, cx| {
+                view.update(cx, |this, cx| this.open_file_tree_prompt(op, window, cx));
+            });
+        }
+    };
+    let abs = path.to_string_lossy().to_string();
+    let rel = path.strip_prefix(root).unwrap_or(path).to_string_lossy().to_string();
+    let reveal = path.to_path_buf();
+    let del_path = path.to_path_buf();
+    let del_view = view.clone();
+    menu.item(
+        PopupMenuItem::new("New File\u{2026}")
+            .on_click(later(view.clone(), crate::FileTreeOp::NewFile { parent: dir.clone() })),
+    )
+    .item(
+        PopupMenuItem::new("New Folder\u{2026}")
+            .on_click(later(view.clone(), crate::FileTreeOp::NewFolder { parent: dir })),
+    )
+    .separator()
+    .item(PopupMenuItem::new("Reveal in Finder").on_click(move |_, _, _| {
+        let _ = std::process::Command::new("open").arg("-R").arg(&reveal).spawn();
+    }))
+    .item(PopupMenuItem::new("Copy Path").on_click(move |_, _, cx| {
+        cx.write_to_clipboard(ClipboardItem::new_string(abs.clone()));
+    }))
+    .item(PopupMenuItem::new("Copy Relative Path").on_click(move |_, _, cx| {
+        cx.write_to_clipboard(ClipboardItem::new_string(rel.clone()));
+    }))
+    .separator()
+    .item(
+        PopupMenuItem::new("Rename\u{2026}")
+            .on_click(later(view, crate::FileTreeOp::Rename(path.to_path_buf()))),
+    )
+    .item(PopupMenuItem::new("Delete").on_click(move |_, _, cx| {
+        let p = del_path.clone();
+        del_view.update(cx, |this, cx| this.delete_tree_path_clicked(p, cx));
+    }))
+}
+
 impl DartIde {
     pub(crate) fn render_files_rail(
         &self,
@@ -425,6 +597,64 @@ impl DartIde {
         let fg = cx.theme().foreground;
         let border = cx.theme().border;
 
+        let tree_empty = self.tree_state.read(cx).entry(0).is_none();
+        let empty = v_flex()
+            .size_full()
+            .items_center()
+            .justify_center()
+            .gap(px(tokens::SPACE_2))
+            .child(
+                Icon::new(gpui_kit::assets::IconName::FolderOpen)
+                    .with_size(px(18.))
+                    .text_color(muted.opacity(0.5)),
+            )
+            .child(
+                div()
+                    .text_size(px(tokens::UI_SM))
+                    .text_color(muted)
+                    .child("No files in this folder"),
+            )
+            .child(
+                h_flex()
+                    .items_center()
+                    .gap(px(tokens::SPACE_3))
+                    .pt(px(tokens::SPACE_2))
+                    .child(
+                        div()
+                            .id("files-empty-new-file")
+                            .cursor_pointer()
+                            .text_size(px(tokens::UI_SM))
+                            .text_color(cx.theme().primary)
+                            .hover(move |s| s.text_color(fg))
+                            .child("New file\u{2026}")
+                            .on_click(cx.listener(|this, _event, window, cx| {
+                                let parent = this.root.clone();
+                                this.open_file_tree_prompt(
+                                    crate::FileTreeOp::NewFile { parent },
+                                    window,
+                                    cx,
+                                );
+                            })),
+                    )
+                    .child(div().text_color(muted.opacity(0.4)).child("\u{b7}"))
+                    .child(
+                        div()
+                            .id("files-empty-new-folder")
+                            .cursor_pointer()
+                            .text_size(px(tokens::UI_SM))
+                            .text_color(muted)
+                            .hover(move |s| s.text_color(fg))
+                            .child("New folder\u{2026}")
+                            .on_click(cx.listener(|this, _event, window, cx| {
+                                let parent = this.root.clone();
+                                this.open_file_tree_prompt(
+                                    crate::FileTreeOp::NewFolder { parent },
+                                    window,
+                                    cx,
+                                );
+                            })),
+                    ),
+            );
         v_flex()
             .size_full()
             .child(
@@ -468,10 +698,11 @@ impl DartIde {
                                             .with_size(px(12.))
                                             .text_color(muted),
                                     )
-                                    .tooltip("New File on Disk\u{2026}")
+                                    .tooltip("New File\u{2026}")
                                     .on_click(cx.listener(|this, _event, window, cx| {
+                                        let parent = this.file_tree_target_dir(cx);
                                         this.open_file_tree_prompt(
-                                            crate::FileTreeOp::NewFile,
+                                            crate::FileTreeOp::NewFile { parent },
                                             window,
                                             cx,
                                         );
@@ -486,10 +717,11 @@ impl DartIde {
                                             .with_size(px(12.))
                                             .text_color(muted),
                                     )
-                                    .tooltip("New Folder on Disk\u{2026}")
+                                    .tooltip("New Folder\u{2026}")
                                     .on_click(cx.listener(|this, _event, window, cx| {
+                                        let parent = this.file_tree_target_dir(cx);
                                         this.open_file_tree_prompt(
-                                            crate::FileTreeOp::NewFolder,
+                                            crate::FileTreeOp::NewFolder { parent },
                                             window,
                                             cx,
                                         );
@@ -536,66 +768,37 @@ impl DartIde {
                             ),
                     ),
             )
-            .when(self.file_tree_op.is_some(), |el| {
-                let label = match &self.file_tree_op {
-                    Some(crate::FileTreeOp::NewFile) => "New file:",
-                    Some(crate::FileTreeOp::NewFolder) => "New folder:",
-                    Some(crate::FileTreeOp::Rename(_)) => "Rename to:",
-                    None => "",
-                };
-                el.child(
-                    v_flex()
-                        .w_auto()
-                        .mx(px(tokens::SPACE_3))
-                        .mb(px(tokens::SPACE_2))
-                        .p(px(tokens::SPACE_2))
-                        .gap(px(tokens::SPACE_1))
-                        .rounded(px(tokens::RADIUS_SM))
-                        .bg(cx.theme().background)
-                        .border_1()
-                        .border_color(cx.theme().primary.opacity(0.6))
-                        .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
-                            let key = event.keystroke.key.as_str();
-                            if key == "escape" {
-                                this.file_tree_op = None;
-                                cx.stop_propagation();
-                                cx.notify();
-                            } else if key == "enter" {
-                                this.submit_file_tree_prompt(window, cx);
-                                cx.stop_propagation();
-                            }
-                        }))
-                        .child(
-                            h_flex()
-                                .items_center()
-                                .justify_between()
-                                .child(
-                                    div()
-                                        .text_size(px(tokens::UI_XS))
-                                        .text_color(cx.theme().primary)
-                                        .child(label),
-                                )
-                                .child(
-                                    div()
-                                        .text_size(px(tokens::UI_XS))
-                                        .text_color(muted)
-                                        .child("\u{21b5} save \u{00b7} esc"),
-                                ),
-                        )
-                        .child(
-                            Input::new(&self.file_tree_input)
-                                .appearance(false)
-                                .xsmall(),
-                        ),
-                )
-            })
             .child(
-                div()
+                v_flex()
                     .flex_1()
                     .w_full()
                     .min_h(px(0.))
-                    .child(
-                        Tree::new(&self.tree_state)
+                    .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
+                        if this.file_tree_op.is_some() {
+                            return;
+                        }
+                        let Some(path) = this
+                            .tree_state
+                            .read(cx)
+                            .selected_item()
+                            .map(|item| PathBuf::from(item.id.as_str()))
+                            .filter(|p| p.starts_with(&this.root) && *p != this.root)
+                        else {
+                            return;
+                        };
+                        let ks = &event.keystroke;
+                        if ks.key == "f2" {
+                            this.open_file_tree_prompt(crate::FileTreeOp::Rename(path), window, cx);
+                            cx.stop_propagation();
+                        } else if ks.key == "backspace" && ks.modifiers.platform {
+                            this.delete_tree_path_clicked(path, cx);
+                            cx.stop_propagation();
+                        }
+                    }))
+                    .when(tree_empty, |el| el.child(empty))
+                    .when(!tree_empty, |el| {
+                        el.child(
+                            Tree::new(&self.tree_state)
                             .item({
                                 let view = view.clone();
                                 let active_path = self
@@ -616,11 +819,40 @@ impl DartIde {
                                 let dirty_folders = std::rc::Rc::new(dirty_folders);
                                 let git_status = std::rc::Rc::new(self.git_status.clone());
                                 let confirm_del = self.git.confirm_discard.clone();
+                                // The row being named inline, if any (VS Code style).
+                                let editing_id: Option<SharedString> = match &self.file_tree_op {
+                                    Some(crate::FileTreeOp::Rename(p)) => {
+                                        Some(p.to_string_lossy().to_string().into())
+                                    }
+                                    Some(_) => Some(NEW_ENTRY_ID.into()),
+                                    None => None,
+                                };
+                                let new_is_folder = matches!(
+                                    self.file_tree_op,
+                                    Some(crate::FileTreeOp::NewFolder { .. })
+                                );
+                                let edit_input = self.file_tree_input.clone();
+                                let edit_error = self.file_tree_error.clone();
+                                let root = self.root.clone();
                                 move |ix, entry, _entry_state, _window, cx| {
                                     let item = entry.item();
                                     let item_path = PathBuf::from(item.id.as_str());
                                     let is_folder = entry.is_folder();
                                     let depth = entry.depth();
+                                    if editing_id.as_ref() == Some(&item.id) {
+                                        let is_new = item.id.as_ref() == NEW_ENTRY_ID;
+                                        return render_tree_edit_row(
+                                            depth,
+                                            is_new,
+                                            if is_new { new_is_folder } else { item_path.is_dir() },
+                                            entry.is_expanded(),
+                                            item.label.clone(),
+                                            &edit_input,
+                                            edit_error.clone(),
+                                            view.clone(),
+                                            cx,
+                                        );
+                                    }
                                     let row_group = format!("tree-row-grp-{ix}");
                                     let del_key = format!("tree-del:{}", item.id);
                                     let del_armed = confirm_del.as_deref() == Some(del_key.as_str());
@@ -738,82 +970,32 @@ impl DartIde {
                                                         .text_size(px(tokens::UI))
                                                         .child(item.label.clone()),
                                                 )
-                                                .child({
-                                                    let view_ren = view.clone();
+                                                // Delete asks once, in the row (right-click
+                                                // → Delete or ⌘⌫ arms it).
+                                                .when(del_armed, |el| {
                                                     let view_del = view.clone();
-                                                    let ren_path = item_path.clone();
                                                     let del_path = item_path.clone();
-                                                    h_flex()
-                                                        .items_center()
-                                                        .gap(px(4.))
-                                                        .when(!del_armed, |r| {
-                                                            r.invisible()
-                                                                .group_hover(row_group.clone(), |s| {
-                                                                    s.visible()
-                                                                })
-                                                        })
-                                                        .child(
-                                                            div()
-                                                                .id(("tree-rename", ix))
-                                                                .text_color(cx.theme().muted_foreground)
-                                                                .hover(move |s| s.text_color(fg))
-                                                                .child(
-                                                                    Icon::new(
-                                                                        gpui_kit::assets::IconName::PenTool,
-                                                                    )
-                                                                    .with_size(px(11.)),
-                                                                )
-                                                                .on_mouse_down(
-                                                                    MouseButton::Left,
-                                                                    |_, _, cx| cx.stop_propagation(),
-                                                                )
-                                                                .on_click(move |_e, window, cx| {
-                                                                    cx.stop_propagation();
-                                                                    let p = ren_path.clone();
-                                                                    view_ren.update(cx, |this, cx| {
-                                                                        this.open_file_tree_prompt(
-                                                                            crate::FileTreeOp::Rename(p),
-                                                                            window,
-                                                                            cx,
-                                                                        );
-                                                                    });
-                                                                }),
-                                                        )
-                                                        .child(
-                                                            div()
-                                                                .id(("tree-delete", ix))
-                                                                .text_size(px(9.5))
-                                                                .text_color(if del_armed {
-                                                                    cx.theme().danger
-                                                                } else {
-                                                                    cx.theme().muted_foreground
-                                                                })
-                                                                .hover(|s| {
-                                                                    s.text_color(cx.theme().danger)
-                                                                })
-                                                                .child(if del_armed {
-                                                                    div().child("Del?").into_any_element()
-                                                                } else {
-                                                                    Icon::new(
-                                                                        gpui_kit::assets::IconName::X,
-                                                                    )
-                                                                    .with_size(px(11.))
-                                                                    .into_any_element()
-                                                                })
-                                                                .on_mouse_down(
-                                                                    MouseButton::Left,
-                                                                    |_, _, cx| cx.stop_propagation(),
-                                                                )
-                                                                .on_click(move |_e, _window, cx| {
-                                                                    cx.stop_propagation();
-                                                                    let p = del_path.clone();
-                                                                    view_del.update(cx, |this, cx| {
-                                                                        this.delete_tree_path_clicked(
-                                                                            p, cx,
-                                                                        );
-                                                                    });
-                                                                }),
-                                                        )
+                                                    el.child(
+                                                        div()
+                                                            .id(("tree-delete", ix))
+                                                            .flex_shrink_0()
+                                                            .px(px(tokens::SPACE_2))
+                                                            .rounded(px(tokens::RADIUS_BADGE))
+                                                            .bg(cx.theme().danger.opacity(0.16))
+                                                            .text_size(px(tokens::UI_XS))
+                                                            .text_color(cx.theme().danger)
+                                                            .child("Delete?")
+                                                            .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                                                                cx.stop_propagation()
+                                                            })
+                                                            .on_click(move |_e, _w, cx| {
+                                                                cx.stop_propagation();
+                                                                let p = del_path.clone();
+                                                                view_del.update(cx, |this, cx| {
+                                                                    this.delete_tree_path_clicked(p, cx);
+                                                                });
+                                                            }),
+                                                    )
                                                 })
                                                 .when_some(badge, |el, letter| {
                                                     el.child(status_badge(letter, cx))
@@ -834,13 +1016,24 @@ impl DartIde {
                                                     })
                                                 }),
                                         )
+                                        .context_menu({
+                                            let view = view.clone();
+                                            let path = item_path.clone();
+                                            let root = root.clone();
+                                            move |menu, _window, _cx| {
+                                                tree_context_menu(menu, &path, &root, view.clone())
+                                            }
+                                        })
                                         .into_any_element()
                                 }
                             })
-                            .list_style(StyleRefinement::default().flex_grow_1().size_full())
-                            .relative()
-                            .size_full(),
-                    ),
+                                .list_style(
+                                    StyleRefinement::default().flex_grow_1().size_full(),
+                                )
+                                .relative()
+                                .size_full(),
+                        )
+                    }),
             )
     }
 }
@@ -872,6 +1065,23 @@ mod tree_state_tests {
         assert!(!fresh[0].is_expanded());
         assert!(fresh[0].children[0].is_expanded());
         assert!(fresh[1].is_expanded());
+    }
+
+    #[core::prelude::v1::test]
+    fn new_entry_row_goes_first_in_its_folder_and_opens_the_path() {
+        let items = vec![
+            folder("/w/lib", vec![folder("/w/lib/src", vec![file("/w/lib/src/a.dart")])]),
+            folder("/w/lib2", vec![file("/w/lib2/b.dart")]),
+        ];
+        let out = with_child_first(&items, "/w/lib/src", file(NEW_ENTRY_ID));
+        assert!(out[0].is_expanded());
+        let src = &out[0].children[0];
+        assert!(src.is_expanded());
+        assert_eq!(src.children[0].id.as_ref(), NEW_ENTRY_ID);
+        assert_eq!(src.children[1].id.as_ref(), "/w/lib/src/a.dart");
+        // `/w/lib2` merely shares a string prefix with `/w/lib`: untouched.
+        assert!(!out[1].is_expanded());
+        assert_eq!(out[1].children.len(), 1);
     }
 
     #[core::prelude::v1::test]

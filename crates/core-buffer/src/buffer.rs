@@ -233,6 +233,14 @@ impl Buffer {
         self.path.as_deref()
     }
 
+    /// Point the buffer at a file that was moved on disk (a rename from the
+    /// file tree). Unsaved edits stay unsaved; nothing is written.
+    pub fn rebind_path(&mut self, path: impl Into<PathBuf>) {
+        let path = path.into();
+        self.disk_stamp = stamp_of(&path);
+        self.path = Some(path);
+    }
+
     pub fn is_dirty(&self) -> bool {
         self.dirty
     }

@@ -233,26 +233,181 @@ impl DartIde {
         cx.notify();
     }
 
+    /// The folder a new file or folder goes into, as in VS Code: the selected
+    /// folder, else the selected file's folder, else the workspace root.
+    pub(crate) fn file_tree_target_dir(&self, cx: &App) -> PathBuf {
+        let selected = self
+            .tree_state
+            .read(cx)
+            .selected_item()
+            .map(|item| PathBuf::from(item.id.as_str()))
+            .filter(|p| p.starts_with(&self.root));
+        match selected {
+            // On disk, not `is_folder()`: GPUI counts an empty folder as a leaf.
+            Some(p) if p.is_dir() => p,
+            Some(p) => p.parent().map(Path::to_path_buf).unwrap_or_else(|| self.root.clone()),
+            None => self.root.clone(),
+        }
+    }
+
+    /// Start an inline create or rename in the file tree. New entries get an
+    /// editable row at the top of their folder (opened if closed); a rename
+    /// turns the row's label into an input with the name, minus its
+    /// extension, selected.
     pub(crate) fn open_file_tree_prompt(
         &mut self,
         op: FileTreeOp,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let initial = match &op {
-            FileTreeOp::Rename(path) => path
-                .strip_prefix(&self.root)
-                .unwrap_or(path)
-                .to_string_lossy()
-                .to_string(),
-            _ => String::new(),
+        // Only one inline edit at a time; drop a pending new-entry row.
+        if self.file_tree_op.take().is_some() {
+            self.rebuild_file_tree(cx);
+        }
+        self.file_tree_error = None;
+        let (initial, stem_len) = match &op {
+            FileTreeOp::Rename(path) => {
+                let name = path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_default();
+                let stem = match name.rfind('.') {
+                    Some(dot) if dot > 0 && !path.is_dir() => dot,
+                    _ => name.len(),
+                };
+                let stem_len = name[..stem].chars().count();
+                (name, stem_len)
+            }
+            FileTreeOp::NewFile { parent } | FileTreeOp::NewFolder { parent } => {
+                self.insert_new_entry_row(parent.clone(), cx);
+                (String::new(), 0)
+            }
         };
+        let row_id: SharedString = match &op {
+            FileTreeOp::Rename(path) => path.to_string_lossy().to_string().into(),
+            _ => crate::rails::files::NEW_ENTRY_ID.into(),
+        };
+        self.tree_state.update(cx, |state, cx| {
+            state.reveal_item(&row_id, ScrollStrategy::Center, cx);
+        });
         self.file_tree_op = Some(op);
         self.file_tree_input.update(cx, |s, cx| {
             s.set_value(initial, window, cx);
             s.focus(window, cx);
         });
+        // Select the stem once the input is on screen (two frames: the next
+        // one renders it, the one after can route the selection action).
+        if stem_len > 0 {
+            let input = self.file_tree_input.clone();
+            window.on_next_frame(move |window, _cx| {
+                window.on_next_frame(move |window, cx| {
+                    input.update(cx, |s, cx| {
+                        s.set_cursor_position(
+                            gpui_kit::component::input::Position::new(0, stem_len as u32),
+                            window,
+                            cx,
+                        );
+                    });
+                    window.dispatch_action(
+                        Box::new(gpui_kit::component::input::SelectToStartOfLine),
+                        cx,
+                    );
+                });
+            });
+        }
         cx.notify();
+    }
+
+    /// Put the editable "new entry" row at the top of `parent` in the tree.
+    fn insert_new_entry_row(&mut self, parent: PathBuf, cx: &mut Context<Self>) {
+        let placeholder = || {
+            gpui_kit::component::tree::TreeItem::new(crate::rails::files::NEW_ENTRY_ID, "")
+        };
+        let parent_id = parent.to_string_lossy().to_string();
+        let items = crate::rails::files::build_tree_items(&self.root, self.show_hidden);
+        let items = if parent == self.root {
+            std::iter::once(placeholder()).chain(items).collect()
+        } else {
+            crate::rails::files::with_child_first(&items, &parent_id, placeholder())
+        };
+        self.set_tree_items(items, cx);
+    }
+
+    /// Leave an inline create/rename without touching the disk.
+    pub(crate) fn cancel_file_tree_prompt(&mut self, cx: &mut Context<Self>) {
+        let Some(op) = self.file_tree_op.take() else {
+            return;
+        };
+        self.file_tree_error = None;
+        if !matches!(op, FileTreeOp::Rename(_)) {
+            self.rebuild_file_tree(cx);
+        }
+        cx.notify();
+    }
+
+    /// Why `name` can't be used for the pending create/rename, if it can't.
+    fn file_tree_name_error(&self, op: &FileTreeOp, name: &str) -> Option<String> {
+        if name.is_empty() {
+            return Some("A file or folder name must be provided.".into());
+        }
+        if name.starts_with('/') {
+            return Some("A file or folder name cannot start with a slash.".into());
+        }
+        if name.contains('\0') || name.split('/').any(|seg| seg == "." || seg == "..") {
+            return Some(format!(
+                "The name {name} is not valid as a file or folder name. Please choose a different name."
+            ));
+        }
+        let target = match op {
+            FileTreeOp::NewFile { parent } | FileTreeOp::NewFolder { parent } => {
+                parent.join(name.trim_end_matches('/'))
+            }
+            FileTreeOp::Rename(old) => {
+                let target = old.parent().unwrap_or(&self.root).join(name);
+                // Renaming to itself, or only changing case, is allowed.
+                let same = target == *old
+                    || target.to_string_lossy().to_lowercase()
+                        == old.to_string_lossy().to_lowercase();
+                if same {
+                    return None;
+                }
+                target
+            }
+        };
+        target.symlink_metadata().is_ok().then(|| {
+            format!(
+                "A file or folder {} already exists at this location. Please choose a different name.",
+                name.trim_end_matches('/')
+            )
+        })
+    }
+
+    pub(crate) fn validate_file_tree_input(&mut self, cx: &mut Context<Self>) {
+        let Some(op) = self.file_tree_op.clone() else {
+            return;
+        };
+        let raw = self.file_tree_input.read(cx).value().to_string();
+        let name = raw.trim();
+        self.file_tree_error = if name.is_empty() {
+            None
+        } else {
+            self.file_tree_name_error(&op, name)
+        };
+        cx.notify();
+    }
+
+    /// Clicking away keeps a valid name and drops an empty or invalid one.
+    pub(crate) fn commit_file_tree_on_blur(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(op) = self.file_tree_op.clone() else {
+            return;
+        };
+        let raw = self.file_tree_input.read(cx).value().to_string();
+        let name = raw.trim();
+        if name.is_empty() || self.file_tree_name_error(&op, name).is_some() {
+            self.cancel_file_tree_prompt(cx);
+        } else {
+            self.submit_file_tree_prompt(window, cx);
+        }
     }
 
     pub(crate) fn submit_file_tree_prompt(
@@ -260,38 +415,85 @@ impl DartIde {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(op) = self.file_tree_op.take() else {
+        let Some(op) = self.file_tree_op.clone() else {
             return;
         };
-        let raw = self.file_tree_input.read(cx).value().trim().to_string();
-        if raw.is_empty() {
+        let raw = self.file_tree_input.read(cx).value().to_string();
+        let name = raw.trim().to_string();
+        if name.is_empty() {
+            self.cancel_file_tree_prompt(cx);
+            return;
+        }
+        if let Some(err) = self.file_tree_name_error(&op, &name) {
+            self.file_tree_error = Some(err);
             cx.notify();
             return;
         }
-        let target = self.root.join(&raw);
-        match op {
-            FileTreeOp::NewFile => {
-                if let Some(parent) = target.parent() {
-                    let _ = std::fs::create_dir_all(parent);
+
+        let result: std::io::Result<(PathBuf, bool)> = (|| match &op {
+            FileTreeOp::NewFile { parent } => {
+                // `a/b/` makes folders; `a/b.dart` makes `a/` then the file.
+                let target = parent.join(name.trim_end_matches('/'));
+                if name.ends_with('/') {
+                    std::fs::create_dir_all(&target)?;
+                    return Ok((target, false));
                 }
-                if !target.exists() {
-                    let _ = std::fs::write(&target, "");
+                if let Some(dir) = target.parent() {
+                    std::fs::create_dir_all(dir)?;
                 }
-                self.rebuild_file_tree(cx);
-                self.open_path(target, window, cx);
+                std::fs::OpenOptions::new().write(true).create_new(true).open(&target)?;
+                Ok((target, true))
             }
-            FileTreeOp::NewFolder => {
-                let _ = std::fs::create_dir_all(&target);
-                self.rebuild_file_tree(cx);
+            FileTreeOp::NewFolder { parent } => {
+                let target = parent.join(name.trim_end_matches('/'));
+                std::fs::create_dir_all(&target)?;
+                Ok((target, false))
             }
-            FileTreeOp::Rename(old_path) => {
-                if let Some(parent) = target.parent() {
-                    let _ = std::fs::create_dir_all(parent);
+            FileTreeOp::Rename(old) => {
+                let target = old.parent().unwrap_or(&self.root).join(&name);
+                if target == *old {
+                    return Ok((target, false));
                 }
-                if std::fs::rename(&old_path, &target).is_ok() {
-                    self.rebuild_file_tree(cx);
+                if let Some(dir) = target.parent() {
+                    std::fs::create_dir_all(dir)?;
                 }
+                std::fs::rename(old, &target)?;
+                Ok((target, false))
             }
+        })();
+
+        let (target, open_it) = match result {
+            Ok(done) => done,
+            Err(err) => {
+                self.file_tree_error = Some(err.to_string());
+                cx.notify();
+                return;
+            }
+        };
+        self.file_tree_op = None;
+        self.file_tree_error = None;
+
+        // Open tabs follow a renamed file, or every file under a renamed folder.
+        if let FileTreeOp::Rename(old) = &op {
+            for tab in &mut self.tabs {
+                let Some(path) = tab.path.clone() else { continue };
+                let Ok(rel) = path.strip_prefix(old) else { continue };
+                let moved = if rel.as_os_str().is_empty() { target.clone() } else { target.join(rel) };
+                tab.path = Some(moved.clone());
+                tab.editor.update(cx, |ed, cx| ed.rebind_path(moved, cx));
+            }
+        }
+
+        self.rebuild_file_tree(cx);
+        let id: SharedString = target.to_string_lossy().to_string().into();
+        self.tree_state.update(cx, |state, cx| {
+            state.reveal_item(&id, ScrollStrategy::Center, cx);
+            if let Some(ix) = state.index_of(&id) {
+                state.set_selected_index(Some(ix), cx);
+            }
+        });
+        if open_it {
+            self.open_path(target, window, cx);
         }
         self.refresh_git(cx);
         cx.notify();

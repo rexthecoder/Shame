@@ -806,6 +806,12 @@ impl EditorView {
         self.buffer.disk_state()
     }
 
+    /// Follow the file to its new path after a rename on disk.
+    pub fn rebind_path(&mut self, path: impl Into<std::path::PathBuf>, cx: &mut Context<Self>) {
+        self.buffer.rebind_path(path);
+        cx.notify();
+    }
+
     /// Replace the text with the file's current contents (dropping local edits).
     pub fn reload_from_disk(&mut self, cx: &mut Context<Self>) -> io::Result<()> {
         self.buffer.reload_from_disk()?;

@@ -14,7 +14,7 @@ impl DartIde {
         }
         let fg = cx.theme().foreground;
         let muted = cx.theme().muted_foreground;
-        let info = cx.theme().info;
+        let primary = cx.theme().primary;
         let border = cx.theme().border;
         let list_hover = cx.theme().list_hover;
         let show_hidden = self.show_hidden;
@@ -45,7 +45,7 @@ impl DartIde {
             ),
         ];
 
-        // Helper for a Zed-style pill toggle switch (`38×20` track with `14×14` thumb circle)
+        // A quiet switch: the accent is the only "on" colour in the modal.
         let toggle_switch = |id: &'static str, enabled: bool| {
             h_flex()
                 .id(id)
@@ -54,45 +54,50 @@ impl DartIde {
                 .px(px(3.))
                 .items_center()
                 .justify_between()
-                .rounded(px(999.))
+                .rounded(px(tokens::RADIUS_PILL))
                 .bg(if enabled {
-                    info.opacity(0.65)
+                    primary.opacity(0.28)
                 } else {
                     cx.theme().background
                 })
                 .border_1()
-                .border_color(if enabled { info } else { border })
+                .border_color(if enabled { primary.opacity(0.7) } else { border })
                 .cursor_pointer()
                 .child(if enabled {
                     div().w(px(14.)).h(px(1.))
                 } else {
                     div()
                         .size(px(13.))
-                        .rounded(px(999.))
+                        .rounded(px(tokens::RADIUS_PILL))
                         .bg(muted.opacity(0.7))
                 })
                 .child(if enabled {
-                    div().size(px(13.)).rounded(px(999.)).bg(fg)
+                    div()
+                        .size(px(13.))
+                        .rounded(px(tokens::RADIUS_PILL))
+                        .bg(primary)
                 } else {
                     div().w(px(14.)).h(px(1.))
                 })
         };
 
-        // Helper for a Zed-style select pill (`Label  ⌄`)
+        // The control a row ends with: a compact, bordered, obviously clickable
+        // pill (the label is the current value, not a menu title).
         let select_pill = |id: &'static str, label: String| {
             h_flex()
                 .id(id)
-                .h(px(28.))
-                .px(px(12.))
+                .flex_shrink_0()
+                .h(px(26.))
+                .px(px(9.))
                 .items_center()
-                .gap(px(8.))
-                .rounded(px(6.))
-                .bg(cx.theme().secondary)
+                .gap(px(tokens::SPACE_2))
+                .rounded(px(tokens::RADIUS_SM))
+                .bg(cx.theme().background)
                 .border_1()
                 .border_color(border)
                 .cursor_pointer()
-                .hover(move |s| s.bg(list_hover))
-                .text_size(px(12.5))
+                .hover(move |s| s.bg(list_hover).border_color(primary.opacity(0.45)))
+                .text_size(px(tokens::UI_SM))
                 .text_color(fg)
                 .child(label)
                 .child(
@@ -102,31 +107,53 @@ impl DartIde {
                 )
         };
 
-        // Helper for a single Zed-style setting row (`Title` + `Description` on left, control on right)
+        // An action in the same pill shape, but without the chevron: these
+        // open a picker or perform something, they are not current values.
+        let action_pill = |id: &'static str, label: &'static str| {
+            h_flex()
+                .id(id)
+                .flex_shrink_0()
+                .h(px(26.))
+                .px(px(9.))
+                .items_center()
+                .rounded(px(tokens::RADIUS_SM))
+                .bg(cx.theme().background)
+                .border_1()
+                .border_color(border)
+                .cursor_pointer()
+                .hover(move |s| s.bg(list_hover).border_color(primary.opacity(0.45)))
+                .text_size(px(tokens::UI_SM))
+                .text_color(fg)
+                .child(label)
+        };
+
+        // One setting: label and explanation on the left, one control on the
+        // right, with a hairline between rows.
         let setting_row = |title: &'static str, desc: String, control: AnyElement| -> Div {
             h_flex()
                 .w_full()
-                .py(px(16.))
+                .flex_shrink_0()
+                .py(px(14.))
                 .items_center()
                 .justify_between()
-                .gap(px(24.))
+                .gap(px(20.))
                 .border_b_1()
                 .border_color(border.opacity(0.55))
                 .child(
                     v_flex()
                         .flex_1()
                         .min_w(px(0.))
-                        .gap(px(4.))
+                        .gap(px(tokens::SPACE_1))
                         .child(
                             div()
-                                .text_size(px(13.5))
+                                .text_size(px(tokens::UI))
                                 .font_medium()
                                 .text_color(fg)
                                 .child(title),
                         )
                         .child(
                             div()
-                                .text_size(px(12.))
+                                .text_size(px(tokens::UI_SM))
                                 .text_color(muted)
                                 .child(desc),
                         ),
@@ -145,14 +172,8 @@ impl DartIde {
 
         // Category 0: General
         if show_cat(0, "workspace folder project open close restore") {
-            let ws_desc = if self.has_workspace {
-                format!("Active workspace: {}", self.root.display())
-            } else {
-                "No project folder open. Open a folder to enable file explorer, Git, and LSP."
-                    .to_string()
-            };
             let v1 = view.clone();
-            let ctrl = select_pill("settings-open-folder", "Open Folder\u{2026}".to_string())
+            let ctrl = action_pill("settings-open-folder", "Open Folder\u{2026}")
                 .on_click(move |_e, window, cx| {
                     v1.update(cx, |this, cx| {
                         this.settings_open = false;
@@ -160,29 +181,79 @@ impl DartIde {
                     });
                 })
                 .into_any_element();
-            rows.push(setting_row("Workspace Folder", ws_desc, ctrl).into_any_element());
+            let mut left = v_flex()
+                .flex_1()
+                .min_w(px(0.))
+                .gap(px(tokens::SPACE_1))
+                .child(
+                    div()
+                        .text_size(px(tokens::UI))
+                        .font_medium()
+                        .text_color(fg)
+                        .child("Workspace Folder"),
+                );
+            if self.has_workspace {
+                let path = self.root.display().to_string();
+                let path_tip = path.clone();
+                left = left
+                    .child(
+                        div()
+                            .text_size(px(tokens::UI_SM))
+                            .text_color(muted)
+                            .child("Active workspace"),
+                    )
+                    .child(
+                        div()
+                            .id("settings-workspace-path")
+                            .min_w(px(0.))
+                            .truncate()
+                            .font_family(cx.theme().mono_font_family.clone())
+                            .text_size(px(tokens::UI_XS))
+                            .text_color(muted.opacity(0.8))
+                            .child(path)
+                            .tooltip(move |window, cx| {
+                                gpui_kit::component::tooltip::Tooltip::new(path_tip.clone())
+                                    .build(window, cx)
+                            }),
+                    );
+            } else {
+                left = left.child(
+                    div()
+                        .text_size(px(tokens::UI_SM))
+                        .text_color(muted)
+                        .child(
+                            "No project folder open. Open a folder to enable the explorer, Git, and LSP.",
+                        ),
+                );
+            }
+            rows.push(
+                h_flex()
+                    .w_full()
+                    .flex_shrink_0()
+                    .py(px(14.))
+                    .items_center()
+                    .justify_between()
+                    .gap(px(20.))
+                    .border_b_1()
+                    .border_color(border.opacity(0.55))
+                    .child(left)
+                    .child(ctrl)
+                    .into_any_element(),
+            );
         }
-        if show_cat(0, "on new window welcome restore folder") {
+        if self.has_workspace
+            && show_cat(0, "close workspace welcome recent folder startup")
+        {
             let v1 = view.clone();
-            let has_ws = self.has_workspace;
-            let ctrl = select_pill(
-                "settings-close-ws",
-                if has_ws {
-                    "Restore Last Workspace".to_string()
-                } else {
-                    "Welcome Screen".to_string()
-                },
-            )
-            .on_click(move |_e, _w, cx| {
-                if has_ws {
+            let ctrl = action_pill("settings-close-ws", "Close Workspace")
+                .on_click(move |_e, _w, cx| {
                     v1.update(cx, |this, cx| this.request_close_workspace(cx));
-                }
-            })
-            .into_any_element();
+                })
+                .into_any_element();
             rows.push(
                 setting_row(
-                    "On Startup",
-                    "Automatically restore the last opened folder on startup, or show the Welcome screen when closed."
+                    "Close Workspace",
+                    "Return to the Welcome screen. The folder stays in Recent Projects."
                         .to_string(),
                     ctrl,
                 )
@@ -683,6 +754,17 @@ impl DartIde {
                 .unwrap_or(("General", "General Settings"))
         };
 
+        let category_icons = |ix: usize| match ix {
+            0 => gpui_kit::assets::IconName::Settings,
+            1 => gpui_kit::assets::IconName::Palette,
+            2 => gpui_kit::assets::IconName::Code,
+            3 => gpui_kit::assets::IconName::Search,
+            4 => gpui_kit::assets::IconName::LayoutPanelLeft,
+            5 => gpui_kit::assets::IconName::Sparkles,
+            6 => gpui_kit::assets::IconName::Smartphone,
+            _ => gpui_kit::assets::IconName::Server,
+        };
+
         Some(
             div()
                 .id("settings-backdrop")
@@ -704,217 +786,275 @@ impl DartIde {
                     }
                 })
                 .child(
-                    h_flex()
+                    v_flex()
                         .id("settings-card")
-                        .w(px(860.))
-                        .h(px(560.))
+                        .w(px(880.))
+                        .h(px(600.))
                         .bg(cx.theme().popover)
                         .border_1()
                         .border_color(border)
-                        .rounded(px(12.))
+                        .rounded(px(tokens::RADIUS_CARD))
                         .shadow_xl()
                         .overflow_hidden()
                         .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                        // Left Navigation Sidebar (Zed-style)
+                        // One modal header, not a second titlebar inside the pane.
                         .child(
-                            v_flex()
-                                .w(px(215.))
-                                .h_full()
+                            h_flex()
+                                .w_full()
+                                .h(px(52.))
                                 .flex_shrink_0()
-                                .bg(cx.theme().sidebar)
-                                .border_r_1()
-                                .border_color(border)
-                                .p(px(12.))
+                                .items_center()
                                 .justify_between()
+                                .px(px(tokens::SPACE_5))
+                                .border_b_1()
+                                .border_color(border)
                                 .child(
-                                    v_flex()
-                                        .w_full()
-                                        .gap(px(10.))
-                                        // Search settings input
+                                    h_flex()
+                                        .items_center()
+                                        .gap(px(tokens::SPACE_3))
                                         .child(
-                                            h_flex()
-                                                .w_full()
-                                                .h(px(30.))
-                                                .px(px(10.))
-                                                .gap(px(8.))
-                                                .items_center()
-                                                .rounded(px(6.))
-                                                .bg(cx.theme().background)
-                                                .border_1()
-                                                .border_color(border)
-                                                .child(
-                                                    gpui_kit::component::Icon::new(
-                                                        gpui_kit::assets::IconName::Search,
-                                                    )
-                                                    .with_size(px(12.))
-                                                    .text_color(muted),
-                                                )
-                                                .child(
-                                                    div()
-                                                        .flex_1()
-                                                        .min_w(px(0.))
-                                                        .child(
-                                                            Input::new(&self.settings_search)
-                                                                .appearance(false)
-                                                                .xsmall(),
-                                                        ),
-                                                ),
+                                            gpui_kit::component::Icon::new(
+                                                gpui_kit::assets::IconName::Settings,
+                                            )
+                                            .with_size(px(15.))
+                                            .text_color(muted),
                                         )
-                                        // Category list
-                                        .child(
-                                            v_flex().w_full().gap(px(2.)).children(
-                                                CATEGORIES.iter().enumerate().map(
-                                                    |(ix, (name, _))| {
-                                                        let is_sel =
-                                                            query.is_empty() && ix == active_cat;
-                                                        let view = view.clone();
-                                                        h_flex()
-                                                            .id(("settings-cat", ix))
-                                                            .w_full()
-                                                            .h(px(30.))
-                                                            .px(px(10.))
-                                                            .gap(px(8.))
-                                                            .items_center()
-                                                            .rounded(px(6.))
-                                                            .cursor_pointer()
-                                                            .when(is_sel, |s| {
-                                                                s.bg(cx.theme().tab_active)
-                                                                    .text_color(fg)
-                                                            })
-                                                            .when(!is_sel, |s| {
-                                                                s.text_color(muted).hover(
-                                                                    move |h| {
-                                                                        h.bg(list_hover)
-                                                                            .text_color(fg)
-                                                                    },
-                                                                )
-                                                            })
-                                                            .child(
-                                                                gpui_kit::component::Icon::new(
-                                                                    gpui_kit::assets::IconName::ChevronRight,
-                                                                )
-                                                                .with_size(px(10.))
-                                                                .text_color(muted),
-                                                            )
-                                                            .child(
-                                                                div()
-                                                                    .text_size(px(13.))
-                                                                    .when(is_sel, |d| {
-                                                                        d.font_medium()
-                                                                    })
-                                                                    .child(*name),
-                                                            )
-                                                            .on_click(move |_e, window, cx| {
-                                                                view.update(cx, |this, cx| {
-                                                                    this.settings_tab = ix;
-                                                                    this.settings_search.update(
-                                                                        cx,
-                                                                        |s, cx| {
-                                                                            s.set_value(
-                                                                                "", window, cx,
-                                                                            )
-                                                                        },
-                                                                    );
-                                                                    cx.notify();
-                                                                });
-                                                            })
-                                                    },
-                                                ),
-                                            ),
-                                        ),
-                                )
-                                // Bottom-left shortcut hint
-                                .child(
-                                    h_flex()
-                                        .px(px(6.))
-                                        .items_center()
-                                        .gap(px(8.))
-                                        .font_family("SF Mono")
-                                        .text_size(px(11.))
-                                        .text_color(muted.opacity(0.75))
-                                        .child("\u{2318},")
-                                        .child("Close Settings"),
-                                ),
-                        )
-                        // Right Content Pane (Zed-style)
-                        .child(
-                            v_flex()
-                                .id("settings-content-scroll")
-                                .flex_1()
-                                .h_full()
-                                .min_w(px(0.))
-                                .overflow_y_scroll()
-                                .px(px(32.))
-                                .py(px(24.))
-                                .gap(px(6.))
-                                // Top bar: "User" pill on left, "Close" button on right
-                                .child(
-                                    h_flex()
-                                        .w_full()
-                                        .pb(px(12.))
-                                        .items_center()
-                                        .justify_between()
                                         .child(
                                             div()
-                                                .px(px(8.))
-                                                .py(px(2.))
-                                                .rounded(px(4.))
-                                                .bg(info.opacity(0.18))
-                                                .text_size(px(11.5))
-                                                .font_medium()
-                                                .text_color(info)
-                                                .child("User"),
-                                        )
+                                                .text_size(px(tokens::UI_LG))
+                                                .font_semibold()
+                                                .text_color(fg)
+                                                .child("Settings"),
+                                        ),
+                                )
+                                .child(
+                                    h_flex()
+                                        .items_center()
+                                        .gap(px(tokens::SPACE_3))
                                         .child(
                                             h_flex()
-                                                .id("close-settings-btn")
-                                                .h(px(26.))
-                                                .px(px(10.))
                                                 .items_center()
-                                                .rounded(px(6.))
-                                                .bg(cx.theme().secondary)
-                                                .border_1()
-                                                .border_color(border)
+                                                .gap(px(tokens::SPACE_2))
+                                                .font_family(
+                                                    cx.theme().mono_font_family.clone(),
+                                                )
+                                                .text_size(px(tokens::UI_XS))
+                                                .text_color(muted.opacity(0.75))
+                                                .child("\u{2318},")
+                                                .child("to close"),
+                                        )
+                                        .child(
+                                            div()
+                                                .id("close-settings-btn")
+                                                .size(px(26.))
+                                                .flex()
+                                                .items_center()
+                                                .justify_center()
+                                                .rounded(px(tokens::RADIUS_SM))
                                                 .cursor_pointer()
                                                 .hover(move |s| s.bg(list_hover))
-                                                .text_size(px(12.))
-                                                .text_color(fg)
-                                                .child("Done")
+                                                .tooltip(|window, cx| {
+                                                    gpui_kit::component::tooltip::Tooltip::new(
+                                                        "Close settings",
+                                                    )
+                                                    .build(window, cx)
+                                                })
+                                                .child(
+                                                    gpui_kit::component::Icon::new(
+                                                        gpui_kit::assets::IconName::X,
+                                                    )
+                                                    .with_size(px(13.))
+                                                    .text_color(muted),
+                                                )
                                                 .on_click({
                                                     let view = view.clone();
                                                     move |_e, _w, cx| {
                                                         view.update(cx, |this, cx| {
                                                             this.settings_open = false;
+                                                            this.save_session_state();
                                                             cx.notify();
                                                         });
                                                     }
                                                 }),
                                         ),
-                                )
-                                // Section Header + Subtitle
+                                ),
+                        )
+                        .child(
+                            h_flex()
+                                .flex_1()
+                                .w_full()
+                                .min_h(px(0.))
+                                // Navigation: a flat list with icons, no disclosure chevrons.
                                 .child(
                                     v_flex()
-                                        .w_full()
-                                        .pb(px(12.))
-                                        .gap(px(4.))
-                                        .border_b_1()
-                                        .border_color(border.opacity(0.6))
+                                        .w(px(220.))
+                                        .h_full()
+                                        .flex_shrink_0()
+                                        .bg(cx.theme().sidebar)
+                                        .border_r_1()
+                                        .border_color(border)
+                                        .p(px(tokens::SPACE_5))
+                                        .justify_between()
                                         .child(
-                                            div()
-                                                .text_size(px(17.))
-                                                .font_medium()
-                                                .text_color(fg)
-                                                .child(cat_title),
+                                            v_flex()
+                                                .w_full()
+                                                .gap(px(tokens::SPACE_4))
+                                                .child(
+                                                    h_flex()
+                                                        .w_full()
+                                                        .h(px(30.))
+                                                        .px(px(tokens::SPACE_2))
+                                                        .gap(px(tokens::SPACE_2))
+                                                        .items_center()
+                                                        .rounded(px(tokens::RADIUS_SM))
+                                                        .bg(cx.theme().background)
+                                                        .border_1()
+                                                        .border_color(border)
+                                                        .child(
+                                                            gpui_kit::component::Icon::new(
+                                                                gpui_kit::assets::IconName::Search,
+                                                            )
+                                                            .with_size(px(12.))
+                                                            .text_color(muted),
+                                                        )
+                                                        .child(
+                                                            div()
+                                                                .flex_1()
+                                                                .min_w(px(0.))
+                                                                .child(
+                                                                    Input::new(
+                                                                        &self.settings_search,
+                                                                    )
+                                                                    .appearance(false)
+                                                                    .xsmall(),
+                                                                ),
+                                                        ),
+                                                )
+                                                .child(
+                                                    v_flex().w_full().gap(px(2.)).children(
+                                                        CATEGORIES.iter().enumerate().map(
+                                                            |(ix, (name, _))| {
+                                                                let is_sel = query.is_empty()
+                                                                    && ix == active_cat;
+                                                                let view = view.clone();
+                                                                h_flex()
+                                                                    .id(("settings-cat", ix))
+                                                                    .w_full()
+                                                                    .h(px(30.))
+                                                                    .px(px(tokens::SPACE_2))
+                                                                    .gap(px(tokens::SPACE_2))
+                                                                    .items_center()
+                                                                    .rounded(px(tokens::RADIUS_SM))
+                                                                    .cursor_pointer()
+                                                                    .when(is_sel, |s| {
+                                                                        s.bg(tokens::accent_dim())
+                                                                            .text_color(fg)
+                                                                    })
+                                                                    .when(!is_sel, |s| {
+                                                                        s.text_color(muted).hover(
+                                                                            move |h| {
+                                                                                h.bg(list_hover)
+                                                                                    .text_color(fg)
+                                                                            },
+                                                                        )
+                                                                    })
+                                                                    .child(
+                                                                        gpui_kit::component::Icon::new(
+                                                                            category_icons(ix),
+                                                                        )
+                                                                        .with_size(px(13.))
+                                                                        .text_color(if is_sel {
+                                                                            primary
+                                                                        } else {
+                                                                            muted
+                                                                        }),
+                                                                    )
+                                                                    .child(
+                                                                        div()
+                                                                            .text_size(px(tokens::UI_SM))
+                                                                            .when(is_sel, |d| {
+                                                                                d.font_medium()
+                                                                            })
+                                                                            .child(*name),
+                                                                    )
+                                                                    .on_click(move |_e, window, cx| {
+                                                                        view.update(cx, |this, cx| {
+                                                                            this.settings_tab = ix;
+                                                                            this.settings_search.update(
+                                                                                cx,
+                                                                                |s, cx| {
+                                                                                    s.set_value(
+                                                                                        "", window, cx,
+                                                                                    )
+                                                                                },
+                                                                            );
+                                                                            cx.notify();
+                                                                        });
+                                                                    })
+                                                            },
+                                                        ),
+                                                    ),
+                                                ),
                                         )
                                         .child(
-                                            div()
-                                                .font_family("SF Mono")
-                                                .text_size(px(11.5))
-                                                .text_color(muted)
-                                                .child(cat_sub),
+                                            h_flex()
+                                                .px(px(tokens::SPACE_2))
+                                                .items_center()
+                                                .gap(px(tokens::SPACE_2))
+                                                .font_family(
+                                                    cx.theme().mono_font_family.clone(),
+                                                )
+                                                .text_size(px(tokens::UI_XS))
+                                                .text_color(muted.opacity(0.7))
+                                                .child(
+                                                    gpui_kit::component::Icon::new(
+                                                        gpui_kit::assets::IconName::Check,
+                                                    )
+                                                    .with_size(px(11.)),
+                                                )
+                                                .child("Saved automatically"),
                                         ),
                                 )
-                                .children(rows),
+                                // Content: one readable column, not a full-width
+                                // label-control gap across the whole modal.
+                                .child(
+                                    v_flex()
+                                        .id("settings-content-scroll")
+                                        .flex_1()
+                                        .h_full()
+                                        .min_w(px(0.))
+                                        .overflow_y_scroll()
+                                        .px(px(28.))
+                                        .py(px(tokens::SPACE_6))
+                                        .child(
+                                            v_flex()
+                                                .w_full()
+                                                .max_w(px(620.))
+                                                .gap(px(tokens::SPACE_1))
+                                                .child(
+                                                    v_flex()
+                                                        .w_full()
+                                                        .pb(px(tokens::SPACE_5))
+                                                        .gap(px(tokens::SPACE_1))
+                                                        .border_b_1()
+                                                        .border_color(border.opacity(0.6))
+                                                        .child(
+                                                            div()
+                                                                .text_size(px(tokens::UI_LG))
+                                                                .font_semibold()
+                                                                .text_color(fg)
+                                                                .child(cat_title),
+                                                        )
+                                                        .child(
+                                                            div()
+                                                                .text_size(px(tokens::UI_SM))
+                                                                .text_color(muted)
+                                                                .child(cat_sub),
+                                                        ),
+                                                )
+                                                .children(rows),
+                                        ),
+                                ),
                         ),
                 ),
         )

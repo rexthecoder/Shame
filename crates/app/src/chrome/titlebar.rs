@@ -127,6 +127,7 @@ impl DartIde {
             .child(
                 h_flex()
                     .id("titlebar-project-pill")
+                    .group("titlebar-project-pill")
                     .flex_shrink_0()
                     .h(px(26.))
                     .px(px(tokens::SPACE_4))
@@ -168,6 +169,16 @@ impl DartIde {
                             div()
                                 .id("titlebar-close-folder")
                                 .cursor_pointer()
+                                // Only on hover: a permanent × next to the
+                                // branch read as "close branch", not "close
+                                // folder". It keeps its space so the pill
+                                // doesn't jump.
+                                .invisible()
+                                .group_hover("titlebar-project-pill", |s| s.visible())
+                                .tooltip(|window, cx| {
+                                    gpui_kit::component::tooltip::Tooltip::new("Close folder")
+                                        .build(window, cx)
+                                })
                                 .text_color(muted)
                                 .hover(move |s| s.text_color(fg))
                                 .child(

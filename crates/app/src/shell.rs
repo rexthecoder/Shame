@@ -13,18 +13,28 @@ use gpui_kit::*;
 use crate::rails::files::{file_icon_color, icon_for_file};
 use crate::{DartIde, MarkdownMode, tokens};
 
+/// A shortcut hint: one cap per key (`⇧⌘P` → three caps), macOS-style, so
+/// the glyphs stay legible instead of being squeezed into a single chip.
 fn keycap(label: &'static str, cx: &App) -> Div {
-    div()
-        .px(px(tokens::SPACE_3))
-        .py(px(tokens::SPACE_1))
-        .rounded(px(tokens::RADIUS_SM))
-        .bg(cx.theme().secondary)
-        .border_1()
-        .border_color(cx.theme().border)
-        .font_family("SF Mono")
-        .text_size(px(tokens::UI_XS))
-        .text_color(cx.theme().foreground)
-        .child(label)
+    let bg = cx.theme().secondary;
+    let border = cx.theme().border;
+    let fg = cx.theme().muted_foreground;
+    h_flex().gap(px(tokens::SPACE_1)).children(label.chars().map(move |ch| {
+        div()
+            .min_w(px(20.))
+            .h(px(20.))
+            .px(px(tokens::SPACE_2))
+            .flex()
+            .items_center()
+            .justify_center()
+            .rounded(px(tokens::RADIUS_BADGE))
+            .bg(bg)
+            .border_1()
+            .border_color(border)
+            .text_size(px(tokens::UI_SM))
+            .text_color(fg)
+            .child(ch.to_string())
+    }))
 }
 
 /// A small on/off chip inside the find input (match case, whole word).
@@ -428,7 +438,6 @@ impl DartIde {
                             .child(
                                 div()
                                     .text_size(px(13.))
-                                    .italic()
                                     .text_color(muted)
                                     .child(if self.has_workspace {
                                         "Pick a file or run a command to begin"
@@ -534,7 +543,7 @@ impl DartIde {
                                     .text_color(muted)
                                     .child("Run Command\u{2026}"),
                             )
-                            .child(keycap("\u{2318}\u{21e7}P", cx))
+                            .child(keycap("\u{21e7}\u{2318}P", cx))
                             .on_click(cx.listener(|this, _event, window, cx| {
                                 this.palette_open = true;
                                 this.palette_selected = 0;
@@ -603,8 +612,10 @@ impl DartIde {
                             let rm_p = path.clone();
                             let view_open = view.clone();
                             let view_rm = view.clone();
+                            let row_group: SharedString = format!("recent-folder-{ix}").into();
                             h_flex()
                                 .id(("recent-folder-row", ix))
+                                .group(row_group.clone())
                                 .w_full()
                                 .h(px(28.))
                                 .px(px(10.))
@@ -641,6 +652,8 @@ impl DartIde {
                                     div()
                                         .id(("rm-recent-folder", ix))
                                         .cursor_pointer()
+                                        .invisible()
+                                        .group_hover(row_group, |s| s.visible())
                                         .text_color(muted)
                                         .hover(move |s| s.text_color(fg))
                                         .child(
@@ -668,16 +681,25 @@ impl DartIde {
                 )
             })
             .when(!quick_files.is_empty(), |el| {
+                // Several `Cargo.toml`s in a row are indistinguishable, so a
+                // name that repeats gets its parent folder as a prefix.
+                let base = |p: &std::path::Path| {
+                    p.file_name().and_then(|n| n.to_str()).unwrap_or_default().to_string()
+                };
+                let names: Vec<String> = quick_files.iter().map(|p| base(p)).collect();
                 el.child(
                     h_flex()
+                        .flex_wrap()
+                        .justify_center()
                         .items_center()
                         .gap(px(tokens::SPACE_2))
                         .children(quick_files.into_iter().enumerate().map(|(ix, path)| {
-                            let name = path
-                                .file_name()
-                                .and_then(|n| n.to_str())
-                                .unwrap_or_default()
-                                .to_string();
+                            let name = names[ix].clone();
+                            let parent = (names.iter().filter(|n| **n == name).count() > 1)
+                                .then(|| path.parent().map(|p| base(p)))
+                                .flatten()
+                                .filter(|p| !p.is_empty())
+                                .map(|p| format!("{p}/"));
                             let view = view.clone();
                             h_flex()
                                 .id(("quick-file", ix))
@@ -699,10 +721,12 @@ impl DartIde {
                                         .xsmall(),
                                 )
                                 .child(
-                                    div()
+                                    h_flex()
                                         .text_size(px(tokens::UI_SM))
-                                        .text_color(fg)
-                                        .child(name),
+                                        .when_some(parent, |el, parent| {
+                                            el.child(div().text_color(muted).child(parent))
+                                        })
+                                        .child(div().text_color(fg).child(name)),
                                 )
                                 .on_click(move |_event, window, cx| {
                                     view.update(cx, |this, cx| {

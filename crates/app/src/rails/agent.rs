@@ -1897,21 +1897,25 @@ impl DartIde {
                                                             red
                                                         })
                                                         .child(if cli_ready {
-                                                            "CLI Ready"
+                                                            "Ready"
                                                         } else {
                                                             "Missing CLI"
                                                         }),
                                                 ),
                                         ),
                                 )
-                                .child(
-                                    div()
-                                        .truncate()
-                                        .font_family(cx.theme().mono_font_family.clone())
-                                        .text_size(px(tokens::UI_XS))
-                                        .text_color(muted)
-                                        .child(cli_status),
-                                )
+                                // The resolved binary path is a diagnostic: only
+                                // worth the space when the CLI can't be found.
+                                .when(!cli_ready, |el| {
+                                    el.child(
+                                        div()
+                                            .truncate()
+                                            .font_family(cx.theme().mono_font_family.clone())
+                                            .text_size(px(tokens::UI_XS))
+                                            .text_color(muted)
+                                            .child(cli_status),
+                                    )
+                                })
                                 .child(
                                     h_flex()
                                         .items_center()
@@ -1951,13 +1955,13 @@ impl DartIde {
                                                 .into_iter()
                                                 .map(|cap| {
                                                     div()
-                                                        .px(px(5.))
-                                                        .py(px(1.))
-                                                        .rounded(px(3.))
+                                                        .px(px(tokens::SPACE_2))
+                                                        .py(px(tokens::SPACE_1 / 2.))
+                                                        .rounded(px(tokens::RADIUS_BADGE))
                                                         .bg(cx.theme().background)
                                                         .border_1()
                                                         .border_color(border)
-                                                        .text_size(px(9.5))
+                                                        .text_size(px(tokens::UI_XS))
                                                         .text_color(muted)
                                                         .child(cap)
                                                 }),
