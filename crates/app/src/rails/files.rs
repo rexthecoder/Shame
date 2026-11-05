@@ -550,7 +550,8 @@ fn render_tree_edit_row(
 /// item's icon and name that follows the pointer.
 #[derive(Clone)]
 pub(crate) struct TreeDrag {
-    pub(crate) path: PathBuf,
+    /// The row dragged, plus the rest of the selection when it was part of one.
+    pub(crate) paths: Vec<PathBuf>,
     label: SharedString,
     is_folder: bool,
 }
@@ -592,10 +593,19 @@ fn drop_dir(target: &Path, root: &Path) -> PathBuf {
     }
 }
 
-/// Right-click menu on a tree row, as in VS Code's explorer.
+/// The key that arms "Move to Trash?" for exactly this set of paths.
+pub(crate) fn trash_confirm_key(paths: &[PathBuf]) -> String {
+    let joined: Vec<String> = paths.iter().map(|p| p.to_string_lossy().to_string()).collect();
+    format!("tree-del:{}", joined.join("\n"))
+}
+
+/// Right-click menu on a tree row, as in VS Code's explorer. `targets` is
+/// what Cut/Copy/Duplicate/Trash act on: the whole ⌘/⇧-click selection when
+/// the row is part of it, else just the row.
 fn tree_context_menu(
     menu: PopupMenu,
     path: &Path,
+    targets: Vec<PathBuf>,
     root: &Path,
     can_paste: bool,
     view: Entity<DartIde>,
@@ -615,11 +625,11 @@ fn tree_context_menu(
             });
         }
     };
+    let many = targets.len() > 1;
+    let count = targets.len();
     let abs = path.to_string_lossy().to_string();
     let rel = path.strip_prefix(root).unwrap_or(path).to_string_lossy().to_string();
     let reveal = path.to_path_buf();
-    let del_path = path.to_path_buf();
-    let del_view = view.clone();
     menu.item(
         PopupMenuItem::new("New File\u{2026}")
             .on_click(later(view.clone(), crate::FileTreeOp::NewFile { parent: dir.clone() })),
@@ -629,31 +639,29 @@ fn tree_context_menu(
             .on_click(later(view.clone(), crate::FileTreeOp::NewFolder { parent: dir.clone() })),
     )
     .separator()
-    .item(PopupMenuItem::new("Cut").on_click({
-        let (view, path) = (view.clone(), path.to_path_buf());
-        move |_, _, cx| view.update(cx, |this, cx| this.set_tree_clipboard(path.clone(), true, cx))
+    .item(PopupMenuItem::new(if many { format!("Cut {count} Items") } else { "Cut".into() }).on_click({
+        let (view, targets) = (view.clone(), targets.clone());
+        move |_, _, cx| view.update(cx, |this, cx| this.set_tree_clipboard(targets.clone(), true, cx))
     }))
-    .item(PopupMenuItem::new("Copy").on_click({
-        let (view, path) = (view.clone(), path.to_path_buf());
-        move |_, _, cx| view.update(cx, |this, cx| this.set_tree_clipboard(path.clone(), false, cx))
+    .item(PopupMenuItem::new(if many { format!("Copy {count} Items") } else { "Copy".into() }).on_click({
+        let (view, targets) = (view.clone(), targets.clone());
+        move |_, _, cx| view.update(cx, |this, cx| this.set_tree_clipboard(targets.clone(), false, cx))
     }))
     .item(PopupMenuItem::new("Paste").disabled(!can_paste).on_click({
         let (view, dir) = (view.clone(), dir.clone());
+        move |_, _, cx| view.update(cx, |this, cx| this.paste_tree_clipboard_into(dir.clone(), cx))
+    }))
+    .item(PopupMenuItem::new("Duplicate").on_click({
+        let (view, targets) = (view.clone(), targets.clone());
+        let root = root.to_path_buf();
         move |_, _, cx| {
             view.update(cx, |this, cx| {
-                let Some(clip) = this.tree_clipboard.clone() else { return };
-                if clip.cut {
-                    this.tree_clipboard = None;
-                    this.move_tree_path(clip.path, dir.clone(), cx);
-                } else {
-                    this.copy_tree_path(clip.path, dir.clone(), cx);
+                for path in crate::workspace::top_level_only(&targets) {
+                    let dir = path.parent().unwrap_or(&root).to_path_buf();
+                    this.copy_tree_path(path, dir, cx);
                 }
             })
         }
-    }))
-    .item(PopupMenuItem::new("Duplicate").on_click({
-        let (view, path, dir) = (view.clone(), path.to_path_buf(), path.parent().unwrap_or(root).to_path_buf());
-        move |_, _, cx| view.update(cx, |this, cx| this.copy_tree_path(path.clone(), dir.clone(), cx))
     }))
     .separator()
     .item(PopupMenuItem::new("Reveal in Finder").on_click(move |_, _, _| {
@@ -668,12 +676,16 @@ fn tree_context_menu(
     .separator()
     .item(
         PopupMenuItem::new("Rename\u{2026}")
-            .on_click(later(view, crate::FileTreeOp::Rename(path.to_path_buf()))),
+            .disabled(many)
+            .on_click(later(view.clone(), crate::FileTreeOp::Rename(path.to_path_buf()))),
     )
-    .item(PopupMenuItem::new("Move to Trash").on_click(move |_, _, cx| {
-        let p = del_path.clone();
-        del_view.update(cx, |this, cx| this.delete_tree_path_clicked(p, cx));
-    }))
+    .item(
+        PopupMenuItem::new(if many { format!("Move {count} Items to Trash") } else { "Move to Trash".into() })
+            .on_click(move |_, _, cx| {
+                let targets = targets.clone();
+                view.update(cx, |this, cx| this.delete_tree_paths_clicked(targets, cx));
+            }),
+    )
 }
 
 impl DartIde {
@@ -895,30 +907,32 @@ impl DartIde {
                             cx.stop_propagation();
                             return;
                         }
-                        let Some(path) = this
-                            .tree_state
-                            .read(cx)
-                            .selected_item()
-                            .map(|item| PathBuf::from(item.id.as_str()))
-                            .filter(|p| p.starts_with(&this.root) && *p != this.root)
-                        else {
+                        if ks.key == "escape" && this.tree_selection.len() > 1 {
+                            this.tree_selection.clear();
+                            cx.stop_propagation();
+                            cx.notify();
                             return;
-                        };
-                        if ks.key == "f2" {
+                        }
+                        let paths = this.selected_tree_paths(cx);
+                        if paths.is_empty() {
+                            return;
+                        }
+                        if ks.key == "f2" && paths.len() == 1 {
+                            let path = paths[0].clone();
                             this.open_file_tree_prompt(crate::FileTreeOp::Rename(path), window, cx);
                             cx.stop_propagation();
                         } else if ks.key == "backspace" && ks.modifiers.platform {
-                            this.delete_tree_path_clicked(path, cx);
+                            this.delete_tree_paths_clicked(paths, cx);
                             cx.stop_propagation();
                         } else if (ks.key == "c" || ks.key == "x") && ks.modifiers.platform {
-                            this.set_tree_clipboard(path, ks.key == "x", cx);
+                            this.set_tree_clipboard(paths, ks.key == "x", cx);
                             cx.stop_propagation();
                         }
                     }))
                     // Dropping on empty space below the rows: the workspace root.
                     .on_drop(cx.listener(|this, drag: &TreeDrag, _window, cx| {
                         let root = this.root.clone();
-                        this.move_tree_path(drag.path.clone(), root, cx);
+                        this.move_tree_paths(drag.paths.clone(), root, cx);
                     }))
                     .on_drop(cx.listener(|this, paths: &ExternalPaths, _window, cx| {
                         let root = this.root.clone();
@@ -964,15 +978,24 @@ impl DartIde {
                                 let edit_error = self.file_tree_error.clone();
                                 let root = self.root.clone();
                                 let can_paste = self.tree_clipboard.is_some();
-                                let cut_path = self
+                                let cut_paths: Vec<PathBuf> = self
                                     .tree_clipboard
                                     .as_ref()
                                     .filter(|c| c.cut)
-                                    .map(|c| c.path.clone());
+                                    .map(|c| c.paths.clone())
+                                    .unwrap_or_default();
+                                // The ⌘/⇧-click set, when there is one.
+                                let multi = std::rc::Rc::new(if self.tree_selection.len() > 1 {
+                                    self.tree_selection.clone()
+                                } else {
+                                    Vec::new()
+                                });
                                 move |ix, entry, _entry_state, _window, cx| {
                                     let item = entry.item();
                                     let item_path = PathBuf::from(item.id.as_str());
-                                    let is_folder = entry.is_folder();
+                                    // GPUI counts an empty folder as a leaf; ask the disk
+                                    // (only rows on screen render, so this stays cheap).
+                                    let is_folder = entry.is_folder() || item_path.is_dir();
                                     let depth = entry.depth();
                                     if editing_id.as_ref() == Some(&item.id) {
                                         let is_new = item.id.as_ref() == NEW_ENTRY_ID;
@@ -989,8 +1012,13 @@ impl DartIde {
                                         );
                                     }
                                     let row_group = format!("tree-row-grp-{ix}");
-                                    let del_key = format!("tree-del:{}", item.id);
-                                    let del_armed = confirm_del.as_deref() == Some(del_key.as_str());
+                                    // What this row's actions apply to: the whole
+                                    // selection if the row is in it, else the row.
+                                    let in_multi = multi.contains(&item_path);
+                                    let targets: Vec<PathBuf> =
+                                        if in_multi { (*multi).clone() } else { vec![item_path.clone()] };
+                                    let del_armed = confirm_del.as_deref()
+                                        == Some(trash_confirm_key(&crate::workspace::top_level_only(&targets)).as_str());
                                     let icon_el: AnyElement = if !is_folder {
                                         render_file_icon(&item.label).into_any_element()
                                     } else {
@@ -1058,11 +1086,19 @@ impl DartIde {
                                                 .cursor_pointer()
                                                 .text_color(row_fg)
                                                 // A cut item stays dimmed until it's pasted.
-                                                .when(cut_path.as_deref() == Some(item_path.as_path()), |el| {
+                                                .when(cut_paths.contains(&item_path), |el| {
                                                     el.opacity(0.5)
                                                 })
                                                 .on_drag(
-                                                    TreeDrag { path: item_path.clone(), label: item.label.clone(), is_folder },
+                                                    TreeDrag {
+                                                        label: if targets.len() > 1 {
+                                                            format!("{} items", targets.len()).into()
+                                                        } else {
+                                                            item.label.clone()
+                                                        },
+                                                        paths: targets.clone(),
+                                                        is_folder,
+                                                    },
                                                     |drag, _offset, _window, cx| cx.new(|_| drag.clone()),
                                                 )
                                                 // Drop onto a folder, or onto a file to land beside it.
@@ -1079,8 +1115,8 @@ impl DartIde {
                                                     let dest = drop_dir(&item_path, &root);
                                                     move |drag: &TreeDrag, _window, cx| {
                                                         cx.stop_propagation();
-                                                        let (src, dest) = (drag.path.clone(), dest.clone());
-                                                        view.update(cx, |this, cx| this.move_tree_path(src, dest, cx));
+                                                        let (srcs, dest) = (drag.paths.clone(), dest.clone());
+                                                        view.update(cx, |this, cx| this.move_tree_paths(srcs, dest, cx));
                                                     }
                                                 })
                                                 .on_drop({
@@ -1108,6 +1144,10 @@ impl DartIde {
                                                                 .rounded(px(2.))
                                                                 .bg(cx.theme().primary),
                                                         )
+                                                })
+                                                .when(in_multi && !is_active_file, |el| {
+                                                    el.bg(cx.theme().primary.opacity(0.12))
+                                                        .border_color(cx.theme().primary.opacity(0.28))
                                                 })
                                                 .when(!is_active_file, |el| {
                                                     el.hover(move |s| {
@@ -1146,7 +1186,8 @@ impl DartIde {
                                                 // → Delete or ⌘⌫ arms it).
                                                 .when(del_armed, |el| {
                                                     let view_del = view.clone();
-                                                    let del_path = item_path.clone();
+                                                    let del_paths = targets.clone();
+                                                    let n = crate::workspace::top_level_only(&targets).len();
                                                     el.child(
                                                         div()
                                                             .id(("tree-delete", ix))
@@ -1156,15 +1197,19 @@ impl DartIde {
                                                             .bg(cx.theme().danger.opacity(0.16))
                                                             .text_size(px(tokens::UI_XS))
                                                             .text_color(cx.theme().danger)
-                                                            .child("Move to Trash?")
+                                                            .child(if n > 1 {
+                                                                format!("Move {n} to Trash?")
+                                                            } else {
+                                                                "Move to Trash?".to_string()
+                                                            })
                                                             .on_mouse_down(MouseButton::Left, |_, _, cx| {
                                                                 cx.stop_propagation()
                                                             })
                                                             .on_click(move |_e, _w, cx| {
                                                                 cx.stop_propagation();
-                                                                let p = del_path.clone();
+                                                                let paths = del_paths.clone();
                                                                 view_del.update(cx, |this, cx| {
-                                                                    this.delete_tree_path_clicked(p, cx);
+                                                                    this.delete_tree_paths_clicked(paths, cx);
                                                                 });
                                                             }),
                                                     )
@@ -1172,28 +1217,42 @@ impl DartIde {
                                                 .when_some(badge, |el, letter| {
                                                     el.child(status_badge(letter, cx))
                                                 })
-                                                .when(!is_folder, |el| {
+                                                .on_click({
                                                     let view = view.clone();
-                                                    let path = PathBuf::from(item.id.as_str());
-                                                    el.on_click(move |event, window, cx| {
-                                                        let as_preview = event.click_count() < 2;
+                                                    let path = item_path.clone();
+                                                    move |event, window, cx| {
+                                                        let m = event.modifiers();
+                                                        // ⌘/⇧-click only change the selection: no
+                                                        // opening files, no folding folders.
+                                                        if m.platform || m.shift {
+                                                            cx.stop_propagation();
+                                                            view.update(cx, |this, cx| {
+                                                                this.tree_click_select(path.clone(), m.platform, m.shift, cx)
+                                                            });
+                                                            return;
+                                                        }
                                                         view.update(cx, |this, cx| {
-                                                            this.open_path_with_mode(
-                                                                path.clone(),
-                                                                as_preview,
-                                                                window,
-                                                                cx,
-                                                            );
+                                                            this.tree_click_select(path.clone(), false, false, cx);
+                                                            if !is_folder {
+                                                                let as_preview = event.click_count() < 2;
+                                                                this.open_path_with_mode(
+                                                                    path.clone(),
+                                                                    as_preview,
+                                                                    window,
+                                                                    cx,
+                                                                );
+                                                            }
                                                         });
-                                                    })
+                                                    }
                                                 }),
                                         )
                                         .context_menu({
                                             let view = view.clone();
                                             let path = item_path.clone();
                                             let root = root.clone();
+                                            let targets = targets.clone();
                                             move |menu, _window, _cx| {
-                                                tree_context_menu(menu, &path, &root, can_paste, view.clone())
+                                                tree_context_menu(menu, &path, targets.clone(), &root, can_paste, view.clone())
                                             }
                                         })
                                         .into_any_element()

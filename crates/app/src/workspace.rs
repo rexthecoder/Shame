@@ -563,28 +563,119 @@ impl DartIde {
     /// Move `src` into the folder `dest_dir` (drag and drop, or cut + paste).
     /// Refuses to overwrite, and to move a folder into itself.
     pub(crate) fn move_tree_path(&mut self, src: PathBuf, dest_dir: PathBuf, cx: &mut Context<Self>) {
-        let Some(name) = src.file_name() else { return };
-        if src.parent() == Some(dest_dir.as_path()) {
+        self.move_tree_paths(vec![src], dest_dir, cx);
+    }
+
+    /// Move several files/folders into `dest_dir` as one operation (one
+    /// language-server round trip). All-or-nothing on clashes: if any can't
+    /// go, nothing moves and the toast says which.
+    pub(crate) fn move_tree_paths(&mut self, srcs: Vec<PathBuf>, dest_dir: PathBuf, cx: &mut Context<Self>) {
+        let mut renames = Vec::new();
+        for src in top_level_only(&srcs) {
+            let Some(name) = src.file_name() else { continue };
+            if src.parent() == Some(dest_dir.as_path()) {
+                continue;
+            }
+            if dest_dir.starts_with(&src) {
+                self.show_toast("Can't move a folder into itself.", true, cx);
+                return;
+            }
+            let target = dest_dir.join(name);
+            if target.symlink_metadata().is_ok() {
+                self.show_toast(
+                    format!(
+                        "{} already exists in {}.",
+                        name.to_string_lossy(),
+                        dest_dir.file_name().unwrap_or(dest_dir.as_os_str()).to_string_lossy()
+                    ),
+                    true,
+                    cx,
+                );
+                return;
+            }
+            renames.push((src, target));
+        }
+        let Some(reveal) = renames.first().map(|(_, new)| new.clone()) else { return };
+        self.tree_selection.clear();
+        self.run_file_moves(renames, reveal, cx);
+    }
+
+    /// Reveal `path` in the tree (opening its folders, scrolling only as
+    /// far as needed) and select it.
+    pub(crate) fn reveal_in_tree(&mut self, path: &Path, cx: &mut Context<Self>) {
+        if !path.starts_with(&self.root) {
             return;
         }
-        if dest_dir.starts_with(&src) {
-            self.show_toast("Can't move a folder into itself.", true, cx);
-            return;
+        let id: SharedString = path.to_string_lossy().to_string().into();
+        self.tree_state.update(cx, |state, cx| {
+            state.reveal_item(&id, ScrollStrategy::Nearest, cx);
+            if let Some(ix) = state.index_of(&id) {
+                state.set_selected_index(Some(ix), cx);
+            }
+        });
+        self.tree_selection.clear();
+        cx.notify();
+    }
+
+    /// What the tree's actions apply to: the ⌘/⇧-click set when there is
+    /// one, else the tree's selected row.
+    pub(crate) fn selected_tree_paths(&self, cx: &App) -> Vec<PathBuf> {
+        if self.tree_selection.len() > 1 {
+            return self.tree_selection.clone();
         }
-        let target = dest_dir.join(name);
-        if target.symlink_metadata().is_ok() {
-            self.show_toast(
-                format!(
-                    "{} already exists in {}.",
-                    name.to_string_lossy(),
-                    dest_dir.file_name().unwrap_or(dest_dir.as_os_str()).to_string_lossy()
-                ),
-                true,
-                cx,
-            );
-            return;
-        }
-        self.run_file_moves(vec![(src, target.clone())], target, cx);
+        self.tree_state
+            .read(cx)
+            .selected_item()
+            .map(|item| PathBuf::from(item.id.as_str()))
+            .filter(|p| p.starts_with(&self.root) && *p != self.root)
+            .into_iter()
+            .collect()
+    }
+
+    /// A row click, VS Code style: plain picks just this row, ⌘ adds or
+    /// removes it, ⇧ selects everything between the anchor and it (in the
+    /// order rows are shown).
+    pub(crate) fn tree_click_select(&mut self, path: PathBuf, toggle: bool, range: bool, cx: &mut Context<Self>) {
+        let current = self.selected_tree_paths(cx);
+        let selection = if range {
+            let anchor = self
+                .tree_anchor
+                .clone()
+                .or_else(|| current.first().cloned())
+                .unwrap_or_else(|| path.clone());
+            let state = self.tree_state.read(cx);
+            let ix = |p: &Path| state.index_of(&p.to_string_lossy().to_string().into());
+            match (ix(&anchor), ix(&path)) {
+                (Some(a), Some(b)) => (a.min(b)..=a.max(b))
+                    .filter_map(|i| state.entry(i))
+                    .map(|e| PathBuf::from(e.item().id.as_str()))
+                    .filter(|p| p.starts_with(&self.root))
+                    .collect(),
+                _ => vec![path.clone()],
+            }
+        } else if toggle {
+            let mut sel = current;
+            match sel.iter().position(|p| *p == path) {
+                Some(pos) => {
+                    sel.remove(pos);
+                }
+                None => sel.push(path.clone()),
+            }
+            self.tree_anchor = Some(path.clone());
+            sel
+        } else {
+            self.tree_anchor = Some(path.clone());
+            vec![path.clone()]
+        };
+        self.tree_selection = selection;
+        // Keep the tree's own focus row on the clicked item.
+        let id: SharedString = path.to_string_lossy().to_string().into();
+        self.tree_state.update(cx, |state, cx| {
+            if let Some(ix) = state.index_of(&id) {
+                state.set_selected_index(Some(ix), cx);
+            }
+        });
+        cx.notify();
     }
 
     /// Copy `src` into `dest_dir`. A clash gets VS Code's names:
@@ -603,21 +694,30 @@ impl DartIde {
     }
 
     /// Remember a file or folder for Paste (`cut` moves it, else copies).
-    pub(crate) fn set_tree_clipboard(&mut self, path: PathBuf, cut: bool, cx: &mut Context<Self>) {
-        self.tree_clipboard = Some(crate::TreeClipboard { path, cut });
+    pub(crate) fn set_tree_clipboard(&mut self, paths: Vec<PathBuf>, cut: bool, cx: &mut Context<Self>) {
+        if paths.is_empty() {
+            return;
+        }
+        self.tree_clipboard = Some(crate::TreeClipboard { paths, cut });
         cx.notify();
     }
 
     /// Paste what was cut or copied in the tree into the target folder.
     pub(crate) fn paste_into_tree(&mut self, cx: &mut Context<Self>) {
-        let Some(clip) = self.tree_clipboard.clone() else { return };
         let dest = self.file_tree_target_dir(cx);
+        self.paste_tree_clipboard_into(dest, cx);
+    }
+
+    pub(crate) fn paste_tree_clipboard_into(&mut self, dest: PathBuf, cx: &mut Context<Self>) {
+        let Some(clip) = self.tree_clipboard.clone() else { return };
         if clip.cut {
             // A cut is used up by its paste, as in VS Code and Finder.
             self.tree_clipboard = None;
-            self.move_tree_path(clip.path, dest, cx);
+            self.move_tree_paths(clip.paths, dest, cx);
         } else {
-            self.copy_tree_path(clip.path, dest, cx);
+            for path in top_level_only(&clip.paths) {
+                self.copy_tree_path(path, dest.clone(), cx);
+            }
         }
     }
 
@@ -641,22 +741,33 @@ impl DartIde {
         }
     }
 
-    pub(crate) fn delete_tree_path_clicked(&mut self, path: PathBuf, cx: &mut Context<Self>) {
-        let key = format!("tree-del:{}", path.to_string_lossy());
+    /// First call arms a "Move to Trash?" confirmation in the rows; the
+    /// second (same set) moves them all to the Trash.
+    pub(crate) fn delete_tree_paths_clicked(&mut self, paths: Vec<PathBuf>, cx: &mut Context<Self>) {
+        let paths = top_level_only(&paths);
+        if paths.is_empty() {
+            return;
+        }
+        let key = crate::rails::files::trash_confirm_key(&paths);
         if self.git.confirm_discard.as_deref() == Some(key.as_str()) {
             self.git.confirm_discard = None;
             // To the Trash, as in VS Code and Finder: recoverable, unlike rm.
-            if let Err(err) = trash::delete(&path) {
+            // `trash` moves them in one call, so Finder's Put Back works.
+            if let Err(err) = trash::delete_all(&paths) {
                 self.show_toast(format!("Couldn't move to Trash: {err}"), true, cx);
                 return;
             }
-            // Close the file's tab, or every tab under a deleted folder.
+            // Close each file's tab, or every tab under a deleted folder.
             while let Some(ix) = self
                 .tabs
                 .iter()
-                .position(|t| t.path.as_ref().is_some_and(|p| p.starts_with(&path)))
+                .position(|t| t.path.as_ref().is_some_and(|p| paths.iter().any(|d| p.starts_with(d))))
             {
                 self.close_tab(ix, cx);
+            }
+            self.tree_selection.clear();
+            if paths.len() > 1 {
+                self.show_toast(format!("Moved {} items to the Trash", paths.len()), false, cx);
             }
             self.rebuild_file_tree(cx);
             self.refresh_git(cx);
@@ -713,7 +824,11 @@ impl DartIde {
                         )
                     };
                 }
+                // The first scan after opening a folder lands after the
+                // editor restored its tabs: reveal the active file then.
+                let was_empty = this.tree_state.read(cx).entry(0).is_none();
                 this.set_tree_items(items, cx);
+                let reveal = reveal.clone().or_else(|| was_empty.then(|| this.tree_followed.clone()).flatten());
                 if let Some(target) = &reveal {
                     let id: SharedString = target.to_string_lossy().to_string().into();
                     this.tree_state.update(cx, |state, cx| {
@@ -918,6 +1033,19 @@ impl DartIde {
     }
 }
 
+/// `paths` minus any inside another of them (moving a folder already moves
+/// what's in it), in their original order, without repeats.
+pub(crate) fn top_level_only(paths: &[PathBuf]) -> Vec<PathBuf> {
+    let mut out: Vec<PathBuf> = Vec::new();
+    for p in paths {
+        let covered = paths.iter().any(|q| q != p && p.starts_with(q));
+        if !covered && !out.contains(p) {
+            out.push(p.clone());
+        }
+    }
+    out
+}
+
 /// Where a copy of `src` lands in `dest_dir`: its own name when free, else
 /// VS Code's `name copy.ext`, `name copy 2.ext`, …
 pub(crate) fn free_copy_name(src: &Path, dest_dir: &Path) -> PathBuf {
@@ -967,6 +1095,21 @@ mod file_op_tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    #[core::prelude::v1::test]
+    fn nested_picks_collapse_into_their_folder() {
+        let picked = [
+            PathBuf::from("/w/lib"),
+            PathBuf::from("/w/lib/a.dart"),
+            PathBuf::from("/w/test/b.dart"),
+            PathBuf::from("/w/lib"),
+            PathBuf::from("/w/lib2/c.dart"),
+        ];
+        assert_eq!(
+            top_level_only(&picked),
+            [PathBuf::from("/w/lib"), PathBuf::from("/w/test/b.dart"), PathBuf::from("/w/lib2/c.dart")]
+        );
     }
 
     #[core::prelude::v1::test]

@@ -238,7 +238,7 @@ pub(crate) enum FileTreeOp {
 /// A file or folder cut or copied in the tree, waiting for Paste.
 #[derive(Debug, Clone)]
 pub(crate) struct TreeClipboard {
-    pub(crate) path: PathBuf,
+    pub(crate) paths: Vec<PathBuf>,
     pub(crate) cut: bool,
 }
 
@@ -545,6 +545,13 @@ pub struct DartIde {
     /// Why the name typed into the inline create/rename row can't be used.
     pub(crate) file_tree_error: Option<String>,
     pub(crate) tree_clipboard: Option<TreeClipboard>,
+    /// Rows picked with ⌘/⇧-click. Only used when it holds 2+ paths; a
+    /// single selection is the tree's own.
+    pub(crate) tree_selection: Vec<PathBuf>,
+    /// Where a ⇧-click range starts.
+    pub(crate) tree_anchor: Option<PathBuf>,
+    /// The active tab's file the tree last revealed (it follows the editor).
+    pub(crate) tree_followed: Option<PathBuf>,
     /// Shown in the Files header while a move waits on the language server.
     pub(crate) file_tree_busy: Option<&'static str>,
     /// The app-wide notice (see `toast.rs`).
@@ -794,6 +801,9 @@ impl DartIde {
             file_tree_op: None,
             file_tree_error: None,
             tree_clipboard: None,
+            tree_selection: Vec::new(),
+            tree_anchor: None,
+            tree_followed: None,
             file_tree_busy: None,
             toast: None,
             toast_seq: 0,
@@ -1342,6 +1352,21 @@ impl Render for DartIde {
             window.focus(&self.root_focus, cx);
         }
         self.web_preview_frame_check(window);
+
+        // The file tree follows the editor, as in VS Code: whenever the
+        // active tab's file changes (from anywhere), reveal and select it.
+        let active_path = self
+            .active_editor()
+            .and_then(|ed| ed.read(cx).buffer().path().map(Path::to_path_buf));
+        if active_path != self.tree_followed {
+            self.tree_followed = active_path.clone();
+            if let Some(path) = active_path {
+                cx.spawn(async move |weak, cx| {
+                    let _ = weak.update(cx, |this, cx| this.reveal_in_tree(&path, cx));
+                })
+                .detach();
+            }
+        }
 
         v_flex()
             .size_full()
