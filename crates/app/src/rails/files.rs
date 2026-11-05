@@ -529,8 +529,60 @@ fn render_tree_edit_row(
         .into_any_element()
 }
 
+/// A tree row being dragged. It is also the drag preview: a chip with the
+/// item's icon and name that follows the pointer.
+#[derive(Clone)]
+pub(crate) struct TreeDrag {
+    pub(crate) path: PathBuf,
+    label: SharedString,
+    is_folder: bool,
+}
+
+impl Render for TreeDrag {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let icon: AnyElement = if self.is_folder {
+            Icon::new(IconName::Folder)
+                .text_color(folder_icon_color(&self.label, cx))
+                .small()
+                .into_any_element()
+        } else {
+            render_file_icon(&self.label).into_any_element()
+        };
+        h_flex()
+            .px(px(tokens::SPACE_3))
+            .py(px(tokens::SPACE_2))
+            .gap(px(tokens::SPACE_2))
+            .items_center()
+            .rounded(px(tokens::RADIUS_SM))
+            .bg(cx.theme().popover)
+            .border_1()
+            .border_color(cx.theme().border)
+            .shadow_md()
+            .text_size(px(tokens::UI))
+            .text_color(cx.theme().foreground)
+            .child(icon)
+            .child(self.label.clone())
+    }
+}
+
+/// The folder an item dropped on `target` goes into: the folder itself, or
+/// a file's own folder.
+fn drop_dir(target: &Path, root: &Path) -> PathBuf {
+    if target.is_dir() {
+        target.to_path_buf()
+    } else {
+        target.parent().map(Path::to_path_buf).unwrap_or_else(|| root.to_path_buf())
+    }
+}
+
 /// Right-click menu on a tree row, as in VS Code's explorer.
-fn tree_context_menu(menu: PopupMenu, path: &Path, root: &Path, view: Entity<DartIde>) -> PopupMenu {
+fn tree_context_menu(
+    menu: PopupMenu,
+    path: &Path,
+    root: &Path,
+    can_paste: bool,
+    view: Entity<DartIde>,
+) -> PopupMenu {
     let dir = if path.is_dir() {
         path.to_path_buf()
     } else {
@@ -557,8 +609,35 @@ fn tree_context_menu(menu: PopupMenu, path: &Path, root: &Path, view: Entity<Dar
     )
     .item(
         PopupMenuItem::new("New Folder\u{2026}")
-            .on_click(later(view.clone(), crate::FileTreeOp::NewFolder { parent: dir })),
+            .on_click(later(view.clone(), crate::FileTreeOp::NewFolder { parent: dir.clone() })),
     )
+    .separator()
+    .item(PopupMenuItem::new("Cut").on_click({
+        let (view, path) = (view.clone(), path.to_path_buf());
+        move |_, _, cx| view.update(cx, |this, cx| this.set_tree_clipboard(path.clone(), true, cx))
+    }))
+    .item(PopupMenuItem::new("Copy").on_click({
+        let (view, path) = (view.clone(), path.to_path_buf());
+        move |_, _, cx| view.update(cx, |this, cx| this.set_tree_clipboard(path.clone(), false, cx))
+    }))
+    .item(PopupMenuItem::new("Paste").disabled(!can_paste).on_click({
+        let (view, dir) = (view.clone(), dir.clone());
+        move |_, _, cx| {
+            view.update(cx, |this, cx| {
+                let Some(clip) = this.tree_clipboard.clone() else { return };
+                if clip.cut {
+                    this.tree_clipboard = None;
+                    this.move_tree_path(clip.path, dir.clone(), cx);
+                } else {
+                    this.copy_tree_path(clip.path, dir.clone(), cx);
+                }
+            })
+        }
+    }))
+    .item(PopupMenuItem::new("Duplicate").on_click({
+        let (view, path, dir) = (view.clone(), path.to_path_buf(), path.parent().unwrap_or(root).to_path_buf());
+        move |_, _, cx| view.update(cx, |this, cx| this.copy_tree_path(path.clone(), dir.clone(), cx))
+    }))
     .separator()
     .item(PopupMenuItem::new("Reveal in Finder").on_click(move |_, _, _| {
         let _ = std::process::Command::new("open").arg("-R").arg(&reveal).spawn();
@@ -574,7 +653,7 @@ fn tree_context_menu(menu: PopupMenu, path: &Path, root: &Path, view: Entity<Dar
         PopupMenuItem::new("Rename\u{2026}")
             .on_click(later(view, crate::FileTreeOp::Rename(path.to_path_buf()))),
     )
-    .item(PopupMenuItem::new("Delete").on_click(move |_, _, cx| {
+    .item(PopupMenuItem::new("Move to Trash").on_click(move |_, _, cx| {
         let p = del_path.clone();
         del_view.update(cx, |this, cx| this.delete_tree_path_clicked(p, cx));
     }))
@@ -777,6 +856,12 @@ impl DartIde {
                         if this.file_tree_op.is_some() {
                             return;
                         }
+                        let ks = &event.keystroke;
+                        if ks.key == "v" && ks.modifiers.platform && this.tree_clipboard.is_some() {
+                            this.paste_into_tree(cx);
+                            cx.stop_propagation();
+                            return;
+                        }
                         let Some(path) = this
                             .tree_state
                             .read(cx)
@@ -786,14 +871,25 @@ impl DartIde {
                         else {
                             return;
                         };
-                        let ks = &event.keystroke;
                         if ks.key == "f2" {
                             this.open_file_tree_prompt(crate::FileTreeOp::Rename(path), window, cx);
                             cx.stop_propagation();
                         } else if ks.key == "backspace" && ks.modifiers.platform {
                             this.delete_tree_path_clicked(path, cx);
                             cx.stop_propagation();
+                        } else if (ks.key == "c" || ks.key == "x") && ks.modifiers.platform {
+                            this.set_tree_clipboard(path, ks.key == "x", cx);
+                            cx.stop_propagation();
                         }
+                    }))
+                    // Dropping on empty space below the rows: the workspace root.
+                    .on_drop(cx.listener(|this, drag: &TreeDrag, _window, cx| {
+                        let root = this.root.clone();
+                        this.move_tree_path(drag.path.clone(), root, cx);
+                    }))
+                    .on_drop(cx.listener(|this, paths: &ExternalPaths, _window, cx| {
+                        let root = this.root.clone();
+                        this.import_external_paths(paths.paths(), root, cx);
                     }))
                     .when(tree_empty, |el| el.child(empty))
                     .when(!tree_empty, |el| {
@@ -834,6 +930,12 @@ impl DartIde {
                                 let edit_input = self.file_tree_input.clone();
                                 let edit_error = self.file_tree_error.clone();
                                 let root = self.root.clone();
+                                let can_paste = self.tree_clipboard.is_some();
+                                let cut_path = self
+                                    .tree_clipboard
+                                    .as_ref()
+                                    .filter(|c| c.cut)
+                                    .map(|c| c.path.clone());
                                 move |ix, entry, _entry_state, _window, cx| {
                                     let item = entry.item();
                                     let item_path = PathBuf::from(item.id.as_str());
@@ -922,6 +1024,43 @@ impl DartIde {
                                                 .border_color(gpui_kit::transparent_black())
                                                 .cursor_pointer()
                                                 .text_color(row_fg)
+                                                // A cut item stays dimmed until it's pasted.
+                                                .when(cut_path.as_deref() == Some(item_path.as_path()), |el| {
+                                                    el.opacity(0.5)
+                                                })
+                                                .on_drag(
+                                                    TreeDrag { path: item_path.clone(), label: item.label.clone(), is_folder },
+                                                    |drag, _offset, _window, cx| cx.new(|_| drag.clone()),
+                                                )
+                                                // Drop onto a folder, or onto a file to land beside it.
+                                                .drag_over::<TreeDrag>(|s, _, _, cx| {
+                                                    s.bg(cx.theme().primary.opacity(0.14))
+                                                        .border_color(cx.theme().primary.opacity(0.5))
+                                                })
+                                                .drag_over::<ExternalPaths>(|s, _, _, cx| {
+                                                    s.bg(cx.theme().primary.opacity(0.14))
+                                                        .border_color(cx.theme().primary.opacity(0.5))
+                                                })
+                                                .on_drop({
+                                                    let view = view.clone();
+                                                    let dest = drop_dir(&item_path, &root);
+                                                    move |drag: &TreeDrag, _window, cx| {
+                                                        cx.stop_propagation();
+                                                        let (src, dest) = (drag.path.clone(), dest.clone());
+                                                        view.update(cx, |this, cx| this.move_tree_path(src, dest, cx));
+                                                    }
+                                                })
+                                                .on_drop({
+                                                    let view = view.clone();
+                                                    let dest = drop_dir(&item_path, &root);
+                                                    move |paths: &ExternalPaths, _window, cx| {
+                                                        cx.stop_propagation();
+                                                        let dest = dest.clone();
+                                                        view.update(cx, |this, cx| {
+                                                            this.import_external_paths(paths.paths(), dest, cx)
+                                                        });
+                                                    }
+                                                })
                                                 .children(guides)
                                                 .when(is_active_file, |el| {
                                                     el.bg(rgba(0xea7a3c16))
@@ -984,7 +1123,7 @@ impl DartIde {
                                                             .bg(cx.theme().danger.opacity(0.16))
                                                             .text_size(px(tokens::UI_XS))
                                                             .text_color(cx.theme().danger)
-                                                            .child("Delete?")
+                                                            .child("Move to Trash?")
                                                             .on_mouse_down(MouseButton::Left, |_, _, cx| {
                                                                 cx.stop_propagation()
                                                             })
@@ -1021,7 +1160,7 @@ impl DartIde {
                                             let path = item_path.clone();
                                             let root = root.clone();
                                             move |menu, _window, _cx| {
-                                                tree_context_menu(menu, &path, &root, view.clone())
+                                                tree_context_menu(menu, &path, &root, can_paste, view.clone())
                                             }
                                         })
                                         .into_any_element()

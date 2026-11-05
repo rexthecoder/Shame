@@ -26,7 +26,7 @@ fn icon_button(
 /// A Flutter daemon exists from the moment `flutter run` is spawned, but the
 /// session is only ready once the CLI reports "Running". Everything in between
 /// (building, installing, hot reload, restart) is a loading state.
-fn flutter_session_busy(is_running: bool, status: Option<&str>) -> bool {
+pub(crate) fn flutter_session_busy(is_running: bool, status: Option<&str>) -> bool {
     is_running && status != Some("Running")
 }
 

@@ -1,6 +1,6 @@
 use std::path::Path;
 
-use gpui_kit::component::{ActiveTheme as _, Icon, IconName, Sizable as _, h_flex};
+use gpui_kit::component::{ActiveTheme as _, Icon, IconName, Sizable as _, h_flex, spinner::Spinner};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
@@ -46,6 +46,78 @@ fn language_label(path: &Path) -> Option<&'static str> {
     })
 }
 
+/// Something long-running the IDE started, shown as a status bar pill.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Process {
+    Flutter,
+    Debugger,
+    Tests,
+    Agent,
+}
+
+/// Where a process stands: starting/working (spinner), live (green dot),
+/// or stopped at a breakpoint (blue dot).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Phase {
+    Busy,
+    Live,
+    Paused,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RunPill {
+    pub(crate) process: Process,
+    pub(crate) phase: Phase,
+    pub(crate) label: String,
+}
+
+/// What the IDE has running right now, in a fixed order, from plain facts
+/// about each process (kept free of UI state so it can be tested).
+pub(crate) struct RunFacts<'a> {
+    pub(crate) flutter_running: bool,
+    pub(crate) flutter_status: Option<&'a str>,
+    pub(crate) device: Option<&'a str>,
+    pub(crate) debugger: bool,
+    pub(crate) debugger_paused: bool,
+    pub(crate) tests_running: bool,
+    pub(crate) tests_secs: u64,
+    pub(crate) agent_running: bool,
+}
+
+pub(crate) fn running_pills(f: &RunFacts) -> Vec<RunPill> {
+    let mut out = Vec::new();
+    if f.flutter_running {
+        let busy = crate::chrome::titlebar::flutter_session_busy(true, f.flutter_status);
+        let what = if busy { f.flutter_status.unwrap_or("Starting") } else { "Running" };
+        out.push(RunPill {
+            process: Process::Flutter,
+            phase: if busy { Phase::Busy } else { Phase::Live },
+            label: match f.device {
+                Some(device) => format!("{what} \u{b7} {device}"),
+                None => what.to_string(),
+            },
+        });
+    }
+    if f.debugger {
+        out.push(RunPill {
+            process: Process::Debugger,
+            phase: if f.debugger_paused { Phase::Paused } else { Phase::Live },
+            label: if f.debugger_paused { "Paused".into() } else { "Debugging".into() },
+        });
+    }
+    if f.tests_running {
+        out.push(RunPill {
+            process: Process::Tests,
+            phase: Phase::Busy,
+            label: format!("Tests \u{b7} {}s", f.tests_secs),
+        });
+    }
+    if f.agent_running {
+        out.push(RunPill { process: Process::Agent, phase: Phase::Busy, label: "Agent working".into() });
+    }
+    out
+}
+
 /// One clickable status bar item: same height, padding and hover everywhere.
 fn status_item(id: &'static str, cx: &App) -> Stateful<Div> {
     let fg = cx.theme().foreground;
@@ -89,6 +161,21 @@ impl DartIde {
         });
         let muted = cx.theme().muted_foreground;
         let view = cx.entity();
+
+        let device = self.selected_device.as_ref().map(|d| d.name.clone());
+        let pills = running_pills(&RunFacts {
+            flutter_running: self.flutter_daemon.is_some(),
+            flutter_status: self.flutter_status.as_deref(),
+            device: device.as_deref(),
+            debugger: self.dap_client.is_some(),
+            debugger_paused: self.dap_paused_thread.is_some(),
+            tests_running: self.test_run.as_ref().is_some_and(|t| t.pid.is_some()),
+            tests_secs: self.test_run.as_ref().map_or(0, |t| t.started.elapsed().as_secs()),
+            agent_running: self.agent.running_pid.is_some(),
+        });
+        let running = h_flex().gap(px(tokens::SPACE_1)).items_center().children(
+            pills.into_iter().map(|pill| self.render_run_pill(pill, cx)),
+        );
 
         let mut breadcrumb = status_item("status-breadcrumb", cx).on_click({
             let view = view.clone();
@@ -181,6 +268,7 @@ impl DartIde {
                         )
                     })
                     .child(problems)
+                    .child(running)
                     .when(!segments.is_empty(), |el| el.child(breadcrumb)),
             )
             .child(
@@ -226,8 +314,84 @@ impl DartIde {
     }
 }
 
+impl DartIde {
+    /// A running process: its state, what it's doing, and a stop button.
+    /// Clicking the pill opens where its output lives.
+    fn render_run_pill(&self, pill: RunPill, cx: &mut Context<Self>) -> AnyElement {
+        let view = cx.entity();
+        let (id, stop_id, tooltip): (&'static str, &'static str, &'static str) = match pill.process {
+            Process::Flutter => ("status-run-flutter", "status-stop-flutter", "Stop app"),
+            Process::Debugger => ("status-run-debug", "status-stop-debug", "Stop debugging"),
+            Process::Tests => ("status-run-tests", "status-stop-tests", "Stop tests"),
+            Process::Agent => ("status-run-agent", "status-stop-agent", "Stop agent"),
+        };
+        let indicator: AnyElement = match pill.phase {
+            Phase::Busy => Spinner::new().xsmall().color(cx.theme().warning).into_any_element(),
+            Phase::Live | Phase::Paused => {
+                let color = if pill.phase == Phase::Live { cx.theme().green } else { cx.theme().info };
+                div()
+                    .size(px(10.))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded(px(5.))
+                    .bg(color.opacity(0.25))
+                    .child(div().size(px(6.)).rounded(px(3.)).bg(color))
+                    .into_any_element()
+            }
+        };
+        let process = pill.process;
+        let stop_view = view.clone();
+        status_item(id, cx)
+            .text_color(cx.theme().foreground)
+            .child(indicator)
+            .child(pill.label)
+            .child(
+                div()
+                    .id(stop_id)
+                    .ml(px(2.))
+                    .p(px(2.))
+                    .rounded(px(tokens::RADIUS_BADGE))
+                    .text_color(cx.theme().muted_foreground)
+                    .hover(|s| s.bg(rgba(0xffffff14)).text_color(cx.theme().danger))
+                    .child(Icon::new(IconName::Square).with_size(px(9.)))
+                    .tooltip(move |window, cx| {
+                        gpui_kit::component::tooltip::Tooltip::new(tooltip).build(window, cx)
+                    })
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .on_click(move |_e, _w, cx| {
+                        cx.stop_propagation();
+                        stop_view.update(cx, |this, cx| match process {
+                            Process::Flutter => this.stop_flutter_run(cx),
+                            Process::Debugger => this.stop_dap_debug(cx),
+                            Process::Tests => this.stop_test_run(cx),
+                            Process::Agent => this.stop_agent_run(cx),
+                        });
+                    }),
+            )
+            .on_click(move |_e, _w, cx| {
+                view.update(cx, |this, cx| {
+                    match process {
+                        Process::Flutter | Process::Debugger => {
+                            this.terminal_open = true;
+                            this.dock_tab = crate::DockTab::DebugConsole;
+                        }
+                        Process::Tests => {
+                            this.terminal_open = true;
+                            this.dock_tab = crate::DockTab::Tests;
+                        }
+                        Process::Agent => this.set_agent_open(true),
+                    }
+                    cx.notify();
+                });
+            })
+            .into_any_element()
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use super::{Phase, Process, RunFacts, running_pills};
     use super::language_label;
     use std::path::Path;
 
@@ -236,5 +400,61 @@ mod tests {
         assert_eq!(language_label(Path::new("lib/main.dart")), Some("Dart"));
         assert_eq!(language_label(Path::new("Cargo.TOML")), Some("TOML"));
         assert_eq!(language_label(Path::new("Makefile")), None);
+    }
+
+    fn idle() -> RunFacts<'static> {
+        RunFacts {
+            flutter_running: false,
+            flutter_status: None,
+            device: None,
+            debugger: false,
+            debugger_paused: false,
+            tests_running: false,
+            tests_secs: 0,
+            agent_running: false,
+        }
+    }
+
+    #[core::prelude::v1::test]
+    fn nothing_running_shows_nothing() {
+        assert!(running_pills(&idle()).is_empty());
+    }
+
+    #[core::prelude::v1::test]
+    fn flutter_is_busy_until_the_cli_says_running() {
+        let building = running_pills(&RunFacts {
+            flutter_running: true,
+            flutter_status: Some("Building"),
+            device: Some("iPhone 16"),
+            ..idle()
+        });
+        assert_eq!(building[0].phase, Phase::Busy);
+        assert_eq!(building[0].label, "Building \u{b7} iPhone 16");
+        let live = running_pills(&RunFacts {
+            flutter_running: true,
+            flutter_status: Some("Running"),
+            device: Some("iPhone 16"),
+            ..idle()
+        });
+        assert_eq!(live[0].phase, Phase::Live);
+        assert_eq!(live[0].label, "Running \u{b7} iPhone 16");
+    }
+
+    #[core::prelude::v1::test]
+    fn every_running_process_gets_a_pill_in_order() {
+        let pills = running_pills(&RunFacts {
+            flutter_running: true,
+            flutter_status: Some("Running"),
+            debugger: true,
+            debugger_paused: true,
+            tests_running: true,
+            tests_secs: 7,
+            agent_running: true,
+            ..idle()
+        });
+        let order: Vec<Process> = pills.iter().map(|p| p.process).collect();
+        assert_eq!(order, [Process::Flutter, Process::Debugger, Process::Tests, Process::Agent]);
+        assert_eq!(pills[1].phase, Phase::Paused);
+        assert_eq!(pills[2].label, "Tests \u{b7} 7s");
     }
 }

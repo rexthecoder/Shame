@@ -809,6 +809,7 @@ impl EditorView {
     /// Follow the file to its new path after a rename on disk.
     pub fn rebind_path(&mut self, path: impl Into<std::path::PathBuf>, cx: &mut Context<Self>) {
         self.buffer.rebind_path(path);
+        self.lsp_follow_path();
         cx.notify();
     }
 

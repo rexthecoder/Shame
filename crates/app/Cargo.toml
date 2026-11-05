@@ -27,3 +27,4 @@ core-lsp = { path = "../core-lsp" }
 core-dap = { path = "../core-dap" }
 core-workspace = { path = "../core-workspace" }
 editor-view = { path = "../editor-view" }
+trash = "5"

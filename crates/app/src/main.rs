@@ -234,6 +234,13 @@ pub(crate) enum FileTreeOp {
     Rename(PathBuf),
 }
 
+/// A file or folder cut or copied in the tree, waiting for Paste.
+#[derive(Debug, Clone)]
+pub(crate) struct TreeClipboard {
+    pub(crate) path: PathBuf,
+    pub(crate) cut: bool,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum MarkdownMode {
     Code,
@@ -536,6 +543,7 @@ pub struct DartIde {
     pub(crate) file_tree_op: Option<FileTreeOp>,
     /// Why the name typed into the inline create/rename row can't be used.
     pub(crate) file_tree_error: Option<String>,
+    pub(crate) tree_clipboard: Option<TreeClipboard>,
     pub(crate) file_tree_input: Entity<InputState>,
     pub(crate) tree_state: Entity<TreeState>,
     pub(crate) tabs: Vec<Tab>,
@@ -777,6 +785,7 @@ impl DartIde {
             show_hidden,
             file_tree_op: None,
             file_tree_error: None,
+            tree_clipboard: None,
             file_tree_input,
             tree_state,
             tabs: Vec::new(),

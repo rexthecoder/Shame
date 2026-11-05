@@ -398,6 +398,45 @@ struct CodeActionRequest {
 }
 
 impl EditorView {
+    /// After the file moved on disk, tell the server the document now lives
+    /// at the new path: close the old URI, open the new one with the current
+    /// text. Keeps this editor's existing subscription, so replies aren't
+    /// delivered twice.
+    pub(crate) fn lsp_follow_path(&mut self) {
+        let Some(path) = self.buffer.path() else {
+            return;
+        };
+        let Ok(uri) = Uri::from_str(&format!("file://{}", path.display())) else {
+            return;
+        };
+        let language_id = self.language.language_id();
+        let text = self.buffer.text();
+        let revision = self.buffer.revision();
+        let Some(lsp) = self.lsp.as_mut() else {
+            return;
+        };
+        if lsp.uri == uri || !lsp.ready {
+            return;
+        }
+        let _ = lsp.client.notify(
+            "textDocument/didClose",
+            serde_json::json!({ "textDocument": { "uri": lsp.uri.as_str() } }),
+        );
+        lsp.version += 1;
+        let _ = lsp.client.notify(
+            "textDocument/didOpen",
+            serde_json::json!({ "textDocument": {
+                "uri": uri.as_str(),
+                "languageId": language_id,
+                "version": lsp.version,
+                "text": text,
+            }}),
+        );
+        lsp.uri = uri;
+        lsp.diagnostics.clear();
+        lsp.last_synced_revision = revision;
+    }
+
     /// Attach this buffer to the shared workspace LSP server for its `LanguageAdapter`
     /// (spawning the server only once per `(language_id, project_root)` pair).
     pub(crate) fn maybe_start_lsp(&mut self, cx: &mut Context<Self>) {

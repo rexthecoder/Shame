@@ -473,17 +473,30 @@ impl DartIde {
         self.file_tree_op = None;
         self.file_tree_error = None;
 
-        // Open tabs follow a renamed file, or every file under a renamed folder.
         if let FileTreeOp::Rename(old) = &op {
-            for tab in &mut self.tabs {
-                let Some(path) = tab.path.clone() else { continue };
-                let Ok(rel) = path.strip_prefix(old) else { continue };
-                let moved = if rel.as_os_str().is_empty() { target.clone() } else { target.join(rel) };
-                tab.path = Some(moved.clone());
-                tab.editor.update(cx, |ed, cx| ed.rebind_path(moved, cx));
-            }
+            self.retarget_tabs(old, &target, cx);
         }
+        self.finish_tree_change(&target, cx);
+        if open_it {
+            self.open_path(target, window, cx);
+        }
+    }
 
+    /// Open tabs follow a moved file, or every file under a moved folder
+    /// (path, title and language server all switch to the new location).
+    fn retarget_tabs(&mut self, old: &Path, new: &Path, cx: &mut Context<Self>) {
+        for tab in &mut self.tabs {
+            let Some(path) = tab.path.clone() else { continue };
+            let Ok(rel) = path.strip_prefix(old) else { continue };
+            let moved = if rel.as_os_str().is_empty() { new.to_path_buf() } else { new.join(rel) };
+            tab.path = Some(moved.clone());
+            tab.editor.update(cx, |ed, cx| ed.rebind_path(moved, cx));
+        }
+        self.save_session_state();
+    }
+
+    /// Rescan, then reveal and select `target` in the tree.
+    fn finish_tree_change(&mut self, target: &Path, cx: &mut Context<Self>) {
         self.rebuild_file_tree(cx);
         let id: SharedString = target.to_string_lossy().to_string().into();
         self.tree_state.update(cx, |state, cx| {
@@ -492,26 +505,110 @@ impl DartIde {
                 state.set_selected_index(Some(ix), cx);
             }
         });
-        if open_it {
-            self.open_path(target, window, cx);
-        }
         self.refresh_git(cx);
         cx.notify();
+    }
+
+    /// Move `src` into the folder `dest_dir` (drag and drop, or cut + paste).
+    /// Refuses to overwrite, and to move a folder into itself.
+    pub(crate) fn move_tree_path(&mut self, src: PathBuf, dest_dir: PathBuf, cx: &mut Context<Self>) {
+        let Some(name) = src.file_name() else { return };
+        if src.parent() == Some(dest_dir.as_path()) {
+            return;
+        }
+        if dest_dir.starts_with(&src) {
+            self.set_git_notice("Can't move a folder into itself.", true, cx);
+            return;
+        }
+        let target = dest_dir.join(name);
+        if target.symlink_metadata().is_ok() {
+            self.set_git_notice(
+                format!(
+                    "{} already exists in {}.",
+                    name.to_string_lossy(),
+                    dest_dir.file_name().unwrap_or(dest_dir.as_os_str()).to_string_lossy()
+                ),
+                true,
+                cx,
+            );
+            return;
+        }
+        if let Err(err) = std::fs::rename(&src, &target) {
+            self.set_git_notice(format!("Couldn't move: {err}"), true, cx);
+            return;
+        }
+        self.retarget_tabs(&src, &target, cx);
+        self.finish_tree_change(&target, cx);
+    }
+
+    /// Copy `src` into `dest_dir`. A clash gets VS Code's names:
+    /// `main copy.dart`, then `main copy 2.dart`, …
+    pub(crate) fn copy_tree_path(&mut self, src: PathBuf, dest_dir: PathBuf, cx: &mut Context<Self>) {
+        if dest_dir.starts_with(&src) && src.is_dir() {
+            self.set_git_notice("Can't copy a folder into itself.", true, cx);
+            return;
+        }
+        let target = free_copy_name(&src, &dest_dir);
+        if let Err(err) = copy_recursively(&src, &target) {
+            self.set_git_notice(format!("Couldn't copy: {err}"), true, cx);
+            return;
+        }
+        self.finish_tree_change(&target, cx);
+    }
+
+    /// Remember a file or folder for Paste (`cut` moves it, else copies).
+    pub(crate) fn set_tree_clipboard(&mut self, path: PathBuf, cut: bool, cx: &mut Context<Self>) {
+        self.tree_clipboard = Some(crate::TreeClipboard { path, cut });
+        cx.notify();
+    }
+
+    /// Paste what was cut or copied in the tree into the target folder.
+    pub(crate) fn paste_into_tree(&mut self, cx: &mut Context<Self>) {
+        let Some(clip) = self.tree_clipboard.clone() else { return };
+        let dest = self.file_tree_target_dir(cx);
+        if clip.cut {
+            // A cut is used up by its paste, as in VS Code and Finder.
+            self.tree_clipboard = None;
+            self.move_tree_path(clip.path, dest, cx);
+        } else {
+            self.copy_tree_path(clip.path, dest, cx);
+        }
+    }
+
+    /// Copy files dropped in from Finder into a folder of the tree.
+    pub(crate) fn import_external_paths(&mut self, paths: &[PathBuf], dest_dir: PathBuf, cx: &mut Context<Self>) {
+        let mut last = None;
+        for src in paths {
+            if src.starts_with(&self.root) {
+                // Dragged from inside the workspace (e.g. another window): move.
+                self.move_tree_path(src.clone(), dest_dir.clone(), cx);
+                continue;
+            }
+            let target = free_copy_name(src, &dest_dir);
+            match copy_recursively(src, &target) {
+                Ok(()) => last = Some(target),
+                Err(err) => self.set_git_notice(format!("Couldn't copy: {err}"), true, cx),
+            }
+        }
+        if let Some(target) = last {
+            self.finish_tree_change(&target, cx);
+        }
     }
 
     pub(crate) fn delete_tree_path_clicked(&mut self, path: PathBuf, cx: &mut Context<Self>) {
         let key = format!("tree-del:{}", path.to_string_lossy());
         if self.git.confirm_discard.as_deref() == Some(key.as_str()) {
             self.git.confirm_discard = None;
-            if path.is_dir() {
-                let _ = std::fs::remove_dir_all(&path);
-            } else {
-                let _ = std::fs::remove_file(&path);
+            // To the Trash, as in VS Code and Finder: recoverable, unlike rm.
+            if let Err(err) = trash::delete(&path) {
+                self.set_git_notice(format!("Couldn't move to Trash: {err}"), true, cx);
+                return;
             }
-            if let Some(ix) = self
+            // Close the file's tab, or every tab under a deleted folder.
+            while let Some(ix) = self
                 .tabs
                 .iter()
-                .position(|t| t.path.as_ref() == Some(&path))
+                .position(|t| t.path.as_ref().is_some_and(|p| p.starts_with(&path)))
             {
                 self.close_tab(ix, cx);
             }
@@ -717,5 +814,84 @@ impl DartIde {
         }
         // The agent thread is saved per workspace, not in session.json.
         self.restore_agent_conversation(cx);
+    }
+}
+
+/// Where a copy of `src` lands in `dest_dir`: its own name when free, else
+/// VS Code's `name copy.ext`, `name copy 2.ext`, …
+pub(crate) fn free_copy_name(src: &Path, dest_dir: &Path) -> PathBuf {
+    let name = src.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+    let first = dest_dir.join(&name);
+    if first.symlink_metadata().is_err() {
+        return first;
+    }
+    let (stem, ext) = match name.rfind('.') {
+        Some(dot) if dot > 0 && !src.is_dir() => (&name[..dot], &name[dot..]),
+        _ => (name.as_str(), ""),
+    };
+    (1..)
+        .map(|n| {
+            let suffix = if n == 1 { " copy".to_string() } else { format!(" copy {n}") };
+            dest_dir.join(format!("{stem}{suffix}{ext}"))
+        })
+        .find(|p| p.symlink_metadata().is_err())
+        .expect("an unused name exists")
+}
+
+/// `cp -R` for one file or folder (symlinks copied as links).
+pub(crate) fn copy_recursively(src: &Path, dst: &Path) -> std::io::Result<()> {
+    let meta = src.symlink_metadata()?;
+    if meta.file_type().is_symlink() {
+        let link = std::fs::read_link(src)?;
+        return std::os::unix::fs::symlink(link, dst);
+    }
+    if meta.is_dir() {
+        std::fs::create_dir(dst)?;
+        for entry in std::fs::read_dir(src)? {
+            let entry = entry?;
+            copy_recursively(&entry.path(), &dst.join(entry.file_name()))?;
+        }
+        Ok(())
+    } else {
+        std::fs::copy(src, dst).map(|_| ())
+    }
+}
+
+#[cfg(test)]
+mod file_op_tests {
+    use super::*;
+
+    fn scratch(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("shame-fileops-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[core::prelude::v1::test]
+    fn copy_names_follow_vscode() {
+        let dir = scratch("names");
+        let src = dir.join("main.dart");
+        std::fs::write(&src, "x").unwrap();
+        assert_eq!(free_copy_name(&src, &dir), dir.join("main copy.dart"));
+        std::fs::write(dir.join("main copy.dart"), "").unwrap();
+        assert_eq!(free_copy_name(&src, &dir), dir.join("main copy 2.dart"));
+        // Elsewhere, the plain name is free.
+        let other = dir.join("other");
+        std::fs::create_dir(&other).unwrap();
+        assert_eq!(free_copy_name(&src, &other), other.join("main.dart"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[core::prelude::v1::test]
+    fn folders_copy_with_their_contents() {
+        let dir = scratch("tree");
+        std::fs::create_dir_all(dir.join("lib/src")).unwrap();
+        std::fs::write(dir.join("lib/src/a.dart"), "a").unwrap();
+        let target = free_copy_name(&dir.join("lib"), &dir);
+        assert_eq!(target, dir.join("lib copy"));
+        copy_recursively(&dir.join("lib"), &target).unwrap();
+        assert_eq!(std::fs::read_to_string(target.join("src/a.dart")).unwrap(), "a");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
