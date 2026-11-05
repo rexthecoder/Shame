@@ -545,14 +545,14 @@ impl DartIde {
                             moved.push((old.clone(), new.clone()));
                         }
                         Err(err) => {
-                            this.set_git_notice(format!("Couldn't move: {err}"), true, cx);
+                            this.show_toast(format!("Couldn't move: {err}"), true, cx);
                         }
                     }
                 }
                 editor_view::did_rename_files(&moved);
                 if edited > 0 && !moved.is_empty() {
                     let files = if edited == 1 { "file" } else { "files" };
-                    this.set_git_notice(format!("Updated imports in {edited} {files}"), false, cx);
+                    this.show_toast(format!("Updated imports in {edited} {files}"), false, cx);
                 }
                 this.finish_tree_change(&reveal, cx);
             });
@@ -568,12 +568,12 @@ impl DartIde {
             return;
         }
         if dest_dir.starts_with(&src) {
-            self.set_git_notice("Can't move a folder into itself.", true, cx);
+            self.show_toast("Can't move a folder into itself.", true, cx);
             return;
         }
         let target = dest_dir.join(name);
         if target.symlink_metadata().is_ok() {
-            self.set_git_notice(
+            self.show_toast(
                 format!(
                     "{} already exists in {}.",
                     name.to_string_lossy(),
@@ -591,12 +591,12 @@ impl DartIde {
     /// `main copy.dart`, then `main copy 2.dart`, …
     pub(crate) fn copy_tree_path(&mut self, src: PathBuf, dest_dir: PathBuf, cx: &mut Context<Self>) {
         if dest_dir.starts_with(&src) && src.is_dir() {
-            self.set_git_notice("Can't copy a folder into itself.", true, cx);
+            self.show_toast("Can't copy a folder into itself.", true, cx);
             return;
         }
         let target = free_copy_name(&src, &dest_dir);
         if let Err(err) = copy_recursively(&src, &target) {
-            self.set_git_notice(format!("Couldn't copy: {err}"), true, cx);
+            self.show_toast(format!("Couldn't copy: {err}"), true, cx);
             return;
         }
         self.finish_tree_change(&target, cx);
@@ -633,7 +633,7 @@ impl DartIde {
             let target = free_copy_name(src, &dest_dir);
             match copy_recursively(src, &target) {
                 Ok(()) => last = Some(target),
-                Err(err) => self.set_git_notice(format!("Couldn't copy: {err}"), true, cx),
+                Err(err) => self.show_toast(format!("Couldn't copy: {err}"), true, cx),
             }
         }
         if let Some(target) = last {
@@ -647,7 +647,7 @@ impl DartIde {
             self.git.confirm_discard = None;
             // To the Trash, as in VS Code and Finder: recoverable, unlike rm.
             if let Err(err) = trash::delete(&path) {
-                self.set_git_notice(format!("Couldn't move to Trash: {err}"), true, cx);
+                self.show_toast(format!("Couldn't move to Trash: {err}"), true, cx);
                 return;
             }
             // Close the file's tab, or every tab under a deleted folder.

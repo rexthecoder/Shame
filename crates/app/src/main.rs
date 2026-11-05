@@ -37,6 +37,7 @@ mod workspace;
 mod shell;
 mod simulator;
 mod theme;
+mod toast;
 #[allow(dead_code)]
 mod tokens;
 
@@ -546,6 +547,9 @@ pub struct DartIde {
     pub(crate) tree_clipboard: Option<TreeClipboard>,
     /// Shown in the Files header while a move waits on the language server.
     pub(crate) file_tree_busy: Option<&'static str>,
+    /// The app-wide notice (see `toast.rs`).
+    pub(crate) toast: Option<toast::Toast>,
+    pub(crate) toast_seq: u64,
     /// Bumped per background tree scan; only the newest scan's result lands.
     pub(crate) tree_scan_gen: u64,
     pub(crate) file_tree_input: Entity<InputState>,
@@ -791,6 +795,8 @@ impl DartIde {
             file_tree_error: None,
             tree_clipboard: None,
             file_tree_busy: None,
+            toast: None,
+            toast_seq: 0,
             tree_scan_gen: 0,
             file_tree_input,
             tree_state,
@@ -1429,6 +1435,7 @@ impl Render for DartIde {
             .child(self.render_titlebar(window, cx))
             .child(self.render_shell(&view, window, cx))
             .child(self.render_status_bar(cx))
+            .when_some(self.render_toast(cx), |el, toast| el.child(deferred(toast).with_priority(90)))
             .when_some(self.render_branch_switcher_modal(&view, cx), |el, modal| {
                 el.child(deferred(modal).with_priority(100))
             })
