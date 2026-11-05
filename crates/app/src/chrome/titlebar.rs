@@ -128,9 +128,16 @@ impl DartIde {
                 h_flex()
                     .id("titlebar-project-pill")
                     .group("titlebar-project-pill")
+                    .relative()
                     .flex_shrink_0()
                     .h(px(26.))
-                    .px(px(tokens::SPACE_4))
+                    // Equal padding on both sides, wide enough for the hover
+                    // × to sit in the right one, so the contents stay centred.
+                    .px(px(if self.has_workspace {
+                        tokens::SPACE_6 + tokens::SPACE_2
+                    } else {
+                        tokens::SPACE_4
+                    }))
                     .rounded(px(tokens::RADIUS_PILL))
                     .bg(rgba(0xffffff05))
                     .border_1()
@@ -171,8 +178,14 @@ impl DartIde {
                                 .cursor_pointer()
                                 // Only on hover: a permanent × next to the
                                 // branch read as "close branch", not "close
-                                // folder". It keeps its space so the pill
-                                // doesn't jump.
+                                // folder". Overlaid in the right padding, so
+                                // it takes no space from the contents.
+                                .absolute()
+                                .right(px(tokens::SPACE_3))
+                                .top_0()
+                                .bottom_0()
+                                .flex()
+                                .items_center()
                                 .invisible()
                                 .group_hover("titlebar-project-pill", |s| s.visible())
                                 .tooltip(|window, cx| {

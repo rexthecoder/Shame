@@ -47,7 +47,9 @@ use gpui_kit::*;
 use gpui_kit::prelude::FluentBuilder as _;
 use language::{LanguageAdapter, language_for_path};
 pub use conflicts::ConflictChoice;
-pub use lsp_integration::{CompletionEntry, CompletionKindBadge};
+pub use lsp_integration::{
+    CompletionEntry, CompletionKindBadge, did_rename_files, will_rename_files, workspace_edit_files,
+};
 pub use core_buffer::DiskState;
 use lsp_integration::LspState;
 

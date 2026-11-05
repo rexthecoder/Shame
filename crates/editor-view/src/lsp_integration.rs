@@ -87,6 +87,10 @@ pub struct CompletionEntry {
 
 struct SharedLspInner {
     ready: bool,
+    /// When `initialize` finished; a server this new may still be indexing.
+    ready_at: Option<std::time::Instant>,
+    /// Dart's `$/analyzerStatus`: `Some(false)` once the first analysis is done.
+    analyzing: Option<bool>,
     pending_opens: Vec<DidOpenTextDocumentParams>,
     subscribers: Vec<async_channel::Sender<ServerMessage>>,
     latest_diagnostics: HashMap<String, Vec<Diagnostic>>,
@@ -172,7 +176,9 @@ fn configuration_response(params: &serde_json::Value) -> serde_json::Value {
         items
             .iter()
             .map(|item| match item.get("section").and_then(|s| s.as_str()) {
-                Some("dart") => serde_json::json!({ "inlayHints": inlay }),
+                // `updateImportsOnRename` is the server's default; said
+                // explicitly because file moves in the tree rely on it.
+                Some("dart") => serde_json::json!({ "inlayHints": inlay, "updateImportsOnRename": true }),
                 _ => serde_json::Value::Null,
             })
             .collect(),
@@ -230,6 +236,12 @@ fn shared_lsp_server(
                     document_changes: Some(true),
                     ..Default::default()
                 }),
+                // The file tree asks before moving files, so imports follow.
+                file_operations: Some(lsp_types::WorkspaceFileOperationsClientCapabilities {
+                    will_rename: Some(true),
+                    did_rename: Some(true),
+                    ..Default::default()
+                }),
                 ..Default::default()
             }),
             text_document: Some(TextDocumentClientCapabilities {
@@ -264,6 +276,8 @@ fn shared_lsp_server(
         client,
         inner: Mutex::new(SharedLspInner {
             ready: false,
+            ready_at: None,
+            analyzing: None,
             pending_opens: Vec::new(),
             subscribers: Vec::new(),
             latest_diagnostics: HashMap::new(),
@@ -283,6 +297,7 @@ fn shared_lsp_server(
                                 .lock()
                                 .unwrap_or_else(|e| e.into_inner());
                             guard.ready = true;
+                            guard.ready_at = Some(std::time::Instant::now());
                             std::mem::take(&mut guard.pending_opens)
                         };
                         for open in opens {
@@ -300,6 +315,10 @@ fn shared_lsp_server(
                         })
                         .is_ok()
                     });
+                }
+                ServerMessage::Notification { method, params } if method == "$/analyzerStatus" => {
+                    let analyzing = params.get("isAnalyzing").and_then(|v| v.as_bool());
+                    server_bg.inner.lock().unwrap_or_else(|e| e.into_inner()).analyzing = analyzing;
                 }
                 ServerMessage::Notification { method, params }
                     if method == "textDocument/publishDiagnostics" =>
@@ -359,6 +378,196 @@ fn shared_lsp_server(
         .unwrap_or_else(|e| e.into_inner())
         .insert(key, server.clone());
     Some(server)
+}
+
+fn file_uri(path: &std::path::Path) -> String {
+    format!("file://{}", path.display())
+}
+
+fn rename_params(renames: &[(PathBuf, PathBuf)]) -> serde_json::Value {
+    serde_json::json!({
+        "files": renames
+            .iter()
+            .map(|(old, new)| serde_json::json!({ "oldUri": file_uri(old), "newUri": file_uri(new) }))
+            .collect::<Vec<_>>(),
+    })
+}
+
+/// The language servers that care about these paths: every running one
+/// whose project holds them, plus one started for a renamed source file's
+/// language when none is running yet (so imports update even if no file of
+/// that language was ever opened).
+fn servers_for_renames(renames: &[(PathBuf, PathBuf)]) -> Vec<Arc<SharedLspServer>> {
+    let mut out: Vec<Arc<SharedLspServer>> = Vec::new();
+    let push = |server: Arc<SharedLspServer>, out: &mut Vec<Arc<SharedLspServer>>| {
+        if !out.iter().any(|s| Arc::ptr_eq(s, &server)) {
+            out.push(server);
+        }
+    };
+    let running: Vec<(Option<PathBuf>, Arc<SharedLspServer>)> = server_pool()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .map(|((_, root), server)| (root.clone(), server.clone()))
+        .collect();
+    for (root, server) in running {
+        if root.is_some_and(|root| renames.iter().any(|(old, _)| old.starts_with(&root))) {
+            push(server, &mut out);
+        }
+    }
+    for (old, _) in renames {
+        // A folder has no language; inside a Dart package, ask as if for a
+        // Dart file in it.
+        let probe = if old.is_dir() {
+            match old.ancestors().any(|a| a.join("pubspec.yaml").exists()) {
+                true => old.join("_.dart"),
+                false => continue,
+            }
+        } else {
+            old.clone()
+        };
+        let adapter = crate::language::language_for_path(Some(&probe));
+        let root = adapter.find_project_root(&probe);
+        let Some((program, args)) = adapter.lsp_command(root.as_deref()) else {
+            continue;
+        };
+        if let Some(server) = shared_lsp_server(adapter.language_id(), root, &program, &args) {
+            push(server, &mut out);
+        }
+    }
+    out
+}
+
+/// Every text edit in a `WorkspaceEdit`, grouped by file.
+pub fn workspace_edit_files(edit: WorkspaceEdit) -> Vec<(PathBuf, Vec<TextEdit>)> {
+    let mut out: Vec<(PathBuf, Vec<TextEdit>)> = Vec::new();
+    let mut add = |uri: &Uri, edits: Vec<TextEdit>| {
+        let Some(path) = uri_to_path(uri) else { return };
+        match out.iter_mut().find(|(p, _)| *p == path) {
+            Some((_, existing)) => existing.extend(edits),
+            None => out.push((path, edits)),
+        }
+    };
+    if let Some(changes) = edit.changes {
+        for (uri, edits) in changes {
+            add(&uri, edits);
+        }
+    }
+    let annotated = |edits: Vec<OneOf<TextEdit, lsp_types::AnnotatedTextEdit>>| -> Vec<TextEdit> {
+        edits
+            .into_iter()
+            .map(|e| match e {
+                OneOf::Left(te) => te,
+                OneOf::Right(ate) => ate.text_edit,
+            })
+            .collect()
+    };
+    match edit.document_changes {
+        Some(DocumentChanges::Edits(docs)) => {
+            for doc in docs {
+                add(&doc.text_document.uri, annotated(doc.edits));
+            }
+        }
+        Some(DocumentChanges::Operations(ops)) => {
+            for op in ops {
+                if let DocumentChangeOperation::Edit(doc) = op {
+                    add(&doc.text_document.uri, annotated(doc.edits));
+                }
+            }
+        }
+        None => {}
+    }
+    out
+}
+
+/// Ask the language servers what to change before `renames` happen on
+/// disk (`workspace/willRenameFiles`): for Dart, the imports that point at
+/// the moved files and the moved files' own relative imports. Apply the
+/// edits, then move the files, then call [`did_rename_files`].
+///
+/// Blocks for up to `timeout` (a server started here needs time to come
+/// up), so call it off the UI thread. Servers that don't answer in time
+/// are skipped: the move still happens, just without import updates.
+pub fn will_rename_files(
+    renames: &[(PathBuf, PathBuf)],
+    timeout: Duration,
+) -> Vec<(PathBuf, Vec<TextEdit>)> {
+    let deadline = std::time::Instant::now() + timeout;
+    let params = rename_params(renames);
+    let mut out = Vec::new();
+    'servers: for server in servers_for_renames(renames) {
+        while !server.inner.lock().unwrap_or_else(|e| e.into_inner()).ready {
+            if std::time::Instant::now() >= deadline {
+                continue 'servers;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        // A private subscriber to catch the reply; dropped (and so pruned
+        // by the router) when this function returns.
+        let (tx, rx) = async_channel::unbounded();
+        server.inner.lock().unwrap_or_else(|e| e.into_inner()).subscribers.push(tx);
+        'ask: loop {
+            let Ok(id) = server.request("workspace/willRenameFiles", params.clone()) else {
+                continue 'servers;
+            };
+            loop {
+                let left = deadline.saturating_duration_since(std::time::Instant::now());
+                let message = smol::block_on(smol::future::or(
+                    async { rx.recv().await.ok() },
+                    async {
+                        Timer::after(left).await;
+                        None
+                    },
+                ));
+                match message {
+                    None => continue 'servers,
+                    Some(ServerMessage::Response { id: reply, result }) if reply == id => {
+                        let edit = result
+                            .ok()
+                            .and_then(|v| serde_json::from_value::<Option<WorkspaceEdit>>(v).ok())
+                            .flatten();
+                        match edit {
+                            Some(edit) => out.extend(workspace_edit_files(edit)),
+                            // A server that just started answers "nothing to
+                            // change" until it has analysed the project. Ask
+                            // again while it is still warming up.
+                            None if still_warming_up(&server)
+                                && std::time::Instant::now() + Duration::from_millis(300) < deadline =>
+                            {
+                                std::thread::sleep(Duration::from_millis(300));
+                                continue 'ask;
+                            }
+                            None => {}
+                        }
+                        continue 'servers;
+                    }
+                    Some(_) => {}
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Whether an empty `willRenameFiles` reply may only mean "not indexed
+/// yet": the server came up moments ago and hasn't said its first analysis
+/// is done.
+fn still_warming_up(server: &SharedLspServer) -> bool {
+    let guard = server.inner.lock().unwrap_or_else(|e| e.into_inner());
+    let fresh = guard.ready_at.is_some_and(|at| at.elapsed() < Duration::from_secs(30));
+    fresh && guard.analyzing != Some(false)
+}
+
+/// Tell the language servers the files moved (`workspace/didRenameFiles`).
+pub fn did_rename_files(renames: &[(PathBuf, PathBuf)]) {
+    let params = rename_params(renames);
+    let servers: Vec<Arc<SharedLspServer>> =
+        server_pool().lock().unwrap_or_else(|e| e.into_inner()).values().cloned().collect();
+    for server in servers {
+        if server.inner.lock().unwrap_or_else(|e| e.into_inner()).ready {
+            let _ = server.notify("workspace/didRenameFiles", params.clone());
+        }
+    }
 }
 
 pub(crate) struct LspState {
@@ -1814,6 +2023,55 @@ mod tests {
     use super::*;
 
     #[test]
+    fn workspace_edits_group_by_file_from_both_shapes() {
+        let edit: WorkspaceEdit = serde_json::from_value(serde_json::json!({
+            "changes": {
+                "file:///p/lib/a.dart": [{"range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 1}}, "newText": "x"}]
+            },
+            "documentChanges": [
+                {"textDocument": {"uri": "file:///p/lib/a.dart", "version": null},
+                 "edits": [{"range": {"start": {"line": 1, "character": 0}, "end": {"line": 1, "character": 1}}, "newText": "y"}]},
+                {"textDocument": {"uri": "file:///p/lib/b.dart", "version": 3},
+                 "edits": [{"range": {"start": {"line": 2, "character": 0}, "end": {"line": 2, "character": 1}}, "newText": "z"}]}
+            ]
+        }))
+        .unwrap();
+        let files = workspace_edit_files(edit);
+        assert_eq!(files.len(), 2);
+        assert_eq!(files[0].0, PathBuf::from("/p/lib/a.dart"));
+        assert_eq!(files[0].1.len(), 2);
+        assert_eq!(files[1].0, PathBuf::from("/p/lib/b.dart"));
+    }
+
+    /// End to end against a real `dart language-server`: moving a file
+    /// yields the edit to the import that points at it. Needs the Dart SDK;
+    /// run with `cargo test -p editor-view -- --ignored dart_rename`.
+    #[test]
+    #[ignore]
+    fn dart_rename_updates_imports() {
+        let dir = std::env::temp_dir().join(format!("shame-dart-rename-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("lib/widgets")).unwrap();
+        std::fs::write(dir.join("pubspec.yaml"), "name: demo\nenvironment:\n  sdk: '>=3.0.0 <4.0.0'\n").unwrap();
+        std::fs::write(dir.join("lib/widgets/button.dart"), "class Button {}\n").unwrap();
+        std::fs::write(
+            dir.join("lib/main.dart"),
+            "import 'widgets/button.dart';\n\nvoid main() => Button();\n",
+        )
+        .unwrap();
+        let dir = std::fs::canonicalize(&dir).unwrap();
+        let old = dir.join("lib/widgets/button.dart");
+        let new = dir.join("lib/ui/primary_button.dart");
+        // Cold: the server is started by this call and must warm up first.
+        let edits = will_rename_files(&[(old, new)], Duration::from_secs(30));
+        let main = edits.iter().find(|(p, _)| p.ends_with("lib/main.dart"));
+        let _ = std::fs::remove_dir_all(&dir);
+        let (_, main_edits) = main.expect("an edit to main.dart's import");
+        let text: String = main_edits.iter().map(|e| e.new_text.as_str()).collect();
+        assert!(text.contains("ui/primary_button.dart"), "got {main_edits:?}");
+    }
+
+    #[test]
     fn configuration_answers_each_item_and_only_sets_the_dart_section() {
         let params = serde_json::json!({
             "items": [{"section": "dart"}, {"section": "editor"}, {"scopeUri": "file:///x", "section": "dart"}]
@@ -1822,7 +2080,11 @@ mod tests {
         let expected_inlay = INLAY_HINTS_SETTING.load(Ordering::Relaxed);
         assert_eq!(
             reply,
-            serde_json::json!([{"inlayHints": expected_inlay}, null, {"inlayHints": expected_inlay}]),
+            serde_json::json!([
+                {"inlayHints": expected_inlay, "updateImportsOnRename": true},
+                null,
+                {"inlayHints": expected_inlay, "updateImportsOnRename": true},
+            ]),
             "one entry per item, in order"
         );
         assert_eq!(configuration_response(&serde_json::json!({})), serde_json::json!([]));

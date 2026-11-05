@@ -167,13 +167,15 @@ impl DartIde {
         self.debug_lines.clear();
         self.dock_tab = DockTab::Terminal;
 
-        let items = build_tree_items(&root, self.show_hidden);
-        self.all_files = flatten_files(&root);
-        self.all_files_hash = hash_paths(&self.all_files);
+        // Clear the old project's tree now; the new one is scanned off the
+        // UI thread so opening a large folder doesn't freeze the window.
+        self.all_files.clear();
+        self.all_files_hash = 0;
         self.tree_state.update(cx, |state, cx| {
-            state.set_items(items, cx);
+            state.set_items(Vec::new(), cx);
         });
         self.root = root;
+        self.rebuild_file_tree(cx);
         self.restore_agent_conversation(cx);
         // A different folder is a different repository.
         self.git.status = None;
@@ -262,7 +264,7 @@ impl DartIde {
     ) {
         // Only one inline edit at a time; drop a pending new-entry row.
         if self.file_tree_op.take().is_some() {
-            self.rebuild_file_tree(cx);
+            self.remove_new_entry_row(cx);
         }
         self.file_tree_error = None;
         let (initial, stem_len) = match &op {
@@ -324,12 +326,20 @@ impl DartIde {
             gpui_kit::component::tree::TreeItem::new(crate::rails::files::NEW_ENTRY_ID, "")
         };
         let parent_id = parent.to_string_lossy().to_string();
-        let items = crate::rails::files::build_tree_items(&self.root, self.show_hidden);
+        // Edit the tree in memory: no disk scan, so the row appears at once.
+        let current = crate::rails::files::root_items(self.tree_state.read(cx));
+        let items = crate::rails::files::without_id(&current, crate::rails::files::NEW_ENTRY_ID);
         let items = if parent == self.root {
             std::iter::once(placeholder()).chain(items).collect()
         } else {
             crate::rails::files::with_child_first(&items, &parent_id, placeholder())
         };
+        self.set_tree_items(items, cx);
+    }
+
+    fn remove_new_entry_row(&mut self, cx: &mut Context<Self>) {
+        let current = crate::rails::files::root_items(self.tree_state.read(cx));
+        let items = crate::rails::files::without_id(&current, crate::rails::files::NEW_ENTRY_ID);
         self.set_tree_items(items, cx);
     }
 
@@ -340,7 +350,7 @@ impl DartIde {
         };
         self.file_tree_error = None;
         if !matches!(op, FileTreeOp::Rename(_)) {
-            self.rebuild_file_tree(cx);
+            self.remove_new_entry_row(cx);
         }
         cx.notify();
     }
@@ -449,17 +459,9 @@ impl DartIde {
                 std::fs::create_dir_all(&target)?;
                 Ok((target, false))
             }
-            FileTreeOp::Rename(old) => {
-                let target = old.parent().unwrap_or(&self.root).join(&name);
-                if target == *old {
-                    return Ok((target, false));
-                }
-                if let Some(dir) = target.parent() {
-                    std::fs::create_dir_all(dir)?;
-                }
-                std::fs::rename(old, &target)?;
-                Ok((target, false))
-            }
+            // Validated above; the move happens in `run_file_moves`, after
+            // the language server has had its say about imports.
+            FileTreeOp::Rename(old) => Ok((old.parent().unwrap_or(&self.root).join(&name), false)),
         })();
 
         let (target, open_it) = match result {
@@ -474,7 +476,11 @@ impl DartIde {
         self.file_tree_error = None;
 
         if let FileTreeOp::Rename(old) = &op {
-            self.retarget_tabs(old, &target, cx);
+            if *old != target {
+                self.run_file_moves(vec![(old.clone(), target.clone())], target, cx);
+            }
+            cx.notify();
+            return;
         }
         self.finish_tree_change(&target, cx);
         if open_it {
@@ -495,18 +501,63 @@ impl DartIde {
         self.save_session_state();
     }
 
-    /// Rescan, then reveal and select `target` in the tree.
+    /// Rescan (off the UI thread), then reveal and select `target`.
     fn finish_tree_change(&mut self, target: &Path, cx: &mut Context<Self>) {
-        self.rebuild_file_tree(cx);
-        let id: SharedString = target.to_string_lossy().to_string().into();
-        self.tree_state.update(cx, |state, cx| {
-            state.reveal_item(&id, ScrollStrategy::Center, cx);
-            if let Some(ix) = state.index_of(&id) {
-                state.set_selected_index(Some(ix), cx);
-            }
-        });
+        self.rescan_tree_then_reveal(Some(target.to_path_buf()), cx);
         self.refresh_git(cx);
         cx.notify();
+    }
+
+    /// Rename or move files the way VS Code does: first ask the language
+    /// servers for the edits that keep imports pointing at the right place
+    /// (`workspace/willRenameFiles`, off the UI thread, capped at a few
+    /// seconds), apply them, then move the files, then tell the servers.
+    pub(crate) fn run_file_moves(
+        &mut self,
+        renames: Vec<(PathBuf, PathBuf)>,
+        reveal: PathBuf,
+        cx: &mut Context<Self>,
+    ) {
+        self.file_tree_busy = Some("Updating imports\u{2026}");
+        cx.notify();
+        let asked = renames.clone();
+        let (tx, rx) = async_channel::bounded(1);
+        std::thread::spawn(move || {
+            let edits = editor_view::will_rename_files(&asked, std::time::Duration::from_secs(5));
+            let _ = tx.send_blocking(edits);
+        });
+        cx.spawn(async move |weak, cx| {
+            let edits = rx.recv().await.unwrap_or_default();
+            let _ = weak.update(cx, |this, cx| {
+                this.file_tree_busy = None;
+                let edited = edits.len();
+                for (path, edits) in edits {
+                    this.apply_external_file_edits(path, edits, cx);
+                }
+                let mut moved = Vec::new();
+                for (old, new) in &renames {
+                    if let Some(dir) = new.parent() {
+                        let _ = std::fs::create_dir_all(dir);
+                    }
+                    match std::fs::rename(old, new) {
+                        Ok(()) => {
+                            this.retarget_tabs(old, new, cx);
+                            moved.push((old.clone(), new.clone()));
+                        }
+                        Err(err) => {
+                            this.set_git_notice(format!("Couldn't move: {err}"), true, cx);
+                        }
+                    }
+                }
+                editor_view::did_rename_files(&moved);
+                if edited > 0 && !moved.is_empty() {
+                    let files = if edited == 1 { "file" } else { "files" };
+                    this.set_git_notice(format!("Updated imports in {edited} {files}"), false, cx);
+                }
+                this.finish_tree_change(&reveal, cx);
+            });
+        })
+        .detach();
     }
 
     /// Move `src` into the folder `dest_dir` (drag and drop, or cut + paste).
@@ -533,12 +584,7 @@ impl DartIde {
             );
             return;
         }
-        if let Err(err) = std::fs::rename(&src, &target) {
-            self.set_git_notice(format!("Couldn't move: {err}"), true, cx);
-            return;
-        }
-        self.retarget_tabs(&src, &target, cx);
-        self.finish_tree_change(&target, cx);
+        self.run_file_moves(vec![(src, target.clone())], target, cx);
     }
 
     /// Copy `src` into `dest_dir`. A clash gets VS Code's names:
@@ -621,11 +667,66 @@ impl DartIde {
     }
 
     pub(crate) fn rebuild_file_tree(&mut self, cx: &mut Context<Self>) {
-        let items = build_tree_items(&self.root, self.show_hidden);
-        let files = flatten_files(&self.root);
-        self.all_files_hash = hash_paths(&files);
-        self.all_files = files;
-        self.set_tree_items(items, cx);
+        self.rescan_tree_then_reveal(None, cx);
+    }
+
+    /// Scan the folder on a background thread and swap the result in,
+    /// keeping open folders, a pending new-entry row, and (optionally)
+    /// revealing and selecting `reveal`. A big project no longer stalls the
+    /// UI after each create, rename, move or paste.
+    pub(crate) fn rescan_tree_then_reveal(&mut self, reveal: Option<PathBuf>, cx: &mut Context<Self>) {
+        self.tree_scan_gen += 1;
+        let generation = self.tree_scan_gen;
+        let root = self.root.clone();
+        let show_hidden = self.show_hidden;
+        let (tx, rx) = async_channel::bounded(1);
+        std::thread::spawn(move || {
+            let nodes = crate::rails::files::scan_tree(&root, show_hidden);
+            let files = flatten_files(&root);
+            let _ = tx.send_blocking((nodes, files));
+        });
+        let scanned_root = self.root.clone();
+        cx.spawn(async move |weak, cx| {
+            let Ok((nodes, files)) = rx.recv().await else { return };
+            let _ = weak.update(cx, |this, cx| {
+                // A newer scan was started, or the folder changed: drop this one.
+                if this.tree_scan_gen != generation || this.root != scanned_root {
+                    return;
+                }
+                this.all_files_hash = hash_paths(&files);
+                this.all_files = files;
+                let mut items = crate::rails::files::to_tree_items(nodes);
+                if let Some(FileTreeOp::NewFile { parent } | FileTreeOp::NewFolder { parent }) =
+                    this.file_tree_op.clone()
+                {
+                    let placeholder = gpui_kit::component::tree::TreeItem::new(
+                        crate::rails::files::NEW_ENTRY_ID,
+                        "",
+                    );
+                    items = if parent == this.root {
+                        std::iter::once(placeholder).chain(items).collect()
+                    } else {
+                        crate::rails::files::with_child_first(
+                            &items,
+                            &parent.to_string_lossy(),
+                            placeholder,
+                        )
+                    };
+                }
+                this.set_tree_items(items, cx);
+                if let Some(target) = &reveal {
+                    let id: SharedString = target.to_string_lossy().to_string().into();
+                    this.tree_state.update(cx, |state, cx| {
+                        state.reveal_item(&id, ScrollStrategy::Center, cx);
+                        if let Some(ix) = state.index_of(&id) {
+                            state.set_selected_index(Some(ix), cx);
+                        }
+                    });
+                }
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     pub(crate) fn save_session_state(&self) {

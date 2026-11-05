@@ -544,6 +544,10 @@ pub struct DartIde {
     /// Why the name typed into the inline create/rename row can't be used.
     pub(crate) file_tree_error: Option<String>,
     pub(crate) tree_clipboard: Option<TreeClipboard>,
+    /// Shown in the Files header while a move waits on the language server.
+    pub(crate) file_tree_busy: Option<&'static str>,
+    /// Bumped per background tree scan; only the newest scan's result lands.
+    pub(crate) tree_scan_gen: u64,
     pub(crate) file_tree_input: Entity<InputState>,
     pub(crate) tree_state: Entity<TreeState>,
     pub(crate) tabs: Vec<Tab>,
@@ -786,6 +790,8 @@ impl DartIde {
             file_tree_op: None,
             file_tree_error: None,
             tree_clipboard: None,
+            file_tree_busy: None,
+            tree_scan_gen: 0,
             file_tree_input,
             tree_state,
             tabs: Vec::new(),

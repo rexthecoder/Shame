@@ -124,8 +124,25 @@ fn collapse_all(items: &[TreeItem]) {
     }
 }
 
+/// `items` without the entry `id` (and its children), at any depth.
+pub(crate) fn without_id(items: &[TreeItem], id: &str) -> Vec<TreeItem> {
+    items
+        .iter()
+        .filter(|item| item.id.as_ref() != id)
+        .map(|item| {
+            if item.children.is_empty() {
+                item.clone()
+            } else {
+                TreeItem::new(item.id.clone(), item.label.clone())
+                    .children(without_id(&item.children, id))
+                    .expanded(item.is_expanded())
+            }
+        })
+        .collect()
+}
+
 /// The tree's top-level items (shared with the state, not copies).
-fn root_items(state: &gpui_kit::component::tree::TreeState) -> Vec<TreeItem> {
+pub(crate) fn root_items(state: &gpui_kit::component::tree::TreeState) -> Vec<TreeItem> {
     (0..)
         .map_while(|ix| state.entry(ix))
         .filter(|entry| entry.depth() == 0)
@@ -762,6 +779,22 @@ impl DartIde {
                                     .text_color(fg)
                                     .child(root_name),
                             )
+                            .when_some(self.file_tree_busy, |el, busy| {
+                                el.child(
+                                    h_flex()
+                                        .flex_shrink_0()
+                                        .gap(px(tokens::SPACE_1))
+                                        .items_center()
+                                        .text_size(px(tokens::UI_XS))
+                                        .text_color(muted)
+                                        .child(
+                                            gpui_kit::component::spinner::Spinner::new()
+                                                .xsmall()
+                                                .color(muted),
+                                        )
+                                        .child(busy),
+                                )
+                            })
                     )
                     .child(
                         h_flex()
@@ -1204,6 +1237,15 @@ mod tree_state_tests {
         assert!(!fresh[0].is_expanded());
         assert!(fresh[0].children[0].is_expanded());
         assert!(fresh[1].is_expanded());
+    }
+
+    #[core::prelude::v1::test]
+    fn the_new_entry_row_comes_out_at_any_depth() {
+        let items = vec![folder("/w/lib", vec![file(NEW_ENTRY_ID), file("/w/lib/a.dart")]), file(NEW_ENTRY_ID)];
+        let out = without_id(&items, NEW_ENTRY_ID);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].children.len(), 1);
+        assert_eq!(out[0].children[0].id.as_ref(), "/w/lib/a.dart");
     }
 
     #[core::prelude::v1::test]
