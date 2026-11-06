@@ -1961,21 +1961,20 @@ mod tests {
     }
 
     #[core::prelude::v1::test]
-    fn loads_and_decodes_png_and_webp_images() {
-        let manifest_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        let root = manifest_dir.parent().unwrap().parent().unwrap();
-        let webp_path = root.join("docs/reference/panes.webp");
-        let png_path = root.join("docs/reference/phase1-shell.png");
-        assert!(crate::is_image_path(&webp_path));
-        assert!(crate::is_image_path(&png_path));
-
-        let webp = crate::load_image_preview(&webp_path).expect("should decode panes.webp");
-        assert!(webp.width > 0 && webp.height > 0);
-        assert_eq!(webp.format_label, "WEBP");
-
-        let png = crate::load_image_preview(&png_path).expect("should decode phase1-shell.png");
-        assert!(png.width > 0 && png.height > 0);
-        assert_eq!(png.format_label, "PNG");
+    fn decodes_png_and_webp_images() {
+        let img = image::RgbaImage::from_pixel(8, 4, image::Rgba([10, 20, 30, 255]));
+        for (format, ext, label) in [
+            (image::ImageFormat::Png, "png", "PNG"),
+            (image::ImageFormat::WebP, "webp", "WEBP"),
+        ] {
+            assert!(crate::is_image_path(std::path::Path::new(&format!("x.{ext}"))));
+            let mut bytes = std::io::Cursor::new(Vec::new());
+            img.write_to(&mut bytes, format).expect("encode test image");
+            let preview = crate::decode_image_preview(bytes.get_ref(), label.to_string())
+                .expect("should decode generated image");
+            assert_eq!((preview.width, preview.height), (8, 4));
+            assert_eq!(preview.format_label, label);
+        }
     }
 }
 

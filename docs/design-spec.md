@@ -1,8 +1,7 @@
 # UI Replica Spec — "panes" target design
 
-Source of truth: `docs/reference/panes.webp` (the 1600×1060 screenshot).
-This document is the *only* input an implementing agent should need besides
-that image. If something is not in here, it does not get invented — ask.
+Source of truth: the target design (a 1600×1060 screenshot, no longer kept in
+the repo). This document is the *only* input an implementing agent should need. If something is not in here, it does not get invented — ask.
 
 Colour values are eyeballed from the screenshot. Before Phase 1, sample
 them with Digital Color Meter and correct the table; do not "improve" them.
@@ -195,7 +194,7 @@ Each entry: name → anatomy → states → notes.
 ## 6. Verification
 
 A component is visually correct only when a screenshot at 1600×1060 diffed
-against `docs/reference/panes.webp` shows no drift in **position, size,
+against the target design shows no drift in **position, size,
 radius, border, or type size** for its region. Colour drift is allowed
 only where §2 says so.
 

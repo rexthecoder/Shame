@@ -66,7 +66,7 @@ mod tests {
           "dartSdkVersion": "3.13.2",
           "devToolsVersion": "2.60.0",
           "flutterVersion": "3.47.2",
-          "flutterRoot": "/Users/bushadigitalltd/fvm/versions/3.47.2"
+          "flutterRoot": "/Users/me/fvm/versions/3.47.2"
         }"#;
         let sdk: FlutterSdk = serde_json::from_str(json).expect("should deserialize");
         assert_eq!(sdk.flutter_version, "3.47.2");
@@ -74,7 +74,7 @@ mod tests {
         assert_eq!(sdk.channel, "stable");
         assert_eq!(
             sdk.dart_sdk_dir(),
-            PathBuf::from("/Users/bushadigitalltd/fvm/versions/3.47.2/bin/cache/dart-sdk")
+            PathBuf::from("/Users/me/fvm/versions/3.47.2/bin/cache/dart-sdk")
         );
     }
 

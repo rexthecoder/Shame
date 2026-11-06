@@ -19,8 +19,6 @@ as one giant render edit with no spec.
 ## Phase 0 — Spec + tokens (no visual change)
 
 **Do**
-- `docs/reference/panes.webp` (the screenshot) is already in-repo so it can
-  be cropped by an agent.
 - Apply only the §2 deltas to `theme.rs`: colour values, add the 7 new
   tokens, set `radius_sm/radius/radius_lg/radius_pill`, spacing consts.
 - Add a `mod tokens;` with `space`, `radii`, `type_scale` consts so widgets
@@ -197,7 +195,6 @@ One phase per session. Prompt template:
 
 ```
 Read docs/design-spec.md and docs/design-plan.md.
-The crop for this phase is docs/reference/crop-<phase>.png.
 Constraint: no colour/radius/spacing literals outside theme.rs/tokens.rs.
 Reuse existing primitives; list any new primitive you must add.
 Do not touch files outside the phase's listed targets.

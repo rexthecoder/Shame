@@ -11,6 +11,29 @@ general-purpose widgets come from [GPUI] via [gpui-kit] and [gpui-component].
 [gpui-kit]: https://github.com/longbridge/gpui-kit
 [gpui-component]: https://github.com/longbridge/gpui-component
 
+## Download
+
+Grab the latest macOS build (Apple Silicon and Intel) from the
+[Releases page](https://github.com/rexthecoder/Shame/releases/latest):
+
+1. Download `Shame-<version>-macos-universal.dmg`.
+2. Open it and drag **Shame** into **Applications**.
+
+Optionally verify the download against the `.sha256` file published next to it:
+
+```bash
+shasum -a 256 -c Shame-<version>-macos-universal.dmg.sha256
+```
+
+Builds that aren't notarized by Apple show an "unidentified developer" warning
+on first launch. Right-click the app and choose **Open**, or run:
+
+```bash
+xattr -dr com.apple.quarantine /Applications/Shame.app
+```
+
+Prefer to build it yourself? See [Building and running](#building-and-running).
+
 ## Status
 
 Daily-usable. Implemented: rope buffer with undo tree and multi-cursor,
@@ -41,9 +64,22 @@ The `core-*` crates have no UI dependency, so the GPUI-based UI layer
 
 ## Building and running
 
+Requirements: macOS (the only platform built and tested in CI), a recent
+stable Rust toolchain (the workspace uses edition 2024, so Rust 1.85 or
+newer), and Xcode command-line tools. For Dart/Flutter features you also need
+the Flutter SDK on your `PATH`.
+
 ```bash
 cargo run -p app
 ```
+
+To produce a macOS `.app` and `.dmg` (Apple Silicon, Intel, or universal):
+
+```bash
+scripts/build-mac.sh --arch universal
+```
+
+Output goes to `dist/`. See the header of the script for signing options.
 
 ## Agent modes
 

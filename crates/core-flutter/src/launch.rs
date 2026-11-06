@@ -106,7 +106,7 @@ impl LaunchConfig {
         }
     }
 
-    /// Short human-readable relative directory label (e.g. `apps/busha`) for UI display.
+    /// Short human-readable relative directory label (e.g. `apps/alpha`) for UI display.
     pub fn relative_cwd_label(&self, workspace_root: &Path) -> Option<String> {
         let resolved = self.resolved_cwd(workspace_root);
         if resolved == workspace_root {
@@ -315,8 +315,8 @@ mod tests {
                     }
                 },
                 {
-                    "name": "[DEV] Busha",
-                    "cwd": "${workspaceFolder}/apps/busha",
+                    "name": "[DEV] Alpha",
+                    "cwd": "${workspaceFolder}/apps/alpha",
                     "type": "dart",
                     "request": "launch",
                     "args": [
@@ -324,12 +324,12 @@ mod tests {
                         "dev"
                     ],
                     "toolArgs": [
-                        "--dart-define-from-file=${workspaceFolder}/apps/busha/.env.dev"
+                        "--dart-define-from-file=${workspaceFolder}/apps/alpha/.env.dev"
                     ]
                 },
                 {
-                    "name": "[PROD] Busha",
-                    "cwd": "${workspaceFolder}/apps/busha",
+                    "name": "[PROD] Alpha",
+                    "cwd": "${workspaceFolder}/apps/alpha",
                     "type": "dart",
                     "request": "launch",
                     "args": [
@@ -337,12 +337,12 @@ mod tests {
                         "prod"
                     ],
                     "toolArgs": [
-                        "--dart-define-from-file=${workspaceFolder}/apps/busha/.env.dev"
+                        "--dart-define-from-file=${workspaceFolder}/apps/alpha/.env.dev"
                     ]
                 },
                 {
-                    "name": "[DEV] Yousend",
-                    "cwd": "${workspaceFolder}/apps/yousend",
+                    "name": "[DEV] Beta",
+                    "cwd": "${workspaceFolder}/apps/beta",
                     "type": "dart",
                     "request": "launch",
                     "args": [
@@ -350,12 +350,12 @@ mod tests {
                         "dev"
                     ],
                     "toolArgs": [
-                        "--dart-define-from-file=${workspaceFolder}/apps/yousend/.env.dev"
+                        "--dart-define-from-file=${workspaceFolder}/apps/beta/.env.dev"
                     ]
                 },
                 {
-                    "name": "Genesis Design gallery",
-                    "cwd": "${workspaceFolder}/genesis/genesis_design_gallery",
+                    "name": "Design gallery",
+                    "cwd": "${workspaceFolder}/packages/design_gallery",
                     "type": "dart",
                     "request": "launch",
                 },
@@ -382,22 +382,22 @@ mod tests {
             .filter(|c| !c.is_test_template())
             .collect();
         assert_eq!(runnable.len(), 4);
-        assert_eq!(runnable[0].name, "[DEV] Busha");
+        assert_eq!(runnable[0].name, "[DEV] Alpha");
         assert_eq!(runnable[0].flavor().as_deref(), Some("dev"));
 
         let root = Path::new("/workspace/mono");
         assert_eq!(
             runnable[0].resolved_cwd(root),
-            PathBuf::from("/workspace/mono/apps/busha")
+            PathBuf::from("/workspace/mono/apps/alpha")
         );
         assert_eq!(
             runnable[0].relative_cwd_label(root).as_deref(),
-            Some("apps/busha")
+            Some("apps/alpha")
         );
         assert_eq!(
             runnable[0].resolved_cli_args(root),
             vec![
-                "--dart-define-from-file=/workspace/mono/apps/busha/.env.dev".to_string(),
+                "--dart-define-from-file=/workspace/mono/apps/alpha/.env.dev".to_string(),
                 "--flavor".to_string(),
                 "dev".to_string(),
             ]

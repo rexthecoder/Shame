@@ -721,7 +721,7 @@ The last item on M3's plan list. `flutter --version --machine` gives a
 single JSON object (not an array, unlike `devices --machine`) with the
 Flutter/Dart SDK versions, channel, and `flutterRoot` — confirmed by
 running it for real on this machine (`fvm`-managed Flutter 3.47.2,
-Dart 3.13.2, under `/Users/bushadigitalltd/fvm/versions/3.47.2`).
+Dart 3.13.2, under `/Users/me/fvm/versions/3.47.2`).
 
 The actual point of this isn't just displaying a version somewhere —
 it's `FlutterSdk::dart_sdk_dir()`, which derives

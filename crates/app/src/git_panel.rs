@@ -975,9 +975,9 @@ mod display_tests {
 
     #[core::prelude::v1::test]
     fn plain_and_merge_subjects_are_left_alone() {
-        let s = parse_commit_subject("Merge branch 'main' into busha-pro");
+        let s = parse_commit_subject("Merge branch 'main' into feature-pro");
         assert!(s.is_merge);
-        assert_eq!((s.kind, s.text), (None, "Merge branch 'main' into busha-pro"));
+        assert_eq!((s.kind, s.text), (None, "Merge branch 'main' into feature-pro"));
         // A capitalised word before a colon isn't a commit type.
         let s = parse_commit_subject("Note: this is prose");
         assert_eq!((s.kind, s.text), (None, "Note: this is prose"));

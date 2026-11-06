@@ -10,6 +10,8 @@
 #   make dmg             create distributable macOS disk image (dist/Dart-IDE-0.1.0-macos.dmg)
 #   make release         full v0.1.0 release pipeline (test + release-build + bundle + dmg)
 #   make install         install dist/Dart IDE.app into /Applications
+#   scripts/build-mac.sh app + dmg for arm64, x86_64 or universal, with optional
+#                        Developer ID signing and a checksum (see its header)
 #   make dev-app         debug build wrapped as target/debug/Shame Dev.app and
 #                        opened on this repo (own bundle id, so it can be
 #                        screenshotted and driven like any app);

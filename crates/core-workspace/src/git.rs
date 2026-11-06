@@ -81,7 +81,7 @@ pub fn line_changes(file: &Path) -> HashMap<u32, LineChange> {
 }
 
 /// Per-line `git blame` summary for `file` keyed by 0-indexed line number:
-/// e.g. `"Busha · Add split editor panes (a1b2c3d)"`.
+/// e.g. `"Alpha · Add split editor panes (a1b2c3d)"`.
 pub fn line_blame(file: &Path) -> HashMap<u32, String> {
     let mut blame = HashMap::new();
     let Some(dir) = file.parent() else {
