@@ -13,8 +13,19 @@ fn main() {
     }
     let src = PathBuf::from("../../tools/simhelper/simhelper.m");
     let out = PathBuf::from(std::env::var("OUT_DIR").unwrap()).join("shame-sim");
-    let status = Command::new("xcrun")
-        .args(["--sdk", "macosx", "clang", "-fobjc-arc", "-O2"])
+    // Build for the cargo *target*, not the host, so `--target x86_64-apple-darwin` on an
+    // Apple Silicon machine (and universal builds) get an Intel helper.
+    let arch = match std::env::var("CARGO_CFG_TARGET_ARCH").as_deref() {
+        Ok("aarch64") => "arm64",
+        Ok("x86_64") => "x86_64",
+        _ => "",
+    };
+    let mut cmd = Command::new("xcrun");
+    cmd.args(["--sdk", "macosx", "clang", "-fobjc-arc", "-O2"]);
+    if !arch.is_empty() {
+        cmd.args(["-arch", arch]);
+    }
+    let status = cmd
         .args(["-framework", "Foundation", "-framework", "CoreGraphics", "-framework", "IOSurface"])
         .arg(&src)
         .arg("-o")
