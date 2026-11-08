@@ -399,7 +399,16 @@ impl DartIde {
         self.new_project_open = true;
         self.new_project_error = None;
         self.new_project_template = 0;
-        let location = default_project_location().to_string_lossy().to_string();
+        let location = if self.has_workspace {
+            self.root
+                .parent()
+                .map(std::path::Path::to_path_buf)
+                .unwrap_or_else(|| self.root.clone())
+        } else {
+            default_project_location()
+        }
+        .to_string_lossy()
+        .to_string();
         self.new_project_name.update(cx, |state, cx| {
             state.set_value("", window, cx);
             state.focus(window, cx);
@@ -525,33 +534,50 @@ impl DartIde {
         let muted = cx.theme().muted_foreground;
         let fg = cx.theme().foreground;
         let border = cx.theme().border;
-        let field = |label: &'static str, input: &Entity<InputState>| {
+        let field_bg = cx.theme().background;
+        let field = |label: &'static str, hint: Option<&'static str>, input: &Entity<InputState>| {
             v_flex()
+                .w_full()
                 .gap(px(4.))
                 .child(
-                    div()
-                        .text_size(px(tokens::UI_XS))
-                        .text_color(muted)
-                        .child(label),
+                    h_flex()
+                        .w_full()
+                        .justify_between()
+                        .child(
+                            div()
+                                .text_size(px(tokens::UI_XS))
+                                .text_color(muted)
+                                .child(label),
+                        )
+                        .when_some(hint, |el, hint| {
+                            el.child(
+                                div()
+                                    .text_size(px(tokens::UI_XS))
+                                    .text_color(muted.opacity(0.65))
+                                    .child(hint),
+                            )
+                        }),
                 )
                 .child(
                     h_flex()
-                        .h(px(30.))
-                        .px(px(8.))
+                        .w_full()
+                        .h(px(32.))
+                        .px(px(9.))
                         .items_center()
                         .rounded(px(tokens::RADIUS_SM))
-                        .bg(cx.theme().background)
+                        .bg(field_bg)
                         .border_1()
                         .border_color(border)
-                        .child(Input::new(input).appearance(false).small()),
+                        .child(Input::new(input).appearance(false).small().w_full()),
                 )
         };
         let template_pill = |ix: usize, label: &'static str| {
             let selected = self.new_project_template == ix;
             h_flex()
                 .id(("new-project-template", ix))
-                .h(px(26.))
-                .px(px(10.))
+                .flex_1()
+                .h(px(28.))
+                .justify_center()
                 .items_center()
                 .rounded(px(tokens::RADIUS_SM))
                 .cursor_pointer()
@@ -562,7 +588,7 @@ impl DartIde {
                         .text_color(fg)
                 })
                 .when(!selected, |el| {
-                    el.bg(cx.theme().background)
+                    el.bg(field_bg)
                         .border_1()
                         .border_color(border)
                         .text_color(muted)
@@ -574,6 +600,29 @@ impl DartIde {
                     cx.notify();
                 }))
         };
+        let close = |view: &Entity<Self>| {
+            h_flex()
+                .id("new-project-close")
+                .size(px(24.))
+                .items_center()
+                .justify_center()
+                .rounded(px(tokens::RADIUS_SM))
+                .cursor_pointer()
+                .text_size(px(14.))
+                .text_color(muted)
+                .hover(|s| s.bg(rgba(0xffffff0c)).text_color(fg))
+                .child("\u{00d7}")
+                .on_click({
+                    let view = view.clone();
+                    move |_event, _window, cx| {
+                        view.update(cx, |this, cx| {
+                            this.new_project_open = false;
+                            this.new_project_error = None;
+                            cx.notify();
+                        });
+                    }
+                })
+        };
 
         Some(
             div()
@@ -581,12 +630,13 @@ impl DartIde {
                 .absolute()
                 .inset_0()
                 .flex()
+                .items_start()
                 .justify_center()
                 .pt(px(84.))
                 .bg(rgba(0x00000066))
                 .child(
                     v_flex()
-                        .w(px(460.))
+                        .w(px(480.))
                         .bg(cx.theme().popover)
                         .border_1()
                         .border_color(border)
@@ -610,10 +660,13 @@ impl DartIde {
                         })
                         .child(
                             h_flex()
-                                .px_3()
-                                .py_2()
+                                .w_full()
+                                .px(px(16.))
+                                .py(px(12.))
                                 .items_center()
                                 .justify_between()
+                                .border_b_1()
+                                .border_color(border)
                                 .child(
                                     v_flex()
                                         .gap(px(2.))
@@ -631,25 +684,29 @@ impl DartIde {
                                                 .child("Create a project, then open it here."),
                                         ),
                                 )
-                                .child(
-                                    div()
-                                        .font_family("SF Mono")
-                                        .text_size(px(tokens::UI_XS))
-                                        .text_color(muted)
-                                        .child("flutter create"),
-                                ),
+                                .child(close(view)),
                         )
                         .child(
                             v_flex()
-                                .px_3()
-                                .pb_3()
-                                .gap(px(10.))
-                                .child(field("Name", &self.new_project_name))
-                                .child(field("Location", &self.new_project_location))
-                                .child(field("Organization", &self.new_project_org))
+                                .w_full()
+                                .px(px(16.))
+                                .py(px(14.))
+                                .gap(px(12.))
+                                .child(field("Project name", None, &self.new_project_name))
+                                .child(field(
+                                    "Location",
+                                    Some("A new folder is created inside this directory."),
+                                    &self.new_project_location,
+                                ))
+                                .child(field(
+                                    "Organization",
+                                    Some("Used for the bundle identifier."),
+                                    &self.new_project_org,
+                                ))
                                 .child(
                                     v_flex()
-                                        .gap(px(4.))
+                                        .w_full()
+                                        .gap(px(6.))
                                         .child(
                                             div()
                                                 .text_size(px(tokens::UI_XS))
@@ -658,7 +715,8 @@ impl DartIde {
                                         )
                                         .child(
                                             h_flex()
-                                                .gap(px(6.))
+                                                .w_full()
+                                                .gap(px(4.))
                                                 .children(PROJECT_TEMPLATES.iter().enumerate().map(
                                                     |(ix, (label, _))| template_pill(ix, label),
                                                 )),
@@ -666,16 +724,35 @@ impl DartIde {
                                 )
                                 .when_some(self.new_project_error.clone(), |el, error| {
                                     el.child(
-                                        div()
+                                        h_flex()
+                                            .w_full()
+                                            .px(px(10.))
+                                            .py(px(8.))
+                                            .rounded(px(tokens::RADIUS_SM))
+                                            .bg(cx.theme().danger.opacity(0.12))
                                             .text_size(px(tokens::UI_SM))
                                             .text_color(cx.theme().danger)
                                             .child(error),
                                     )
-                                })
+                                }),
+                        )
+                        .child(
+                            h_flex()
+                                .w_full()
+                                .px(px(16.))
+                                .py(px(10.))
+                                .items_center()
+                                .justify_between()
+                                .border_t_1()
+                                .border_color(border)
+                                .child(
+                                    div()
+                                        .text_size(px(tokens::UI_XS))
+                                        .text_color(muted.opacity(0.7))
+                                        .child("Runs flutter create in the Debug Console"),
+                                )
                                 .child(
                                     h_flex()
-                                        .w_full()
-                                        .justify_end()
                                         .gap(px(8.))
                                         .child(
                                             h_flex()
@@ -685,9 +762,11 @@ impl DartIde {
                                                 .items_center()
                                                 .rounded(px(tokens::RADIUS_SM))
                                                 .cursor_pointer()
+                                                .border_1()
+                                                .border_color(border)
                                                 .text_size(px(tokens::UI_SM))
                                                 .text_color(muted)
-                                                .hover(|s| s.text_color(fg))
+                                                .hover(|s| s.text_color(fg).bg(rgba(0xffffff08)))
                                                 .child("Cancel")
                                                 .on_click(cx.listener(|this, _event, _window, cx| {
                                                     this.new_project_open = false;
@@ -707,6 +786,7 @@ impl DartIde {
                                                 .text_size(px(tokens::UI_SM))
                                                 .font_medium()
                                                 .text_color(cx.theme().primary_foreground)
+                                                .hover(|s| s.bg(cx.theme().primary.opacity(0.88)))
                                                 .child("Create")
                                                 .on_click(cx.listener(|this, _event, window, cx| {
                                                     this.submit_new_project(window, cx);
