@@ -42,6 +42,7 @@ Daily-usable. Implemented: rope buffer with undo tree and multi-cursor,
 tree-sitter highlighting, LSP (completion, hover, definition, references,
 signature help, rename, formatting, code actions, organize imports,
 diagnostics), DAP debugging, Flutter run / hot reload / devices / tests,
+creating a Flutter project from the welcome screen or the command palette,
 git panel and diff view, terminal dock, iOS simulator rail, web preview,
 and an agent rail whose thread is saved per workspace. See
 [`NOTES.md`](NOTES.md) for the development log and

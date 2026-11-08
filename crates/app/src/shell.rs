@@ -476,6 +476,34 @@ impl DartIde {
                     )
                     .child(
                         h_flex()
+                            .id("empty-new-project")
+                            .w_full()
+                            .h(px(30.))
+                            .px(px(10.))
+                            .rounded(px(tokens::RADIUS_SM))
+                            .items_center()
+                            .justify_between()
+                            .cursor_pointer()
+                            .hover(move |s| s.bg(rgba(0xffffff08)).text_color(fg))
+                            .child(
+                                div()
+                                    .text_size(px(13.))
+                                    .text_color(muted)
+                                    .child("New Flutter Project\u{2026}"),
+                            )
+                            .child(
+                                div()
+                                    .font_family("SF Mono")
+                                    .text_size(px(tokens::UI_XS))
+                                    .text_color(muted.opacity(0.6))
+                                    .child("flutter create"),
+                            )
+                            .on_click(cx.listener(|this, _event, window, cx| {
+                                this.open_new_project(window, cx);
+                            })),
+                    )
+                    .child(
+                        h_flex()
                             .id("empty-new-file")
                             .w_full()
                             .h(px(30.))

@@ -41,7 +41,7 @@ pub use launch::{
     LaunchCodeLens, LaunchConfig, LaunchFile, expand_workspace_vars, load_launch_file,
     parse_launch_json,
 };
-pub use pubspec::{PubOutput, add_package, pub_get};
+pub use pubspec::{PubOutput, add_package, create_project, pub_get};
 pub use sdk::{FlutterSdk, detect_sdk};
 pub use tests::{
     Counts, GroupNode, SuiteNode, TestCase, TestRun, TestStatus, is_flutter_package, name_filter_regex,

@@ -1,5 +1,22 @@
 # Milestone notes
 
+## New Flutter Project, without leaving the editor
+
+- **The welcome screen has a create path.** "New Flutter Project…" opens a
+  small modal with name, location, organization and a template (App, Package,
+  Plugin, Module). It is also `Flutter: New Project…` in the command palette
+  and the File menu.
+- **`flutter create` runs off the UI thread.** The command streams into the
+  Debug Console while it works; on success the editor switches to the new
+  folder and opens `lib/main.dart`, on failure it reopens the modal with the
+  reason and leaves the console output in place.
+- **Names are checked before the process starts.** Flutter's package rule
+  (lowercase letter first, then lowercase letters, digits and underscores) and
+  an existing target directory both produce an inline error instead of a
+  failed process.
+- The backend is `core_flutter::create_project`, so the UI layer only passes a
+  parent directory, name, org and template.
+
 ## Editor: navigation that respects the text, not just bytes
 
 - **Up/Down keeps the column.** The cursor now remembers the display column it

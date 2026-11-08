@@ -24,6 +24,46 @@ fn run_pub(project_dir: &Path, args: &[&str]) -> io::Result<PubOutput> {
     })
 }
 
+/// `flutter create` a new project at `parent/name`.
+///
+/// `template` is Flutter's own name (`app`, `package`, `plugin`, `module`);
+/// `None` leaves the CLI default. The parent directory is created if needed,
+/// and the command runs there so the generated project lands at
+/// `parent/name`.
+pub fn create_project(
+    parent: &Path,
+    name: &str,
+    org: Option<&str>,
+    template: Option<&str>,
+) -> io::Result<PubOutput> {
+    std::fs::create_dir_all(parent)?;
+    let output = Command::new("flutter")
+        .args(create_project_args(name, org, template))
+        .current_dir(parent)
+        .output()?;
+    Ok(PubOutput {
+        success: output.status.success(),
+        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+    })
+}
+
+/// The arguments `create_project` passes to `flutter`, kept separate so the
+/// option handling can be tested without running the CLI.
+fn create_project_args(name: &str, org: Option<&str>, template: Option<&str>) -> Vec<String> {
+    let mut args = vec!["create".to_string()];
+    if let Some(template) = template.filter(|t| !t.trim().is_empty()) {
+        args.push("--template".into());
+        args.push(template.into());
+    }
+    if let Some(org) = org.filter(|o| !o.trim().is_empty()) {
+        args.push("--org".into());
+        args.push(org.into());
+    }
+    args.push(name.into());
+    args
+}
+
 /// `flutter pub get` in `project_dir`.
 pub fn pub_get(project_dir: &Path) -> io::Result<PubOutput> {
     run_pub(project_dir, &["get"])
@@ -56,6 +96,20 @@ mod tests {
     /// pointing `FLUTTER_TEST_PROJECT` at it exercises this for real.
     fn test_project_dir() -> Option<std::path::PathBuf> {
         std::env::var_os("FLUTTER_TEST_PROJECT").map(std::path::PathBuf::from).filter(|p| p.is_dir())
+    }
+
+    #[test]
+    fn create_project_args_carry_template_and_org() {
+        assert_eq!(
+            create_project_args("my_app", Some("com.example"), Some("app")),
+            vec!["create", "--template", "app", "--org", "com.example", "my_app"]
+        );
+        assert_eq!(create_project_args("my_app", None, None), vec!["create", "my_app"]);
+        assert_eq!(
+            create_project_args("my_app", Some(" "), Some(" ")),
+            vec!["create", "my_app"],
+            "blank options are left out"
+        );
     }
 
     #[test]

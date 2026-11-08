@@ -265,6 +265,7 @@ actions!(
         OpenSettings,
         QuitShame,
         MenuOpenFolder,
+        MenuNewProject,
         MenuCloseFolder,
         MenuNewFile,
         MenuSaveFile,
@@ -305,6 +306,7 @@ const IDE_COMMANDS: &[IdeCommand] = &[
     IdeCommand { id: "build-runner-watch", title: "Flutter: Watch build_runner", shortcut: "", flutter_only: true },
     IdeCommand { id: "gen-l10n", title: "Flutter: Generate Localizations (gen-l10n)", shortcut: "", flutter_only: true },
     IdeCommand { id: "add-package", title: "Flutter: Add Package (pub.dev)\u{2026}", shortcut: "", flutter_only: true },
+    IdeCommand { id: "new-flutter-project", title: "Flutter: New Project\u{2026}", shortcut: "", flutter_only: false },
     IdeCommand { id: "open-devtools", title: "Flutter: Open DevTools in Browser", shortcut: "", flutter_only: true },
     IdeCommand { id: "toggle-perf-overlay", title: "Flutter: Toggle Performance Overlay", shortcut: "", flutter_only: true },
     IdeCommand { id: "toggle-debug-paint", title: "Flutter: Toggle Debug Paint (Widget Bounds)", shortcut: "", flutter_only: true },
@@ -644,6 +646,12 @@ pub struct DartIde {
     pub(crate) light_theme: bool,
     pub(crate) add_package_open: bool,
     pub(crate) add_package_input: Entity<InputState>,
+    pub(crate) new_project_open: bool,
+    pub(crate) new_project_name: Entity<InputState>,
+    pub(crate) new_project_location: Entity<InputState>,
+    pub(crate) new_project_org: Entity<InputState>,
+    pub(crate) new_project_template: usize,
+    pub(crate) new_project_error: Option<String>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -694,6 +702,15 @@ impl DartIde {
         let add_package_input = cx.new(|cx| {
             InputState::new(window, cx)
                 .placeholder("Package name (e.g. provider, http, dev:build_runner)...")
+        });
+        let new_project_name = cx.new(|cx| {
+            InputState::new(window, cx).placeholder("my_app")
+        });
+        let new_project_location = cx.new(|cx| {
+            InputState::new(window, cx).placeholder("~/Projects")
+        });
+        let new_project_org = cx.new(|cx| {
+            InputState::new(window, cx).placeholder("com.example")
         });
         let project_search_input = cx.new(|cx| {
             InputState::new(window, cx).placeholder("Search")
@@ -875,6 +892,12 @@ impl DartIde {
             light_theme: false,
             add_package_open: false,
             add_package_input,
+            new_project_open: false,
+            new_project_name,
+            new_project_location,
+            new_project_org,
+            new_project_template: 0,
+            new_project_error: None,
             _subscriptions: Vec::new(),
         };
 
@@ -1248,6 +1271,7 @@ impl DartIde {
             "send-to-agent" => self.attach_editor_context(window, cx),
             "workspace-symbols" => self.open_workspace_symbols(window, cx),
             "open-folder" => self.open_folder(window, cx),
+            "new-flutter-project" => self.open_new_project(window, cx),
             "new-file" => self.new_scratch_tab(window, cx),
             "close-tab" => {
                 if !self.tabs.is_empty() {
@@ -1387,6 +1411,9 @@ impl Render for DartIde {
             .on_action(cx.listener(|this, _: &MenuOpenFolder, window, cx| {
                 this.open_folder(window, cx);
             }))
+            .on_action(cx.listener(|this, _: &MenuNewProject, window, cx| {
+                this.open_new_project(window, cx);
+            }))
             .on_action(cx.listener(|this, _: &MenuCloseFolder, _w, cx| {
                 this.request_close_workspace(cx);
             }))
@@ -1485,6 +1512,9 @@ impl Render for DartIde {
             .when_some(self.render_add_package_prompt(&view, cx), |el, prompt| {
                 el.child(deferred(prompt).with_priority(100))
             })
+            .when_some(self.render_new_project_prompt(&view, cx), |el, prompt| {
+                el.child(deferred(prompt).with_priority(100))
+            })
             .when_some(self.render_rename_prompt(&view, cx), |el, prompt| {
                 el.child(deferred(prompt).with_priority(100))
             })
@@ -1564,6 +1594,7 @@ fn main() {
                 name: "File".into(),
                 items: vec![
                     MenuItem::action("New Scratch File", MenuNewFile),
+                    MenuItem::action("New Flutter Project\u{2026}", MenuNewProject),
                     MenuItem::action("Open Folder\u{2026}", MenuOpenFolder),
                     MenuItem::separator(),
                     MenuItem::action("Save", MenuSaveFile),
@@ -1607,6 +1638,7 @@ fn main() {
 
         cx.set_dock_menu(vec![
             MenuItem::action("Open Folder\u{2026}", MenuOpenFolder),
+            MenuItem::action("New Flutter Project\u{2026}", MenuNewProject),
             MenuItem::action("New Scratch File", MenuNewFile),
             MenuItem::separator(),
             MenuItem::action("Settings\u{2026}", OpenSettings),

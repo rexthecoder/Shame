@@ -152,6 +152,8 @@ impl DartIde {
         self.device_picker_open = false;
         self.launch_picker_open = false;
         self.add_package_open = false;
+        self.new_project_open = false;
+        self.new_project_error = None;
         self.palette_open = false;
         self.find_open = false;
         self.go_to_line_open = false;
@@ -204,6 +206,8 @@ impl DartIde {
         self.tabs.clear();
         self.active_tab = 0;
         self.split_tab = None;
+        self.new_project_open = false;
+        self.new_project_error = None;
         self.diff = None;
         self.all_files.clear();
         self.all_files_hash = 0;

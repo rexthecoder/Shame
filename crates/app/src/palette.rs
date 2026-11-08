@@ -537,6 +537,7 @@ impl DartIde {
                 cx,
             ),
             "add-package" => self.open_add_package(window, cx),
+            "new-flutter-project" => self.open_new_project(window, cx),
             "debug-dap" => self.start_dap_debug(window, cx),
             "toggle-sim" => {
                 if self.sim.attached {
