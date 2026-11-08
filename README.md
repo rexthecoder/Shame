@@ -11,6 +11,8 @@ general-purpose widgets come from [GPUI] via [gpui-kit] and [gpui-component].
 [gpui-kit]: https://github.com/longbridge/gpui-kit
 [gpui-component]: https://github.com/longbridge/gpui-component
 
+![Shame's workspace: file tree, editor, agent rail and terminal](docs/screenshot.png)
+
 ## Download
 
 Grab the latest macOS build (Apple Silicon and Intel) from the
