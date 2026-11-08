@@ -236,3 +236,71 @@ fn commenting_many_lines_undoes_in_one_step(cx: &mut TestAppContext) {
     cx.simulate_keystrokes("cmd-z");
     assert_eq!(text(&editor, cx), original);
 }
+
+#[gpui::test]
+fn option_arrows_move_by_word(cx: &mut TestAppContext) {
+    let (editor, cx) = open_editor(cx, "foo.bar baz_qux");
+    cx.simulate_keystrokes("alt-right");
+    assert_eq!(cx.update(|_, cx| editor.read(cx).cursor_position()), (1, 4));
+    cx.simulate_keystrokes("alt-right");
+    assert_eq!(cx.update(|_, cx| editor.read(cx).cursor_position()), (1, 8));
+    cx.simulate_keystrokes("alt-right");
+    assert_eq!(cx.update(|_, cx| editor.read(cx).cursor_position()), (1, 16));
+    cx.simulate_keystrokes("alt-left");
+    assert_eq!(cx.update(|_, cx| editor.read(cx).cursor_position()), (1, 9));
+}
+
+#[gpui::test]
+fn up_down_keeps_the_goal_column_through_short_lines(cx: &mut TestAppContext) {
+    let (editor, cx) = open_editor(cx, "0123456789\nx\n0123456789\n");
+    for _ in 0..8 {
+        cx.simulate_keystrokes("right");
+    }
+    assert_eq!(cx.update(|_, cx| editor.read(cx).cursor_position()), (1, 9));
+
+    cx.simulate_keystrokes("down");
+    assert_eq!(
+        cx.update(|_, cx| editor.read(cx).cursor_position()),
+        (2, 2),
+        "the short line clamps"
+    );
+    cx.simulate_keystrokes("down");
+    assert_eq!(
+        cx.update(|_, cx| editor.read(cx).cursor_position()),
+        (3, 9),
+        "the original column comes back"
+    );
+    cx.simulate_keystrokes("up up");
+    assert_eq!(cx.update(|_, cx| editor.read(cx).cursor_position()), (1, 9));
+}
+
+#[gpui::test]
+fn page_keys_move_by_a_viewport_and_keep_the_column(cx: &mut TestAppContext) {
+    let text = "abcdefghij\n".repeat(80);
+    let (editor, cx) = open_editor(cx, &text);
+    for _ in 0..5 {
+        cx.simulate_keystrokes("right");
+    }
+    let (start_row, start_col) = cx.update(|_, cx| editor.read(cx).cursor_position());
+    assert_eq!((start_row, start_col), (1, 6));
+
+    cx.simulate_keystrokes("pagedown");
+    let (down_row, down_col) = cx.update(|_, cx| editor.read(cx).cursor_position());
+    assert!(down_row > start_row + 5, "Page Down moved {start_row} -> {down_row}");
+    assert_eq!(down_col, start_col, "the goal column is kept");
+
+    cx.simulate_keystrokes("pageup");
+    assert_eq!(
+        cx.update(|_, cx| editor.read(cx).cursor_position()),
+        (start_row, start_col)
+    );
+}
+
+#[gpui::test]
+fn cmd_up_and_down_go_to_the_document_edges(cx: &mut TestAppContext) {
+    let (editor, cx) = open_editor(cx, "one\ntwo\nthree\n");
+    cx.simulate_keystrokes("cmd-down");
+    assert_eq!(cx.update(|_, cx| editor.read(cx).cursor_position()), (4, 1));
+    cx.simulate_keystrokes("cmd-up");
+    assert_eq!(cx.update(|_, cx| editor.read(cx).cursor_position()), (1, 1));
+}

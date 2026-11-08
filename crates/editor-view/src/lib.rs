@@ -14,12 +14,11 @@
 //! but the actual "type a new name" prompt is `app`'s job — see
 //! `EditorEvent::RequestRename`.
 //!
-//! Known M1 scope cuts (not yet implemented, tracked for M2+):
-//! - Only the primary selection gets a visual highlight; a second
-//!   multi-cursor selection (if one were added) wouldn't show one.
-//! - No double/triple-click word/line selection.
-//! - Every line is rendered on every frame; no virtualization for huge
-//!   files.
+//! Interaction: column-accurate mouse hit-testing, word and line selection on
+//! double/triple click, multi-cursor carets and selections, folding, and a
+//! virtualised list that only builds the rows in view. Keyboard navigation
+//! keeps the display column across short lines: ⌥←/→ move by word, Page
+//! Up/Down page the viewport, and ⌘↑/↓ jump to the document edges.
 
 pub mod language;
 mod code_actions;
@@ -278,6 +277,12 @@ pub struct EditorView {
     /// The cursor head the view last scrolled to reveal. Panning by hand must
     /// not be undone on the next frame, so only a moved cursor re-centres.
     revealed_head: Option<usize>,
+    /// Display column Up/Down aims for. Kept while the cursor passes through
+    /// shorter lines, so returning to a long line restores the same column.
+    /// Any horizontal move, click or edit clears it.
+    preferred_column: Option<usize>,
+    /// Rows the list last built, used as the Page Up/Page Down step.
+    viewport_lines: usize,
     /// Horizontal scrollbar thumb drag in progress.
     h_drag: Option<HorizontalDrag>,
     /// Track width minus thumb width, from the last painted scrollbar.
@@ -415,6 +420,8 @@ impl EditorView {
             content_revision: Some(synced_revision),
             content_scan_len: content_len,
             revealed_head: None,
+            preferred_column: None,
+            viewport_lines: 30,
             h_drag: None,
             h_span: px(1.),
             display_line_index: Vec::new(),
@@ -855,6 +862,7 @@ impl EditorView {
     }
 
     fn set_cursor(&mut self, offset: usize, cx: &mut Context<Self>) {
+        self.preferred_column = None;
         self.buffer
             .selections_mut()
             .set_primary(Selection::cursor(offset));
@@ -1186,6 +1194,7 @@ impl EditorView {
         let line_text = self.buffer.line(line_idx);
         let display = line_text.trim_end_matches(['\n', '\r']);
         if let Some(range) = Self::word_range_at(display, column.min(display.len())) {
+            self.preferred_column = None;
             self.buffer.selections_mut().set_primary(Selection::new(
                 line_start + range.start,
                 line_start + range.end,
@@ -1204,6 +1213,7 @@ impl EditorView {
         } else {
             self.buffer.len_bytes()
         };
+        self.preferred_column = None;
         self.buffer
             .selections_mut()
             .set_primary(Selection::new(start, end));
@@ -1219,6 +1229,7 @@ impl EditorView {
         if primary.head == offset {
             return;
         }
+        self.preferred_column = None;
         self.buffer
             .selections_mut()
             .set_primary(Selection::new(primary.anchor, offset));
@@ -1825,7 +1836,17 @@ impl EditorView {
     fn move_vertical(&mut self, delta: isize, extend: bool, cx: &mut Context<Self>) {
         let head = self.buffer.selections().primary().head;
         let line = self.buffer.byte_to_line(head);
-        let column = head - self.buffer.line_to_byte(line);
+        let line_start = self.buffer.line_to_byte(line);
+        let line_text = self.buffer.line(line);
+        let display = line_text.trim_end_matches(['\n', '\r']);
+        let column = (head - line_start).min(display.len());
+        // Remember the display column, not the byte offset: tabs and
+        // non-ASCII characters make the two differ, and a short line in
+        // between must not shrink the column the cursor returns to.
+        let goal = self
+            .preferred_column
+            .unwrap_or_else(|| display_column_at_byte(display, column));
+        self.preferred_column = Some(goal);
 
         let target_line = line as isize + delta;
         if target_line < 0 || target_line as usize >= self.buffer.line_count() {
@@ -1835,9 +1856,43 @@ impl EditorView {
 
         let line_start = self.buffer.line_to_byte(target_line);
         let line_text = self.buffer.line(target_line);
-        let line_len_without_ending = line_text.trim_end_matches(['\n', '\r']).len();
-        let new_offset = line_start + column.min(line_len_without_ending);
+        let display = line_text.trim_end_matches(['\n', '\r']);
+        let new_offset = line_start + byte_at_display_column(display, goal);
         self.move_head_or_cursor(new_offset, extend, cx);
+        // `set_cursor`/`extend_to` clear the goal; keep it for the next
+        // vertical step.
+        self.preferred_column = Some(goal);
+    }
+
+    /// Move to the start of the previous word, or past the end of the next
+    /// one, with the usual punctuation/whitespace skipping.
+    fn move_word(&mut self, left: bool, extend: bool, cx: &mut Context<Self>) {
+        let text = self.buffer.text();
+        let head = self.buffer.selections().primary().head;
+        let target = if left {
+            prev_word_boundary(&text, head)
+        } else {
+            next_word_boundary(&text, head)
+        };
+        self.move_head_or_cursor(target, extend, cx);
+    }
+
+    /// Page Up/Page Down: move by the rows the list last built, keeping the
+    /// goal column, and let `ensure_cursor_visible` bring the caret back.
+    fn move_page(&mut self, direction: isize, extend: bool, cx: &mut Context<Self>) {
+        let step = self.viewport_lines.saturating_sub(1).max(1) as isize;
+        self.move_vertical(direction * step, extend, cx);
+    }
+
+    /// Cmd/Ctrl+Up and Cmd/Ctrl+Down: the first and last line.
+    fn move_document_edge(&mut self, start: bool, extend: bool, cx: &mut Context<Self>) {
+        self.preferred_column = None;
+        let offset = if start {
+            0
+        } else {
+            self.buffer.len_bytes()
+        };
+        self.move_head_or_cursor(offset, extend, cx);
     }
 
     fn move_home(&mut self, extend: bool, cx: &mut Context<Self>) {
@@ -1985,12 +2040,29 @@ impl EditorView {
                 return;
             }
             // An app-level command (`⌘B`, `⌘P`, …): leave it for
-            // `DartIde::on_key_down`. Without ⌘/Ctrl (e.g. ⌥↑, which reviews a
+            // `DartIde::on_key_down`. Without ⌘/Ctrl (e.g. `⌥↑`, which reviews a
             // diff in the app) the key still does its normal editing job too.
             if primary_mod {
                 return;
             }
         } else if primary_mod {
+            // Cmd/Ctrl+Up and Cmd/Ctrl+Down are navigation, not an unbound
+            // app chord. Option is excluded because ⌥⌘↑/↓ add cursors.
+            if !keystroke.modifiers.alt {
+                match keystroke.key.as_str() {
+                    "up" => {
+                        self.dismiss_completions(cx);
+                        self.move_document_edge(true, keystroke.modifiers.shift, cx);
+                        return;
+                    }
+                    "down" => {
+                        self.dismiss_completions(cx);
+                        self.move_document_edge(false, keystroke.modifiers.shift, cx);
+                        return;
+                    }
+                    _ => {}
+                }
+            }
             // Unbound ⌘/Ctrl chords never type a character.
             return;
         }
@@ -2008,11 +2080,19 @@ impl EditorView {
             }
             "left" => {
                 self.dismiss_completions(cx);
-                self.move_left(extend, cx);
+                if keystroke.modifiers.alt {
+                    self.move_word(true, extend, cx);
+                } else {
+                    self.move_left(extend, cx);
+                }
             }
             "right" => {
                 self.dismiss_completions(cx);
-                self.move_right(extend, cx);
+                if keystroke.modifiers.alt {
+                    self.move_word(false, extend, cx);
+                } else {
+                    self.move_right(extend, cx);
+                }
             }
             "up" => {
                 self.dismiss_completions(cx);
@@ -2021,6 +2101,14 @@ impl EditorView {
             "down" => {
                 self.dismiss_completions(cx);
                 self.move_vertical(1, extend, cx);
+            }
+            "pageup" => {
+                self.dismiss_completions(cx);
+                self.move_page(-1, extend, cx);
+            }
+            "pagedown" => {
+                self.dismiss_completions(cx);
+                self.move_page(1, extend, cx);
             }
             "home" => {
                 self.dismiss_completions(cx);
@@ -2130,26 +2218,41 @@ impl EditorView {
     }
 
     fn word_range_at(text: &str, col: usize) -> Option<Range<usize>> {
-        let bytes = text.as_bytes();
-        if col > bytes.len() {
+        if col > text.len() {
             return None;
         }
-        let is_word = |i: usize| i < bytes.len() && is_word_byte(bytes[i]);
         let mut idx = col;
-        if !is_word(idx) {
-            if idx > 0 && is_word(idx - 1) {
-                idx -= 1;
+        while idx > 0 && !text.is_char_boundary(idx) {
+            idx -= 1;
+        }
+        let word_at = |i: usize| text[i..].chars().next().is_some_and(is_word_char);
+        if !word_at(idx) {
+            if idx > 0 {
+                let prev = text[..idx].chars().next_back().expect("idx > 0");
+                if is_word_char(prev) {
+                    idx -= prev.len_utf8();
+                } else {
+                    return None;
+                }
             } else {
                 return None;
             }
         }
         let mut start = idx;
-        while start > 0 && is_word(start - 1) {
-            start -= 1;
+        while start > 0 {
+            let prev = text[..start].chars().next_back().expect("start > 0");
+            if !is_word_char(prev) {
+                break;
+            }
+            start -= prev.len_utf8();
         }
         let mut end = idx;
-        while is_word(end) {
-            end += 1;
+        while end < text.len() {
+            let next = text[end..].chars().next().expect("end < len");
+            if !is_word_char(next) {
+                break;
+            }
+            end += next.len_utf8();
         }
         Some(start..end)
     }
@@ -3885,6 +3988,79 @@ fn display_rows(visible: &[usize], line_count: usize) -> (Vec<usize>, Vec<usize>
     (rows, line_row)
 }
 
+/// The display column of a byte offset in one line, rounded down to a
+/// character boundary. Tabs count as four cells, as [`display_columns`] does.
+fn display_column_at_byte(text: &str, byte: usize) -> usize {
+    let mut byte = byte.min(text.len());
+    while byte > 0 && !text.is_char_boundary(byte) {
+        byte -= 1;
+    }
+    display_columns(&text[..byte])
+}
+
+/// The byte offset of a display column in one line. A column inside a wide
+/// character or a tab lands on that character's start, and a column past the
+/// end lands on the line's end, so a short line clamps without losing the
+/// caller's goal column.
+fn byte_at_display_column(text: &str, column: usize) -> usize {
+    let mut used = 0;
+    for (byte, ch) in text.char_indices() {
+        let width = char_columns(ch);
+        if used + width > column {
+            return byte;
+        }
+        used += width;
+    }
+    text.len()
+}
+
+fn is_word_char(ch: char) -> bool {
+    ch.is_alphanumeric() || ch == '_'
+}
+
+/// Start of the word before `byte`, skipping punctuation and whitespace.
+fn prev_word_boundary(text: &str, byte: usize) -> usize {
+    let mut i = byte.min(text.len());
+    while i > 0 && !text.is_char_boundary(i) {
+        i -= 1;
+    }
+    while i > 0 {
+        let ch = text[..i].chars().next_back().expect("i > 0");
+        if is_word_char(ch) {
+            break;
+        }
+        i -= ch.len_utf8();
+    }
+    while i > 0 {
+        let ch = text[..i].chars().next_back().expect("i > 0");
+        if !is_word_char(ch) {
+            break;
+        }
+        i -= ch.len_utf8();
+    }
+    i
+}
+
+/// End of the word after `byte`, skipping punctuation and whitespace.
+fn next_word_boundary(text: &str, byte: usize) -> usize {
+    let mut i = byte.min(text.len());
+    while i < text.len() {
+        let ch = text[i..].chars().next().expect("i < len");
+        if is_word_char(ch) {
+            break;
+        }
+        i += ch.len_utf8();
+    }
+    while i < text.len() {
+        let ch = text[i..].chars().next().expect("i < len");
+        if !is_word_char(ch) {
+            break;
+        }
+        i += ch.len_utf8();
+    }
+    i
+}
+
 fn is_word_byte(b: u8) -> bool {
     b.is_ascii_alphanumeric() || b == b'_' || b >= 0x80
 }
@@ -4171,6 +4347,42 @@ mod tests {
     }
 
     #[core::prelude::v1::test]
+    fn display_columns_round_trip_tabs_and_unicode() {
+        let text = "a\tbé";
+        assert_eq!(display_columns(text), 1 + 4 + 1 + 1);
+        assert_eq!(display_column_at_byte(text, 2), 5);
+        assert_eq!(byte_at_display_column(text, 5), 2);
+        assert_eq!(byte_at_display_column(text, 6), 3);
+        assert_eq!(byte_at_display_column("ab", 9), 2);
+    }
+
+    #[core::prelude::v1::test]
+    fn a_short_line_keeps_the_vertical_goal_column() {
+        let long = "abcdefghij";
+        let goal = display_column_at_byte(long, 8);
+        assert_eq!(goal, 8);
+        assert_eq!(byte_at_display_column("x", goal), 1);
+        assert_eq!(byte_at_display_column(long, goal), 8);
+    }
+
+    #[core::prelude::v1::test]
+    fn word_boundaries_skip_punctuation_and_whitespace() {
+        assert_eq!(next_word_boundary("foo.bar", 0), 3);
+        assert_eq!(prev_word_boundary("foo.bar", 7), 4);
+        assert_eq!(next_word_boundary("foo bar", 3), 7);
+        assert_eq!(prev_word_boundary("foo bar", 7), 4);
+        assert_eq!(prev_word_boundary("héllo world", 12), 7);
+        assert_eq!(next_word_boundary("héllo world", 0), 6);
+    }
+
+    #[core::prelude::v1::test]
+    fn word_selection_handles_unicode_identifiers() {
+        assert_eq!(EditorView::word_at("héllo world", 1), Some("héllo"));
+        assert_eq!(EditorView::word_at("héllo world", 5), Some("héllo"));
+        assert_eq!(EditorView::word_at("héllo world", 7), Some("world"));
+    }
+
+    #[core::prelude::v1::test]
     fn minimal_replacement_finds_the_changed_middle() {
         assert_eq!(minimal_replacement("same", "same"), None);
         assert_eq!(minimal_replacement("abcXdef", "abcYYdef"), Some((3..4, "YY")));
@@ -4180,8 +4392,9 @@ mod tests {
     }
 
     use super::{
-        diff_as_edit, display_columns, display_rows, find_matches, fit_label,
-        lens_left_after_text, minimal_replacement, normalize_for_save, reveal_offset,
+        byte_at_display_column, diff_as_edit, display_column_at_byte, display_columns,
+        display_rows, find_matches, fit_label, lens_left_after_text, minimal_replacement,
+        next_word_boundary, normalize_for_save, prev_word_boundary, reveal_offset, EditorView,
     };
 
     #[test]
@@ -4460,6 +4673,7 @@ impl Render for EditorView {
                 if visible_range.is_empty() {
                     return Vec::new();
                 }
+                this.viewport_lines = visible_range.len();
                 let mut first_line = None;
                 let mut end_line = 0usize;
                 for &line in &display_items[visible_range.clone()] {

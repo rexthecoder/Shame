@@ -111,8 +111,10 @@ Esc stops a running agent.
 | ⌥F12 | Peek definition (↩ opens it, ⌘↩ opens to the side) |
 | ⇧⌘R | Refactor (wrap with widget, extract widget, ...) |
 | ⌥⌘S | Save all |
+| ⌥→ / ⌥← | Next / previous word (editor); next / previous file in a diff |
+| Page Up / Page Down | Move by a viewport, keeping the column |
+| ⌘↑ / ⌘↓ | Start / end of document |
 | ⌥↓ / ⌥↑ | Next / previous change in a diff |
-| ⌥→ / ⌥← | Next / previous file in a diff |
 | ⌥↩ | Mark the open diff file reviewed |
 
 Everything else is in the command palette.

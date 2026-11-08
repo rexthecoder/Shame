@@ -1,5 +1,23 @@
 # Milestone notes
 
+## Editor: navigation that respects the text, not just bytes
+
+- **Up/Down keeps the column.** The cursor now remembers the display column it
+  is aiming for, so passing through a short line and back restores the original
+  column instead of leaving the caret at the short line's end. The column is
+  measured in display cells (tabs and wide characters included), not bytes.
+- **Word movement.** ⌥← and ⌥→ move to the start of the previous word and the
+  end of the next one, skipping punctuation and whitespace. Shift extends the
+  selection the same way.
+- **Page keys and document edges.** Page Up/Page Down move by the rows the
+  editor last built (so the step follows the window height) and keep the goal
+  column; ⌘↑/⌘↓ jump to the start/end of the document. Shift extends.
+- **Double-click is Unicode-aware.** Word selection now uses the same
+  `is_word_char` rule as navigation, so `héllo` selects as one word instead of
+  falling back to a single caret.
+- Covered by 75 unit tests and 19 headless GPUI UI tests, including the
+  goal-column round trip, word boundaries, page steps and Unicode words.
+
 ## Flutter run: the titlebar shows loading, not a lie
 
 - **A daemon is not a running app.** The titlebar treated `flutter_daemon` as
