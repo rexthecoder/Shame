@@ -12,8 +12,7 @@
 //! a crate meant to stay LSP-generic.
 //!
 //! Breakpoints, stepping, variable inspection, and a debug console are
-//! all UI work and not built here yet — see the project's M3/M4 notes
-//! in `NOTES.md` at the repo root for why UI work stays deferred.
+//! all UI work and deliberately not built here yet.
 
 mod client;
 mod transport;

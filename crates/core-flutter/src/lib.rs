@@ -4,9 +4,8 @@
 //! `editor-view`) can be replaced later without touching this crate.
 //!
 //! This is the backend only — a device picker, a Run/Stop button, and a
-//! log panel are all UI work, deliberately not built here yet (see the
-//! project's M3 notes in `NOTES.md` at the repo root for why that's
-//! staying deferred for now). `pubspec::{add_package, pub_get}` and
+//! log panel are all UI work, deliberately not built here yet.
+//! `pubspec::{add_package, pub_get}` and
 //! `sdk::detect_sdk` round out the plan's M3 list ("pubspec.yaml
 //! helpers: add package, pub get" and "SDK detection").
 //!

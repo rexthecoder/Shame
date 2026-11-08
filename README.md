@@ -1,4 +1,4 @@
-# Dart/Flutter IDE
+# Shame IDE
 
 A small, fast code editor, first-class for Dart and Flutter. Built for daily
 use first; open-sourced from day one.
@@ -45,7 +45,6 @@ diagnostics), DAP debugging, Flutter run / hot reload / devices / tests,
 creating a Flutter project from the welcome screen or the command palette,
 git panel and diff view, terminal dock, iOS simulator rail, web preview,
 and an agent rail whose thread is saved per workspace. See
-[`NOTES.md`](NOTES.md) for the development log and
 [`docs/benchmarks.md`](docs/benchmarks.md) for performance numbers.
 
 ## Crate layout

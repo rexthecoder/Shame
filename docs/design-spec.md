@@ -1,7 +1,7 @@
 # UI Replica Spec — "panes" target design
 
 Source of truth: the target design (a 1600×1060 screenshot, no longer kept in
-the repo). This document is the *only* input an implementing agent should need. If something is not in here, it does not get invented — ask.
+the repo). This document is the *only* input needed to implement the design. If something is not in here, it does not get invented — ask.
 
 Colour values are eyeballed from the screenshot. Before Phase 1, sample
 them with Digital Color Meter and correct the table; do not "improve" them.

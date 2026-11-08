@@ -2,8 +2,7 @@
 //!
 //! Built only on raw `gpui-kit` primitives (`gpui_kit::*`), never on
 //! `gpui_kit::component`'s pre-built `Editor`/`Textarea` widgets — those
-//! are read as a reference (see `NOTES.md` at the repo root), not a
-//! dependency. `core-buffer` and `core-syntax` are the other two
+//! are read as a reference, not a dependency. `core-buffer` and `core-syntax` are the other two
 //! dependencies, kept behind this crate's own API so the UI layer can
 //! change without touching either of them.
 //!

@@ -1,9 +1,6 @@
 //! A GPUI window with a dock-style split layout: a file tree panel reading
 //! the real project directory, and our own `editor-view` (M1) in place of
 //! the M0 `Textarea` stand-in.
-//!
-//! See `NOTES.md` at the repo root for the measured startup time, idle RAM,
-//! and binary size from the M0 spike.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
