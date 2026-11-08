@@ -1177,7 +1177,7 @@ impl DartIde {
                                                 .font_family("SF Mono")
                                                 .text_size(px(10.))
                                                 .text_color(info)
-                                                .child("0.1.0"),
+                                                .child(env!("CARGO_PKG_VERSION")),
                                         )
                                         .child(
                                             div()

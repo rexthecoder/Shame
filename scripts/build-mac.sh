@@ -37,6 +37,9 @@ APP_NAME="$(make_var APP_NAME)"
 BUNDLE_ID="$(make_var BUNDLE_ID)"
 BIN="$(make_var BIN)"
 VERSION="$(make_var VERSION)"
+SHORT_VERSION="${VERSION%%+*}"
+BUILD_NUMBER="${VERSION#*+}"
+if [[ "$BUILD_NUMBER" == "$VERSION" ]]; then BUILD_NUMBER=1; fi
 CRATE="$(make_var CRATE)"
 DIST_DIR="dist"
 
@@ -147,8 +150,8 @@ cat > "$APP_DIR/Contents/Info.plist" <<PLIST
   <key>CFBundleName</key><string>$APP_NAME</string>
   <key>CFBundleDisplayName</key><string>$APP_NAME</string>
   <key>CFBundleIdentifier</key><string>$BUNDLE_ID</string>
-  <key>CFBundleVersion</key><string>$VERSION</string>
-  <key>CFBundleShortVersionString</key><string>$VERSION</string>
+  <key>CFBundleVersion</key><string>$BUILD_NUMBER</string>
+  <key>CFBundleShortVersionString</key><string>$SHORT_VERSION</string>
   <key>CFBundlePackageType</key><string>APPL</string>
   <key>CFBundleExecutable</key><string>$BIN</string>
   <key>CFBundleIconFile</key><string>icon.icns</string>

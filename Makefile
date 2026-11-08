@@ -22,7 +22,13 @@ CRATE     := app
 BIN       := dart-ide
 APP_NAME  := Shame
 BUNDLE_ID := dev.shame.ide
-VERSION   := 0.0.1+1
+VERSION       := 0.0.1+1
+# CFBundleShortVersionString is 0.0.1; CFBundleVersion is the +N build number.
+SHORT_VERSION := $(word 1,$(subst +, ,$(VERSION)))
+BUILD_NUMBER  := $(word 2,$(subst +, ,$(VERSION)))
+ifeq ($(BUILD_NUMBER),)
+BUILD_NUMBER := 1
+endif
 DIST_DIR  := dist
 APP_DIR   := $(DIST_DIR)/$(APP_NAME).app
 DMG_PATH  := $(DIST_DIR)/$(APP_NAME)-$(VERSION)-macos.dmg
@@ -122,8 +128,8 @@ bundle: icon release-build
 		'  <key>CFBundleName</key><string>$(APP_NAME)</string>' \
 		'  <key>CFBundleDisplayName</key><string>$(APP_NAME)</string>' \
 		'  <key>CFBundleIdentifier</key><string>$(BUNDLE_ID)</string>' \
-		'  <key>CFBundleVersion</key><string>$(VERSION)</string>' \
-		'  <key>CFBundleShortVersionString</key><string>$(VERSION)</string>' \
+		'  <key>CFBundleVersion</key><string>$(BUILD_NUMBER)</string>' \
+		'  <key>CFBundleShortVersionString</key><string>$(SHORT_VERSION)</string>' \
 		'  <key>CFBundlePackageType</key><string>APPL</string>' \
 		'  <key>CFBundleExecutable</key><string>$(BIN)</string>' \
 		'  <key>CFBundleIconFile</key><string>icon.icns</string>' \
