@@ -1,6 +1,6 @@
 name: Release
 
-# Push a tag like v0.1.0 to build a universal macOS .dmg and attach it to a
+# Push a tag like v0.0.1+1 to build a universal macOS .dmg and attach it to a
 # GitHub Release. Run it manually (Actions tab) to get the build as a
 # downloadable workflow artifact without publishing anything.
 on:
@@ -80,6 +80,14 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "$GITHUB_REF_NAME" dist/*.dmg dist/*.dmg.sha256 \
-            --title "$GITHUB_REF_NAME" \
-            --generate-notes
+          version="${GITHUB_REF_NAME#v}"
+          notes="docs/releases/${version}.md"
+          if [[ -f "$notes" ]]; then
+            gh release create "$GITHUB_REF_NAME" dist/*.dmg dist/*.dmg.sha256 \
+              --title "Shame $version" \
+              --notes-file "$notes"
+          else
+            gh release create "$GITHUB_REF_NAME" dist/*.dmg dist/*.dmg.sha256 \
+              --title "$GITHUB_REF_NAME" \
+              --generate-notes
+          fi
