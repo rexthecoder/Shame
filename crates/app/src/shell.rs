@@ -1353,10 +1353,12 @@ impl DartIde {
         };
         // Saved split sizes are per layout, so the Flutter rail gets its own ids.
         let flutter_open = self.flutter_panel.open && self.has_workspace;
-        let split_id: SharedString = if flutter_open {
-            format!("{split_id}-flutter").into()
-        } else {
-            split_id.into()
+        let ai_open = self.ai_panel.open && self.has_workspace;
+        let split_id: SharedString = match (flutter_open, ai_open) {
+            (true, true) => format!("{split_id}-flutter-ai").into(),
+            (true, false) => format!("{split_id}-flutter").into(),
+            (false, true) => format!("{split_id}-ai").into(),
+            (false, false) => split_id.into(),
         };
         let mut split = h_resizable(split_id);
 
@@ -1394,7 +1396,7 @@ impl DartIde {
         split = split.child(resizable_panel().child(editor_column));
 
         if flutter_open {
-            let more_right = self.sim.attached || self.web_preview_open || self.agent_open;
+            let more_right = ai_open || self.sim.attached || self.web_preview_open || self.agent_open;
             split = split.child(
                 resizable_panel()
                     .size(px(380.))
@@ -1403,6 +1405,19 @@ impl DartIde {
                     .pl(px(tokens::GUTTER / 2.))
                     .when(more_right, |p| p.pr(px(tokens::GUTTER / 2.)))
                     .child(self.render_flutter_rail(cx)),
+            );
+        }
+
+        if ai_open {
+            let more_right = self.sim.attached || self.web_preview_open || self.agent_open;
+            split = split.child(
+                resizable_panel()
+                    .size(px(tokens::RAIL_RIGHT))
+                    .size_range(px(tokens::RAIL_RIGHT_MIN)..px(tokens::RAIL_RIGHT_MAX))
+                    .fixed()
+                    .pl(px(tokens::GUTTER / 2.))
+                    .when(more_right, |p| p.pr(px(tokens::GUTTER / 2.)))
+                    .child(self.render_ai_rail(cx)),
             );
         }
 

@@ -41,6 +41,7 @@ mod data_file;
 mod data_view;
 mod run_sessions;
 mod notebook_view;
+mod ai_panel;
 #[allow(dead_code)]
 mod tokens;
 
@@ -334,6 +335,7 @@ const IDE_COMMANDS: &[IdeCommand] = &[
     IdeCommand { id: "python-run-file", title: "Python: Run Current File", shortcut: "", flutter_only: false },
     IdeCommand { id: "python-pytest", title: "Python: Run pytest", shortcut: "", flutter_only: false },
     IdeCommand { id: "python-pytest-file", title: "Python: Run pytest on Current File", shortcut: "", flutter_only: false },
+    IdeCommand { id: "python-ai-panel", title: "Python: Toggle AI Panel (Environment, Models, Tools)", shortcut: "", flutter_only: false },
     IdeCommand { id: "open-git", title: "Git: Open Git Panel", shortcut: "\u{2318}\u{21e7}G", flutter_only: false },
     IdeCommand { id: "git-switch-branch", title: "Git: Switch / Create Branch\u{2026}", shortcut: "", flutter_only: false },
     IdeCommand { id: "git-stage-all", title: "Git: Stage All Changes", shortcut: "", flutter_only: false },
@@ -629,6 +631,7 @@ pub struct DartIde {
     pub(crate) autosave: file_state::AutosaveMode,
     pub(crate) test_run: Option<test_runner::TestRunState>,
     pub(crate) runs: run_sessions::RunStore,
+    pub(crate) ai_panel: ai_panel::AiPanelState,
     /// The next test run should collect coverage.
     pub(crate) coverage_requested: bool,
     /// Coverage bars are on in the editors.
@@ -898,6 +901,7 @@ impl DartIde {
             autosave: file_state::AutosaveMode::Off,
             test_run: None,
             runs: run_sessions::RunStore::default(),
+            ai_panel: ai_panel::AiPanelState::default(),
             coverage_requested: false,
             coverage_shown: false,
             save_options: editor_view::SaveOptions::default(),

@@ -562,6 +562,20 @@ impl DartIde {
                             })),
                         )
                     })
+                    // The AI panel, for Python projects.
+                    .when(self.is_python_workspace(), |row| {
+                        row.child(
+                            icon_button(
+                                "titlebar-ai-panel",
+                                gpui_kit::assets::IconName::Cpu,
+                                Some(if self.ai_panel.open { cx.theme().primary } else { muted }),
+                                "AI panel: environment, accelerator, models and tools",
+                            )
+                            .on_click(cx.listener(|this, _event, _window, cx| {
+                                this.toggle_ai_panel(cx);
+                            })),
+                        )
+                    })
                     // Right-hand tool icons: Web Preview, Agent, Quick Open, Settings
                     .child(
                         icon_button(
