@@ -74,6 +74,8 @@ const LINE_HEIGHT: f32 = 22.;
 const BRACKET_COLORS: [u32; 3] = [0xe5c07b, 0xc678dd, 0x61afef];
 /// Space above the first line.
 const LIST_TOP_PAD: f32 = 8.;
+/// At most this many enclosing blocks stick to the top while scrolling.
+const STICKY_MAX: usize = 4;
 /// Gap kept between an inlay hint pill and neighbouring text when the
 /// server asks for padding, and the pill's own inner horizontal padding.
 const INLAY_PAD: Pixels = px(4.);
@@ -598,6 +600,41 @@ impl EditorView {
             .ok()?;
         let r = self.fold_ranges[ix];
         (r.end_line > start_line).then_some(r)
+    }
+
+    /// The opening lines of the blocks that contain `top` (and whose
+    /// opening line has scrolled away), outermost first. With more than
+    /// [`STICKY_MAX`] levels, the two outermost (the class, the method) and
+    /// the two innermost are kept.
+    fn sticky_header_lines(&self, top: usize) -> Vec<usize> {
+        if top == 0 || self.fold_ranges.is_empty() {
+            return Vec::new();
+        }
+        let containing = |line: usize| -> Vec<usize> {
+            let mut starts: Vec<usize> = self
+                .fold_ranges
+                .iter()
+                .filter(|r| r.start_line < line && r.end_line > line)
+                .map(|r| r.start_line)
+                .collect();
+            starts.sort_unstable();
+            starts.dedup();
+            starts
+        };
+        // The headers cover rows themselves; the line just below them is the
+        // one whose context matters.
+        let first = containing(top);
+        if first.is_empty() {
+            return first;
+        }
+        let mut lines = containing(top + first.len().min(STICKY_MAX));
+        if lines.len() > STICKY_MAX {
+            let k = lines.len();
+            let mut kept = lines[..2].to_vec();
+            kept.extend_from_slice(&lines[k - 2..]);
+            lines = kept;
+        }
+        lines
     }
 
     fn rebuild_visible_lines(&mut self) {
@@ -4714,6 +4751,79 @@ impl Render for EditorView {
         let margin_notes =
             self.render_margin_notes(line_notes, notes_width, LIST_TOP_PAD, window, cx);
 
+        // Sticky scroll: the enclosing blocks' opening lines, pinned at the
+        // top, drawn exactly like code lines. Clicking one scrolls to it.
+        // The top row comes from the scroll offset (rows are LINE_HEIGHT
+        // each), so the pinned lines match this frame, not the last one.
+        let scroll_y = -self.scroll_handle.0.borrow().base_handle.offset().y;
+        let top_row = (scroll_y.to_f64() / LINE_HEIGHT as f64).floor().max(0.) as usize;
+        let sticky_top = display_items.get(top_row).copied().unwrap_or(0);
+        let sticky_rows: Vec<AnyElement> = self
+            .sticky_header_lines(sticky_top)
+            .into_iter()
+            .map(|line| {
+                let start = self.buffer.line_to_byte(line).min(self.synced_text.len());
+                let end = if line + 1 < self.buffer.line_count() {
+                    self.buffer.line_to_byte(line + 1)
+                } else {
+                    self.buffer.len_bytes()
+                }
+                .min(self.synced_text.len())
+                .max(start);
+                let highlights = if let Some(tree) = &self.syntax_tree {
+                    tree.highlights_in_range(&self.synced_text, start..end)
+                } else {
+                    lexical_highlights_in_range(&self.synced_text, start..end, self.language.keywords())
+                };
+                let text = self.buffer.line(line);
+                let row = self.render_line(
+                    line,
+                    &text,
+                    None,
+                    &highlights,
+                    None,
+                    &diagnostics_by_line,
+                    &diagnostic_messages,
+                    &self.line_changes,
+                    None,
+                    None,
+                    scroll_x,
+                    char_width,
+                    window,
+                    cx,
+                );
+                div()
+                    .id(("sticky-line", line))
+                    .w_full()
+                    .h(px(LINE_HEIGHT))
+                    .overflow_hidden()
+                    .cursor_pointer()
+                    .child(row)
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _e, _w, cx| {
+                            this.scroll_to_line(line, ScrollStrategy::Top);
+                            cx.notify();
+                        }),
+                    )
+                    .into_any_element()
+            })
+            .collect();
+        let sticky_overlay = (!sticky_rows.is_empty()).then(|| {
+            v_flex()
+                .id("editor-sticky")
+                .occlude()
+                .absolute()
+                .top(px(LIST_TOP_PAD))
+                .left_0()
+                .right(px(notes_width))
+                .bg(cx.theme().background)
+                .border_b_1()
+                .border_color(cx.theme().border.opacity(0.6))
+                .shadow_sm()
+                .children(sticky_rows)
+        });
+
         let list = uniform_list(
             "editor-lines",
             display_items.len(),
@@ -4923,6 +5033,7 @@ impl Render for EditorView {
             .pt(px(LIST_TOP_PAD))
             .child(drag_tracker)
             .child(div().size_full().pr(px(notes_width)).child(list))
+            .when_some(sticky_overlay, |el, overlay| el.child(overlay))
             .children(margin_notes)
             .when(show_h_scroll, |el| {
                 el.child(
