@@ -1,0 +1,13 @@
+[package]
+name = "core-jupyter"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+async-channel.workspace = true
+ureq = { version = "3", default-features = false, features = ["rustls"] }
+tungstenite = { version = "0.27", default-features = false, features = ["handshake", "rustls-tls-webpki-roots"] }

@@ -27,6 +27,7 @@ core-lsp = { path = "../core-lsp" }
 core-dap = { path = "../core-dap" }
 core-workspace = { path = "../core-workspace" }
 editor-view = { path = "../editor-view" }
+core-jupyter = { path = "../core-jupyter" }
 trash = "5"
 
 [dev-dependencies]

@@ -32,8 +32,11 @@ impl DartIde {
         let preview_label = self
             .tabs
             .get(self.active_tab)
-            .and_then(|t| t.data.as_ref())
-            .map(|d| d.read(cx).kind().view_label())
+            .and_then(|t| match (&t.data, &t.notebook) {
+                (Some(d), _) => Some(d.read(cx).kind().view_label()),
+                (None, Some(_)) => Some("Notebook"),
+                _ => None,
+            })
             .unwrap_or("Preview");
         let active_is_pubspec = self
             .tabs

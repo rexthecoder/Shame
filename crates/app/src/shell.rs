@@ -1131,6 +1131,7 @@ impl DartIde {
         let active_editor = active_tab.map(|t| t.editor.clone());
         let active_image = active_tab.and_then(|t| t.image.clone());
         let active_data = active_tab.and_then(|t| t.data.clone());
+        let active_notebook = active_tab.and_then(|t| t.notebook.clone());
         let active_md_mode = active_tab
             .filter(|t| t.is_markdown())
             .map(|t| t.md_mode)
@@ -1158,17 +1159,27 @@ impl DartIde {
             (Some(_), MarkdownMode::Preview) if active_data.is_some() => {
                 active_data.clone().unwrap().into_any_element()
             }
+            (Some(_), MarkdownMode::Preview) if active_notebook.is_some() => {
+                active_notebook.clone().unwrap().into_any_element()
+            }
             (Some(editor), MarkdownMode::Preview) => render_md_pane(&editor, cx).into_any_element(),
             (Some(editor), MarkdownMode::Split) => {
-                let preview: AnyElement = match &active_data {
-                    Some(data) => div()
+                let preview: AnyElement = match (&active_data, &active_notebook) {
+                    (Some(data), _) => div()
                         .flex_1()
                         .h_full()
                         .min_w(px(0.))
                         .min_h(px(0.))
                         .child(data.clone())
                         .into_any_element(),
-                    None => render_md_pane(&editor, cx).into_any_element(),
+                    (None, Some(nb)) => div()
+                        .flex_1()
+                        .h_full()
+                        .min_w(px(0.))
+                        .min_h(px(0.))
+                        .child(nb.clone())
+                        .into_any_element(),
+                    (None, None) => render_md_pane(&editor, cx).into_any_element(),
                 };
                 h_flex()
                     .size_full()

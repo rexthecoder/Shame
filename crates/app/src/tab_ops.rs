@@ -54,6 +54,7 @@ impl DartIde {
                 md_mode: MarkdownMode::Code,
                 image: Some(preview),
                 data: None,
+                notebook: None,
                 is_preview: as_preview,
                 opened_revision: 0,
             };
@@ -94,12 +95,19 @@ impl DartIde {
                 let editor = editor.clone();
                 cx.new(|cx| crate::data_view::DataView::new(editor, kind, cx))
             });
+            // Notebooks open on their cells, with Code one click away.
+            let is_notebook = canonical.extension().is_some_and(|e| e.eq_ignore_ascii_case("ipynb"));
+            let notebook = is_notebook.then(|| {
+                let (editor, root, path) = (editor.clone(), self.root.clone(), canonical.clone());
+                cx.new(|cx| crate::notebook_view::NotebookView::new(editor, root, path, cx))
+            });
             let new_tab = Tab {
                 path: Some(canonical),
                 editor,
-                md_mode: if data.is_some() { MarkdownMode::Preview } else { MarkdownMode::Code },
+                md_mode: if data.is_some() || notebook.is_some() { MarkdownMode::Preview } else { MarkdownMode::Code },
                 image: None,
                 data,
+                notebook,
                 is_preview: as_preview,
                 opened_revision,
             };
@@ -150,6 +158,7 @@ impl DartIde {
             md_mode: MarkdownMode::Code,
             image: None,
             data: None,
+            notebook: None,
             is_preview: false,
             opened_revision,
         });
@@ -173,6 +182,7 @@ impl DartIde {
                 md_mode: keep.md_mode,
                 image: keep.image.clone(),
                 data: keep.data.clone(),
+                notebook: keep.notebook.clone(),
                 is_preview: false,
                 opened_revision: keep.opened_revision,
             };
