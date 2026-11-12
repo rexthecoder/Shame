@@ -29,6 +29,7 @@ mod indent_guides;
 mod lsp_integration;
 mod margin_notes;
 mod multicursor;
+pub mod python;
 mod snippet;
 
 use std::io;
@@ -38,7 +39,7 @@ use std::sync::Arc;
 
 use core_buffer::{Buffer, Selection};
 use core_lsp::lsp_types;
-use core_syntax::{Highlight, HighlightKind, InputEdit, SyntaxTree, point_at};
+use core_syntax::{Highlight, HighlightKind, InputEdit, SyntaxLanguage, SyntaxTree, point_at};
 use core_workspace::LineChange;
 use gpui_kit::component::menu::{ContextMenuExt as _, PopupMenu, PopupMenuItem};
 use gpui_kit::component::{ActiveTheme as _, Sizable as _, h_flex, v_flex};
@@ -394,13 +395,15 @@ impl EditorView {
     pub fn from_buffer(buffer: Buffer, cx: &mut Context<Self>) -> Self {
         let language = language_for_path(buffer.path());
         let parse_syntax = should_parse_syntax(&buffer);
-        let is_dart = language.language_id() == "dart" || buffer.path().is_none();
+        let grammar = syntax_language(language.language_id(), buffer.path());
         let synced_text = if parse_syntax {
             buffer.text()
         } else {
             String::new()
         };
-        let syntax_tree = (parse_syntax && is_dart).then(|| SyntaxTree::parse(&synced_text));
+        let syntax_tree = grammar
+            .filter(|_| parse_syntax)
+            .map(|g| SyntaxTree::parse_as(g, &synced_text));
         let fold_ranges = if let Some(t) = &syntax_tree {
             t.fold_ranges()
         } else if parse_syntax {
@@ -548,14 +551,15 @@ impl EditorView {
                     edit.new_end_byte,
                 );
             }
-            let is_dart = self.language.language_id() == "dart" || self.buffer.path().is_none();
-            if is_dart {
-                if let Some(tree) = &mut self.syntax_tree {
-                    if let Some(edit) = edit {
-                        tree.reparse(&text, edit);
+            let grammar = syntax_language(self.language.language_id(), self.buffer.path());
+            if let Some(grammar) = grammar {
+                match &mut self.syntax_tree {
+                    Some(tree) if tree.language() == grammar => {
+                        if let Some(edit) = edit {
+                            tree.reparse(&text, edit);
+                        }
                     }
-                } else {
-                    self.syntax_tree = Some(SyntaxTree::parse(&text));
+                    _ => self.syntax_tree = Some(SyntaxTree::parse_as(grammar, &text)),
                 }
                 self.fold_ranges = self
                     .syntax_tree
@@ -750,11 +754,11 @@ impl EditorView {
         self.buffer = Buffer::open(path)?;
         self.language = language_for_path(self.buffer.path());
         let parse_syntax = should_parse_syntax(&self.buffer);
-        let is_dart = self.language.language_id() == "dart" || self.buffer.path().is_none();
+        let grammar = syntax_language(self.language.language_id(), self.buffer.path());
         if parse_syntax {
             let text = self.buffer.text();
-            if is_dart {
-                let tree = SyntaxTree::parse(&text);
+            if let Some(grammar) = grammar {
+                let tree = SyntaxTree::parse_as(grammar, &text);
                 self.fold_ranges = tree.fold_ranges();
                 self.syntax_tree = Some(tree);
             } else {
@@ -3521,7 +3525,13 @@ impl EditorView {
             } else {
                 first_block
             };
-            let tree = SyntaxTree::parse(&capped_sig);
+            // Fence info strings say which grammar the server meant.
+            let grammar = if raw.contains("```python") || raw.contains("```py\n") {
+                SyntaxLanguage::Python
+            } else {
+                SyntaxLanguage::Dart
+            };
+            let tree = SyntaxTree::parse_as(grammar, &capped_sig);
             let highlights = tree.highlights(&capped_sig);
             let mut block_el = v_flex()
                 .w_full()
@@ -4225,6 +4235,15 @@ fn contains_ascii_ci(haystack: &str, needle_lower: &str) -> bool {
 /// blue-gray instead of competing with any of it.
 /// Fast single-pass `{ ... }` fold range scanner for non-Dart languages.
 /// Returns sorted, deduplicated `FoldRange` entries by `start_line`.
+/// The tree-sitter grammar for a buffer, if `core-syntax` has one. Untitled
+/// buffers are Dart, matching the default language.
+fn syntax_language(language_id: &str, path: Option<&Path>) -> Option<SyntaxLanguage> {
+    if path.is_none() {
+        return Some(SyntaxLanguage::Dart);
+    }
+    SyntaxLanguage::from_language_id(language_id)
+}
+
 fn lexical_fold_ranges(source: &str) -> Vec<core_syntax::FoldRange> {
     let bytes = source.as_bytes();
     let mut stack: Vec<(usize, usize)> = Vec::new();

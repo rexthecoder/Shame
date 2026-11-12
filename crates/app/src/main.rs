@@ -36,6 +36,7 @@ mod shell;
 mod simulator;
 mod theme;
 mod toast;
+mod python;
 #[allow(dead_code)]
 mod tokens;
 
@@ -324,6 +325,9 @@ const IDE_COMMANDS: &[IdeCommand] = &[
     IdeCommand { id: "debug-exceptions-never", title: "Debug: Don't Pause on Exceptions", shortcut: "", flutter_only: true },
     IdeCommand { id: "debug-breakpoint-condition", title: "Debug: Set Breakpoint Condition on Current Line\u{2026}", shortcut: "", flutter_only: true },
     IdeCommand { id: "toggle-sim", title: "Simulator: Attach / Detach iOS Simulator", shortcut: "", flutter_only: true },
+    IdeCommand { id: "python-run-file", title: "Python: Run Current File", shortcut: "", flutter_only: false },
+    IdeCommand { id: "python-pytest", title: "Python: Run pytest", shortcut: "", flutter_only: false },
+    IdeCommand { id: "python-pytest-file", title: "Python: Run pytest on Current File", shortcut: "", flutter_only: false },
     IdeCommand { id: "open-git", title: "Git: Open Git Panel", shortcut: "\u{2318}\u{21e7}G", flutter_only: false },
     IdeCommand { id: "git-switch-branch", title: "Git: Switch / Create Branch\u{2026}", shortcut: "", flutter_only: false },
     IdeCommand { id: "git-stage-all", title: "Git: Stage All Changes", shortcut: "", flutter_only: false },
@@ -1171,6 +1175,14 @@ impl DartIde {
                         path.clone(), *line, *start_line, *end_line, code.clone(), message.clone(), *is_test,
                         window, cx,
                     );
+                }
+                EditorEvent::RunTest {
+                    path,
+                    test_name,
+                    extra_args,
+                    label,
+                } if path.extension().is_some_and(|e| e == "py") => {
+                    this.run_pytest(Some(path.clone()), test_name.clone(), cx);
                 }
                 EditorEvent::RunTest {
                     path,

@@ -8,3 +8,4 @@ publish = false
 [dependencies]
 tree-sitter.workspace = true
 tree-sitter-dart.workspace = true
+tree-sitter-python.workspace = true

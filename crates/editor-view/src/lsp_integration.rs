@@ -170,8 +170,9 @@ pub(crate) fn set_inlay_hints_setting(enabled: bool) {
 }
 
 /// The reply to a `workspace/configuration` request: one entry per item
-/// asked for. Only the `dart` section is ours to set (inlay hints); anything
-/// else gets `null`, meaning "use your defaults".
+/// asked for. We set the `dart` section (inlay hints) and point Python
+/// servers at the project's interpreter (`python`, `pylsp`); anything else
+/// gets `null`, meaning "use your defaults".
 fn configuration_response(params: &serde_json::Value) -> serde_json::Value {
     let items = params.get("items").and_then(|v| v.as_array()).map_or(&[][..], Vec::as_slice);
     let inlay = INLAY_HINTS_SETTING.load(Ordering::Relaxed);
@@ -182,6 +183,15 @@ fn configuration_response(params: &serde_json::Value) -> serde_json::Value {
                 // `updateImportsOnRename` is the server's default; said
                 // explicitly because file moves in the tree rely on it.
                 Some("dart") => serde_json::json!({ "inlayHints": inlay, "updateImportsOnRename": true }),
+                Some(section @ ("python" | "pylsp")) => {
+                    let scope = item
+                        .get("scopeUri")
+                        .and_then(|u| u.as_str())
+                        .and_then(|u| u.strip_prefix("file://"))
+                        .map(|p| PathBuf::from(percent_decode(p)));
+                    crate::python::configuration_for(section, scope.as_deref())
+                        .unwrap_or(serde_json::Value::Null)
+                }
                 _ => serde_json::Value::Null,
             })
             .collect(),
@@ -1971,6 +1981,26 @@ fn first_definition_target(response: &GotoDefinitionResponse) -> Option<(Uri, u3
 /// only kind this app ever constructs or expects back from the server).
 fn uri_to_path(uri: &Uri) -> Option<PathBuf> {
     uri.as_str().strip_prefix("file://").map(PathBuf::from)
+}
+
+/// Decode `%XX` escapes in a URI path that a server built itself (pyright
+/// encodes spaces as `%20`).
+fn percent_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() && s.is_char_boundary(i + 3) {
+            if let Ok(b) = u8::from_str_radix(&s[i + 1..i + 3], 16) {
+                out.push(b);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 pub(crate) fn completion_item_to_entry(item: CompletionItem) -> Option<CompletionEntry> {

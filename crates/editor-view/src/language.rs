@@ -119,6 +119,7 @@ fn adapters() -> &'static [Arc<dyn LanguageAdapter>] {
             Arc::new(DartLanguageAdapter),
             Arc::new(RustLanguageAdapter),
             Arc::new(TypeScriptLanguageAdapter),
+            Arc::new(crate::python::PythonLanguageAdapter),
         ];
         for spec in BUILTIN_SIMPLE_LANGUAGES {
             list.push(Arc::new(SimpleLanguageAdapter(spec)));
@@ -199,20 +200,6 @@ impl LanguageAdapter for SimpleLanguageAdapter {
 }
 
 static BUILTIN_SIMPLE_LANGUAGES: &[SimpleLanguageSpec] = &[
-    SimpleLanguageSpec {
-        language_id: "python",
-        extensions: &["py", "pyi"],
-        exact_names: &[],
-        root_markers: &["pyproject.toml", "setup.py", "requirements.txt"],
-        lsp_bin: "pyright-langserver",
-        lsp_args: &["--stdio"],
-        keywords: &[
-            "and", "as", "assert", "async", "await", "break", "class", "continue", "def", "del",
-            "elif", "else", "except", "False", "finally", "for", "from", "global", "if", "import",
-            "in", "is", "lambda", "None", "nonlocal", "not", "or", "pass", "raise", "return",
-            "self", "True", "try", "while", "with", "yield",
-        ],
-    },
     SimpleLanguageSpec {
         language_id: "go",
         extensions: &["go"],
@@ -1251,7 +1238,7 @@ fn language_install_hint(language_id: &str) -> &'static str {
         "typescript" | "html" | "css" | "json" => {
             "npm i -g typescript typescript-language-server vscode-langservers-extracted"
         }
-        "python" => "npm i -g pyright",
+        "python" => "pip install basedpyright  (or: npm i -g pyright)",
         "go" => "go install golang.org/x/tools/gopls@latest",
         "swift" => "xcode-select --install",
         "kotlin" => "brew install kotlin-language-server",

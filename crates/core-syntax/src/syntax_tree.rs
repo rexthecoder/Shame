@@ -7,24 +7,58 @@ use tree_sitter::{
 
 use crate::highlight::{Highlight, HighlightKind};
 
-fn dart_language() -> Language {
-    tree_sitter_dart::LANGUAGE.into()
+/// A grammar `core-syntax` can parse. Everything else falls back to the
+/// editor's lexical highlighter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SyntaxLanguage {
+    Dart,
+    Python,
 }
 
-fn dart_query() -> &'static Query {
-    static QUERY: OnceLock<Query> = OnceLock::new();
-    QUERY.get_or_init(|| {
-        Query::new(&dart_language(), tree_sitter_dart::HIGHLIGHTS_QUERY)
-            .expect("tree-sitter-dart ships a highlights query valid for its own grammar")
-    })
-}
+impl SyntaxLanguage {
+    /// Map an LSP language id (`"dart"`, `"python"`) to a grammar.
+    pub fn from_language_id(id: &str) -> Option<Self> {
+        match id {
+            "dart" => Some(Self::Dart),
+            "python" => Some(Self::Python),
+            _ => None,
+        }
+    }
 
-fn dart_parser() -> Parser {
-    let mut parser = Parser::new();
-    parser
-        .set_language(&dart_language())
-        .expect("tree-sitter-dart ships a grammar compatible with this tree-sitter version");
-    parser
+    fn language(self) -> Language {
+        match self {
+            Self::Dart => tree_sitter_dart::LANGUAGE.into(),
+            Self::Python => tree_sitter_python::LANGUAGE.into(),
+        }
+    }
+
+    fn query(self) -> &'static Query {
+        static DART: OnceLock<Query> = OnceLock::new();
+        static PYTHON: OnceLock<Query> = OnceLock::new();
+        match self {
+            Self::Dart => DART.get_or_init(|| {
+                Query::new(&self.language(), tree_sitter_dart::HIGHLIGHTS_QUERY)
+                    .expect("tree-sitter-dart ships a highlights query valid for its own grammar")
+            }),
+            Self::Python => PYTHON.get_or_init(|| {
+                let source = format!(
+                    "{}\n{}",
+                    tree_sitter_python::HIGHLIGHTS_QUERY,
+                    include_str!("../queries/python-extra.scm")
+                );
+                Query::new(&self.language(), &source)
+                    .expect("the Python highlights query is valid for tree-sitter-python")
+            }),
+        }
+    }
+
+    fn parser(self) -> Parser {
+        let mut parser = Parser::new();
+        parser
+            .set_language(&self.language())
+            .expect("bundled grammars are compatible with this tree-sitter version");
+        parser
+    }
 }
 
 /// A fold candidate: a `{ ... }` block spanning more than one line.
@@ -36,20 +70,34 @@ pub struct FoldRange {
     pub end_byte: usize,
 }
 
-/// A parsed Dart syntax tree, re-parsed incrementally as the source edits.
+/// A parsed syntax tree, re-parsed incrementally as the source edits.
 pub struct SyntaxTree {
+    language: SyntaxLanguage,
     parser: Parser,
     tree: Tree,
 }
 
 impl SyntaxTree {
+    /// Parse `source` as Dart.
     pub fn parse(source: &str) -> Self {
-        let mut parser = dart_parser();
+        Self::parse_as(SyntaxLanguage::Dart, source)
+    }
+
+    pub fn parse_as(language: SyntaxLanguage, source: &str) -> Self {
+        let mut parser = language.parser();
         let tree = parser
             .parse(source, None)
             .expect("tree-sitter only returns None if parsing was cancelled or timed out");
-        let _ = dart_query();
-        Self { parser, tree }
+        let _ = language.query();
+        Self {
+            language,
+            parser,
+            tree,
+        }
+    }
+
+    pub fn language(&self) -> SyntaxLanguage {
+        self.language
     }
 
     /// Apply a text edit and re-parse, reusing the previous tree and parser so
@@ -75,21 +123,33 @@ impl SyntaxTree {
     /// Run the grammar's highlights query restricted to `byte_range` so
     /// virtualized editor rendering only queries the visible viewport lines.
     pub fn highlights_in_range(&self, source: &str, byte_range: Range<usize>) -> Vec<Highlight> {
-        let query = dart_query();
+        let language = self.language;
+        let query = language.query();
         let capture_names = query.capture_names();
         let mut cursor = QueryCursor::new();
         cursor.set_byte_range(byte_range);
         let mut matches = cursor.matches(query, self.tree.root_node(), source.as_bytes());
 
         let mut highlights = Vec::new();
+        // Pattern index per query capture, for Python's "later pattern wins".
+        let mut patterns: Vec<usize> = Vec::new();
         while let Some(m) = matches.next() {
             for capture in m.captures() {
+                patterns.push(m.pattern_index);
                 let name = capture_names[capture.index as usize];
                 let range = capture.node.start_byte()..capture.node.end_byte();
                 let mut kind = HighlightKind::from_capture_name(name);
+                // Python's query tags PascalCase identifiers `constructor`:
+                // they are classes.
+                if language == SyntaxLanguage::Python && name == "constructor" {
+                    kind = HighlightKind::Type;
+                }
                 // In Dart, PascalCase function calls (`Divider(...)`, `StatelessWidget(...)`)
                 // are widget/class constructor invocations and should highlight as `Type`.
-                if kind == HighlightKind::Function && name == "function.call" {
+                if language == SyntaxLanguage::Dart
+                    && kind == HighlightKind::Function
+                    && name == "function.call"
+                {
                     if source[range.clone()]
                         .bytes()
                         .next()
@@ -103,7 +163,7 @@ impl SyntaxTree {
                     kind,
                 });
                 // Highlight `[identifier]` references inside `///` doc comments.
-                if kind == HighlightKind::Comment {
+                if language == SyntaxLanguage::Dart && kind == HighlightKind::Comment {
                     let slice = &source[range.clone()];
                     if slice.trim_start().starts_with("///") {
                         let bytes = slice.as_bytes();
@@ -127,6 +187,15 @@ impl SyntaxTree {
                     }
                 }
             }
+        }
+        if language == SyntaxLanguage::Python {
+            // The editor paints spans in order, later ones on top: outer
+            // spans first, and for the same span the most specific (last)
+            // query pattern last. Python adds no extra spans, so `patterns`
+            // lines up with `highlights`.
+            let mut tagged: Vec<(usize, Highlight)> = patterns.into_iter().zip(highlights).collect();
+            tagged.sort_by_key(|(p, h)| (h.range.start, std::cmp::Reverse(h.range.end), *p));
+            return tagged.into_iter().map(|(_, h)| h).collect();
         }
         highlights.sort_by_key(|h| (h.range.start, h.kind != HighlightKind::Comment));
         highlights
@@ -208,9 +277,15 @@ impl SyntaxTree {
     /// found generically (first child is an anonymous `{` token, last is
     /// an anonymous `}` token) rather than by naming specific Dart node
     /// kinds, so it keeps working across grammar versions.
+    ///
+    /// Python has no braces: a compound statement (`def`, `class`, `if`,
+    /// `with`, ...) folds from its header line to the end of its `block`.
     pub fn fold_ranges(&self) -> Vec<FoldRange> {
         let mut ranges = Vec::new();
-        collect_fold_ranges(self.tree.root_node(), &mut ranges);
+        match self.language {
+            SyntaxLanguage::Dart => collect_fold_ranges(self.tree.root_node(), &mut ranges),
+            SyntaxLanguage::Python => collect_block_folds(self.tree.root_node(), &mut ranges),
+        }
         ranges.sort_by_key(|r| r.start_byte);
         ranges
     }
@@ -258,11 +333,88 @@ fn collect_fold_ranges(node: Node, out: &mut Vec<FoldRange>) {
     }
 }
 
+/// Indentation-based folds: every multi-line node with a `block` child
+/// folds from its own first line to the block's last line. Decorated
+/// definitions fold from the `def`/`class` line, so sticky scroll shows the
+/// signature rather than the decorator.
+fn collect_block_folds(node: Node, out: &mut Vec<FoldRange>) {
+    let (start_line, end_line) = (node.start_position().row, node.end_position().row);
+    if end_line == start_line {
+        return;
+    }
+    let mut cursor = node.walk();
+    if node.kind() != "decorated_definition" {
+        if let Some(block) = node.children(&mut cursor).find(|c| c.kind() == "block") {
+            let block_end = block.end_position().row;
+            if block_end > start_line {
+                out.push(FoldRange {
+                    start_line,
+                    end_line: block_end,
+                    start_byte: node.start_byte(),
+                    end_byte: block.end_byte(),
+                });
+            }
+        }
+    }
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        collect_block_folds(child, out);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     const SAMPLE: &str = "// A comment\nclass Foo {\n  int bar() {\n    return 1;\n  }\n}\n";
+
+    const PY: &str = "import os\n\n@dataclass\nclass Model:\n    \"\"\"Doc.\"\"\"\n\n    def forward(self, x: int) -> int:\n        if x:\n            return x + 1\n        return 0\n";
+
+    #[test]
+    fn python_highlights_keywords_strings_and_self() {
+        let tree = SyntaxTree::parse_as(SyntaxLanguage::Python, PY);
+        let hs = tree.highlights(PY);
+        // Later spans win in the editor, so check the last one per range.
+        // Match whole words: `class` must not hit `dataclass`.
+        let kind_of = |text: &str| {
+            let at = PY
+                .match_indices(text)
+                .map(|(i, _)| i)
+                .find(|&i| {
+                    let before = PY[..i].chars().last();
+                    !before.is_some_and(|c| c.is_alphanumeric() || c == '_')
+                })
+                .unwrap();
+            hs.iter()
+                .filter(|h| h.range == (at..at + text.len()))
+                .last()
+                .map(|h| h.kind)
+        };
+        assert_eq!(kind_of("def"), Some(HighlightKind::Keyword));
+        assert_eq!(kind_of("class"), Some(HighlightKind::Keyword));
+        assert_eq!(kind_of("self"), Some(HighlightKind::Keyword));
+        assert_eq!(kind_of("Model"), Some(HighlightKind::Type));
+        assert_eq!(kind_of("forward"), Some(HighlightKind::Function));
+        assert_eq!(kind_of("int"), Some(HighlightKind::BuiltinType));
+        assert_eq!(kind_of("dataclass"), Some(HighlightKind::Attribute));
+        assert_eq!(kind_of("\"\"\"Doc.\"\"\""), Some(HighlightKind::String));
+    }
+
+    #[test]
+    fn python_folds_follow_blocks() {
+        let tree = SyntaxTree::parse_as(SyntaxLanguage::Python, PY);
+        let folds: Vec<(usize, usize)> =
+            tree.fold_ranges().iter().map(|f| (f.start_line, f.end_line)).collect();
+        // class (line 3, not the decorator on 2), def, if.
+        assert_eq!(folds, vec![(3, 9), (6, 9), (7, 8)]);
+    }
+
+    #[test]
+    fn language_ids_map_to_grammars() {
+        assert_eq!(SyntaxLanguage::from_language_id("python"), Some(SyntaxLanguage::Python));
+        assert_eq!(SyntaxLanguage::from_language_id("dart"), Some(SyntaxLanguage::Dart));
+        assert_eq!(SyntaxLanguage::from_language_id("rust"), None);
+    }
 
     #[test]
     fn parses_without_panicking() {

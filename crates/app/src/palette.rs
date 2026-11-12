@@ -336,7 +336,10 @@ impl DartIde {
         let query = self.palette_command_query(cx);
         let words: Vec<&str> = query.split_whitespace().collect();
         let is_flutter = self.is_flutter_or_dart_workspace();
-        let available = |cmd: &&IdeCommand| !cmd.flutter_only || is_flutter;
+        let is_python = self.is_python_workspace();
+        let available = |cmd: &&IdeCommand| {
+            (!cmd.flutter_only || is_flutter) && (!cmd.id.starts_with("python-") || is_python)
+        };
         if words.is_empty() {
             let recent: Vec<IdeCommand> = self
                 .recent_commands
@@ -481,6 +484,9 @@ impl DartIde {
             "test-file" => self.run_tests_in_active_file(cx),
             "test-rerun-failed" => self.rerun_failed_tests(cx),
             "run-flutter" => self.start_flutter_run(window, cx),
+            "python-run-file" => self.run_python_file(cx),
+            "python-pytest" => self.run_pytest(None, None, cx),
+            "python-pytest-file" => self.run_pytest_in_active_file(cx),
             "hot-reload" => self.trigger_hot_reload(cx),
             "hot-restart" => self.trigger_hot_restart(cx),
             "pub-get" => self.run_pub_get(cx),
