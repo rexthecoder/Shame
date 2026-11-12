@@ -111,6 +111,9 @@ pub(crate) enum Attachment {
     Symbol { name: String, rel: String, line: usize },
     /// Live IDE state, resolved when the message is sent.
     Context(ContextKind),
+    /// A run from the Runs tab: its command, outcome and output (the tail,
+    /// already captured when attached).
+    Run { title: String, command: String, cwd: String, status: String, output: String },
 }
 
 /// IDE state a mention can pull in.
@@ -164,6 +167,7 @@ impl Attachment {
             }
             Attachment::Symbol { name, .. } => name.clone(),
             Attachment::Context(kind) => kind.name().to_string(),
+            Attachment::Run { title, .. } => format!("run: {title}"),
             Attachment::Selection { rel, start_line, end_line, .. } if start_line == end_line => {
                 format!("{}:{start_line}", name(rel))
             }
@@ -395,6 +399,15 @@ pub(crate) fn attachment_prompt(root: &Path, attachments: &[Attachment]) -> Stri
             }
             // Resolved from live IDE state when the message is sent.
             Attachment::Context(_) => {}
+            Attachment::Run { title, command, cwd, status, output } => {
+                let (output, cut) = clip(output, MAX_INLINE_BYTES.min(budget));
+                budget -= output.len();
+                out.push_str(&format!(
+                    "Run `{title}` ({status}), from `{cwd}`:\n$ {command}\nOutput{}:\n```text\n{}\n```\n",
+                    if cut { " (truncated)" } else { "" },
+                    output.trim_end_matches('\n')
+                ));
+            }
             Attachment::Selection { rel, start_line, end_line, text } => {
                 let (text, cut) = clip(text, MAX_INLINE_BYTES.min(budget));
                 budget -= text.len();
@@ -623,6 +636,22 @@ mod tests {
         let sel = |a, b| Attachment::Selection { rel: "lib/a.dart".into(), start_line: a, end_line: b, text: String::new() };
         assert_eq!(sel(4, 4).label(), "a.dart:4");
         assert_eq!(sel(4, 9).label(), "a.dart:4\u{2013}9");
+    }
+
+    #[core::prelude::v1::test]
+    fn a_run_reaches_the_agent_with_its_command_and_output() {
+        let run = Attachment::Run {
+            title: "pytest".into(),
+            command: ".venv/bin/python -m pytest -q".into(),
+            cwd: "/p".into(),
+            status: "Failed · exit 1".into(),
+            output: "E   assert 1 == 2\n".into(),
+        };
+        assert_eq!(run.label(), "run: pytest");
+        let prompt = attachment_prompt(Path::new("/p"), &[run]);
+        assert!(prompt.contains("Run `pytest` (Failed · exit 1)"), "{prompt}");
+        assert!(prompt.contains("$ .venv/bin/python -m pytest -q"));
+        assert!(prompt.contains("E   assert 1 == 2"));
     }
 
     #[core::prelude::v1::test]

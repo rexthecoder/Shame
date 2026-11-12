@@ -39,6 +39,7 @@ mod toast;
 mod python;
 mod data_file;
 mod data_view;
+mod run_sessions;
 #[allow(dead_code)]
 mod tokens;
 
@@ -257,6 +258,8 @@ pub(crate) enum DockTab {
     Problems,
     DebugConsole,
     Tests,
+    /// Run sessions: Python files, pytest, scripts.
+    Runs,
 }
 
 actions!(
@@ -622,6 +625,7 @@ pub struct DartIde {
     pub(crate) history: Option<(Entity<EditorView>, Vec<core_workspace::Snapshot>)>,
     pub(crate) autosave: file_state::AutosaveMode,
     pub(crate) test_run: Option<test_runner::TestRunState>,
+    pub(crate) runs: run_sessions::RunStore,
     /// The next test run should collect coverage.
     pub(crate) coverage_requested: bool,
     /// Coverage bars are on in the editors.
@@ -890,6 +894,7 @@ impl DartIde {
             history: None,
             autosave: file_state::AutosaveMode::Off,
             test_run: None,
+            runs: run_sessions::RunStore::default(),
             coverage_requested: false,
             coverage_shown: false,
             save_options: editor_view::SaveOptions::default(),

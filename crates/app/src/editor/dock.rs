@@ -573,6 +573,7 @@ impl DartIde {
         let debug_active = self.dock_tab == DockTab::DebugConsole;
         let problems_active = self.dock_tab == DockTab::Problems;
         let tests_active = self.dock_tab == DockTab::Tests;
+        let runs_active = self.dock_tab == DockTab::Runs;
         let debug_count_err = self
             .debug_lines
             .iter()
@@ -720,6 +721,50 @@ impl DartIde {
                             .text_size(px(9.5))
                             .text_color(tone)
                             .child(count.to_string()),
+                    )
+                })
+        };
+
+        let runs_pill = {
+            let view_select = view.clone();
+            let badge = self.runs_tab_badge();
+            h_flex()
+                .id("runs-dock-tab")
+                .items_center()
+                .gap(px(tokens::SPACE_2))
+                .px(px(tokens::SPACE_3))
+                .h(px(28.))
+                .rounded(px(tokens::RADIUS_PANEL))
+                .border_1()
+                .border_color(if runs_active { cx.theme().border } else { gpui_kit::transparent_black() })
+                .when(runs_active, |el| el.bg(cx.theme().tab_active).text_color(fg))
+                .when(!runs_active, |el| {
+                    el.text_color(muted).hover(move |s| s.bg(rgba(0xffffff08)).text_color(fg))
+                })
+                .text_size(px(tokens::UI_SM))
+                .cursor_pointer()
+                .on_click(move |_event, _window, cx| {
+                    view_select.update(cx, |this, cx| {
+                        this.dock_tab = DockTab::Runs;
+                        cx.notify();
+                    });
+                })
+                .child(
+                    Icon::new(gpui_kit::assets::IconName::Play)
+                        .xsmall()
+                        .text_color(if self.runs.any_running() { primary } else { muted }),
+                )
+                .child("Runs")
+                .when_some(badge, |el, (label, failing)| {
+                    let tone = if failing { red } else { primary };
+                    el.child(
+                        div()
+                            .px(px(5.))
+                            .rounded(px(8.))
+                            .bg(tone.opacity(0.18))
+                            .text_size(px(9.5))
+                            .text_color(tone)
+                            .child(label),
                     )
                 })
         };
@@ -888,6 +933,8 @@ impl DartIde {
                 .into_any_element()
         } else if tests_active {
             self.render_tests_panel(cx).into_any_element()
+        } else if runs_active {
+            self.render_runs_panel(cx).into_any_element()
         } else if debug_active {
             let running = self.flutter_daemon.is_some() || self.dap_client.is_some();
             let dap_paused = self.dap_paused_thread.is_some();
@@ -1368,6 +1415,9 @@ impl DartIde {
                                 self.is_flutter_or_dart_workspace() || self.test_run.is_some(),
                                 |r| r.child(tests_pill),
                             )
+                            .when(self.runs.has_sessions() || self.is_python_workspace(), |r| {
+                                r.child(runs_pill)
+                            })
                             .child(
                                 Button::new("new-terminal-tab")
                                     .ghost()

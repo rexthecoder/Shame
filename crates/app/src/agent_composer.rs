@@ -124,6 +124,7 @@ pub(crate) fn attachment_sub(attachment: &Attachment) -> String {
             format!("lines {start_line}\u{2013}{end_line}")
         }
         Attachment::Image { .. } | Attachment::Folder { .. } | Attachment::Context(_) => String::new(),
+        Attachment::Run { status, .. } => status.clone(),
         Attachment::Symbol { rel, line, .. } => format!("{rel}:{line}"),
     }
 }
@@ -431,6 +432,7 @@ impl DartIde {
             Attachment::Folder { .. } => "folder",
             Attachment::Symbol { .. } => "symbol",
             Attachment::Context(kind) => kind.name(),
+            Attachment::Run { .. } => "run",
         };
         let id = format!("mention-{}:{kind}", self.agent.next_mention);
         self.agent.next_mention += 1;
@@ -457,6 +459,12 @@ impl DartIde {
             Attachment::File { rel } => (rel, None),
             Attachment::Selection { rel, start_line, .. } => (rel, Some(start_line as u32 - 1)),
             Attachment::Symbol { rel, line, .. } => (rel, Some(line as u32 - 1)),
+            Attachment::Run { .. } => {
+                self.terminal_open = true;
+                self.dock_tab = crate::DockTab::Runs;
+                cx.notify();
+                return;
+            }
             Attachment::Image { .. } | Attachment::Folder { .. } | Attachment::Context(_) => return,
         };
         self.open_path(self.root.join(rel), window, cx);
