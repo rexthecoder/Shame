@@ -24,6 +24,9 @@ impl ServerInfo {
     /// are dropped; a JupyterHub `/user/<name>` prefix is kept.
     pub fn parse(url: &str) -> Result<Self, String> {
         let url = url.trim();
+        if is_colab_url(url) {
+            return Err(COLAB_UNSUPPORTED.into());
+        }
         if !(url.starts_with("http://") || url.starts_with("https://")) {
             return Err("a Jupyter server URL starts with http:// or https://".into());
         }
@@ -182,6 +185,17 @@ impl ServerInfo {
     }
 }
 
+/// Why a Colab link can't be used as a server URL (see docs/colab.md).
+pub const COLAB_UNSUPPORTED: &str = "Google Colab runtimes aren't Jupyter servers you can reach by URL: \
+Colab only hands them to Google's own signed-in clients (its website and its VS Code extension). \
+Use a Jupyter server URL instead: a local `jupyter server`, JupyterHub, Kaggle, Vertex AI Workbench or RunPod.";
+
+/// A link to Colab itself (a notebook or the Colab site), not to a Jupyter server.
+pub fn is_colab_url(url: &str) -> bool {
+    let host = url.split("://").nth(1).unwrap_or(url).split(['/', '?', ':']).next().unwrap_or("");
+    host == "colab.research.google.com" || host == "colab.google" || host.ends_with(".colab.googleusercontent.com")
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct KernelSpec {
     pub name: String,
@@ -293,6 +307,10 @@ mod tests {
         assert_eq!(bare.token, None);
 
         assert!(ServerInfo::parse("localhost:8888").is_err());
+        let colab = ServerInfo::parse("https://colab.research.google.com/drive/1abc").unwrap_err();
+        assert!(colab.contains("Colab"), "{colab}");
+        assert!(is_colab_url("https://8080-m-s-abc.asia-east1-0.prod.colab.googleusercontent.com/"));
+        assert!(!is_colab_url("https://hub.example.com/user/ada"));
         assert!(ServerInfo::parse("https://").is_err());
     }
 
