@@ -791,6 +791,17 @@ impl EditorView {
         Ok(())
     }
 
+    /// Treat a path-less buffer as the language of `sample_file` (e.g.
+    /// `"cell.py"`): its highlighting, folding, keywords and snippets. Used
+    /// by notebook cells, which have no file of their own.
+    pub fn set_language_hint(&mut self, sample_file: &str, cx: &mut Context<Self>) {
+        self.language = language_for_path(Some(Path::new(sample_file)));
+        self.syntax_tree = None;
+        self.synced_revision = u64::MAX;
+        self.sync_buffer_state();
+        cx.notify();
+    }
+
     /// Replace `range` (byte offsets) with `text` as one undoable edit,
     /// leaving the cursor where it was (used by the CSV grid's cell edits).
     pub fn replace_range(&mut self, range: std::ops::Range<usize>, text: &str, cx: &mut Context<Self>) {
@@ -4246,12 +4257,10 @@ fn contains_ascii_ci(haystack: &str, needle_lower: &str) -> bool {
 /// Fast single-pass `{ ... }` fold range scanner for non-Dart languages.
 /// Returns sorted, deduplicated `FoldRange` entries by `start_line`.
 /// The tree-sitter grammar for a buffer, if `core-syntax` has one. Untitled
-/// buffers are Dart, matching the default language.
+/// buffers without a language hint are Dart, matching the default language.
 fn syntax_language(language_id: &str, path: Option<&Path>) -> Option<SyntaxLanguage> {
-    if path.is_none() {
-        return Some(SyntaxLanguage::Dart);
-    }
     SyntaxLanguage::from_language_id(language_id)
+        .or_else(|| path.is_none().then_some(SyntaxLanguage::Dart))
 }
 
 fn lexical_fold_ranges(source: &str) -> Vec<core_syntax::FoldRange> {

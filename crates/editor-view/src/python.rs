@@ -396,6 +396,9 @@ mod tests {
             Some(SyntaxLanguage::Python)
         );
         assert_eq!(crate::syntax_language("rust", Some(Path::new("/p/a.rs"))), None);
+        // Notebook cells: no path, but a Python language hint.
+        assert_eq!(crate::syntax_language("python", None), Some(SyntaxLanguage::Python));
+        assert_eq!(crate::syntax_language("plaintext", None), Some(SyntaxLanguage::Dart));
     }
 
     #[test]
