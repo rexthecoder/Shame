@@ -32,6 +32,10 @@ const CHAT_MAX_W: f32 = 760.;
 const ROLE_W: f32 = 72.;
 /// Lines of a turn shown before "Show more".
 const TURN_CLAMP: usize = 6;
+/// The record inspector beside a JSONL table.
+const INSPECTOR_W: f32 = 440.;
+/// Lines of one field shown in the inspector before "Show all".
+const FIELD_CLAMP: usize = 40;
 
 #[derive(Clone)]
 enum Grid {
@@ -127,6 +131,11 @@ pub(crate) struct DataView {
     chat_list: ListState,
     expanded: Rc<std::cell::RefCell<HashSet<usize>>>,
     selected: Option<(usize, usize)>,
+    /// Show the selected JSONL record in full beside the table.
+    inspect: bool,
+    /// Inspector fields expanded past `FIELD_CLAMP`, by key.
+    expanded_fields: HashSet<String>,
+    inspector_scroll: ScrollHandle,
     editing: Option<Editing>,
     _observe: Subscription,
 }
@@ -149,6 +158,9 @@ impl DataView {
             chat_list: ListState::new(0, ListAlignment::Top, px(400.)),
             expanded: Rc::default(),
             selected: None,
+            inspect: true,
+            expanded_fields: HashSet::new(),
+            inspector_scroll: ScrollHandle::new(),
             editing: None,
             _observe: observe,
         };
@@ -197,6 +209,13 @@ impl DataView {
             }
         }
         self.measure_columns();
+        if matches!(self.grid, Grid::Jsonl { .. }) {
+            let rows = self.grid.row_count();
+            match self.selected {
+                Some((r, _)) if r < rows => {}
+                _ => self.selected = (rows > 0).then_some((0, 0)),
+            }
+        }
     }
 
     fn measure_columns(&mut self) {
@@ -327,6 +346,15 @@ impl DataView {
                     .on_click(cx.listener(|this, _, _, cx| this.write_file(cx))),
             );
         }
+        if self.kind == DataKind::Jsonl && (self.chat.is_none() || self.chat_as_table) {
+            let inspect = self.inspect;
+            bar = bar.child(chip("data-inspect", "Details", inspect, cx).on_click(cx.listener(
+                move |this, _, _, cx| {
+                    this.inspect = !inspect;
+                    cx.notify();
+                },
+            )));
+        }
         if self.chat.is_some() {
             let as_table = self.chat_as_table;
             bar = bar.child(chip("data-raw", "Columns", as_table, cx).on_click(cx.listener(
@@ -428,11 +456,13 @@ impl DataView {
                                     .into_any_element()
                             })
                             .collect();
+                        let row_selected = !editable && selected.map(|s| s.0) == Some(r);
                         h_flex()
                             .h(px(ROW_H))
                             .w(px(total_w))
                             .border_b_1()
                             .border_color(border.opacity(0.5))
+                            .when(row_selected, |d| d.bg(tokens::accent_dim()))
                             .hover(|s| s.bg(tokens::line_active()))
                             .child(
                                 div()
@@ -640,12 +670,149 @@ fn fmt_count(n: usize) -> String {
     out
 }
 
+impl DataView {
+    /// The selected JSONL record, every field in full.
+    fn render_inspector(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let Grid::Jsonl { file, .. } = &self.grid else { return None };
+        let (row, _) = self.selected?;
+        let record = file.records.get(row)?;
+        let theme = cx.theme();
+        let (fg, muted, border, primary, red, green) =
+            (theme.foreground, theme.muted_foreground, theme.border, theme.primary, theme.red, theme.green);
+        let mono = theme.mono_font_family.clone();
+
+        let header = h_flex()
+            .h(px(tokens::PANEL_BAR_H))
+            .flex_none()
+            .px(px(tokens::SPACE_5))
+            .gap(px(tokens::SPACE_3))
+            .items_center()
+            .border_b_1()
+            .border_color(border)
+            .child(div().text_size(px(tokens::UI_SM)).font_weight(FontWeight::MEDIUM).text_color(fg).child(format!("Record {}", row + 1)))
+            .child(div().text_size(px(tokens::UI_XS)).text_color(muted).child(format!("line {}", record.line + 1)));
+
+        let mut fields = v_flex().w_full().p(px(tokens::SPACE_5)).gap(px(tokens::SPACE_5));
+        let value = match &record.value {
+            Err(e) => {
+                fields = fields.child(div().text_size(px(tokens::UI_SM)).text_color(red).child(format!("Invalid JSON: {e}")));
+                None
+            }
+            Ok(v) => Some(v.clone()),
+        };
+        let entries: Vec<(String, serde_json::Value)> = match value {
+            Some(serde_json::Value::Object(o)) => o.into_iter().collect(),
+            Some(other) => vec![("value".into(), other)],
+            None => Vec::new(),
+        };
+        for (key, v) in entries {
+            let (text, color, kind) = match &v {
+                serde_json::Value::String(s) => (s.clone(), fg, format!("text · {} chars", s.chars().count())),
+                serde_json::Value::Number(n) => (n.to_string(), primary, "number".into()),
+                serde_json::Value::Bool(b) => (b.to_string(), if *b { green } else { red }, "bool".into()),
+                serde_json::Value::Null => ("null".into(), muted, "null".into()),
+                serde_json::Value::Array(a) => (
+                    serde_json::to_string_pretty(&v).unwrap_or_default(),
+                    fg,
+                    format!("list · {} items", a.len()),
+                ),
+                serde_json::Value::Object(o) => (
+                    serde_json::to_string_pretty(&v).unwrap_or_default(),
+                    fg,
+                    format!("object · {} keys", o.len()),
+                ),
+            };
+            let lines: Vec<&str> = text.lines().collect();
+            let open = self.expanded_fields.contains(&key);
+            let shown = if open { lines.len() } else { lines.len().min(FIELD_CLAMP) };
+            let more = lines.len() - shown;
+            let body = if text.is_empty() { "(empty)".to_string() } else { lines[..shown].join("\n") };
+            let key_for_click = key.clone();
+            fields = fields.child(
+                v_flex()
+                    .w_full()
+                    .gap(px(tokens::SPACE_2))
+                    .child(
+                        h_flex()
+                            .gap(px(tokens::SPACE_3))
+                            .items_baseline()
+                            .child(div().font_family(mono.clone()).text_size(px(tokens::UI_SM)).text_color(fg).font_weight(FontWeight::MEDIUM).child(key.clone()))
+                            .child(div().text_size(px(tokens::UI_XS)).text_color(muted).child(kind)),
+                    )
+                    .child(
+                        div()
+                            .w_full()
+                            .px(px(tokens::SPACE_4))
+                            .py(px(tokens::SPACE_3))
+                            .rounded(px(tokens::RADIUS_SM))
+                            .bg(tokens::bg_editor())
+                            .border_1()
+                            .border_color(border)
+                            .font_family(mono.clone())
+                            .text_size(px(tokens::UI_SM))
+                            .line_height(px(tokens::CODE_LINE_H - tokens::SPACE_2))
+                            .text_color(if text.is_empty() { muted } else { color })
+                            .child(body),
+                    )
+                    .when(more > 0 || open && lines.len() > FIELD_CLAMP, |c| {
+                        c.child(
+                            div()
+                                .id(SharedString::from(format!("field-more-{key}")))
+                                .text_size(px(tokens::UI_XS))
+                                .text_color(primary)
+                                .cursor_pointer()
+                                .child(if open { "Show less".to_string() } else { format!("Show all ({more} more lines)") })
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    if !this.expanded_fields.remove(&key_for_click) {
+                                        this.expanded_fields.insert(key_for_click.clone());
+                                    }
+                                    cx.notify();
+                                })),
+                        )
+                    }),
+            );
+        }
+        Some(
+            v_flex()
+                .w(px(INSPECTOR_W))
+                .flex_none()
+                .h_full()
+                .border_l_1()
+                .border_color(border)
+                .child(header)
+                .child(
+                    div()
+                        .id("data-inspector")
+                        .flex_1()
+                        .min_h(px(0.))
+                        .overflow_y_scroll()
+                        .track_scroll(&self.inspector_scroll)
+                        .child(fields),
+                )
+                .into_any_element(),
+        )
+    }
+}
+
 impl Render for DataView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.reparse_if_needed(cx);
         let body = match (&self.chat, self.chat_as_table) {
             (Some(chat), false) => self.render_chat(chat.clone(), cx),
-            _ => self.render_grid(cx),
+            _ => {
+                let grid = self.render_grid(cx);
+                let inspector = self.inspect.then(|| self.render_inspector(cx)).flatten();
+                match inspector {
+                    Some(inspector) => h_flex()
+                        .flex_1()
+                        .min_h(px(0.))
+                        .w_full()
+                        .child(div().flex_1().min_w(px(0.)).h_full().flex().flex_col().child(grid))
+                        .child(inspector)
+                        .into_any_element(),
+                    None => grid,
+                }
+            }
         };
         v_flex()
             .on_key_down(cx.listener(|this, ev: &KeyDownEvent, _, cx| {
@@ -737,6 +904,32 @@ mod ui_tests {
             view.update(cx, |v, cx| v.commit_edit(window, cx));
         });
         assert_eq!(buffer_text(&view, cx), "a,b,c\n1,,z\n");
+    }
+
+    #[::gpui::test]
+    fn plain_jsonl_selects_the_first_record_for_the_inspector(cx: &mut ::gpui::TestAppContext) {
+        // The shape of the harness's attempts.jsonl: long text, nested maps, nulls.
+        let src = "{\"task\":\"tree2graph_concrete\",\"n\":1,\"parse_error\":null,\"verified\":{\"p1\":\"holds\"},\"reply\":\"line one\\nline two\"}\n";
+        let (view, cx) = open(cx, src, DataKind::Jsonl);
+        cx.update(|_, cx| {
+            let v = view.read(cx);
+            assert!(v.chat.is_none());
+            assert_eq!(v.selected, Some((0, 0)));
+            assert!(v.inspect);
+            let task = (0..v.grid.column_count()).find(|&c| v.grid.header(c) == "task").unwrap();
+            assert_eq!(v.grid.cell(0, task), "tree2graph_concrete");
+        });
+        // Expanding a field and hiding the inspector both re-render cleanly.
+        cx.update(|_, cx| view.update(cx, |v, cx| {
+            v.expanded_fields.insert("reply".into());
+            cx.notify();
+        }));
+        cx.run_until_parked();
+        cx.update(|_, cx| view.update(cx, |v, cx| {
+            v.inspect = false;
+            cx.notify();
+        }));
+        cx.run_until_parked();
     }
 
     #[::gpui::test]
