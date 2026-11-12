@@ -358,6 +358,35 @@ impl DartIde {
         )
     }
 
+    /// Read each recent project's branch and whether it has uncommitted
+    /// changes, once, in the background.
+    fn load_recent_project_info(&mut self, paths: Vec<std::path::PathBuf>, cx: &mut Context<Self>) {
+        if self.git.recent_info_requested {
+            return;
+        }
+        self.git.recent_info_requested = true;
+        cx.spawn(async move |weak, cx| {
+            let info = cx
+                .background_executor()
+                .spawn(async move {
+                    paths
+                        .into_iter()
+                        .map(|p| {
+                            let branch = core_workspace::current_branch(&p);
+                            let dirty = branch.is_some() && core_workspace::has_uncommitted_changes(&p);
+                            (p, (branch, dirty))
+                        })
+                        .collect::<std::collections::HashMap<_, _>>()
+                })
+                .await;
+            let _ = weak.update(cx, |this, cx| {
+                this.git.recent_info = info;
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
     fn render_empty_editor(
         &self,
         view: &Entity<Self>,
@@ -368,7 +397,37 @@ impl DartIde {
         let border = cx.theme().border;
         let home_prefix = std::env::var("HOME").ok();
 
-        let quick_files: Vec<_> = if self.has_workspace {
+        // Inside a project with uncommitted work, the empty editor picks up
+        // where you left off: the files you were changing, biggest first,
+        // and a way into reviewing them. Otherwise a few source files.
+        let changed: Vec<core_workspace::ChangedFile> = self
+            .git
+            .status
+            .as_ref()
+            .filter(|_| self.has_workspace)
+            .map(|s| {
+                let mut files: Vec<_> = s
+                    .staged
+                    .iter()
+                    .chain(s.unstaged.iter())
+                    .filter(|f| f.kind != core_workspace::ChangeKind::Deleted)
+                    .cloned()
+                    .collect();
+                files.sort_by_key(|f| {
+                    std::cmp::Reverse(self.git.stats.get(&f.path).map_or(0, |(a, r)| a + r))
+                });
+                files.dedup_by(|a, b| a.path == b.path);
+                files
+            })
+            .unwrap_or_default();
+        let change_count = changed.len();
+        let review_file = changed.first().cloned();
+        let repo_root = self.git.status.as_ref().map(|s| s.root.clone());
+        let from_changes = !changed.is_empty();
+        let quick_files: Vec<_> = if from_changes {
+            let root = repo_root.clone().unwrap_or_else(|| self.root.clone());
+            changed.iter().take(4).map(|f| root.join(&f.path)).collect()
+        } else if self.has_workspace {
             self.all_files
                 .iter()
                 .filter(|p| {
@@ -390,6 +449,15 @@ impl DartIde {
             .take(5)
             .cloned()
             .collect();
+        // Branch and uncommitted-changes state per recent project, read once
+        // off the UI thread (each is a couple of `git` calls).
+        if !self.git.recent_info_requested && !recent_folders.is_empty() && !self.has_workspace {
+            let view = view.clone();
+            let paths = recent_folders.clone();
+            cx.defer(move |cx| {
+                view.update(cx, |this, cx| this.load_recent_project_info(paths, cx));
+            });
+        }
 
         v_flex()
             .size_full()
@@ -440,16 +508,19 @@ impl DartIde {
                                     .text_size(px(13.))
                                     .text_color(muted)
                                     .child(if self.has_workspace {
-                                        "Pick a file or run a command to begin"
+                                        "\u{2318}P to open a file \u{b7} \u{21e7}\u{2318}P for commands"
                                     } else {
                                         "Built for speed, craft, and flow"
                                     }),
                             ),
                     ),
             )
-            // Clean, borderless Zed-style Action Rows
+            // Clean, borderless Zed-style Action Rows. Inside a project they
+            // are noise (the subtitle names the two shortcuts that matter),
+            // so they show only on the welcome screen.
             .child(
                 v_flex()
+                    .when(self.has_workspace, |el| el.hidden())
                     .w(px(320.))
                     .gap(px(2.))
                     .child(
@@ -606,7 +677,7 @@ impl DartIde {
                     ),
             )
             // Recent Projects Section (Folder Restoration)
-            .when(!recent_folders.is_empty(), |el| {
+            .when(!recent_folders.is_empty() && !self.has_workspace, |el| {
                 el.child(
                     v_flex()
                         .w(px(320.))
@@ -666,6 +737,31 @@ impl DartIde {
                                                 .text_color(fg)
                                                 .child(name),
                                         )
+                                        .when_some(self.git.recent_info.get(&path).cloned(), |el, (branch, dirty)| {
+                                            el.when_some(branch, |el, branch| {
+                                                el.child(
+                                                    h_flex()
+                                                        .flex_shrink_0()
+                                                        .items_center()
+                                                        .gap(px(3.))
+                                                        .text_size(px(11.))
+                                                        .text_color(muted)
+                                                        .child(
+                                                            Icon::new(gpui_kit::assets::IconName::GitBranch)
+                                                                .with_size(px(10.)),
+                                                        )
+                                                        .child(div().max_w(px(150.)).truncate().child(branch))
+                                                        .when(dirty, |el| {
+                                                            el.child(
+                                                                div()
+                                                                    .size(px(5.))
+                                                                    .rounded(px(3.))
+                                                                    .bg(cx.theme().warning),
+                                                            )
+                                                        }),
+                                                )
+                                            })
+                                        })
                                         .child(
                                             div()
                                                 .flex_1()
@@ -715,6 +811,43 @@ impl DartIde {
                     p.file_name().and_then(|n| n.to_str()).unwrap_or_default().to_string()
                 };
                 let names: Vec<String> = quick_files.iter().map(|p| base(p)).collect();
+                let el = el.when(from_changes, |el| {
+                    el.child(
+                        h_flex()
+                            .items_center()
+                            .gap(px(tokens::SPACE_3))
+                            .child(
+                                div()
+                                    .text_size(px(tokens::UI_XS))
+                                    .font_medium()
+                                    .text_color(muted.opacity(0.8))
+                                    .child("Continue where you left off"),
+                            )
+                            .when_some(review_file.clone(), |row, file| {
+                                let view = view.clone();
+                                row.child(
+                                    h_flex()
+                                        .id("review-changes")
+                                        .items_center()
+                                        .gap(px(tokens::SPACE_1))
+                                        .cursor_pointer()
+                                        .text_size(px(tokens::UI_XS))
+                                        .text_color(cx.theme().primary)
+                                        .hover(|s| s.opacity(0.8))
+                                        .child(format!(
+                                            "Review {change_count} change{} \u{2192}",
+                                            if change_count == 1 { "" } else { "s" }
+                                        ))
+                                        .on_click(move |_e, _w, cx| {
+                                            view.update(cx, |this, cx| {
+                                                this.set_sidebar_tab(crate::git_panel::SidebarTab::Git, cx);
+                                                this.open_git_diff(file.clone(), false, cx);
+                                            });
+                                        }),
+                                )
+                            }),
+                    )
+                });
                 el.child(
                     h_flex()
                         .flex_wrap()
@@ -1194,6 +1327,13 @@ impl DartIde {
             (false, true, true, _) => "shell-split-sim-web",
             (false, false, false, false) => "shell-split-center",
         };
+        // Saved split sizes are per layout, so the Flutter rail gets its own ids.
+        let flutter_open = self.flutter_panel.open && self.has_workspace;
+        let split_id: SharedString = if flutter_open {
+            format!("{split_id}-flutter").into()
+        } else {
+            split_id.into()
+        };
         let mut split = h_resizable(split_id);
 
         if sidebar_visible {
@@ -1228,6 +1368,19 @@ impl DartIde {
         }
 
         split = split.child(resizable_panel().child(editor_column));
+
+        if flutter_open {
+            let more_right = self.sim.attached || self.web_preview_open || self.agent_open;
+            split = split.child(
+                resizable_panel()
+                    .size(px(380.))
+                    .size_range(px(320.)..px(560.))
+                    .fixed()
+                    .pl(px(tokens::GUTTER / 2.))
+                    .when(more_right, |p| p.pr(px(tokens::GUTTER / 2.)))
+                    .child(self.render_flutter_rail(cx)),
+            );
+        }
 
         if self.sim.attached {
             split = split.child(

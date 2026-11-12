@@ -25,6 +25,7 @@ mod rails;
 mod peek;
 mod debug;
 mod flutter;
+mod flutter_panel;
 mod palette;
 mod prompts;
 mod settings_ui;
@@ -293,6 +294,7 @@ const IDE_COMMANDS: &[IdeCommand] = &[
     IdeCommand { id: "test-all", title: "Test: Run All Tests", shortcut: "", flutter_only: true },
     IdeCommand { id: "test-file", title: "Test: Run Tests in Current File", shortcut: "", flutter_only: true },
     IdeCommand { id: "test-rerun-failed", title: "Test: Re-run Failed Tests", shortcut: "", flutter_only: true },
+    IdeCommand { id: "flutter-panel", title: "Flutter: Open Flutter Panel (Devices, SDK, Tools)", shortcut: "\u{2318}\u{21e7}D", flutter_only: true },
     IdeCommand { id: "run-flutter", title: "Flutter: Run App on Selected Device", shortcut: "", flutter_only: true },
     IdeCommand { id: "hot-reload", title: "Flutter: Hot Reload", shortcut: "\u{2318}S", flutter_only: true },
     IdeCommand { id: "hot-restart", title: "Flutter: Hot Restart", shortcut: "", flutter_only: true },
@@ -640,6 +642,7 @@ pub struct DartIde {
     pub(crate) lsp_servers: Vec<crate::lsp_health::LspServerStatus>,
     pub(crate) settings_search: Entity<InputState>,
     pub(crate) about_open: bool,
+    pub(crate) flutter_panel: flutter_panel::FlutterPanelState,
     pub(crate) light_theme: bool,
     pub(crate) add_package_open: bool,
     pub(crate) add_package_input: Entity<InputState>,
@@ -696,6 +699,7 @@ impl DartIde {
             InputState::new(window, cx).placeholder("Line[:Column] (e.g. 42 or 42:8)...")
         });
         let rename_input = cx.new(|cx| InputState::new(window, cx).placeholder("New name..."));
+        let flutter_panel = flutter_panel::FlutterPanelState::new(window, cx);
         let add_package_input = cx.new(|cx| {
             InputState::new(window, cx)
                 .placeholder("Package name (e.g. provider, http, dev:build_runner)...")
@@ -886,6 +890,7 @@ impl DartIde {
             lsp_servers: Vec::new(),
             settings_search,
             about_open: false,
+            flutter_panel,
             light_theme: false,
             add_package_open: false,
             add_package_input,
@@ -1054,13 +1059,18 @@ impl DartIde {
                         });
                     }
                 }
-                EditorEvent::RequestRename { line, column } => {
+                EditorEvent::RequestRename { line, column, current_name } => {
                     this.rename_target = Some((editor.clone(), *line, *column));
                     this.rename_input.update(cx, |state, cx| {
-                        state.set_value("", window, cx);
+                        state.set_value(current_name.clone(), window, cx);
                         state.focus(window, cx);
                     });
+                    // Selected, so typing replaces the name and Enter keeps it.
+                    window.dispatch_action(Box::new(gpui_kit::component::input::SelectAll), cx);
                     cx.notify();
+                }
+                EditorEvent::RenameUnavailable => {
+                    this.show_toast("This symbol can't be renamed.", true, cx);
                 }
                 EditorEvent::ShowPeek { title, locations } => {
                     this.open_peek(title.clone(), locations, window, cx);

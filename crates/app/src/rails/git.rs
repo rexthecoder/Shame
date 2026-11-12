@@ -11,6 +11,7 @@ use gpui_kit::component::{
     button::{Button, ButtonCustomVariant, ButtonVariants as _},
     h_flex,
     input::{Input, Textarea},
+    menu::{ContextMenuExt as _, DropdownMenu as _, PopupMenu, PopupMenuItem},
     v_flex,
 };
 use gpui_kit::prelude::FluentBuilder as _;
@@ -27,11 +28,197 @@ enum Section {
     Changes = 2,
 }
 
+/// Right-click menu on a changed-file row, as in VS Code's Source Control view.
+/// Discard is left to the row's own two-step button, so a stray click in a menu
+/// can't throw work away.
+fn git_file_context_menu(
+    menu: PopupMenu,
+    view: Entity<DartIde>,
+    file: ChangedFile,
+    section: Section,
+    root: &Path,
+) -> PopupMenu {
+    let full = root.join(&file.path);
+    let abs = full.to_string_lossy().to_string();
+    let rel = file.path.clone();
+    let can_open_file = file.kind != ChangeKind::Deleted;
+    let staged = section == Section::Staged;
+    let mut menu = menu;
+    if section != Section::Conflicts {
+        menu = menu.item(PopupMenuItem::new("Open Changes").on_click({
+            let (view, file) = (view.clone(), file.clone());
+            move |_, _, cx| view.update(cx, |this, cx| this.open_git_diff(file.clone(), staged, cx))
+        }));
+    }
+    menu = menu.item(PopupMenuItem::new("Open File").disabled(!can_open_file).on_click({
+        let (view, full) = (view.clone(), full.clone());
+        move |_, window, cx| view.update(cx, |this, cx| this.open_path(full.clone(), window, cx))
+    }));
+    match section {
+        Section::Changes => {
+            menu = menu.separator().item(PopupMenuItem::new("Stage Changes").on_click({
+                let (view, file) = (view.clone(), file.clone());
+                move |_, window, cx| {
+                    view.update(cx, |this, cx| this.git_stage(std::slice::from_ref(&file), window, cx))
+                }
+            }));
+        }
+        Section::Staged => {
+            menu = menu.separator().item(PopupMenuItem::new("Unstage Changes").on_click({
+                let (view, file) = (view.clone(), file.clone());
+                move |_, window, cx| {
+                    view.update(cx, |this, cx| this.git_unstage(std::slice::from_ref(&file), window, cx))
+                }
+            }));
+        }
+        Section::Conflicts => {}
+    }
+    menu.separator()
+        .item(PopupMenuItem::new("Copy Path").on_click(move |_, _, cx| {
+            cx.write_to_clipboard(ClipboardItem::new_string(abs.clone()));
+        }))
+        .item(PopupMenuItem::new("Copy Relative Path").on_click(move |_, _, cx| {
+            cx.write_to_clipboard(ClipboardItem::new_string(rel.clone()));
+        }))
+        .item(PopupMenuItem::new("Reveal in Finder").on_click(move |_, _, _| {
+            let _ = std::process::Command::new("open").arg("-R").arg(&full).spawn();
+        }))
+}
+
+/// Right-click menu on a commit row: the things you reach for when talking
+/// about a commit (its hash, its message) plus expanding its files.
+fn git_commit_context_menu(
+    menu: PopupMenu,
+    view: Entity<DartIde>,
+    commit: &CommitInfo,
+    expanded: bool,
+) -> PopupMenu {
+    let hash = commit.hash.clone();
+    let view_for_revert = view.clone();
+    let short: String = commit.hash.chars().take(7).collect();
+    let subject = commit.subject.clone();
+    menu.item(PopupMenuItem::new(if expanded { "Hide Files" } else { "Show Files" }).on_click({
+        let hash = hash.clone();
+        move |_, _, cx| view.update(cx, |this, cx| this.git_toggle_commit(hash.clone(), cx))
+    }))
+    .separator()
+    .item(PopupMenuItem::new("Copy Commit Hash").on_click({
+        let hash = hash.clone();
+        move |_, _, cx| cx.write_to_clipboard(ClipboardItem::new_string(hash.clone()))
+    }))
+    .item(PopupMenuItem::new(format!("Copy Short Hash ({short})")).on_click(move |_, _, cx| {
+        cx.write_to_clipboard(ClipboardItem::new_string(short.clone()))
+    }))
+    .item(PopupMenuItem::new("Copy Message").on_click(move |_, _, cx| {
+        cx.write_to_clipboard(ClipboardItem::new_string(subject.clone()))
+    }))
+    .separator()
+    .item(PopupMenuItem::new("Revert Commit").on_click({
+        let view = view_for_revert;
+        move |_, window, cx| view.update(cx, |this, cx| this.git_revert_commit(hash.clone(), window, cx))
+    }))
+}
+
+/// Where a commit falls in the timeline, from git's relative date
+/// ("3 hours ago", "2 days ago", "3 weeks ago", ...).
+fn time_bucket(relative: &str) -> &'static str {
+    let mut words = relative.split_whitespace();
+    let n: u32 = words.next().and_then(|w| w.parse().ok()).unwrap_or(0);
+    let unit = words.next().unwrap_or("");
+    match unit.trim_end_matches('s') {
+        "second" | "minute" | "hour" => "Today",
+        "day" if n <= 1 => "Yesterday",
+        "day" => "This week",
+        "week" if n <= 1 => "Last week",
+        "week" => "This month",
+        "month" => "Earlier this year",
+        _ => "Older",
+    }
+}
+
+/// A timeline heading between groups of commits: a small label on a hairline.
+fn commit_bucket_heading(label: &'static str, cx: &App) -> Div {
+    let muted = cx.theme().muted_foreground;
+    h_flex()
+        .w_full()
+        .items_center()
+        .gap(px(tokens::SPACE_3))
+        .pl(px(tokens::SPACE_5 + 18.))
+        .pr(px(tokens::SPACE_5))
+        .pt(px(tokens::SPACE_4))
+        .pb(px(tokens::SPACE_1))
+        .child(
+            div()
+                .flex_shrink_0()
+                .text_size(px(tokens::UI_XS - 0.5))
+                .font_medium()
+                .text_color(muted.opacity(0.75))
+                .child(label),
+        )
+        .child(div().flex_1().h(px(1.)).bg(cx.theme().border.opacity(0.5)))
+}
+
+/// Initials in a small round chip, tinted from the name so each author keeps
+/// one colour.
+fn author_avatar(author: &str) -> Div {
+    let initials: String = author
+        .split_whitespace()
+        .filter_map(|w| w.chars().next())
+        .take(2)
+        .collect::<String>()
+        .to_uppercase();
+    let hue = author.bytes().fold(0u32, |h, b| h.wrapping_mul(31).wrapping_add(b as u32)) % 360;
+    let tint = hsla(hue as f32 / 360., 0.55, 0.62, 1.);
+    div()
+        .flex_shrink_0()
+        .size(px(14.))
+        .rounded(px(tokens::RADIUS_PILL))
+        .flex()
+        .items_center()
+        .justify_center()
+        .bg(tint.opacity(0.18))
+        .text_color(tint)
+        .text_size(px(7.5))
+        .font_medium()
+        .child(initials)
+}
+
+/// "↑2" / "↓1" beside the branch name.
+fn sync_count(arrow: &'static str, n: u32, tint: Hsla, cx: &App) -> Div {
+    div()
+        .flex_shrink_0()
+        .px(px(tokens::SPACE_2))
+        .rounded(px(tokens::RADIUS_PILL))
+        .bg(tint.opacity(0.14))
+        .text_color(tint)
+        .text_size(px(tokens::UI_XS))
+        .font_family(cx.theme().mono_font_family.clone())
+        .child(format!("{arrow}{n}"))
+}
+
+/// The added/removed split of a section's lines as one thin bar.
+fn churn_bar(added: usize, removed: usize, cx: &App) -> Div {
+    let total = (added + removed).max(1) as f32;
+    h_flex()
+        .mx(px(tokens::SPACE_5))
+        .mb(px(tokens::SPACE_2))
+        .h(px(2.))
+        .rounded(px(tokens::RADIUS_PILL))
+        .overflow_hidden()
+        .bg(cx.theme().border.opacity(0.4))
+        .when(added > 0, |bar| {
+            bar.child(div().h_full().w(relative(added as f32 / total)).bg(cx.theme().green.opacity(0.75)))
+        })
+        .when(removed > 0, |bar| {
+            bar.child(div().h_full().w(relative(removed as f32 / total)).bg(cx.theme().red.opacity(0.75)))
+        })
+}
+
 /// Horizontal inset shared by every row inside the commit card, so their edges line up.
 const CARD_INSET: f32 = 10.;
 
 /// A soft orange pill: the accent as a tint, for secondary calls to action (push, publish).
-fn accent_tint(cx: &App) -> ButtonCustomVariant {
+pub(crate) fn accent_tint(cx: &App) -> ButtonCustomVariant {
     let accent = cx.theme().primary;
     ButtonCustomVariant::new(cx)
         .color(accent.opacity(0.16))
@@ -171,7 +358,9 @@ impl DartIde {
     }
 
     pub(crate) fn render_git_rail(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        v_flex().size_full().child(match self.git.status.clone() {
+        // Below the sidebar tabs: fill what is left, not the whole card, or
+        // the bottom (the commit button) is pushed out of view.
+        v_flex().flex_1().w_full().min_h(px(0.)).child(match self.git.status.clone() {
             Some(status) => self.render_git_body(&status, cx).into_any_element(),
             None => self.render_git_not_a_repo(cx).into_any_element(),
         })
@@ -1208,6 +1397,14 @@ impl DartIde {
                             .text_color(fg)
                             .child(name),
                     )
+                    // How far this branch is from its upstream, right in the chip:
+                    // accent for commits waiting to go up, amber for ones to pull.
+                    .when(status.ahead > 0, |el| {
+                        el.child(sync_count("\u{2191}", status.ahead, primary, cx))
+                    })
+                    .when(status.behind > 0, |el| {
+                        el.child(sync_count("\u{2193}", status.behind, cx.theme().warning, cx))
+                    })
                     .child(Icon::new(IconName::ChevronDown).xsmall().text_color(muted))
                     .on_click(
                         cx.listener(|this, _event, window, cx| {
@@ -1230,7 +1427,7 @@ impl DartIde {
                                 .xsmall()
                                 .disabled(busy)
                                 .icon(
-                                    Icon::new(IconName::FolderPlus)
+                                    Icon::new(IconName::Archive)
                                         .with_size(px(13.))
                                         .text_color(muted),
                                 )
@@ -1768,7 +1965,6 @@ impl DartIde {
     /// two steps that finish a piece of work.
     fn render_git_commit_box(&self, status: &RepoStatus, cx: &mut Context<Self>) -> Div {
         let muted = cx.theme().muted_foreground;
-        let fg = cx.theme().foreground;
         let primary = cx.theme().primary;
         let primary_hover = cx.theme().primary_hover;
         let border = cx.theme().border;
@@ -1782,17 +1978,6 @@ impl DartIde {
         let subject_len = message.lines().next().unwrap_or("").chars().count();
         let plural = |n: usize| if n == 1 { "" } else { "s" };
 
-        // The input's footer already spells out staged vs. left-out files, so the
-        // button can stay short enough for the narrowest rail.
-        let button_label = if amend {
-            "Amend commit".to_string()
-        } else if staged > 0 {
-            format!("Commit {staged}")
-        } else if unstaged > 0 {
-            "Commit all".to_string()
-        } else {
-            "Commit".to_string()
-        };
         let can_commit = !busy && (amend || (has_message && (staged + unstaged > 0)));
 
         let types = self.git.commit_types.clone().unwrap_or_default();
@@ -1800,38 +1985,196 @@ impl DartIde {
             .then(|| core_workspace::suggest_message(self.commit_candidates(), &types))
             .flatten();
 
-        v_flex()
+        // What this commit will carry: the staged files, or everything when
+        // nothing is staged ("Commit all").
+        let going_in: Vec<&ChangedFile> = if staged > 0 {
+            status.staged.iter().collect()
+        } else {
+            status.unstaged.iter().collect()
+        };
+        let (added, removed) = going_in
+            .iter()
+            .filter_map(|f| self.git.stats.get(&f.path))
+            .fold((0usize, 0usize), |(a, r), (fa, fr)| (a + *fa as usize, r + *fr as usize));
+        let left_out = if staged > 0 { unstaged } else { 0 };
+        let n = going_in.len();
+        let has_upstream = status.upstream.is_some();
+        let upstream = status.upstream.clone().unwrap_or_else(|| "origin".into());
+        let branch = status.branch.clone().unwrap_or_else(|| "HEAD".into());
+        let recent: Vec<String> = status
+            .recent_commits
+            .iter()
+            .map(|c| c.subject.clone())
+            .filter(|s| !s.is_empty())
+            .take(8)
+            .collect();
+        let view = cx.entity();
+        let live = has_message || amend;
+        let what = if amend {
+            "Amend the last commit".to_string()
+        } else if staged > 0 {
+            format!("Commit {staged} staged file{} to {branch}", plural(staged))
+        } else {
+            format!("Commit all {n} file{} to {branch}", plural(n))
+        };
+        let commit_tip = if can_commit {
+            format!("{what} (\u{2318}\u{21b5})")
+        } else {
+            format!("Write a message first, then {}", what.to_lowercase())
+        };
+
+        // One quiet icon button for the card's footer.
+        let foot_icon = |id: &'static str, icon: IconName, tint: Hsla| {
+            Button::new(id)
+                .ghost()
+                .xsmall()
+                .icon(Icon::new(icon).with_size(px(13.)).text_color(tint))
+        };
+
+        let menu_view = view.clone();
+        let menu_upstream = upstream.clone();
+        let more_menu = move |menu: PopupMenu, _w: &mut Window, _cx: &mut Context<PopupMenu>| {
+            let (v1, v2, v3, v4) = (
+                menu_view.clone(),
+                menu_view.clone(),
+                menu_view.clone(),
+                menu_view.clone(),
+            );
+            menu.item(
+                PopupMenuItem::new(if ahead > 0 {
+                    format!("Push {ahead} commit{} to {menu_upstream}", plural(ahead as usize))
+                } else if !has_upstream {
+                    "Publish branch".to_string()
+                } else {
+                    "Push".to_string()
+                })
+                .on_click(move |_, window, cx| v1.update(cx, |this, cx| this.git_push(window, cx))),
+            )
+            .item(
+                PopupMenuItem::new("Commit & Push  \u{21e7}\u{2318}\u{21b5}")
+                    .disabled(!can_commit)
+                    .on_click(move |_, window, cx| {
+                        v2.update(cx, |this, cx| this.git_commit_and_push(window, cx))
+                    }),
+            )
+            .separator()
+            .item(
+                PopupMenuItem::new(if amend { "Stop amending" } else { "Amend last commit" })
+                    .on_click(move |_, window, cx| {
+                        v3.update(cx, |this, cx| this.git_toggle_amend(window, cx))
+                    }),
+            )
+            .item(
+                PopupMenuItem::new("Force push (with lease)")
+                    .disabled(!has_upstream)
+                    .on_click(move |_, window, cx| {
+                        v4.update(cx, |this, cx| this.git_force_push(window, cx))
+                    }),
+            )
+        };
+
+        // The split button: Commit on the left, its menu on the right. Quiet
+        // (outlined) until there is a message, accent once there is.
+        let (btn_bg, btn_fg, btn_border) = if can_commit {
+            (primary, cx.theme().primary_foreground, primary)
+        } else {
+            (gpui_kit::transparent_black(), muted, border)
+        };
+        let divider = if can_commit {
+            cx.theme().primary_foreground.opacity(0.3)
+        } else {
+            border
+        };
+        let ahead_tint = if can_commit {
+            cx.theme().primary_foreground
+        } else {
+            primary
+        };
+        let split = h_flex()
+            .flex_shrink_0()
+            .h(px(24.))
+            .items_center()
+            .rounded(px(tokens::RADIUS_SM))
+            .border_1()
+            .border_color(btn_border)
+            .bg(btn_bg)
+            .text_color(btn_fg)
+            .text_size(px(tokens::UI_SM))
+            .font_medium()
+            .overflow_hidden()
+            .child(
+                h_flex()
+                    .id("git-commit")
+                    .h_full()
+                    .px(px(tokens::SPACE_4))
+                    .items_center()
+                    .child(if amend { "Amend" } else { "Commit" })
+                    .tooltip(move |window, cx| {
+                        gpui_kit::component::tooltip::Tooltip::new(commit_tip.clone()).build(window, cx)
+                    })
+                    .when(can_commit, |el| {
+                        el.cursor_pointer()
+                            .hover(move |s| s.bg(primary_hover))
+                            .on_click(cx.listener(|this, _e, window, cx| {
+                                this.git_primary_action(window, cx)
+                            }))
+                    }),
+            )
+            .child(div().w(px(1.)).h(px(14.)).bg(divider))
+            .child({
+                // The right half: commits waiting to go up ("↑2"), or a chevron.
+                // Either way it opens the push / amend menu.
+                let more = Button::new("git-commit-more")
+                    .ghost()
+                    .xsmall()
+                    .h_full()
+                    .rounded(px(0.))
+                    .disabled(busy)
+                    .tooltip(if ahead > 0 {
+                        format!("{ahead} commit{} to push \u{b7} push and more", plural(ahead as usize))
+                    } else {
+                        "Push, amend and more".to_string()
+                    });
+                let more = if ahead > 0 {
+                    more.label(format!("\u{2191}{ahead}")).text_color(ahead_tint)
+                } else {
+                    more.icon(Icon::new(IconName::ChevronDown).with_size(px(11.)).text_color(btn_fg))
+                };
+                more.dropdown_menu_with_anchor(Anchor::BottomRight, more_menu)
+            });
+
+        div()
             .w_full()
             .flex_shrink_0()
             .border_t_1()
-            .border_color(border)
-            .bg(cx.theme().muted)
-            .px(px(tokens::SPACE_4))
-            .pt(px(tokens::SPACE_3))
-            .pb(px(tokens::SPACE_3))
-            .gap(px(tokens::SPACE_3))
-            // Cmd/Ctrl+Enter runs the primary action from inside the message box.
+            .border_color(border.opacity(0.6))
+            .p(px(tokens::SPACE_4))
+            // ⌘↵ commits; ⇧⌘↵ commits and pushes.
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
                 let m = event.keystroke.modifiers;
                 if (m.platform || m.control) && event.keystroke.key == "enter" {
-                    this.git_primary_action(window, cx);
+                    if m.shift {
+                        this.git_commit_and_push(window, cx);
+                    } else {
+                        this.git_primary_action(window, cx);
+                    }
                     cx.stop_propagation();
                 }
             }))
             .child(
                 v_flex()
                     .w_full()
-                    .rounded(px(tokens::RADIUS_SM))
+                    .rounded(px(tokens::RADIUS_PANEL))
                     .border_1()
-                    .border_color(border)
+                    .border_color(if live { primary.opacity(0.5) } else { border })
                     .bg(cx.theme().background)
                     .overflow_hidden()
                     .child(
                         div()
                             .w_full()
                             .px(px(CARD_INSET))
-                            .pt(px(7.))
-                            .pb(px(2.))
+                            .pt(px(tokens::SPACE_3))
+                            .pb(px(tokens::SPACE_2))
                             .child(
                                 div().mx(px(-8.)).child(
                                     Textarea::new(&self.git.message)
@@ -1842,185 +2185,101 @@ impl DartIde {
                             ),
                     )
                     .child(
-                        // What the commit will contain, at the foot of the box:
-                        // staged files, the ones left out, and the counter.
                         h_flex()
                             .w_full()
-                            .h(px(22.))
-                            .px(px(CARD_INSET))
-                            .pb(px(5.))
+                            .h(px(36.))
+                            .pl(px(tokens::SPACE_2))
+                            .pr(px(tokens::SPACE_3))
+                            .gap(px(tokens::SPACE_1))
                             .items_center()
-                            .justify_between()
-                            .gap(px(tokens::SPACE_2))
+                            .border_t_1()
+                            .border_color(border.opacity(0.5))
+                            .when_some(suggestion.clone(), |el, suggested| {
+                                el.child(
+                                    foot_icon("git-suggestion", IconName::Sparkles, primary)
+                                        .tooltip(format!("Write it for me: {suggested}"))
+                                        .on_click(cx.listener(|this, _e, window, cx| {
+                                            this.git_apply_suggestion(window, cx)
+                                        })),
+                                )
+                            })
+                            .when(!recent.is_empty(), |el| {
+                                let view = view.clone();
+                                el.child(
+                                    foot_icon("git-recent-messages", IconName::Clock, muted)
+                                        .tooltip("Reuse a recent message")
+                                        .dropdown_menu(move |menu, _w, _cx| {
+                                            let mut menu = menu;
+                                            for subject in recent.clone() {
+                                                let view = view.clone();
+                                                let label: String = if subject.chars().count() > 48 {
+                                                    format!(
+                                                        "{}\u{2026}",
+                                                        subject.chars().take(47).collect::<String>()
+                                                    )
+                                                } else {
+                                                    subject.clone()
+                                                };
+                                                menu = menu.item(PopupMenuItem::new(label).on_click(
+                                                    move |_, window, cx| {
+                                                        let subject = subject.clone();
+                                                        view.update(cx, |this, cx| {
+                                                            this.git.message.update(cx, |s, cx| {
+                                                                s.set_value(subject, window, cx)
+                                                            });
+                                                            cx.notify();
+                                                        });
+                                                    },
+                                                ));
+                                            }
+                                            menu
+                                        }),
+                                )
+                            })
+                            // The middle says what goes in: the size, a dot
+                            // when some changes stay out, or "Amending".
                             .child(
                                 h_flex()
+                                    .id("git-commit-summary")
+                                    .flex_1()
                                     .min_w(px(0.))
-                                    .items_center()
+                                    .px(px(tokens::SPACE_2))
                                     .gap(px(tokens::SPACE_2))
+                                    .items_center()
                                     .text_size(px(tokens::UI_XS))
                                     .text_color(muted)
-                                    .when(staged > 0, |el| el.child(format!("{staged} staged")))
-                                    .when(staged > 0 && unstaged > 0, |el| {
-                                        el.child(
-                                            div().text_color(muted.opacity(0.4)).child("\u{b7}"),
-                                        )
+                                    .when(amend, |el| {
+                                        el.child(div().truncate().text_color(primary).child("Amending"))
                                     })
-                                    .when(unstaged > 0, |el| {
-                                        // Left out of the commit: warn only when
-                                        // something is staged and would be skipped.
+                                    .when(!amend && subject_len > 72, |el| {
                                         el.child(
                                             div()
-                                                .text_color(if staged > 0 {
-                                                    cx.theme().yellow
-                                                } else {
-                                                    muted
-                                                })
-                                                .child(format!("{unstaged} unstaged")),
-                                        )
-                                    }),
-                            )
-                            .child(
-                                h_flex()
-                                    .flex_shrink_0()
-                                    .items_center()
-                                    .gap(px(tokens::SPACE_2))
-                                    .when(subject_len > 40, |el| {
-                                        el.child(
-                                            div()
-                                                .font_family(cx.theme().mono_font_family.clone())
-                                                .text_size(px(tokens::UI_XS))
-                                                .text_color(if subject_len > 72 {
-                                                    cx.theme().red
-                                                } else {
-                                                    muted.opacity(0.7)
-                                                })
+                                                .text_color(cx.theme().red)
                                                 .child(format!("{subject_len}/72")),
                                         )
                                     })
-                                    .when_some(suggestion, |el, suggested_text| {
-                                        el.child(
-                                            h_flex()
-                                                .id("git-suggestion")
-                                                .items_center()
-                                                .gap(px(tokens::SPACE_1))
-                                                .px(px(tokens::SPACE_2))
-                                                .h(px(18.))
-                                                .rounded(px(tokens::RADIUS_SM))
-                                                .cursor_pointer()
-                                                .text_size(px(tokens::UI_XS))
-                                                .text_color(primary)
-                                                .hover(|s| s.bg(cx.theme().list_hover))
-                                                .child(
-                                                    Icon::new(IconName::Sparkles)
-                                                        .with_size(px(10.5)),
-                                                )
-                                                .child("Auto-fill")
-                                                .on_click(cx.listener(
-                                                    move |this, _e, window, cx| {
-                                                        let _ = &suggested_text;
-                                                        this.git_apply_suggestion(window, cx)
-                                                    },
-                                                )),
-                                        )
-                                    }),
-                            ),
-                    ),
-            )
-            .child(
-                h_flex()
-                    .w_full()
-                    .items_center()
-                    .gap(px(tokens::SPACE_2))
-                    .child(
-                        h_flex()
-                            .id("git-amend")
-                            .items_center()
-                            .gap(px(tokens::SPACE_2))
-                            .cursor_pointer()
-                            .text_size(px(tokens::UI_XS))
-                            .text_color(if amend { primary } else { muted })
-                            .hover(move |s| s.text_color(fg))
-                            .child(
-                                div()
-                                    .size(px(11.))
-                                    .rounded(px(3.))
-                                    .border_1()
-                                    .border_color(if amend { primary } else { border })
-                                    .when(amend, |b| b.bg(primary.opacity(0.2)))
-                                    .flex()
-                                    .items_center()
-                                    .justify_center()
-                                    .when(amend, |b| {
-                                        b.child(
-                                            Icon::new(IconName::Check)
-                                                .with_size(px(8.))
-                                                .text_color(primary),
-                                        )
+                                    .when(!amend && subject_len <= 72 && added + removed > 0, |el| {
+                                        el.child(crate::diff_view::stat_chip(added as _, removed as _, cx))
+                                    })
+                                    .when(left_out > 0 && !amend, |el| {
+                                        el.child(div().size(px(5.)).rounded(px(3.)).bg(cx.theme().yellow))
+                                    })
+                                    .tooltip({
+                                        let text = if left_out > 0 {
+                                            format!(
+                                                "{n} file{} go in \u{b7} {left_out} not staged stay out",
+                                                plural(n)
+                                            )
+                                        } else {
+                                            format!("{n} file{} go in", plural(n))
+                                        };
+                                        move |window, cx| {
+                                            gpui_kit::component::tooltip::Tooltip::new(text.clone())
+                                                .build(window, cx)
+                                        }
                                     }),
                             )
-                            .child("Amend")
-                            .on_click(cx.listener(|this, _e, window, cx| {
-                                this.git_toggle_amend(window, cx)
-                            })),
-                    )
-                    .child(div().flex_1())
-                    .when(ahead > 0, |el| {
-                        el.child(
-                            Button::new("git-commit-push")
-                                .xsmall()
-                                .custom(accent_tint(cx))
-                                .disabled(busy)
-                                .icon(Icon::new(IconName::ArrowUp).with_size(px(12.)))
-                                .label(ahead.to_string())
-                                .tooltip(format!(
-                                    "Push {ahead} commit{} to {}",
-                                    plural(ahead as usize),
-                                    status.upstream.clone().unwrap_or_default()
-                                ))
-                                .on_click(
-                                    cx.listener(|this, _e, window, cx| this.git_push(window, cx)),
-                                ),
-                        )
-                    })
-                    .child(
-                        h_flex()
-                            .id("git-commit")
-                            .flex_shrink_0()
-                            .h(px(28.))
-                            .px(px(tokens::SPACE_4))
-                            .items_center()
-                            .justify_center()
-                            .gap(px(tokens::SPACE_2))
-                            .rounded(px(tokens::RADIUS_SM))
-                            .border_1()
-                            .border_color(if can_commit { primary } else { border })
-                            .bg(if can_commit {
-                                primary
-                            } else {
-                                cx.theme().muted
-                            })
-                            .text_color(if can_commit {
-                                cx.theme().primary_foreground
-                            } else {
-                                muted
-                            })
-                            .text_size(px(tokens::UI_SM))
-                            .font_medium()
-                            .when(can_commit, |el| {
-                                el.cursor_pointer()
-                                    .hover(move |s| s.bg(primary_hover))
-                                    .on_click(cx.listener(|this, _e, window, cx| {
-                                        this.git_primary_action(window, cx)
-                                    }))
-                            })
-                            .child(button_label)
-                            .child(
-                                div()
-                                    .font_family(cx.theme().mono_font_family.clone())
-                                    .text_size(px(tokens::UI_XS))
-                                    .opacity(0.7)
-                                    .child("\u{2318}\u{21b5}"),
-                            ),
+                            .child(split),
                     ),
             )
     }
@@ -2260,6 +2519,13 @@ impl DartIde {
         let staged = section == Section::Staged;
         let discard_all_armed = section == Section::Changes
             && self.git.confirm_discard.as_deref() == Some("discard-all");
+        // The size of this section's change at a glance: summed line stats
+        // in the header, and their added/removed split as a thin bar under it.
+        let (added, removed) = files
+            .iter()
+            .filter_map(|f| self.git.stats.get(&f.path))
+            .fold((0usize, 0usize), |(a, r), (fa, fr)| (a + *fa as usize, r + *fr as usize));
+        let totals = (added + removed > 0).then_some((added, removed));
         v_flex()
             .w_full()
             .child(
@@ -2292,6 +2558,40 @@ impl DartIde {
                             h_flex()
                                 .items_center()
                                 .gap(px(tokens::SPACE_1))
+                                .when_some(totals, |row, (a, r)| {
+                                    row.child(
+                                        div()
+                                            .mr(px(tokens::SPACE_2))
+                                            .child(crate::diff_view::stat_chip(a as _, r as _, cx)),
+                                    )
+                                })
+                                .child(
+                                    Button::new(("git-group-toggle", section as usize))
+                                        .ghost()
+                                        .xsmall()
+                                        .icon(
+                                            Icon::new(if self.git.group_by_folder {
+                                                IconName::FolderTree
+                                            } else {
+                                                IconName::List
+                                            })
+                                            .with_size(px(12.))
+                                            .text_color(if self.git.group_by_folder {
+                                                cx.theme().primary
+                                            } else {
+                                                muted
+                                            }),
+                                        )
+                                        .tooltip(if self.git.group_by_folder {
+                                            "Show as a flat list"
+                                        } else {
+                                            "Group by folder"
+                                        })
+                                        .on_click(cx.listener(|this, _e, _w, cx| {
+                                            this.git.group_by_folder = !this.git.group_by_folder;
+                                            cx.notify();
+                                        })),
+                                )
                                 .when(section == Section::Changes, |row| {
                                     row.child(if discard_all_armed {
                                         Button::new("git-discard-all-confirm")
@@ -2350,23 +2650,113 @@ impl DartIde {
                     }),
             )
             .when(!collapsed, |el| {
-                el.children(
-                    files
-                        .iter()
-                        .cloned()
-                        .enumerate()
-                        .map(|(ix, file)| self.render_git_file_row(section, ix, file, cx)),
-                )
+                let el = el.when_some(totals, |el, (a, r)| el.child(churn_bar(a, r, cx)));
+                if self.git.group_by_folder && section != Section::Conflicts {
+                    el.children(self.render_git_folder_groups(section, files, cx))
+                } else {
+                    el.children(
+                        files
+                            .iter()
+                            .cloned()
+                            .enumerate()
+                            .map(|(ix, file)| self.render_git_file_row(section, ix, file, true, cx)),
+                    )
+                }
             })
     }
 
     /// One file: icon, name, dimmed folder, and a right-hand slot that shows its status letter
     /// and swaps to the Open / Stage / Unstage / Discard buttons while the row is hovered.
+    /// Changed files under one header per folder: the folder, how many files
+    /// and lines changed there, and a hover button that stages (or unstages)
+    /// the whole folder. Rows inside drop their own folder label.
+    fn render_git_folder_groups(
+        &self,
+        section: Section,
+        files: &[ChangedFile],
+        cx: &mut Context<Self>,
+    ) -> Vec<AnyElement> {
+        let mut groups: Vec<(String, Vec<(usize, ChangedFile)>)> = Vec::new();
+        for (ix, file) in files.iter().enumerate() {
+            let dir = Path::new(&file.path)
+                .parent()
+                .and_then(|p| p.to_str())
+                .unwrap_or("")
+                .to_string();
+            match groups.iter_mut().find(|(d, _)| *d == dir) {
+                Some((_, list)) => list.push((ix, file.clone())),
+                None => groups.push((dir, vec![(ix, file.clone())])),
+            }
+        }
+        groups.sort_by(|a, b| a.0.cmp(&b.0));
+        let muted = cx.theme().muted_foreground;
+        let fg = cx.theme().foreground;
+        let staged = section == Section::Staged;
+        let mut out = Vec::new();
+        for (gix, (dir, members)) in groups.into_iter().enumerate() {
+            let (a, r) = members
+                .iter()
+                .filter_map(|(_, f)| self.git.stats.get(&f.path))
+                .fold((0u32, 0u32), |(a, r), (fa, fr)| (a + fa, r + fr));
+            let group: SharedString = format!("git-folder-{}-{gix}", section as usize).into();
+            let batch: Vec<ChangedFile> = members.iter().map(|(_, f)| f.clone()).collect();
+            let label = if dir.is_empty() { "(root)".to_string() } else { format!("{dir}/") };
+            out.push(
+                h_flex()
+                    .id(("git-folder", section as usize * 10_000 + gix))
+                    .group(group.clone())
+                    .w_full()
+                    .h(px(24.))
+                    .mt(px(if gix == 0 { 0. } else { tokens::SPACE_2 }))
+                    .px(px(tokens::SPACE_5))
+                    .items_center()
+                    .gap(px(tokens::SPACE_2))
+                    .text_size(px(tokens::UI_XS))
+                    .text_color(muted)
+                    .child(Icon::new(IconName::FolderOpen).with_size(px(12.)).text_color(muted))
+                    .child(div().flex_1().min_w(px(0.)).truncate().text_color(fg.opacity(0.8)).child(label))
+                    .child(
+                        div()
+                            .flex_shrink_0()
+                            .group_hover(group.clone(), |s| s.invisible())
+                            .when(a + r > 0, |el| el.child(crate::diff_view::stat_chip(a, r, cx))),
+                    )
+                    .child(
+                        div().absolute().right(px(tokens::SPACE_5)).invisible().group_hover(group, |s| s.visible()).child(
+                            Button::new(("git-folder-stage", section as usize * 10_000 + gix))
+                                .ghost()
+                                .xsmall()
+                                .icon(
+                                    Icon::new(if staged { IconName::Minus } else { IconName::Plus })
+                                        .with_size(px(12.))
+                                        .text_color(muted),
+                                )
+                                .tooltip(if staged { "Unstage this folder" } else { "Stage this folder" })
+                                .on_click(cx.listener(move |this, _e, window, cx| {
+                                    if staged {
+                                        this.git_unstage(&batch, window, cx);
+                                    } else {
+                                        this.git_stage(&batch, window, cx);
+                                    }
+                                })),
+                        ),
+                    )
+                    .relative()
+                    .into_any_element(),
+            );
+            for (ix, file) in members {
+                out.push(self.render_git_file_row(section, ix, file, false, cx).into_any_element());
+            }
+        }
+        out
+    }
+
     fn render_git_file_row(
         &self,
         section: Section,
         ix: usize,
         file: ChangedFile,
+        show_dir: bool,
         cx: &mut Context<Self>,
     ) -> Div {
         let muted = cx.theme().muted_foreground;
@@ -2392,7 +2782,7 @@ impl DartIde {
         let mut dir = path
             .parent()
             .and_then(|p| p.to_str())
-            .filter(|p| !p.is_empty())
+            .filter(|p| !p.is_empty() && show_dir)
             .map(str::to_string);
         if let Some(orig) = file.orig_path.as_deref() {
             // A rename reads better as where it came from.
@@ -2446,6 +2836,8 @@ impl DartIde {
                 .icon(Icon::new(icon).with_size(px(12.)).text_color(muted))
                 .tooltip(tip)
         };
+        let menu_file = file.clone();
+        let menu_root = root.clone();
         let stage_file = file.clone();
         let discard_file = file.clone();
         let unstage_file = file.clone();
@@ -2660,7 +3052,15 @@ impl DartIde {
                         } else {
                             this.open_git_diff(row_file.clone(), section == Section::Staged, cx);
                         }
-                    })),
+                    }))
+                    .context_menu({
+                        let view = cx.entity();
+                        let file = menu_file;
+                        let root = menu_root;
+                        move |menu, _window, _cx| {
+                            git_file_context_menu(menu, view.clone(), file.clone(), section, &root)
+                        }
+                    }),
             )
     }
 
@@ -2840,6 +3240,15 @@ impl DartIde {
                 let commits = &status.recent_commits;
                 el.children(commits.iter().enumerate().flat_map(|(ix, commit)| {
                     let last = ix + 1 == commits.len();
+                    let prev = ix.checked_sub(1).map(|p| &commits[p]);
+                    // A quiet heading where the day bucket changes ("Today",
+                    // "This week", ...) replaces the time on every row.
+                    let bucket = time_bucket(&commit.relative_time);
+                    let heading = (prev.map(|p| time_bucket(&p.relative_time)) != Some(bucket))
+                        .then(|| commit_bucket_heading(bucket, cx).into_any_element());
+                    // The author is noise when it is the same person all the
+                    // way down; show it only where it changes.
+                    let show_author = prev.is_none_or(|p| p.author != commit.author);
                     // Where the remote branch sits: between the last unpushed
                     // commit and the first pushed one.
                     let divider =
@@ -2848,8 +3257,8 @@ impl DartIde {
                                 self.render_git_upstream_divider(status, cx)
                                     .into_any_element()
                             });
-                    divider.into_iter().chain(std::iter::once(
-                        self.render_git_commit_row(ix, last, commit, has_upstream, cx)
+                    heading.into_iter().chain(divider).chain(std::iter::once(
+                        self.render_git_commit_row(ix, last, commit, has_upstream, show_author, cx)
                             .into_any_element(),
                     ))
                 }))
@@ -2951,6 +3360,7 @@ impl DartIde {
         last: bool,
         commit: &CommitInfo,
         has_upstream: bool,
+        show_author: bool,
         cx: &mut Context<Self>,
     ) -> Div {
         let muted = cx.theme().muted_foreground;
@@ -2971,10 +3381,9 @@ impl DartIde {
         } else {
             muted.opacity(0.8)
         };
-        let sep = || div().text_color(muted.opacity(0.45)).child("\u{b7}");
         // Where the rail line runs within this row: from the dot down for
         // the newest commit, up to the dot for the oldest.
-        const DOT_Y: f32 = 11.;
+        const DOT_Y: f32 = 8.;
         let first = ix == 0;
 
         v_flex()
@@ -3026,7 +3435,7 @@ impl DartIde {
                             v_flex()
                                 .flex_1()
                                 .min_w(px(0.))
-                                .py(px(5.))
+                                .py(px(4.))
                                 .gap(px(1.))
                                 .child(
                                     h_flex()
@@ -3043,18 +3452,27 @@ impl DartIde {
                                                     .child(kind.to_string()),
                                             )
                                         })
+                                        .when_some(subject.ticket, |row, ticket| {
+                                            row.child(
+                                                div()
+                                                    .flex_shrink_0()
+                                                    .font_family(cx.theme().mono_font_family.clone())
+                                                    .text_size(px(tokens::UI_XS - 0.5))
+                                                    .text_color(muted)
+                                                    .child(ticket.to_string()),
+                                            )
+                                        })
                                         .child(
                                             div()
+                                                .flex_1()
                                                 .min_w(px(0.))
                                                 .truncate()
                                                 .text_size(px(tokens::UI_SM))
-                                                .text_color(if subject.is_merge {
-                                                    muted
-                                                } else {
-                                                    fg
-                                                })
+                                                .text_color(if subject.is_merge { muted } else { fg })
                                                 .child(subject.text.to_string()),
                                         )
+                                        // HEAD wears its badge; every other row ends in its
+                                        // hash, right-aligned so the hashes form a column.
                                         .when(first, |row| {
                                             let tint = if unpushed {
                                                 cx.theme().primary
@@ -3068,93 +3486,68 @@ impl DartIde {
                                                     .rounded(px(tokens::RADIUS_SM))
                                                     .border_1()
                                                     .border_color(tint.opacity(0.45))
-                                                    .font_family(
-                                                        cx.theme().mono_font_family.clone(),
-                                                    )
+                                                    .font_family(cx.theme().mono_font_family.clone())
                                                     .text_size(px(tokens::UI_XS - 1.5))
                                                     .text_color(tint)
                                                     // The hover actions take its place.
-                                                    .group_hover("git-head-row", |s| {
-                                                        s.invisible()
-                                                    })
+                                                    .group_hover("git-head-row", |s| s.invisible())
                                                     .child("HEAD"),
+                                            )
+                                        })
+                                        .when(!first, |row| {
+                                            let copy_hash = commit.hash.clone();
+                                            let when = commit.relative_time.clone();
+                                            row.child(
+                                                div()
+                                                    .id(("git-copy-sha", ix))
+                                                    .flex_shrink_0()
+                                                    .font_family(cx.theme().mono_font_family.clone())
+                                                    .text_size(px(tokens::UI_XS - 0.5))
+                                                    .text_color(if unpushed {
+                                                        cx.theme().primary
+                                                    } else {
+                                                        muted.opacity(0.7)
+                                                    })
+                                                    .hover(move |s| s.text_color(fg))
+                                                    .child(commit.hash.clone())
+                                                    .tooltip(move |window, cx| {
+                                                        let text = if unpushed {
+                                                            format!("{when} \u{b7} not pushed yet \u{b7} click to copy")
+                                                        } else {
+                                                            format!("{when} \u{b7} click to copy")
+                                                        };
+                                                        gpui_kit::component::tooltip::Tooltip::new(text)
+                                                            .build(window, cx)
+                                                    })
+                                                    .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                                                        cx.stop_propagation();
+                                                    })
+                                                    .on_click(cx.listener(move |this, _e, _w, cx| {
+                                                        cx.stop_propagation();
+                                                        cx.write_to_clipboard(ClipboardItem::new_string(
+                                                            copy_hash.clone(),
+                                                        ));
+                                                        this.set_git_notice(
+                                                            format!("Copied commit {copy_hash}"),
+                                                            false,
+                                                            cx,
+                                                        );
+                                                    })),
                                             )
                                         }),
                                 )
-                                .child(
-                                    h_flex()
-                                        .min_w(px(0.))
-                                        .items_center()
-                                        .gap(px(5.))
-                                        .text_size(px(tokens::UI_XS))
-                                        .text_color(muted)
-                                        .when_some(subject.ticket, |row, ticket| {
-                                            row.child(
-                                                div()
-                                                    .flex_shrink_0()
-                                                    .font_family(
-                                                        cx.theme().mono_font_family.clone(),
-                                                    )
-                                                    .text_size(px(tokens::UI_XS - 0.5))
-                                                    .child(ticket.to_string()),
-                                            )
-                                            .child(sep())
-                                        })
-                                        .child(
-                                            div()
-                                                .min_w(px(0.))
-                                                .truncate()
-                                                .child(commit.author.clone()),
-                                        )
-                                        .child(sep())
-                                        .child(
-                                            div()
-                                                .flex_shrink_0()
-                                                .child(commit.relative_time.clone()),
-                                        )
-                                        .child(sep())
-                                        .child({
-                                            let copy_hash = commit.hash.clone();
-                                            div()
-                                                .id(("git-copy-sha", ix))
-                                                .flex_shrink_0()
-                                                .font_family(cx.theme().mono_font_family.clone())
-                                                .text_size(px(tokens::UI_XS - 0.5))
-                                                .text_color(if unpushed {
-                                                    cx.theme().primary
-                                                } else {
-                                                    muted
-                                                })
-                                                .hover(move |s| s.text_color(fg))
-                                                .child(commit.hash.clone())
-                                                .tooltip(move |window, cx| {
-                                                    gpui_kit::component::tooltip::Tooltip::new(
-                                                        if unpushed {
-                                                            "Not pushed yet \u{b7} click to copy"
-                                                        } else {
-                                                            "Click to copy"
-                                                        },
-                                                    )
-                                                    .build(window, cx)
-                                                })
-                                                .on_mouse_down(MouseButton::Left, |_, _, cx| {
-                                                    cx.stop_propagation();
-                                                })
-                                                .on_click(cx.listener(move |this, _e, _w, cx| {
-                                                    cx.stop_propagation();
-                                                    cx.write_to_clipboard(
-                                                        ClipboardItem::new_string(
-                                                            copy_hash.clone(),
-                                                        ),
-                                                    );
-                                                    this.set_git_notice(
-                                                        format!("Copied commit {copy_hash}"),
-                                                        false,
-                                                        cx,
-                                                    );
-                                                }))
-                                        }),
-                                ),
+                                .when(show_author, |col| {
+                                    col.child(
+                                        h_flex()
+                                            .min_w(px(0.))
+                                            .items_center()
+                                            .gap(px(5.))
+                                            .text_size(px(tokens::UI_XS))
+                                            .text_color(muted)
+                                            .child(author_avatar(&commit.author))
+                                            .child(div().min_w(px(0.)).truncate().child(commit.author.clone())),
+                                    )
+                                }),
                         )
                         // HEAD carries the actions that rewrite it. They float
                         // over the row on hover instead of permanently taking
@@ -3182,7 +3575,12 @@ impl DartIde {
                         })
                         .on_click(cx.listener(move |this, _e, _w, cx| {
                             this.git_toggle_commit(hash.clone(), cx);
-                        })),
+                        }))
+                        .context_menu({
+                            let view = cx.entity();
+                            let commit = commit.clone();
+                            move |menu, _window, _cx| git_commit_context_menu(menu, view.clone(), &commit, expanded)
+                        }),
                 ),
             )
             .when(expanded, |el| {

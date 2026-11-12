@@ -156,18 +156,54 @@ impl DartIde {
                     .when_some(
                         self.git_branch.clone().filter(|_| self.has_workspace),
                         |el, branch| {
+                            // The one place the branch is shown outside the Git
+                            // panel: click it to switch, with ahead/behind beside it.
+                            let (ahead, behind) = self
+                                .git
+                                .status
+                                .as_ref()
+                                .map_or((0, 0), |s| (s.ahead, s.behind));
                             el.child(
                                 h_flex()
+                                    .id("titlebar-branch")
                                     .items_center()
                                     .gap_1()
+                                    .px(px(tokens::SPACE_2))
+                                    .rounded(px(tokens::RADIUS_PILL))
                                     .text_size(px(tokens::UI_SM))
                                     .text_color(muted)
+                                    .hover(move |s| s.text_color(fg).bg(rgba(0xffffff0c)))
                                     .child(
                                         Icon::new(gpui_kit::assets::IconName::GitBranch)
-                                            .small()
-                                            .text_color(muted),
+                                            .small(),
                                     )
-                                    .child(branch),
+                                    .child(branch)
+                                    .when(ahead > 0, |el| {
+                                        el.child(
+                                            div()
+                                                .text_color(cx.theme().primary)
+                                                .child(format!("\u{2191}{ahead}")),
+                                        )
+                                    })
+                                    .when(behind > 0, |el| {
+                                        el.child(
+                                            div()
+                                                .text_color(cx.theme().warning)
+                                                .child(format!("\u{2193}{behind}")),
+                                        )
+                                    })
+                                    .tooltip(|window, cx| {
+                                        gpui_kit::component::tooltip::Tooltip::new("Switch branch")
+                                            .build(window, cx)
+                                    })
+                                    .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                                        cx.stop_propagation();
+                                    })
+                                    .on_click(cx.listener(|this, _e, window, cx| {
+                                        cx.stop_propagation();
+                                        this.set_sidebar_tab(crate::git_panel::SidebarTab::Git, cx);
+                                        this.git_open_branch_switcher(window, cx);
+                                    })),
                             )
                         },
                     )
@@ -491,6 +527,17 @@ impl DartIde {
                                     )
                                     .on_click(cx.listener(|this, _event, window, cx| {
                                         this.start_dap_debug(window, cx);
+                                    })),
+                                )
+                                .child(
+                                    icon_button(
+                                        "flutter-panel",
+                                        gpui_kit::assets::IconName::LayoutDashboard,
+                                        Some(if self.flutter_panel.open { cx.theme().primary } else { muted }),
+                                        "Flutter panel: devices, SDK and tools (\u{2318}\u{21e7}D)",
+                                    )
+                                    .on_click(cx.listener(|this, _event, window, cx| {
+                                        this.toggle_flutter_panel(window, cx);
                                     })),
                                 )
                                 .into_any_element()

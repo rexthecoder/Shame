@@ -91,6 +91,9 @@ struct SharedLspInner {
     ready_at: Option<std::time::Instant>,
     /// Dart's `$/analyzerStatus`: `Some(false)` once the first analysis is done.
     analyzing: Option<bool>,
+    /// The server process ended (or never really started: a missing binary
+    /// behind a rustup proxy exits at once).
+    exited: bool,
     pending_opens: Vec<DidOpenTextDocumentParams>,
     subscribers: Vec<async_channel::Sender<ServerMessage>>,
     latest_diagnostics: HashMap<String, Vec<Diagnostic>>,
@@ -278,6 +281,7 @@ fn shared_lsp_server(
             ready: false,
             ready_at: None,
             analyzing: None,
+            exited: false,
             pending_opens: Vec::new(),
             subscribers: Vec::new(),
             latest_diagnostics: HashMap::new(),
@@ -372,6 +376,7 @@ fn shared_lsp_server(
                 }
             }
         }
+        server_bg.inner.lock().unwrap_or_else(|e| e.into_inner()).exited = true;
     });
 
     pool.lock()
@@ -391,6 +396,46 @@ fn rename_params(renames: &[(PathBuf, PathBuf)]) -> serde_json::Value {
             .map(|(old, new)| serde_json::json!({ "oldUri": file_uri(old), "newUri": file_uri(new) }))
             .collect::<Vec<_>>(),
     })
+}
+
+/// What the language servers are doing, for the status bar.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LspActivity {
+    /// No server running (no file of a served language is open).
+    Idle,
+    /// A server is starting up (`initialize` not answered yet).
+    Starting,
+    /// A server is indexing or re-analysing the project.
+    Analyzing,
+    /// Every running server is up and idle.
+    Ready,
+    /// A server was started but its process ended, and none is running.
+    Failed,
+}
+
+/// The busiest state across all running language servers.
+pub fn lsp_activity() -> LspActivity {
+    let pool = server_pool().lock().unwrap_or_else(|e| e.into_inner());
+    let mut out = LspActivity::Idle;
+    for server in pool.values() {
+        let inner = server.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let state = if inner.exited {
+            LspActivity::Failed
+        } else if !inner.ready {
+            LspActivity::Starting
+        } else if inner.analyzing == Some(true) {
+            LspActivity::Analyzing
+        } else {
+            LspActivity::Ready
+        };
+        out = match (out, state) {
+            (LspActivity::Starting, _) | (_, LspActivity::Starting) => LspActivity::Starting,
+            (LspActivity::Analyzing, _) | (_, LspActivity::Analyzing) => LspActivity::Analyzing,
+            (LspActivity::Ready, _) | (_, LspActivity::Ready) => LspActivity::Ready,
+            _ => LspActivity::Failed,
+        };
+    }
+    out
 }
 
 /// The language servers that care about these paths: every running one
@@ -583,6 +628,9 @@ pub(crate) struct LspState {
     peek_definition: bool,
     pending_format_id: Option<i64>,
     pending_rename_id: Option<i64>,
+    /// An in-flight `textDocument/prepareRename`: request id, the LSP position it
+    /// asked about, and the identifier under the cursor to fall back to.
+    pending_prepare_rename: Option<(i64, u32, u32, String)>,
     pending_code_action_id: Option<i64>,
     /// What the in-flight `textDocument/codeAction` was for.
     code_action_request: Option<CodeActionRequest>,
@@ -702,6 +750,7 @@ impl EditorView {
             peek_definition: false,
             pending_format_id: None,
             pending_rename_id: None,
+            pending_prepare_rename: None,
             pending_code_action_id: None,
             code_action_request: None,
             pending_completion_id: None,
@@ -822,6 +871,12 @@ impl EditorView {
         self.hover_result.as_ref().map(|(line, text)| (*line, text.as_str()))
     }
 
+    /// Whether a language server is up and answering for this buffer (the
+    /// right-click menu greys out symbol commands without one).
+    pub(crate) fn lsp_ready(&self) -> bool {
+        self.lsp.as_ref().is_some_and(|lsp| lsp.ready)
+    }
+
     /// Ask `app` to collect a new name for the symbol at the cursor (see
     /// the module docs at the top of `lib.rs` for why the prompt itself
     /// isn't here). No-op if there's no ready LSP server for this buffer.
@@ -832,7 +887,24 @@ impl EditorView {
         }
         let head = self.buffer.selections().primary().head;
         let (line, column) = self.buffer.lsp_position(head);
-        cx.emit(EditorEvent::RequestRename { line, column });
+        let line_start = self.buffer.line_to_byte(self.buffer.byte_to_line(head));
+        let line_text = self.buffer.line(line as usize);
+        let current_name =
+            Self::word_at(&line_text, head - line_start).unwrap_or_default().to_string();
+        // Ask the server first (as VS Code does): it knows whether this is a
+        // renamable symbol and what exactly the name is. A server without
+        // prepareRename answers with an error and we use the word instead.
+        let Some(lsp) = &mut self.lsp else {
+            return;
+        };
+        let params = TextDocumentPositionParams {
+            text_document: TextDocumentIdentifier { uri: lsp.uri.clone() },
+            position: Position { line, character: column },
+        };
+        match lsp.client.request("textDocument/prepareRename", serde_json::to_value(params).unwrap_or_default()) {
+            Ok(id) => lsp.pending_prepare_rename = Some((id, line, column, current_name)),
+            Err(_) => cx.emit(EditorEvent::RequestRename { line, column, current_name }),
+        }
     }
 
     /// Send `textDocument/rename` for `(line, column)` with `new_name`.
@@ -1614,6 +1686,31 @@ impl EditorView {
                 // pending save still has to happen, exactly once.
                 if save_after {
                     self.finish_save(cx);
+                }
+            }
+            ServerMessage::Response { id, result }
+                if lsp.pending_prepare_rename.as_ref().is_some_and(|p| p.0 == id) =>
+            {
+                let Some((_, line, column, word)) = lsp.pending_prepare_rename.take() else {
+                    return;
+                };
+                use lsp_types::PrepareRenameResponse as Prepared;
+                let name = match result {
+                    Err(_) => Some(word),
+                    Ok(value) => match serde_json::from_value::<Option<Prepared>>(value) {
+                        Ok(None) => None,
+                        Ok(Some(Prepared::Range(r))) => {
+                            let start = self.buffer.offset_from_lsp(r.start.line, r.start.character);
+                            let end = self.buffer.offset_from_lsp(r.end.line, r.end.character);
+                            Some(self.buffer.slice(start..end))
+                        }
+                        Ok(Some(Prepared::RangeWithPlaceholder { placeholder, .. })) => Some(placeholder),
+                        Ok(Some(Prepared::DefaultBehavior { .. })) | Err(_) => Some(word),
+                    },
+                };
+                match name {
+                    Some(current_name) => cx.emit(EditorEvent::RequestRename { line, column, current_name }),
+                    None => cx.emit(EditorEvent::RenameUnavailable),
                 }
             }
             ServerMessage::Response { id, result } if lsp.pending_rename_id == Some(id) => {

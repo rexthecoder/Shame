@@ -79,6 +79,58 @@ pub fn parse_selected_widget(response: &Value) -> Option<WidgetLocation> {
     })
 }
 
+/// One node of the app's widget tree, as the inspector's summary tree
+/// reports it (only widgets the project created, plus the framework widgets
+/// directly needed to connect them).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WidgetNode {
+    /// `Text`, `Column`, `MyHomePage`, ...
+    pub name: String,
+    /// Where it is created in source, when known.
+    pub location: Option<(PathBuf, u32, u32)>,
+    pub local: bool,
+    pub children: Vec<WidgetNode>,
+}
+
+impl WidgetNode {
+    fn from_value(node: &Value) -> Option<Self> {
+        let name = node
+            .get("widgetRuntimeType")
+            .or_else(|| node.get("description"))
+            .and_then(Value::as_str)?
+            .to_string();
+        let location = node.get("creationLocation").and_then(|loc| {
+            Some((
+                file_uri_to_path(loc.get("file")?.as_str()?)?,
+                loc.get("line")?.as_u64()? as u32,
+                loc.get("column").and_then(Value::as_u64).unwrap_or(1) as u32,
+            ))
+        });
+        let children = node
+            .get("children")
+            .and_then(Value::as_array)
+            .map(|c| c.iter().filter_map(WidgetNode::from_value).collect())
+            .unwrap_or_default();
+        Some(WidgetNode {
+            name,
+            location,
+            local: node.get("createdByLocalProject").and_then(Value::as_bool).unwrap_or(false),
+            children,
+        })
+    }
+
+    /// How many nodes are in this subtree, itself included.
+    pub fn count(&self) -> usize {
+        1 + self.children.iter().map(WidgetNode::count).sum::<usize>()
+    }
+}
+
+/// The root of the widget tree, from the daemon's reply to
+/// `getRootWidgetSummaryTree`.
+pub fn parse_widget_tree(response: &Value) -> Option<WidgetNode> {
+    WidgetNode::from_value(response.get("result")?)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -86,6 +138,26 @@ mod tests {
     /// The daemon's real reply (trimmed) after tapping `const Text('Hello from the demo')` in a
     /// freshly created app: a `Text` at lib/main.dart:28:19, created by the local project.
     const REAL_REPLY: &str = r#"{"result": {"description": "Text", "type": "_ElementDiagnosticableTreeNode", "style": "dense", "hasChildren": true, "allowWrap": false, "valueId": "inspector-0", "locationId": 0, "creationLocation": {"file": "file:///private/tmp/inspect_demo/lib/main.dart", "line": 28, "column": 19, "name": "Text"}, "createdByLocalProject": true, "children": [{"description": "RichText", "creationLocation": {"file": "file:///Users/me/fvm/versions/3.47.2/packages/flutter/lib/src/widgets/text.dart", "line": 780, "column": 16, "name": "RichText"}}], "widgetRuntimeType": "Text", "stateful": false}, "type": "_extensionType", "method": "ext.flutter.inspector.getSelectedSummaryWidget"}"#;
+
+    #[test]
+    fn reads_the_widget_tree() {
+        let reply: Value = serde_json::from_str(
+            r#"{"result": {"description": "[root]", "children": [
+                {"description": "MyApp", "widgetRuntimeType": "MyApp", "createdByLocalProject": true,
+                 "creationLocation": {"file": "file:///p/lib/main.dart", "line": 10, "column": 7},
+                 "children": [{"description": "Text", "children": []}]}
+            ]}}"#,
+        )
+        .unwrap();
+        let root = parse_widget_tree(&reply).unwrap();
+        assert_eq!(root.name, "[root]");
+        assert_eq!(root.count(), 3);
+        let app = &root.children[0];
+        assert_eq!(app.name, "MyApp");
+        assert!(app.local);
+        assert_eq!(app.location, Some((PathBuf::from("/p/lib/main.dart"), 10, 7)));
+        assert!(parse_widget_tree(&serde_json::json!({"result": null})).is_none());
+    }
 
     #[test]
     fn reads_the_location_of_the_selected_widget() {

@@ -727,10 +727,28 @@ impl DartIde {
         const MAX_RENDERED_DOCK_LINES: usize = 350;
 
         let body_element = if problems_active {
-            let rows: Vec<AnyElement> = all_problems
-                .into_iter()
-                .enumerate()
-                .map(|(ix, (path, diag))| {
+            // One header per file (its name, folder and counts), then its
+            // problems: errors before warnings, each in line order.
+            let mut by_file: Vec<(std::path::PathBuf, Vec<core_lsp::lsp_types::Diagnostic>)> = Vec::new();
+            for (path, diag) in all_problems {
+                match by_file.iter_mut().find(|(p, _)| *p == path) {
+                    Some((_, list)) => list.push(diag),
+                    None => by_file.push((path, vec![diag])),
+                }
+            }
+            let is_error = |d: &core_lsp::lsp_types::Diagnostic| {
+                d.severity == Some(core_lsp::lsp_types::DiagnosticSeverity::ERROR)
+            };
+            for (_, list) in &mut by_file {
+                list.sort_by_key(|d| (!is_error(d), d.range.start.line, d.range.start.character));
+            }
+            // Files with errors first.
+            by_file.sort_by_key(|(_, list)| !list.iter().any(is_error));
+            let root = self.root.clone();
+            let problem_row = |ix: usize,
+                               path: std::path::PathBuf,
+                               diag: core_lsp::lsp_types::Diagnostic|
+             -> AnyElement {
                     let is_err = diag.severity
                         == Some(core_lsp::lsp_types::DiagnosticSeverity::ERROR);
                     let sev_color = if is_err { red } else { yellow };
@@ -739,11 +757,6 @@ impl DartIde {
                     } else {
                         gpui_kit::assets::IconName::TriangleAlert
                     };
-                    let file_name = path
-                        .file_name()
-                        .and_then(|n| n.to_str())
-                        .unwrap_or("")
-                        .to_string();
                     let line_0 = diag.range.start.line;
                     let col_0 = diag.range.start.character;
                     let msg = diag
@@ -759,7 +772,8 @@ impl DartIde {
                         .id(("problem-row", ix))
                         .w_full()
                         .h(px(26.))
-                        .px(px(tokens::SPACE_4))
+                        .pl(px(tokens::SPACE_7))
+                        .pr(px(tokens::SPACE_4))
                         .items_center()
                         .justify_between()
                         .gap(px(tokens::SPACE_3))
@@ -787,7 +801,6 @@ impl DartIde {
                                 .gap(px(tokens::SPACE_2))
                                 .font_family("SF Mono")
                                 .text_size(px(tokens::UI_XS))
-                                .child(div().text_color(muted).child(file_name))
                                 .child(
                                     div()
                                         .text_color(primary)
@@ -805,8 +818,53 @@ impl DartIde {
                             });
                         })
                         .into_any_element()
-                })
-                .collect();
+            };
+            let mut rows: Vec<AnyElement> = Vec::new();
+            let mut ix = 0usize;
+            for (fix, (path, diags)) in by_file.into_iter().enumerate() {
+                let errs = diags.iter().filter(|d| is_error(d)).count();
+                let warns = diags.len() - errs;
+                let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("").to_string();
+                let dir = path
+                    .parent()
+                    .map(|p| p.strip_prefix(&root).unwrap_or(p).to_string_lossy().to_string())
+                    .unwrap_or_default();
+                rows.push(
+                    h_flex()
+                        .w_full()
+                        .h(px(24.))
+                        .mt(px(if fix == 0 { 0. } else { tokens::SPACE_2 }))
+                        .px(px(tokens::SPACE_4))
+                        .items_center()
+                        .gap(px(tokens::SPACE_2))
+                        .child(crate::rails::files::render_file_icon(&name))
+                        .child(div().text_size(px(tokens::UI_SM)).text_color(fg).child(name))
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w(px(0.))
+                                .truncate()
+                                .text_size(px(tokens::UI_XS))
+                                .text_color(muted)
+                                .child(dir),
+                        )
+                        .when(errs > 0, |el| {
+                            el.child(div().text_size(px(tokens::UI_XS)).text_color(red).child(format!("{errs} error{}", if errs == 1 { "" } else { "s" })))
+                        })
+                        .when(warns > 0, |el| {
+                            el.child(div().text_size(px(tokens::UI_XS)).text_color(yellow).child(format!("{warns} warning{}", if warns == 1 { "" } else { "s" })))
+                        })
+                        .into_any_element(),
+                );
+                for diag in diags {
+                    let path = path.clone();
+                    rows.push({
+                        let row_ix = ix;
+                        ix += 1;
+                        problem_row(row_ix, path, diag)
+                    });
+                }
+            }
 
             v_flex()
                 .id("problems-scrollback")

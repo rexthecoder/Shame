@@ -706,7 +706,7 @@ impl DartIde {
                 )
                 .child(
                     div()
-                        .min_w(px(34.))
+                        .min_w(px(52.))
                         .text_center()
                         .font_family(cx.theme().mono_font_family.clone())
                         .text_size(px(tokens::UI_XS))
@@ -898,9 +898,9 @@ impl DartIde {
                             .child(stepper(
                                 "diff-change-nav",
                                 if change_count == 0 {
-                                    "\u{2013}".to_string()
+                                    "No changes".to_string()
                                 } else {
-                                    format!("{}/{}", state.current_change + 1, change_count)
+                                    format!("Change {}/{}", state.current_change + 1, change_count)
                                 },
                                 "change",
                                 change_count > 1,
@@ -911,7 +911,7 @@ impl DartIde {
                             .child(stepper(
                                 "diff-file-nav",
                                 file_pos.map_or("\u{2013}".to_string(), |i| {
-                                    format!("{}/{}", i + 1, files.len())
+                                    format!("File {}/{}", i + 1, files.len())
                                 }),
                                 "file",
                                 files.len() > 1,
@@ -982,7 +982,11 @@ impl DartIde {
                             .when(!is_commit_diff && !ai_pending, |el| {
                                 let stage_button = Button::new("diff-stage")
                                     .small()
-                                    .label(if staged { "Unstage" } else { "Stage" })
+                                    .icon(
+                                        Icon::new(if staged { IconName::Minus } else { IconName::Plus })
+                                            .with_size(px(12.)),
+                                    )
+                                    .label(if staged { "Unstage file" } else { "Stage file" })
                                     .on_click(cx.listener(move |this, _event, window, cx| {
                                         if staged {
                                             this.git_unstage(
@@ -999,9 +1003,9 @@ impl DartIde {
                                         }
                                     }));
                                 el.child(if staged {
-                                    stage_button
+                                    stage_button.ghost()
                                 } else {
-                                    stage_button.primary()
+                                    stage_button.custom(crate::rails::git::accent_tint(cx))
                                 })
                             }),
                     ),
@@ -1396,6 +1400,7 @@ fn render_diff_item(
             let left_ratio = state.split_ratio;
             let right_ratio = 1.0 - left_ratio;
             h_flex()
+                .group("diff-row")
                 .w_full()
                 .h(px(ROW_H))
                 .child(diff_half(
@@ -1422,8 +1427,11 @@ fn render_diff_item(
     }
 }
 
-/// "Stage hunk" / "Revert" (or "Unstage hunk") chips at the right edge of a block's first row.
-/// Revert asks twice: the first click arms it (`armed` names the armed action), the second runs it.
+/// A small floating toolbar on a block's first row: stage (or unstage),
+/// revert, and accept for agent edits. It stays out of the code: it shows
+/// for the hunk you navigated to, and for any other hunk while its first row
+/// is hovered. Revert asks twice: the first click arms it (`armed` names the
+/// armed action) and widens the button to say so; the second runs it.
 fn hunk_chips(
     state: &DiffState,
     block: usize,
@@ -1432,95 +1440,76 @@ fn hunk_chips(
     cx: &mut Context<DartIde>,
 ) -> Div {
     let revert_armed = armed == Some(format!("hunk:{}:{block}", state.file.path).as_str());
-    let chip = |id: &'static str,
-                label: &'static str,
-                danger: bool,
-                positive: bool,
+    let current = state.current_change == block;
+    let (muted, green, red, border, popover) = {
+        let t = cx.theme();
+        (t.muted_foreground, t.green, t.red, t.border, t.popover)
+    };
+    let tool = |id: &'static str,
+                icon: IconName,
+                tint: Hsla,
+                tip: &'static str,
                 action: HunkAction,
                 cx: &mut Context<DartIde>| {
-        let theme = cx.theme();
-        let (red, green, fg, border, bg, muted, font) = (
-            theme.red,
-            theme.green,
-            theme.foreground,
-            theme.border,
-            theme.background,
-            theme.muted_foreground,
-            theme.font_family.clone(),
-        );
-        let (chip_border, chip_bg) = if danger {
-            (red.opacity(0.5), red.opacity(0.18))
-        } else if positive {
-            (green.opacity(0.5), green.opacity(0.18))
-        } else {
-            (border, bg)
-        };
-        let chip_text = if danger { red } else if positive { green } else { muted };
-        div()
-            .id((id, block))
-            .px(px(7.))
-            .h(px(18.))
-            .flex()
-            .items_center()
-            .rounded(px(4.))
-            .border_1()
-            .border_color(chip_border)
-            .bg(chip_bg)
-            .cursor_pointer()
-            .text_size(px(tokens::UI_XS))
-            .font_family(font)
-            .text_color(chip_text)
-            .hover(move |s| s.text_color(fg))
-            .child(label)
+        Button::new((id, block))
+            .ghost()
+            .xsmall()
+            .icon(Icon::new(icon).with_size(px(12.)).text_color(tint))
+            .tooltip(tip)
             .on_click(cx.listener(move |this, _e, window, cx| {
                 this.diff_hunk_action(action, block, window, cx)
             }))
     };
     h_flex()
         .absolute()
-        .top(px(2.))
-        .right(px(16.))
-        .gap(px(4.))
+        .top(px(1.))
+        .right(px(14.))
+        .h(px(ROW_H - 2.))
+        .px(px(2.))
+        .gap(px(1.))
+        .items_center()
+        .rounded(px(tokens::RADIUS_SM))
+        .border_1()
+        .border_color(border)
+        .bg(popover)
+        .shadow_sm()
+        .when(!current && !revert_armed, |el| {
+            el.invisible().group_hover("diff-row", |s| s.visible())
+        })
+        .child(
+            div()
+                .px(px(tokens::SPACE_2))
+                .text_size(px(tokens::UI_XS))
+                .text_color(muted)
+                .child(format!("{} / {}", block + 1, state.blocks.len())),
+        )
         .when(state.staged, |el| {
-            el.child(chip(
-                "hunk-unstage",
-                "Unstage hunk",
-                false,
-                false,
-                HunkAction::Unstage,
-                cx,
-            ))
+            el.child(tool("hunk-unstage", IconName::Minus, muted, "Unstage this change", HunkAction::Unstage, cx))
         })
         .when(!state.staged, |el| {
-            // AI-touched diffs get an "Accept hunk" chip that keeps the agent's
-            // edit (staging it) instead of leaving it pending for review.
             let mut row = el;
             if accept {
-                row = row.child(chip(
+                row = row.child(tool(
                     "hunk-accept",
-                    "Accept hunk",
-                    false,
-                    true,
+                    IconName::Check,
+                    green,
+                    "Accept the agent's change",
                     HunkAction::Accept,
                     cx,
                 ));
             }
-            row.child(chip(
-                "hunk-stage",
-                "Stage hunk",
-                false,
-                false,
-                HunkAction::Stage,
-                cx,
-            ))
-            .child(chip(
-                "hunk-revert",
-                if revert_armed { "Revert?" } else { "Revert" },
-                revert_armed,
-                false,
-                HunkAction::Revert,
-                cx,
-            ))
+            row = row.child(tool("hunk-stage", IconName::Plus, green, "Stage this change", HunkAction::Stage, cx));
+            row.child(if revert_armed {
+                Button::new(("hunk-revert", block))
+                    .xsmall()
+                    .danger()
+                    .label("Revert?")
+                    .on_click(cx.listener(move |this, _e, window, cx| {
+                        this.diff_hunk_action(HunkAction::Revert, block, window, cx)
+                    }))
+            } else {
+                tool("hunk-revert", IconName::Undo2, red.opacity(0.85), "Revert this change", HunkAction::Revert, cx)
+            })
         })
 }
 
@@ -1691,6 +1680,7 @@ fn diff_unified_row(
     };
     let styles = merge_styles(text.len(), &spans, &marks, mark_bg);
     h_flex()
+        .group("diff-row")
         .relative()
         .w_full()
         .h(px(ROW_H))

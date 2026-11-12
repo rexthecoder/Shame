@@ -35,7 +35,7 @@ pub use message::{apply_commit_type, commit_type_of, commit_types, suggest_messa
 pub use repo::{
     BranchInfo, ChangeKind, ChangedFile, CommitInfo, RepoStatus, StashEntry, branches, checkout,
     commit, commit_files, create_branch, delete_branch, discard, discard_files, fetch, init,
-    last_commit_message, pull, push, recent_commits, repo_root, repo_status, stage, stage_all,
+    last_commit_message, pull, push, push_force_with_lease, revert_commit, recent_commits, repo_root, repo_status, stage, stage_all,
     stash_apply, stash_drop, stash_pop, stash_save, stashes, uncommit_last, unstage, unstage_all,
 };
 pub use history::{Snapshot, list_snapshots, record_snapshot};

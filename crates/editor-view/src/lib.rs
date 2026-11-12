@@ -40,13 +40,15 @@ use core_buffer::{Buffer, Selection};
 use core_lsp::lsp_types;
 use core_syntax::{Highlight, HighlightKind, InputEdit, SyntaxTree, point_at};
 use core_workspace::LineChange;
+use gpui_kit::component::menu::{ContextMenuExt as _, PopupMenu, PopupMenuItem};
 use gpui_kit::component::{ActiveTheme as _, Sizable as _, h_flex, v_flex};
 use gpui_kit::*;
 use gpui_kit::prelude::FluentBuilder as _;
 use language::{LanguageAdapter, language_for_path};
 pub use conflicts::ConflictChoice;
 pub use lsp_integration::{
-    CompletionEntry, CompletionKindBadge, did_rename_files, will_rename_files, workspace_edit_files,
+    CompletionEntry, CompletionKindBadge, LspActivity, did_rename_files, lsp_activity,
+    will_rename_files, workspace_edit_files,
 };
 pub use core_buffer::DiskState;
 use lsp_integration::LspState;
@@ -105,7 +107,11 @@ pub struct TestCodeLensTemplate {
 pub enum EditorEvent {
     OpenAt { path: PathBuf, line: u32, column: u32 },
     /// LSP position (UTF-16 column) of the symbol to rename; pass it back to `send_rename`.
-    RequestRename { line: u32, column: u32 },
+    /// `current_name` is the identifier under the cursor, so the prompt can open
+    /// prefilled and selected the way VS Code's does (empty if there is none).
+    RequestRename { line: u32, column: u32, current_name: String },
+    /// The server says the symbol under the cursor can't be renamed.
+    RenameUnavailable,
     /// A set of locations to peek at (references, or a definition's targets).
     ShowPeek { title: String, locations: Vec<lsp_types::Location> },
     ExternalFileEdits { path: PathBuf, edits: Vec<lsp_types::TextEdit> },
@@ -2995,12 +3001,13 @@ impl EditorView {
                 let down_hitbox = hitbox.clone();
                 window.on_mouse_event(move |event: &MouseDownEvent, phase, window, cx| {
                     if phase != DispatchPhase::Bubble
-                        || event.button != MouseButton::Left
+                        || !matches!(event.button, MouseButton::Left | MouseButton::Right)
                         || !frame_bounds.contains(&event.position)
                         || !down_hitbox.is_hovered(window)
                     {
                         return;
                     }
+                    let is_right_click = event.button == MouseButton::Right;
                     let rel_x = (event.position.x - bounds.origin.x).max(px(0.));
                     let column = down_inlays.column_for_x(
                         rel_x,
@@ -3013,7 +3020,21 @@ impl EditorView {
                         window.focus(&this.focus_handle, cx);
                         this.clear_hover(cx);
                         this.dismiss_completions(cx);
-                        if go_to_definition {
+                        if is_right_click {
+                            // As in VS Code: right-clicking outside the selection
+                            // moves the cursor there, so the menu acts on what was
+                            // clicked; inside the selection it leaves it alone.
+                            let offset = line_start + column;
+                            let inside = this
+                                .buffer
+                                .selections()
+                                .as_slice()
+                                .iter()
+                                .any(|s| !s.is_empty() && s.range().contains(&offset));
+                            if !inside {
+                                this.set_cursor(offset, cx);
+                            }
+                        } else if go_to_definition {
                             this.request_definition(index, column);
                         } else if click_count >= 3 {
                             this.select_line(index, cx);
@@ -4803,6 +4824,10 @@ impl Render for EditorView {
         .w(px(1.))
         .h(px(1.));
 
+        let menu_view = cx.entity();
+        let menu_lsp_ready = self.lsp_ready();
+        let menu_has_selection = !primary.is_empty();
+
         div()
             .id("editor-view")
             .key_context("Editor")
@@ -4913,5 +4938,48 @@ impl Render for EditorView {
                         ),
                 )
             })
+            .context_menu(move |menu, _window, _cx| {
+                editor_context_menu(menu, menu_view.clone(), menu_lsp_ready, menu_has_selection)
+            })
     }
+}
+
+/// Right-click menu in the text area, in the order VS Code's editor menu
+/// uses. Each entry runs the same command as its keyboard shortcut.
+fn editor_context_menu(
+    menu: PopupMenu,
+    view: Entity<EditorView>,
+    lsp_ready: bool,
+    has_selection: bool,
+) -> PopupMenu {
+    let run = |view: Entity<EditorView>, command: &'static str| {
+        move |_: &ClickEvent, _: &mut Window, cx: &mut App| {
+            view.update(cx, |this, cx| {
+                this.run_editor_command(command, cx);
+            });
+        }
+    };
+    menu.item(PopupMenuItem::new("Go to Definition").disabled(!lsp_ready).on_click({
+        let view = view.clone();
+        move |_, _, cx| {
+            view.update(cx, |this, _cx| {
+                let head = this.buffer.selections().primary().head;
+                let line = this.buffer.byte_to_line(head);
+                this.request_definition(line, head - this.buffer.line_to_byte(line));
+            });
+        }
+    }))
+    .item(PopupMenuItem::new("Peek Definition").disabled(!lsp_ready).on_click(run(view.clone(), "peek-definition")))
+    .item(PopupMenuItem::new("Find All References").disabled(!lsp_ready).on_click(run(view.clone(), "find-references")))
+    .separator()
+    .item(PopupMenuItem::new("Rename Symbol").disabled(!lsp_ready).on_click(run(view.clone(), "rename")))
+    .item(PopupMenuItem::new("Refactor\u{2026}").disabled(!lsp_ready).on_click(run(view.clone(), "refactor")))
+    .item(PopupMenuItem::new("Quick Fix\u{2026}").disabled(!lsp_ready).on_click(run(view.clone(), "code-actions")))
+    .item(PopupMenuItem::new("Format Document").disabled(!lsp_ready).on_click(run(view.clone(), "format-doc")))
+    .separator()
+    .item(PopupMenuItem::new("Cut").disabled(!has_selection).on_click(run(view.clone(), "cut")))
+    .item(PopupMenuItem::new("Copy").disabled(!has_selection).on_click(run(view.clone(), "copy")))
+    .item(PopupMenuItem::new("Paste").on_click(run(view.clone(), "paste")))
+    .separator()
+    .item(PopupMenuItem::new("Select All").on_click(run(view, "select-all")))
 }

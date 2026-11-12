@@ -1,0 +1,46 @@
+{
+  "shame": [
+    {
+      "ready_s": 23.054451542004244,
+      "ready_app_s": 1.8412649999954738,
+      "cpu_s": 15.329999999999998,
+      "cpu_app_s": 1.9,
+      "cpu_dart_s": 11.069999999999999,
+      "idle_cpu_pct": 4.651051308611107,
+      "footprint_mb": 804.8603515625,
+      "footprint_app_mb": 114.0,
+      "footprint_dart_mb": 687.0,
+      "peak_rss_mb": 907.875,
+      "quit_s": 0.1931444579968229,
+      "killed_on_quit": 0.0
+    },
+    {
+      "ready_s": 22.870658375002677,
+      "ready_app_s": 1.114416041993536,
+      "cpu_s": 15.65,
+      "cpu_app_s": 1.9,
+      "cpu_dart_s": 11.58,
+      "idle_cpu_pct": 2.6768854289311226,
+      "footprint_mb": 806.8134765625,
+      "footprint_app_mb": 113.0,
+      "footprint_dart_mb": 690.0,
+      "peak_rss_mb": 798.5625,
+      "quit_s": 0.1978196249983739,
+      "killed_on_quit": 0.0
+    },
+    {
+      "ready_s": 29.44422679200943,
+      "ready_app_s": 1.7282922500016866,
+      "cpu_s": 19.52,
+      "cpu_app_s": 2.3,
+      "cpu_dart_s": 14.06,
+      "idle_cpu_pct": 2.838253974104984,
+      "footprint_mb": 791.9228515625,
+      "footprint_app_mb": 115.0,
+      "footprint_dart_mb": 673.0,
+      "peak_rss_mb": 732.84375,
+      "quit_s": 0.31991745899722446,
+      "killed_on_quit": 0.0
+    }
+  ]
+}

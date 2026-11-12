@@ -78,10 +78,19 @@ pub(crate) struct GitState {
     pub(crate) branches_open: bool,
     pub(crate) branch_selected: usize,
     pub(crate) amend: bool,
+    /// Push as soon as the commit in flight lands ("Commit & Push").
+    pub(crate) push_after_commit: bool,
     pub(crate) staged_collapsed: bool,
     pub(crate) changes_collapsed: bool,
     pub(crate) stashes_collapsed: bool,
     pub(crate) commits_collapsed: bool,
+    /// Changed files grouped under their folders instead of one flat list.
+    pub(crate) group_by_folder: bool,
+    /// Branch and dirty state of each recent project, for the welcome screen.
+    pub(crate) recent_info: std::collections::HashMap<std::path::PathBuf, (Option<String>, bool)>,
+    pub(crate) recent_info_requested: bool,
+    /// A repaint is scheduled while a language server is busy.
+    pub(crate) lsp_poll: bool,
     /// Hash of the commit currently expanded in the Recent Commits list, if any.
     pub(crate) expanded_commit: Option<String>,
     pub(crate) expanded_commit_files: Vec<ChangedFile>,
@@ -118,10 +127,15 @@ impl GitState {
             branches_open: false,
             branch_selected: 0,
             amend: false,
+            push_after_commit: false,
             staged_collapsed: false,
             changes_collapsed: false,
             stashes_collapsed: false,
             commits_collapsed: false,
+            group_by_folder: false,
+            recent_info: std::collections::HashMap::new(),
+            recent_info_requested: false,
+            lsp_poll: false,
             expanded_commit: None,
             expanded_commit_files: Vec::new(),
             unified_diff: false,
@@ -356,8 +370,14 @@ impl DartIde {
                             this.git.commit_types = None;
                         }
                         this.set_git_notice(text, false, cx);
+                        if clear_message && std::mem::take(&mut this.git.push_after_commit) {
+                            this.git_push_now(window, cx);
+                        }
                     }
-                    Err(text) => this.set_git_notice(text, true, cx),
+                    Err(text) => {
+                        this.git.push_after_commit = false;
+                        this.set_git_notice(text, true, cx)
+                    }
                     Ok(_) => {}
                 }
                 this.refresh_git(cx);
@@ -733,6 +753,28 @@ impl DartIde {
     pub(crate) fn git_pull(&mut self, window: &Window, cx: &mut Context<Self>) {
         self.git_run(window, Some("Pulling…"), false, cx, |root, _| {
             core_workspace::pull(root)
+        });
+    }
+
+    /// Commit (as the main button would), then push once it lands.
+    pub(crate) fn git_commit_and_push(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.git.push_after_commit = true;
+        self.git_primary_action(window, cx);
+        // Nothing was started (no message, nothing to commit): don't push later by surprise.
+        if self.git.busy.is_none() && self.pending_git.is_none() {
+            self.git.push_after_commit = false;
+        }
+    }
+
+    pub(crate) fn git_force_push(&mut self, window: &Window, cx: &mut Context<Self>) {
+        self.git_run(window, Some("Force-pushing\u{2026}"), false, cx, |root, status| {
+            core_workspace::push_force_with_lease(root, status)
+        });
+    }
+
+    pub(crate) fn git_revert_commit(&mut self, hash: String, window: &Window, cx: &mut Context<Self>) {
+        self.git_run(window, Some("Reverting\u{2026}"), false, cx, move |root, _| {
+            core_workspace::revert_commit(root, &hash)
         });
     }
 

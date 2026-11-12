@@ -66,6 +66,7 @@ pub const DEFAULT_BINDINGS: &[(&str, &str)] = &[
     ("cmd-shift-m", "toggle-problems"),
     ("cmd-shift-g", "open-git"),
     ("cmd-shift-v", "markdown-cycle-view"),
+    ("cmd-shift-d", "flutter-panel"),
     // Reviewing a diff
     ("alt-down", "diff-next-change"),
     ("alt-up", "diff-prev-change"),

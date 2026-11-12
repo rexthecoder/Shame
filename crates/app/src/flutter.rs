@@ -429,6 +429,9 @@ impl DartIde {
                 self.finish_inspect(result.clone(), window, cx);
                 return;
             }
+            if self.handle_panel_response(*id, result, window, cx) {
+                return;
+            }
         }
         match output {
             core_flutter::DaemonOutput::Event { event, params } => match event.as_str() {
@@ -479,6 +482,8 @@ impl DartIde {
                     }
                 }
                 "app.stop" => {
+                    self.flutter_panel.tree = None;
+                    self.flutter_panel.devtools_base = None;
                     self.sim.inspect = false;
                     self.sim.inspected = None;
                     self.flutter_app_id = None;

@@ -577,6 +577,26 @@ pub fn push(root: &Path, status: &RepoStatus) -> Result<String, String> {
     Ok(format!("Pushed to {destination}"))
 }
 
+/// Push the current branch over a rewritten remote history, but only if the
+/// remote still points where we last saw it (`--force-with-lease`), so
+/// someone else's newer commits are never thrown away.
+pub fn push_force_with_lease(root: &Path, status: &RepoStatus) -> Result<String, String> {
+    if status.branch.is_none() {
+        return Err("HEAD is detached; switch to a branch to push".to_string());
+    }
+    let Some(upstream) = &status.upstream else {
+        return Err("This branch isn't published yet; use Push first".to_string());
+    };
+    git(root, &["push", "--force-with-lease"], None)?;
+    Ok(format!("Force-pushed to {upstream} (with lease)"))
+}
+
+/// Make a new commit that undoes `hash`.
+pub fn revert_commit(root: &Path, hash: &str) -> Result<String, String> {
+    git(root, &["revert", "--no-edit", hash], None)?;
+    git(root, &["log", "-1", "--format=%h %s"], None).map(|s| format!("Reverted: {}", s.trim()))
+}
+
 /// Local branches (most recently committed first), followed by remote branches (`origin/...`)
 /// that do not yet have a local tracking branch of the same name.
 pub fn branches(root: &Path) -> Vec<BranchInfo> {

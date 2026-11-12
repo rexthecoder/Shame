@@ -90,6 +90,39 @@ fn common_dir(files: &[ChangedFile]) -> Option<String> {
 }
 
 /// A conventional type that plainly fits every file (docs, tests, chores), else `None`.
+/// The part of the repo a path belongs to: the package or crate under a
+/// container folder (`crates/app/...` → `app`, `packages/auth/...` → `auth`,
+/// `lib/features/login/...` → `login`), else the top folder, else the file.
+fn area_of(path: &str) -> String {
+    let parts: Vec<&str> = path.split('/').collect();
+    let containers = ["crates", "packages", "apps", "modules", "plugins", "features"];
+    for (i, part) in parts.iter().enumerate() {
+        if containers.contains(part) && i + 2 < parts.len() {
+            return parts[i + 1].to_string();
+        }
+    }
+    match parts.as_slice() {
+        [file] => file.to_string(),
+        ["lib" | "src" | "test", second, _, ..] => second.to_string(),
+        [first, ..] => first.to_string(),
+        [] => String::new(),
+    }
+}
+
+/// The distinct areas touched, the most-changed first.
+fn areas(files: &[ChangedFile]) -> Vec<String> {
+    let mut counts: Vec<(String, usize)> = Vec::new();
+    for f in files {
+        let area = area_of(&f.path);
+        match counts.iter_mut().find(|(a, _)| *a == area) {
+            Some((_, n)) => *n += 1,
+            None => counts.push((area, 1)),
+        }
+    }
+    counts.sort_by(|a, b| b.1.cmp(&a.1));
+    counts.into_iter().map(|(a, _)| a).collect()
+}
+
 fn guess_type(files: &[ChangedFile]) -> Option<&'static str> {
     let all = |pred: fn(&str) -> bool| files.iter().all(|f| pred(&f.path));
     if all(|p| p.ends_with(".md") || p.starts_with("docs/")) {
@@ -143,7 +176,14 @@ pub fn suggest_message(files: &[ChangedFile], types: &[String]) -> Option<String
         };
         match common_dir(files) {
             Some(dir) => format!("{verb} {dir} ({} files)", files.len()),
-            None => format!("{verb} {} files", files.len()),
+            // Spread across the repo: name the areas touched, most first, so
+            // the subject says *what* changed rather than only how much.
+            None => match areas(files).as_slice() {
+                [] | [_] => format!("{verb} {} files", files.len()),
+                [a, b] => format!("{verb} {a} and {b}"),
+                [a, b, c] => format!("{verb} {a}, {b} and {c}"),
+                [a, b, rest @ ..] => format!("{verb} {a}, {b} and {} more", rest.len()),
+            },
         }
     };
     if types.is_empty() {
@@ -241,7 +281,28 @@ mod tests {
             file("y/b", ChangeKind::Added),
             file("c", ChangeKind::Added),
         ];
-        assert_eq!(suggest_message(&added, &[]).unwrap(), "Add 3 files");
+        assert_eq!(suggest_message(&added, &[]).unwrap(), "Add x, y and c");
+    }
+
+    #[test]
+    fn changes_across_the_repo_name_the_areas_touched() {
+        let spread = [
+            file("crates/app/src/main.rs", ChangeKind::Modified),
+            file("crates/app/src/git.rs", ChangeKind::Modified),
+            file("crates/editor-view/src/lib.rs", ChangeKind::Modified),
+            file("docs/benchmarks.md", ChangeKind::Modified),
+        ];
+        assert_eq!(suggest_message(&spread, &[]).unwrap(), "Update app, editor-view and docs");
+        let many = [
+            file("crates/app/a.rs", ChangeKind::Modified),
+            file("crates/core/b.rs", ChangeKind::Modified),
+            file("docs/c.md", ChangeKind::Modified),
+            file("perf/d.py", ChangeKind::Modified),
+        ];
+        assert_eq!(suggest_message(&many, &[]).unwrap(), "Update app, core and 2 more");
+        assert_eq!(area_of("lib/features/login/page.dart"), "login");
+        assert_eq!(area_of("lib/main.dart"), "lib");
+        assert_eq!(area_of("README.md"), "README.md");
     }
 
     #[test]

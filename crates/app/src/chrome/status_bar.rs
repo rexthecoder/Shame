@@ -4,7 +4,6 @@ use gpui_kit::component::{ActiveTheme as _, Icon, IconName, Sizable as _, h_flex
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
-use crate::git_panel::SidebarTab;
 use crate::{DartIde, tokens};
 
 /// `lib › src › pane_controller.dart` — relative to the project root, matching
@@ -151,16 +150,42 @@ impl DartIde {
             .try_global::<editor_view::keymap::Keymap>()
             .map(|k| k.errors.clone())
             .unwrap_or_default();
-        let branch = self.git.status.as_ref().map(|status| {
-            let name = status
-                .branch
-                .clone()
-                .or_else(|| status.head.as_ref().map(|h| format!("detached @ {h}")))
-                .unwrap_or_else(|| "no commits".to_string());
-            (name, status.ahead, status.behind)
-        });
         let muted = cx.theme().muted_foreground;
         let view = cx.entity();
+        // Language servers: say when they are starting or indexing (a big
+        // Flutter project takes ~20 s), and keep repainting until they settle,
+        // since the server's status changes arrive without a UI event.
+        let lsp = editor_view::lsp_activity();
+        let lsp_busy = matches!(lsp, editor_view::LspActivity::Starting | editor_view::LspActivity::Analyzing);
+        if lsp_busy && !self.git.lsp_poll {
+            cx.defer({
+                let view = view.clone();
+                move |cx| {
+                    view.update(cx, |this, cx| {
+                        if this.git.lsp_poll {
+                            return;
+                        }
+                        this.git.lsp_poll = true;
+                        cx.spawn(async move |weak, cx| {
+                            cx.background_executor().timer(std::time::Duration::from_millis(500)).await;
+                            let _ = weak.update(cx, |this, cx| {
+                                this.git.lsp_poll = false;
+                                cx.notify();
+                            });
+                        })
+                        .detach();
+                    })
+                }
+            });
+        }
+        let lsp_item = match lsp {
+            editor_view::LspActivity::Idle => None,
+            editor_view::LspActivity::Starting => Some(("Starting language server\u{2026}", cx.theme().warning)),
+            editor_view::LspActivity::Analyzing => Some(("Analyzing\u{2026}", cx.theme().warning)),
+            editor_view::LspActivity::Ready => Some(("Language server", cx.theme().green)),
+            editor_view::LspActivity::Failed => Some(("Language server stopped", cx.theme().danger)),
+        };
+        let lsp_failed = lsp == editor_view::LspActivity::Failed;
 
         let device = self.selected_device.as_ref().map(|d| d.name.clone());
         let pills = running_pills(&RunFacts {
@@ -249,24 +274,6 @@ impl DartIde {
                     .min_w(px(0.))
                     .gap(px(tokens::SPACE_2))
                     .items_center()
-                    .when_some(branch, |el, (name, ahead, behind)| {
-                        let view = view.clone();
-                        el.child(
-                            status_item("status-branch", cx)
-                                .child(
-                                    Icon::new(gpui_kit::assets::IconName::GitBranch)
-                                        .with_size(px(13.)),
-                                )
-                                .child(name)
-                                .when(behind > 0, |el| el.child(format!("\u{2193}{behind}")))
-                                .when(ahead > 0, |el| el.child(format!("\u{2191}{ahead}")))
-                                .on_click(move |_e, _w, cx| {
-                                    view.update(cx, |this, cx| {
-                                        this.set_sidebar_tab(SidebarTab::Git, cx)
-                                    });
-                                }),
-                        )
-                    })
                     .child(problems)
                     .child(running)
                     .when(!segments.is_empty(), |el| el.child(breadcrumb)),
@@ -292,6 +299,33 @@ impl DartIde {
                                     view.update(cx, |this, cx| {
                                         this.execute_ide_command("open-keymap", window, cx)
                                     });
+                                }),
+                        )
+                    })
+                    .when_some(lsp_item, |el, (text, tone)| {
+                        el.child(
+                            h_flex()
+                                .id("status-lsp")
+                                .px(px(7.))
+                                .gap(px(5.))
+                                .items_center()
+                                .child(div().size(px(6.)).rounded(px(3.)).bg(tone))
+                                .when(lsp_busy || lsp_failed, |el| el.text_color(cx.theme().foreground).child(text))
+                                .tooltip(move |window, cx| {
+                                    gpui_kit::component::tooltip::Tooltip::new(if lsp_failed {
+                                        "The language server exited. Settings lists what is installed."
+                                    } else if lsp_busy {
+                                        text
+                                    } else {
+                                        "Language server ready"
+                                    })
+                                    .build(window, cx)
+                                })
+                                .when(lsp_failed, |el| {
+                                    let view = view.clone();
+                                    el.cursor_pointer().on_click(move |_e, _w, cx| {
+                                        view.update(cx, |this, cx| this.toggle_settings(cx));
+                                    })
                                 }),
                         )
                     })

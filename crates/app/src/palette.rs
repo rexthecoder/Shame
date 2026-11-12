@@ -654,6 +654,7 @@ impl DartIde {
             "open-folder" => self.open_folder(window, cx),
             "close-folder" => self.request_close_workspace(cx),
             "open-settings" => self.toggle_settings(cx),
+            "flutter-panel" => self.toggle_flutter_panel(window, cx),
             "about-shame" => {
                 self.about_open = true;
             }

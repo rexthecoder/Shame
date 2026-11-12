@@ -86,7 +86,34 @@ whole index, ranked): 0.5 ms for an empty query and under 2 ms for a path
 query, on both projects. The first grep after a scan pays for warming the
 content cache (roughly a disk-walk's cost); every later query runs against it.
 
+## Startup, memory and quit (black box)
+
+`perf/bench.py` launches the real app on a project and measures it from the
+outside (macOS, standard library only). Quit Shame first; it refuses to run
+if an instance is open.
+
+```bash
+python3 perf/bench.py --project ~/path/to/app            # 3 runs + a discarded warm-up
+python3 perf/bench.py --project ~/p --app zed=/Applications/Zed.app/Contents/MacOS/zed
+```
+
+"Ready" is the first moment the process tree's CPU stays under 0.1 core for
+3 s. Shame's own process is tracked apart from the Dart tooling it spawns
+(`dart`/`flutter` processes), because the analyzer's indexing would otherwise
+be counted as editor work. Memory is macOS's physical footprint.
+
+| `luna` (1,912 `.dart` files, M3 Pro), median of 3 | Shame only | Dart tooling | Total |
+|---|---:|---:|---:|
+| Ready (CPU settled) | 1.7 s | n/a | 23.1 s |
+| CPU time until ready | 1.9 s | 11.6 s | 15.7 s |
+| Memory footprint | 114 MB | 687 MB | 805 MB |
+
+Idle CPU is about 3% of one core and quit takes about 0.2 s. The total is
+what a Flutter user waits for; the first column is the editor's own cost.
+The window-appears time is not measured (it needs Screen Recording
+permission).
+
 ## Not measured yet
 
-Startup time to first paint, keystroke-to-paint latency, scroll frame time,
-and idle RAM need an instrumented GPUI run, not a headless harness.
+Keystroke-to-paint latency and scroll frame time need an instrumented GPUI
+run, not a headless harness.
