@@ -488,6 +488,7 @@ impl DartIde {
             "python-pytest" => self.run_pytest(None, None, cx),
             "python-pytest-file" => self.run_pytest_in_active_file(cx),
             "python-ai-panel" => self.toggle_ai_panel(cx),
+            "run-command" => self.open_run_command(window, cx),
             "hot-reload" => self.trigger_hot_reload(cx),
             "hot-restart" => self.trigger_hot_restart(cx),
             "pub-get" => self.run_pub_get(cx),

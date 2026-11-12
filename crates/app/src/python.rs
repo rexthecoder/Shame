@@ -59,6 +59,7 @@ impl DartIde {
             args,
             cwd: root.to_path_buf(),
             env: Vec::new(),
+            display: None,
         };
         self.start_run(spec, cx);
     }

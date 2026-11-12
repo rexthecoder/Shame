@@ -12,7 +12,7 @@ use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use gpui_kit::component::{ActiveTheme as _, h_flex, v_flex};
+use gpui_kit::component::{ActiveTheme as _, Sizable as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
@@ -52,11 +52,47 @@ pub(crate) struct RunSpec {
     pub(crate) args: Vec<String>,
     pub(crate) cwd: PathBuf,
     pub(crate) env: Vec<(String, String)>,
+    /// What to show as the command, when it isn't `program args` (a typed
+    /// shell command runs through the login shell).
+    pub(crate) display: Option<String>,
 }
 
 impl RunSpec {
+    /// A command line typed by the user, run by their login shell in
+    /// `cwd` with the project's Python environment first on `PATH`, so
+    /// `python`, `pip` and the env's scripts are the project's.
+    pub(crate) fn shell(command: &str, cwd: PathBuf, env: Option<&editor_view::python::PythonEnv>) -> Self {
+        let shell = std::env::var("SHELL").ok().filter(|s| !s.is_empty()).unwrap_or_else(|| "/bin/zsh".into());
+        // After the login profile, which may rewrite PATH.
+        let mut script = String::new();
+        if let Some(bin) = env.and_then(|e| e.bin_dir()) {
+            let bin = crate::python::sh_quote(&bin.to_string_lossy());
+            script.push_str(&format!("export PATH={bin}:\"$PATH\"; "));
+            if let Some(venv) = bin_parent_venv(env) {
+                script.push_str(&format!("export VIRTUAL_ENV={}; ", crate::python::sh_quote(&venv)));
+            }
+        }
+        script.push_str(command);
+        let title: String = {
+            let words: Vec<&str> = command.split_whitespace().take(4).collect();
+            let t = words.join(" ");
+            if t.chars().count() > 40 { format!("{}…", t.chars().take(39).collect::<String>()) } else { t }
+        };
+        RunSpec {
+            title,
+            program: PathBuf::from(shell),
+            args: vec!["-lc".into(), script],
+            cwd,
+            env: Vec::new(),
+            display: Some(command.to_string()),
+        }
+    }
+
     /// The command as a shell line, for display and for the agent.
     pub(crate) fn command_line(&self) -> String {
+        if let Some(display) = &self.display {
+            return display.clone();
+        }
         let mut s = crate::python::sh_quote(&self.program.to_string_lossy());
         for a in &self.args {
             s.push(' ');
@@ -64,6 +100,15 @@ impl RunSpec {
         }
         s
     }
+}
+
+/// The venv folder of a virtual-environment interpreter (not conda/system).
+fn bin_parent_venv(env: Option<&editor_view::python::PythonEnv>) -> Option<String> {
+    use editor_view::python::PythonEnvKind;
+    let env = env?;
+    matches!(env.kind, PythonEnvKind::Venv | PythonEnvKind::Uv | PythonEnvKind::Active)
+        .then(|| env.python.parent()?.parent().map(|p| p.to_string_lossy().into_owned()))
+        .flatten()
 }
 
 pub(crate) struct RunSession {
@@ -123,6 +168,9 @@ pub(crate) struct RunStore {
     scroll: UniformListScrollHandle,
     /// Keep the output scrolled to its end while it streams.
     follow: bool,
+    /// The "Run a command" field, made on first use.
+    command_input: Option<Entity<gpui_kit::component::input::InputState>>,
+    _command_sub: Option<Subscription>,
 }
 
 impl RunStore {
@@ -352,6 +400,41 @@ impl DartIde {
         cx.notify();
     }
 
+    /// Show the Runs tab with the command field focused.
+    pub(crate) fn open_run_command(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        use gpui_kit::component::input::{InputEvent, InputState};
+        if self.runs.command_input.is_none() {
+            let input = cx.new(|cx| {
+                InputState::new(window, cx).placeholder("Run a command in the project, e.g. python -m my_tool run")
+            });
+            let sub = cx.subscribe_in(&input, window, |this, input, ev: &InputEvent, window, cx| {
+                if matches!(ev, InputEvent::PressEnter { .. }) {
+                    let command = input.read(cx).value().trim().to_string();
+                    if !command.is_empty() {
+                        input.update(cx, |s, cx| s.set_value("", window, cx));
+                        this.run_shell_command(&command, cx);
+                    }
+                }
+            });
+            self.runs.command_input = Some(input);
+            self.runs._command_sub = Some(sub);
+        }
+        if let Some(input) = &self.runs.command_input {
+            input.update(cx, |s, cx| s.focus(window, cx));
+        }
+        self.terminal_open = true;
+        self.dock_tab = DockTab::Runs;
+        cx.notify();
+    }
+
+    /// Run a typed command as a session (see [`RunSpec::shell`]).
+    pub(crate) fn run_shell_command(&mut self, command: &str, cx: &mut Context<Self>) {
+        self.save_dirty_python_buffers(cx);
+        let env = editor_view::python::detect_env(Some(&self.root));
+        let spec = RunSpec::shell(command, self.root.clone(), env.as_ref());
+        self.start_run(spec, cx);
+    }
+
     fn stop_run(&mut self, id: u64, cx: &mut Context<Self>) {
         let Some(s) = self.runs.get_mut(id) else { return };
         if let Some(child) = &s.child {
@@ -419,8 +502,53 @@ impl DartIde {
         let (green, red, primary) = (cx.theme().green, cx.theme().red, cx.theme().primary);
         let mono = cx.theme().mono_font_family.clone();
 
+        let command_bar = match &self.runs.command_input {
+            Some(input) => h_flex()
+                .h(px(tokens::PANEL_BAR_H))
+                .flex_none()
+                .px(px(tokens::SPACE_3))
+                .gap(px(tokens::SPACE_2))
+                .items_center()
+                .border_b_1()
+                .border_color(border)
+                .child(div().text_size(px(tokens::UI_SM)).text_color(muted).font_family(mono.clone()).child("$"))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w(px(0.))
+                        .font_family(mono.clone())
+                        .child(gpui_kit::component::input::Input::new(input).appearance(false).small()),
+                )
+                .into_any_element(),
+            None => h_flex()
+                .id("runs-command-open")
+                .h(px(tokens::PANEL_BAR_H))
+                .flex_none()
+                .px(px(tokens::SPACE_5))
+                .gap(px(tokens::SPACE_3))
+                .items_center()
+                .border_b_1()
+                .border_color(border)
+                .cursor_pointer()
+                .text_size(px(tokens::UI_SM))
+                .text_color(muted)
+                .hover(move |s| s.bg(hover))
+                .child(gpui_kit::component::Icon::new(gpui_kit::assets::IconName::SquareTerminal).xsmall())
+                .child("Run a command…")
+                .on_click(cx.listener(|this, _, window, cx| this.open_run_command(window, cx)))
+                .into_any_element(),
+        };
+
         if self.runs.sessions.is_empty() {
-            return v_flex()
+            return h_flex().flex_1().w_full().min_h(px(0.)).child(
+                v_flex()
+                    .w(px(LIST_W * 2.))
+                    .flex_none()
+                    .h_full()
+                    .border_r_1()
+                    .border_color(border)
+                    .child(command_bar),
+            ).child(v_flex()
                 .flex_1()
                 .w_full()
                 .items_center()
@@ -431,8 +559,8 @@ impl DartIde {
                     div()
                         .text_size(px(tokens::UI_XS))
                         .text_color(muted)
-                        .child("Run a Python file or pytest from the command palette; each run stays here."),
-                );
+                        .child("Type a command on the left, or run a Python file or pytest; each run stays here."),
+                ));
         }
 
         let status_dot = |status: &RunStatus| {
@@ -445,14 +573,11 @@ impl DartIde {
             div().size(px(tokens::SPACE_3)).flex_none().rounded(px(tokens::RADIUS_PILL)).bg(color)
         };
 
-        let list = v_flex()
+        let list_rows = v_flex()
             .id("runs-list")
-            .w(px(LIST_W))
-            .flex_none()
-            .h_full()
+            .flex_1()
+            .min_h(px(0.))
             .overflow_y_scroll()
-            .border_r_1()
-            .border_color(border)
             .py(px(tokens::SPACE_2))
             .children(self.runs.sessions.iter().rev().map(|s| {
                 let id = s.id;
@@ -489,6 +614,14 @@ impl DartIde {
                         cx.notify();
                     }))
             }));
+        let list = v_flex()
+            .w(px(LIST_W))
+            .flex_none()
+            .h_full()
+            .border_r_1()
+            .border_color(border)
+            .child(command_bar)
+            .child(list_rows);
 
         let Some(session) = self.runs.selected() else {
             return h_flex().flex_1().w_full().min_h(px(0.)).child(list);
@@ -614,7 +747,30 @@ fn fmt_duration(d: Duration) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{clean_output, fmt_duration};
+    use super::{RunSpec, clean_output, fmt_duration};
+
+    /// A typed `python` resolves to the project's venv, through the login
+    /// shell, from the project folder.
+    #[test]
+    fn typed_commands_use_the_project_env() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = std::env::temp_dir().join(format!("shame-run-{}", std::process::id()));
+        let bin = root.join(".venv/bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::write(root.join(".venv/pyvenv.cfg"), "").unwrap();
+        let fake = bin.join("python");
+        std::fs::write(&fake, "#!/bin/sh\necho \"venv-python $VIRTUAL_ENV $*\"\n").unwrap();
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let env = editor_view::python::detect_env(Some(&root));
+        let spec = RunSpec::shell("python -m slm_harness run --tasks tree2graph && pwd", root.clone(), env.as_ref());
+        assert_eq!(spec.title, "python -m slm_harness run");
+        assert_eq!(spec.command_line(), "python -m slm_harness run --tasks tree2graph && pwd");
+        let out = std::process::Command::new(&spec.program).args(&spec.args).current_dir(&spec.cwd).output().unwrap();
+        let text = String::from_utf8_lossy(&out.stdout);
+        let venv = root.join(".venv");
+        assert!(text.contains(&format!("venv-python {} -m slm_harness run --tasks tree2graph", venv.display())), "{text}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
     use std::time::Duration;
 
     #[test]

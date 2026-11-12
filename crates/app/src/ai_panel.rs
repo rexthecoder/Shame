@@ -304,7 +304,7 @@ impl DartIde {
             self.show_toast("No requirements.txt, pyproject.toml or uv.lock in this project.", true, cx);
             return;
         };
-        self.start_run(RunSpec { title, program, args, cwd: self.root.clone(), env: Vec::new() }, cx);
+        self.start_run(RunSpec { title, program, args, cwd: self.root.clone(), env: Vec::new(), display: None }, cx);
     }
 
     fn ai_run_script(&mut self, script: PathBuf, cx: &mut Context<Self>) {
@@ -315,7 +315,7 @@ impl DartIde {
         self.save_dirty_python_buffers(cx);
         let rel = script.strip_prefix(&self.root).unwrap_or(&script).to_string_lossy().into_owned();
         let title = script.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| rel.clone());
-        self.start_run(RunSpec { title, program: env.python, args: vec![rel], cwd: self.root.clone(), env: Vec::new() }, cx);
+        self.start_run(RunSpec { title, program: env.python, args: vec![rel], cwd: self.root.clone(), env: Vec::new(), display: None }, cx);
     }
 
     /// Start TensorBoard as a run and show it in the web preview rail.
@@ -335,6 +335,7 @@ impl DartIde {
                 args: vec!["--logdir".into(), rel, "--host".into(), "127.0.0.1".into(), "--port".into(), port.to_string()],
                 cwd: self.root.clone(),
                 env: Vec::new(),
+                display: None,
             },
             cx,
         );

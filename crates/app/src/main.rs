@@ -335,6 +335,7 @@ const IDE_COMMANDS: &[IdeCommand] = &[
     IdeCommand { id: "python-run-file", title: "Python: Run Current File", shortcut: "", flutter_only: false },
     IdeCommand { id: "python-pytest", title: "Python: Run pytest", shortcut: "", flutter_only: false },
     IdeCommand { id: "python-pytest-file", title: "Python: Run pytest on Current File", shortcut: "", flutter_only: false },
+    IdeCommand { id: "run-command", title: "Run: Run a Command in the Project\u{2026}", shortcut: "", flutter_only: false },
     IdeCommand { id: "python-ai-panel", title: "Python: Toggle AI Panel (Environment, Models, Tools)", shortcut: "", flutter_only: false },
     IdeCommand { id: "open-git", title: "Git: Open Git Panel", shortcut: "\u{2318}\u{21e7}G", flutter_only: false },
     IdeCommand { id: "git-switch-branch", title: "Git: Switch / Create Branch\u{2026}", shortcut: "", flutter_only: false },
