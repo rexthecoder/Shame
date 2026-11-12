@@ -42,6 +42,8 @@ pub(crate) struct TestRunState {
     pub expanded: HashSet<i64>,
     /// Runner output that wasn't a test event (build errors and the like).
     pub log: Vec<String>,
+    /// Run with `--coverage`; the report is loaded when it finishes.
+    pub coverage: bool,
 }
 
 /// The nearest directory at or above `from` containing a `pubspec.yaml`.
@@ -116,7 +118,12 @@ impl DartIde {
             TestTarget::All => None,
         };
         let program = tool_binary(&package_dir, &self.root, flutter);
-        let args = core_flutter::test_args(flutter, rel_file.as_deref(), plain_name.as_deref(), name_regex.as_deref());
+        let mut args = core_flutter::test_args(flutter, rel_file.as_deref(), plain_name.as_deref(), name_regex.as_deref());
+        // `flutter test --coverage` writes coverage/lcov.info in the package.
+        let with_coverage = std::mem::take(&mut self.coverage_requested) && flutter;
+        if with_coverage {
+            args.insert(1, "--coverage".into());
+        }
 
         self.terminal_open = true;
         self.dock_tab = crate::DockTab::Tests;
@@ -130,6 +137,7 @@ impl DartIde {
             only_failures: false,
             expanded: HashSet::new(),
             log: Vec::new(),
+            coverage: with_coverage,
         });
         cx.notify();
 
@@ -192,7 +200,44 @@ impl DartIde {
         .detach();
     }
 
+    /// Run every test with coverage; the editors show it when the run ends.
+    pub(crate) fn start_coverage_run(&mut self, cx: &mut Context<Self>) {
+        self.coverage_requested = true;
+        self.start_test_run(TestTarget::All, None, None, cx);
+    }
+
+    /// Read `coverage/lcov.info` under `package_dir` and show it in every editor.
+    pub(crate) fn load_coverage(&mut self, package_dir: &std::path::Path, cx: &mut Context<Self>) {
+        let file = package_dir.join("coverage/lcov.info");
+        let Ok(text) = std::fs::read_to_string(&file) else {
+            self.show_toast("No coverage report was written (coverage/lcov.info).", true, cx);
+            return;
+        };
+        let coverage = core_flutter::parse_lcov(&text, package_dir);
+        let (hit, all) = core_flutter::coverage_totals(&coverage);
+        let pct = if all == 0 { 0.0 } else { hit as f64 * 100.0 / all as f64 };
+        cx.set_global(editor_view::Coverage(coverage));
+        self.coverage_shown = true;
+        self.refresh_editors(cx);
+        self.show_toast(format!("Coverage {pct:.1}% \u{b7} {hit} of {all} lines run by tests"), false, cx);
+    }
+
+    /// Hide the coverage bars.
+    pub(crate) fn clear_coverage(&mut self, cx: &mut Context<Self>) {
+        cx.set_global(editor_view::Coverage::default());
+        self.coverage_shown = false;
+        self.refresh_editors(cx);
+    }
+
+    fn refresh_editors(&mut self, cx: &mut Context<Self>) {
+        for tab in &self.tabs {
+            tab.editor.update(cx, |_, cx| cx.notify());
+        }
+        cx.notify();
+    }
+
     fn handle_test_event(&mut self, event: TestEvent, cx: &mut Context<Self>) {
+        let mut coverage_dir = None;
         let Some(state) = self.test_run.as_mut() else { return };
         match event {
             TestEvent::Started { pid } => state.pid = Some(pid),
@@ -211,10 +256,16 @@ impl DartIde {
             TestEvent::Finished => {
                 state.pid = None;
                 state.elapsed = Some(state.started.elapsed());
+                if state.coverage {
+                    coverage_dir = Some(state.package_dir.clone());
+                }
             }
         }
         if state.log.len() > 400 {
             state.log.drain(..state.log.len() - 400);
+        }
+        if let Some(dir) = coverage_dir {
+            self.load_coverage(&dir, cx);
         }
         self.sync_test_marks(cx);
         cx.notify();
@@ -678,5 +729,92 @@ mod tests {
         let lone = root.join("elsewhere/b_test.dart");
         assert_eq!(package_dir_for(&lone, &root), root);
         let _ = std::fs::remove_dir_all(&root);
+    }
+}
+
+/// `lib/a/b.dart` ↔ `test/a/b_test.dart`, relative to the package. `None`
+/// when the file is neither a library file nor a test.
+pub(crate) fn test_counterpart(rel: &std::path::Path) -> Option<std::path::PathBuf> {
+    let rel = rel.to_str()?;
+    if let Some(rest) = rel.strip_prefix("test/") {
+        let source = rest.strip_suffix("_test.dart")?;
+        return Some(std::path::PathBuf::from(format!("lib/{source}.dart")));
+    }
+    let rest = rel.strip_prefix("lib/")?;
+    let stem = rest.strip_suffix(".dart")?;
+    Some(std::path::PathBuf::from(format!("test/{stem}_test.dart")))
+}
+
+impl DartIde {
+    /// Jump between a Dart file and its test. A missing test is created from
+    /// a small template first, so the shortcut always lands somewhere useful.
+    pub(crate) fn go_to_test_or_source(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(path) = self
+            .active_editor()
+            .and_then(|ed| ed.read(cx).buffer().path().map(std::path::Path::to_path_buf))
+        else {
+            return;
+        };
+        let package_dir = package_dir_for(&path, &self.root);
+        let Some(rel) = path.strip_prefix(&package_dir).ok().map(std::path::Path::to_path_buf) else {
+            return;
+        };
+        let Some(target_rel) = test_counterpart(&rel) else {
+            self.show_toast("Only files under lib/ or test/ have a test counterpart.", true, cx);
+            return;
+        };
+        let target = package_dir.join(&target_rel);
+        if !target.exists() {
+            if target_rel.starts_with("lib") {
+                self.show_toast(format!("No source file at {}", target_rel.display()), true, cx);
+                return;
+            }
+            let package = std::fs::read_to_string(package_dir.join("pubspec.yaml"))
+                .ok()
+                .and_then(|t| {
+                    t.lines()
+                        .find_map(|l| l.strip_prefix("name:"))
+                        .map(|n| n.trim().to_string())
+                })
+                .unwrap_or_else(|| "app".into());
+            let flutter = std::fs::read_to_string(package_dir.join("pubspec.yaml"))
+                .map(|text| core_flutter::is_flutter_package(&text))
+                .unwrap_or(true);
+            let import_rel = rel.strip_prefix("lib").unwrap_or(&rel).to_string_lossy().trim_start_matches('/').to_string();
+            let name = rel.file_stem().and_then(|s| s.to_str()).unwrap_or("it");
+            let test_pkg = if flutter { "flutter_test/flutter_test.dart" } else { "test/test.dart" };
+            let body = format!(
+                "import 'package:{test_pkg}';\nimport 'package:{package}/{import_rel}';\n\nvoid main() {{\n  group('{name}', () {{\n    test('works', () {{\n    }});\n  }});\n}}\n"
+            );
+            if let Some(parent) = target.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            if let Err(err) = std::fs::write(&target, body) {
+                self.show_toast(format!("Couldn't create {}: {err}", target_rel.display()), true, cx);
+                return;
+            }
+            self.show_toast(format!("Created {}", target_rel.display()), false, cx);
+        }
+        self.open_path(target, window, cx);
+    }
+}
+
+#[cfg(test)]
+mod counterpart_tests {
+    use super::test_counterpart;
+    use std::path::{Path, PathBuf};
+
+    #[core::prelude::v1::test]
+    fn library_files_and_tests_point_at_each_other() {
+        assert_eq!(
+            test_counterpart(Path::new("lib/src/auth/login.dart")),
+            Some(PathBuf::from("test/src/auth/login_test.dart"))
+        );
+        assert_eq!(
+            test_counterpart(Path::new("test/src/auth/login_test.dart")),
+            Some(PathBuf::from("lib/src/auth/login.dart"))
+        );
+        assert_eq!(test_counterpart(Path::new("bin/main.dart")), None);
+        assert_eq!(test_counterpart(Path::new("test/helpers.dart")), None);
     }
 }

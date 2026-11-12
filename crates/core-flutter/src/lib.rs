@@ -25,6 +25,7 @@ mod daemon;
 mod devices;
 mod inspector;
 mod launch;
+mod coverage;
 mod pubspec;
 mod sdk;
 mod tests;
@@ -44,6 +45,7 @@ pub use launch::{
     parse_launch_json,
 };
 pub use pubspec::{PubOutput, add_package, create_project, pub_get};
+pub use coverage::{LineCoverage, coverage_totals, parse_lcov};
 pub use sdk::{FlutterSdk, detect_sdk};
 pub use tests::{
     Counts, GroupNode, SuiteNode, TestCase, TestRun, TestStatus, is_flutter_package, name_filter_regex,

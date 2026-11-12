@@ -71,6 +71,36 @@ pub(crate) enum DebugPrompt {
     Watch,
     /// A condition for the breakpoint at `(file, 1-indexed line)`.
     BreakpointCondition(PathBuf, u32),
+    /// The message a logpoint at `(file, 1-indexed line)` prints.
+    Logpoint(PathBuf, u32),
+}
+
+/// Which exceptions pause a debug session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ExceptionMode {
+    Never,
+    /// Only exceptions nothing catches: the crashes.
+    Uncaught,
+    All,
+}
+
+impl ExceptionMode {
+    /// The Dart adapter's filter ids for this mode.
+    pub(crate) fn filters(self) -> &'static [&'static str] {
+        match self {
+            ExceptionMode::Never => &[],
+            ExceptionMode::Uncaught => &["Unhandled"],
+            ExceptionMode::All => &["All"],
+        }
+    }
+
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            ExceptionMode::Never => "Not pausing on exceptions",
+            ExceptionMode::Uncaught => "Pausing on uncaught exceptions",
+            ExceptionMode::All => "Pausing on all exceptions",
+        }
+    }
 }
 
 impl DartIde {
@@ -161,6 +191,7 @@ impl DartIde {
                 );
             }
         }
+        let _ = client.set_exception_breakpoints(self.dap_exception_mode.filters());
         let _ = client.configuration_done();
 
         self.push_flutter_log(&format!(
@@ -208,6 +239,20 @@ impl DartIde {
                         .unwrap_or("breakpoint");
                     self.dap_paused_thread = Some(thread_id);
                     self.dap_stack_summary = Some(format!("Paused ({reason})"));
+                    // "Run to Cursor" was a one-off stop: take it back out.
+                    if let Some((path, _)) = self.dap_run_to.take() {
+                        self.send_breakpoints(&path);
+                    }
+                    if reason == "exception" {
+                        let text = body
+                            .get("text")
+                            .or_else(|| body.get("description"))
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("an exception")
+                            .to_string();
+                        self.dap_stack_summary = Some(format!("Paused on {text}"));
+                        self.push_flutter_log(&format!("\x1b[31m\u{25cf} Paused on {text}\x1b[0m"));
+                    }
                     if let Some(dap) = &self.dap_client {
                         if let Ok(guard) = dap.lock() {
                             let _ = guard.stack_trace(thread_id);
@@ -404,13 +449,68 @@ impl DartIde {
     /// Breakpoint list for `path` with any conditions attached.
     pub(crate) fn breakpoints_with_conditions(&self, path: &Path, lines: &[u32]) -> Vec<core_dap::Breakpoint> {
         let conditions = self.dap_conditions.get(path);
-        lines
+        let messages = self.dap_log_messages.get(path);
+        let mut out: Vec<core_dap::Breakpoint> = lines
             .iter()
             .map(|&line| core_dap::Breakpoint {
                 line,
                 condition: conditions.and_then(|c| c.get(&line)).cloned(),
+                log_message: messages.and_then(|m| m.get(&line)).cloned(),
             })
-            .collect()
+            .collect();
+        // The one-off "Run to Cursor" stop, unless a breakpoint is already there.
+        if let Some((run_path, line)) = &self.dap_run_to {
+            if run_path == path && !out.iter().any(|b| b.line == *line) {
+                out.push(core_dap::Breakpoint { line: *line, ..Default::default() });
+            }
+        }
+        out
+    }
+
+    /// Change which exceptions pause the program, live if a session runs.
+    pub(crate) fn set_exception_mode(&mut self, mode: ExceptionMode, cx: &mut Context<Self>) {
+        self.dap_exception_mode = mode;
+        if let Some(dap) = &self.dap_client {
+            if let Ok(guard) = dap.lock() {
+                let _ = guard.set_exception_breakpoints(mode.filters());
+            }
+        }
+        self.push_flutter_log(&format!("\x1b[36m{}\x1b[0m", mode.label()));
+        cx.notify();
+    }
+
+    /// Continue until the cursor's line: a one-off breakpoint there, then
+    /// resume. It is removed as soon as the program stops anywhere.
+    pub(crate) fn dap_run_to_cursor(&mut self, cx: &mut Context<Self>) {
+        if self.dap_client.is_none() || self.dap_paused_thread.is_none() {
+            self.push_flutter_log("\x1b[33mRun to Cursor needs a paused debug session.\x1b[0m");
+            cx.notify();
+            return;
+        }
+        let Some(editor) = self.active_editor().cloned() else { return };
+        let (path, line) = {
+            let ed = editor.read(cx);
+            let Some(path) = ed.buffer().path().map(|p| p.to_path_buf()) else { return };
+            (path, ed.cursor_position().0 as u32)
+        };
+        self.dap_run_to = Some((path.clone(), line));
+        self.send_breakpoints(&path);
+        self.dap_continue(cx);
+    }
+
+    /// Prompt for a logpoint message on the cursor's line (a breakpoint that
+    /// prints instead of stopping), creating the breakpoint if needed.
+    pub(crate) fn open_logpoint_prompt(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(editor) = self.active_editor().cloned() else { return };
+        let (path, line_1) = {
+            let ed = editor.read(cx);
+            let Some(path) = ed.buffer().path().map(|p| p.to_path_buf()) else { return };
+            (path, ed.cursor_position().0)
+        };
+        if !editor.read(cx).breakpoints().contains(&line_1) {
+            editor.update(cx, |ed, cx| ed.toggle_breakpoint(line_1, cx));
+        }
+        self.open_debug_prompt(DebugPrompt::Logpoint(path, line_1 as u32), window, cx);
     }
 
     /// Push `path`'s breakpoints (and conditions) to the running adapter.
@@ -441,6 +541,7 @@ impl DartIde {
         let placeholder = match &kind {
             DebugPrompt::Watch => "Expression to watch (e.g. items.length)",
             DebugPrompt::BreakpointCondition(..) => "Stop only when… (e.g. i > 2); empty clears",
+            DebugPrompt::Logpoint(..) => "Message to print, e.g. count = {count}; empty clears",
         };
         self.debug_prompt = Some(kind);
         self.debug_prompt_input.update(cx, |state, cx| {
@@ -476,6 +577,15 @@ impl DartIde {
                     self.refresh_watches();
                 }
             }
+            DebugPrompt::Logpoint(path, line) => {
+                let messages = self.dap_log_messages.entry(path.clone()).or_default();
+                if text.is_empty() {
+                    messages.remove(&line);
+                } else {
+                    messages.insert(line, text);
+                }
+                self.send_breakpoints(&path);
+            }
             DebugPrompt::BreakpointCondition(path, line) => {
                 let conditions = self.dap_conditions.entry(path.clone()).or_default();
                 if text.is_empty() {
@@ -494,6 +604,7 @@ impl DartIde {
         let title = match kind {
             DebugPrompt::Watch => "Add watch expression",
             DebugPrompt::BreakpointCondition(..) => "Breakpoint condition",
+            DebugPrompt::Logpoint(..) => "Logpoint: print instead of stopping",
         };
         Some(
             div()

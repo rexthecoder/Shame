@@ -292,6 +292,9 @@ pub(crate) struct IdeCommand {
 
 const IDE_COMMANDS: &[IdeCommand] = &[
     IdeCommand { id: "test-all", title: "Test: Run All Tests", shortcut: "", flutter_only: true },
+    IdeCommand { id: "test-coverage", title: "Test: Run All Tests with Coverage", shortcut: "", flutter_only: true },
+    IdeCommand { id: "coverage-hide", title: "Test: Hide Coverage", shortcut: "", flutter_only: true },
+    IdeCommand { id: "go-to-test", title: "Go to Test / Source File", shortcut: "\u{2318}\u{21e7}T", flutter_only: false },
     IdeCommand { id: "test-file", title: "Test: Run Tests in Current File", shortcut: "", flutter_only: true },
     IdeCommand { id: "test-rerun-failed", title: "Test: Re-run Failed Tests", shortcut: "", flutter_only: true },
     IdeCommand { id: "flutter-panel", title: "Flutter: Open Flutter Panel (Devices, SDK, Tools)", shortcut: "\u{2318}\u{21e7}D", flutter_only: true },
@@ -314,6 +317,11 @@ const IDE_COMMANDS: &[IdeCommand] = &[
     IdeCommand { id: "debug-dap", title: "Debug: Start Dart DAP Debugger", shortcut: "", flutter_only: true },
     IdeCommand { id: "debug-add-watch", title: "Debug: Add Watch Expression\u{2026}", shortcut: "", flutter_only: true },
     IdeCommand { id: "debug-clear-watches", title: "Debug: Clear Watch Expressions", shortcut: "", flutter_only: true },
+    IdeCommand { id: "debug-run-to-cursor", title: "Debug: Run to Cursor", shortcut: "", flutter_only: true },
+    IdeCommand { id: "debug-add-logpoint", title: "Debug: Add Logpoint on Current Line\u{2026}", shortcut: "", flutter_only: true },
+    IdeCommand { id: "debug-exceptions-uncaught", title: "Debug: Pause on Uncaught Exceptions", shortcut: "", flutter_only: true },
+    IdeCommand { id: "debug-exceptions-all", title: "Debug: Pause on All Exceptions", shortcut: "", flutter_only: true },
+    IdeCommand { id: "debug-exceptions-never", title: "Debug: Don't Pause on Exceptions", shortcut: "", flutter_only: true },
     IdeCommand { id: "debug-breakpoint-condition", title: "Debug: Set Breakpoint Condition on Current Line\u{2026}", shortcut: "", flutter_only: true },
     IdeCommand { id: "toggle-sim", title: "Simulator: Attach / Detach iOS Simulator", shortcut: "", flutter_only: true },
     IdeCommand { id: "open-git", title: "Git: Open Git Panel", shortcut: "\u{2318}\u{21e7}G", flutter_only: false },
@@ -323,6 +331,7 @@ const IDE_COMMANDS: &[IdeCommand] = &[
     IdeCommand { id: "git-stash", title: "Git: Stash Uncommitted Changes", shortcut: "", flutter_only: false },
     IdeCommand { id: "git-uncommit", title: "Git: Undo Last Commit (Keep Staged)", shortcut: "", flutter_only: false },
     IdeCommand { id: "diff-unified", title: "Diff: Toggle Split / Unified View", shortcut: "", flutter_only: false },
+    IdeCommand { id: "show-todos", title: "Search: Show TODO / FIXME Comments", shortcut: "", flutter_only: false },
     IdeCommand { id: "project-search", title: "Search: Find in Project", shortcut: "\u{2318}\u{21e7}F", flutter_only: false },
     IdeCommand { id: "toggle-problems", title: "View: Toggle Problems Panel", shortcut: "\u{2318}\u{21e7}M", flutter_only: false },
     IdeCommand { id: "toggle-terminal", title: "View: Toggle Terminal Dock", shortcut: "\u{2318}J", flutter_only: false },
@@ -534,6 +543,12 @@ pub struct DartIde {
     pub(crate) dap_var_pending: HashMap<i64, i64>,
     /// Conditional-breakpoint expressions, keyed by file then 1-indexed line.
     pub(crate) dap_conditions: HashMap<PathBuf, std::collections::BTreeMap<u32, String>>,
+    /// Logpoint messages, by file and 1-indexed line.
+    pub(crate) dap_log_messages: HashMap<PathBuf, std::collections::BTreeMap<u32, String>>,
+    /// Which exceptions pause a debug session.
+    pub(crate) dap_exception_mode: debug::ExceptionMode,
+    /// A one-off stop for "Run to Cursor", removed once the program stops.
+    pub(crate) dap_run_to: Option<(PathBuf, u32)>,
     pub(crate) dap_watches: Vec<String>,
     pub(crate) dap_watch_values: HashMap<String, String>,
     pub(crate) dap_frame_id: Option<i64>,
@@ -594,6 +609,10 @@ pub struct DartIde {
     pub(crate) history: Option<(Entity<EditorView>, Vec<core_workspace::Snapshot>)>,
     pub(crate) autosave: file_state::AutosaveMode,
     pub(crate) test_run: Option<test_runner::TestRunState>,
+    /// The next test run should collect coverage.
+    pub(crate) coverage_requested: bool,
+    /// Coverage bars are on in the editors.
+    pub(crate) coverage_shown: bool,
     pub(crate) save_options: editor_view::SaveOptions,
     pub(crate) editor_options: editor_view::EditorOptions,
     /// Per editor: the revision last seen and when it last changed (autosave timing).
@@ -809,6 +828,9 @@ impl DartIde {
             dap_expanded: std::collections::HashSet::new(),
             dap_var_pending: HashMap::new(),
             dap_conditions: HashMap::new(),
+            dap_log_messages: HashMap::new(),
+            dap_exception_mode: debug::ExceptionMode::Uncaught,
+            dap_run_to: None,
             dap_watches: Vec::new(),
             dap_watch_values: HashMap::new(),
             dap_frame_id: None,
@@ -855,6 +877,8 @@ impl DartIde {
             history: None,
             autosave: file_state::AutosaveMode::Off,
             test_run: None,
+            coverage_requested: false,
+            coverage_shown: false,
             save_options: editor_view::SaveOptions::default(),
             editor_options: editor_view::EditorOptions::default(),
             edit_marks: HashMap::new(),

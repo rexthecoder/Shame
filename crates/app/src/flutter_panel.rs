@@ -784,6 +784,7 @@ impl DartIde {
             tile("run-flutter", IconName::Play, "Run app", "On the selected target"),
             tile("test-all", IconName::FlaskConical, "Run all tests", "flutter test"),
             tile("test-rerun-failed", IconName::RotateCcw, "Re-run failed", "Only what failed"),
+            tile("test-coverage", IconName::Scale, "Coverage", "Tests + covered lines"),
             tile("debug-dap", IconName::Bug, "Debug", "Start the debugger"),
         ];
         let group = |label: &'static str, tiles: Vec<Stateful<Div>>| {

@@ -475,6 +475,9 @@ impl DartIde {
         }
         match id {
             "test-all" => self.start_test_run(crate::test_runner::TestTarget::All, None, None, cx),
+            "test-coverage" => self.start_coverage_run(cx),
+            "coverage-hide" => self.clear_coverage(cx),
+            "go-to-test" => self.go_to_test_or_source(window, cx),
             "test-file" => self.run_tests_in_active_file(cx),
             "test-rerun-failed" => self.rerun_failed_tests(cx),
             "run-flutter" => self.start_flutter_run(window, cx),
@@ -556,6 +559,18 @@ impl DartIde {
             "git-stash" => self.git_stash_save(window, cx),
             "git-uncommit" => self.git_uncommit_last(window, cx),
             "diff-unified" => self.toggle_diff_unified(cx),
+            "show-todos" => {
+                // TODO / FIXME / HACK / XXX comments across the project, as a
+                // regex project search (results are grouped by file there).
+                let query = r"(TODO|FIXME|HACK|XXX)".to_string();
+                self.sidebar_open = true;
+                self.set_sidebar_tab(git_panel::SidebarTab::Search, cx);
+                self.project_search_options.regex = true;
+                self.project_search_options.case_sensitive = true;
+                self.project_search_input
+                    .update(cx, |s, cx| s.set_value(query.clone(), window, cx));
+                self.run_project_search(query, cx);
+            }
             "project-search" => {
                 self.sidebar_open = true;
                 self.set_sidebar_tab(git_panel::SidebarTab::Search, cx);
@@ -600,6 +615,11 @@ impl DartIde {
                 cx.notify();
             }
             "debug-breakpoint-condition" => self.open_breakpoint_condition_prompt(window, cx),
+            "debug-add-logpoint" => self.open_logpoint_prompt(window, cx),
+            "debug-run-to-cursor" => self.dap_run_to_cursor(cx),
+            "debug-exceptions-uncaught" => self.set_exception_mode(crate::debug::ExceptionMode::Uncaught, cx),
+            "debug-exceptions-all" => self.set_exception_mode(crate::debug::ExceptionMode::All, cx),
+            "debug-exceptions-never" => self.set_exception_mode(crate::debug::ExceptionMode::Never, cx),
             "save-all" => self.save_all(cx),
             "open-keymap" => {
                 let Some(path) = editor_view::keymap::Keymap::user_path() else {

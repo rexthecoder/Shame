@@ -103,6 +103,13 @@ pub struct TestCodeLensTemplate {
     pub for_file: bool,
 }
 
+/// Test coverage for open files: hits per 1-based line, by absolute path.
+/// The app sets it after a coverage run; every editor reads its own file.
+#[derive(Default)]
+pub struct Coverage(pub std::collections::HashMap<PathBuf, std::collections::HashMap<u32, u32>>);
+
+impl Global for Coverage {}
+
 #[derive(Debug, Clone)]
 pub enum EditorEvent {
     OpenAt { path: PathBuf, line: u32, column: u32 },
@@ -2344,6 +2351,10 @@ impl EditorView {
             })
             .map(|set| set.has_quick_fix());
         let has_breakpoint = self.breakpoints.contains(&line_1);
+        // Covered (green) or missed (red) by the last coverage run.
+        let coverage_hit = self.buffer.path().and_then(|path| {
+            cx.try_global::<Coverage>()?.0.get(path)?.get(&line_1).copied()
+        });
         let is_debug_line = self.active_debug_line == Some(line_1);
         let mono_family = cx.theme().mono_font_family.clone();
         let bp_view = cx.entity();
@@ -2359,9 +2370,26 @@ impl EditorView {
                 h_flex()
                     .w(px(40.))
                     .h_full()
+                    .relative()
                     .items_center()
                     .justify_end()
                     .gap(px(3.))
+                    .when_some(coverage_hit, |el, hits| {
+                        el.child(
+                            div()
+                                .absolute()
+                                .left(px(2.))
+                                .top(px(2.))
+                                .bottom(px(2.))
+                                .w(px(3.))
+                                .rounded(px(1.5))
+                                .bg(if hits > 0 {
+                                    cx.theme().green.opacity(0.7)
+                                } else {
+                                    cx.theme().red.opacity(0.7)
+                                }),
+                        )
+                    })
                     .cursor_pointer()
                     .on_mouse_down(MouseButton::Left, move |_event, _window, cx| {
                         cx.stop_propagation();

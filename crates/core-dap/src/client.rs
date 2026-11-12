@@ -26,22 +26,28 @@ pub enum DapMessage {
     Request { seq: i64, command: String, arguments: Value },
 }
 
-/// A line breakpoint, optionally conditional.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// A line breakpoint, optionally conditional, or a logpoint (it prints
+/// `log_message` instead of stopping; `{expr}` parts are evaluated).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Breakpoint {
     pub line: u32,
     pub condition: Option<String>,
+    pub log_message: Option<String>,
 }
 
 /// The `breakpoints` array of a `setBreakpoints` request.
 pub fn breakpoints_json(breakpoints: &[Breakpoint]) -> Vec<Value> {
     breakpoints
         .iter()
-        .map(|bp| match &bp.condition {
-            Some(condition) if !condition.trim().is_empty() => {
-                serde_json::json!({"line": bp.line, "condition": condition})
+        .map(|bp| {
+            let mut entry = serde_json::json!({"line": bp.line});
+            if let Some(condition) = bp.condition.as_deref().filter(|c| !c.trim().is_empty()) {
+                entry["condition"] = condition.into();
             }
-            _ => serde_json::json!({"line": bp.line}),
+            if let Some(message) = bp.log_message.as_deref().filter(|m| !m.trim().is_empty()) {
+                entry["logMessage"] = message.into();
+            }
+            entry
         })
         .collect()
 }
@@ -132,7 +138,7 @@ impl DapClient {
     /// per the DAP spec this *replaces* whatever breakpoints were
     /// previously set for that file, it isn't additive.
     pub fn set_breakpoints(&self, path: &str, lines: &[u32]) -> io::Result<i64> {
-        let plain: Vec<Breakpoint> = lines.iter().map(|&line| Breakpoint { line, condition: None }).collect();
+        let plain: Vec<Breakpoint> = lines.iter().map(|&line| Breakpoint { line, ..Default::default() }).collect();
         self.set_breakpoints_ex(path, &plain)
     }
 
@@ -144,6 +150,12 @@ impl DapClient {
             "setBreakpoints",
             serde_json::json!({"source": {"path": path}, "breakpoints": breakpoints_json(breakpoints)}),
         )
+    }
+
+    /// Which exceptions pause the program, by the adapter's filter ids
+    /// (Dart's are `"All"` and `"Unhandled"`; none means never pause).
+    pub fn set_exception_breakpoints(&self, filters: &[&str]) -> io::Result<i64> {
+        self.request("setExceptionBreakpoints", serde_json::json!({"filters": filters}))
     }
 
     /// Tell the adapter the client is done setting up (breakpoints,
@@ -562,9 +574,9 @@ mod tests {
     #[test]
     fn breakpoints_json_includes_conditions_only_when_present() {
         let json = breakpoints_json(&[
-            Breakpoint { line: 3, condition: None },
-            Breakpoint { line: 9, condition: Some("i > 2".into()) },
-            Breakpoint { line: 12, condition: Some("  ".into()) },
+            Breakpoint { line: 3, ..Default::default() },
+            Breakpoint { line: 9, condition: Some("i > 2".into()), ..Default::default() },
+            Breakpoint { line: 12, condition: Some("  ".into()), ..Default::default() },
         ]);
         assert_eq!(json[0], serde_json::json!({"line": 3}));
         assert_eq!(json[1], serde_json::json!({"line": 9, "condition": "i > 2"}));
