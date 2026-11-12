@@ -26,8 +26,15 @@ impl DartIde {
         let active_md_mode = self
             .tabs
             .get(self.active_tab)
-            .filter(|t| t.is_markdown())
+            .filter(|t| t.has_preview_mode())
             .map(|t| t.md_mode);
+        // CSV calls its view "Table"; Markdown and JSONL say "Preview".
+        let preview_label = self
+            .tabs
+            .get(self.active_tab)
+            .and_then(|t| t.data.as_ref())
+            .map(|d| d.read(cx).kind().view_label())
+            .unwrap_or("Preview");
         let active_is_pubspec = self
             .tabs
             .get(self.active_tab)
@@ -323,7 +330,7 @@ impl DartIde {
                                 ))
                                 .child(mode_pill(
                                     "md-mode-preview",
-                                    "Preview",
+                                    preview_label,
                                     gpui_kit::assets::IconName::Eye,
                                     MarkdownMode::Preview,
                                     view,

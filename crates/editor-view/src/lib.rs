@@ -791,6 +791,16 @@ impl EditorView {
         Ok(())
     }
 
+    /// Replace `range` (byte offsets) with `text` as one undoable edit,
+    /// leaving the cursor where it was (used by the CSV grid's cell edits).
+    pub fn replace_range(&mut self, range: std::ops::Range<usize>, text: &str, cx: &mut Context<Self>) {
+        let len = self.buffer.len_bytes();
+        let range = range.start.min(len)..range.end.min(len);
+        self.buffer.edit(range, text);
+        self.recompute_content_cols();
+        cx.notify();
+    }
+
     /// Replace the whole buffer text as a single undoable edit (used by
     /// "restore from local history").
     pub fn replace_all_text(&mut self, text: &str, cx: &mut Context<Self>) {

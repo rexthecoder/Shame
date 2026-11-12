@@ -53,6 +53,7 @@ impl DartIde {
                 editor,
                 md_mode: MarkdownMode::Code,
                 image: Some(preview),
+                data: None,
                 is_preview: as_preview,
                 opened_revision: 0,
             };
@@ -88,11 +89,17 @@ impl DartIde {
                 ed
             });
             self.watch_editor(&editor, window, cx);
+            // Data files open on their Table / Preview view.
+            let data = crate::data_file::DataKind::for_path(&canonical).map(|kind| {
+                let editor = editor.clone();
+                cx.new(|cx| crate::data_view::DataView::new(editor, kind, cx))
+            });
             let new_tab = Tab {
                 path: Some(canonical),
                 editor,
-                md_mode: MarkdownMode::Code,
+                md_mode: if data.is_some() { MarkdownMode::Preview } else { MarkdownMode::Code },
                 image: None,
+                data,
                 is_preview: as_preview,
                 opened_revision,
             };
@@ -142,6 +149,7 @@ impl DartIde {
             editor,
             md_mode: MarkdownMode::Code,
             image: None,
+            data: None,
             is_preview: false,
             opened_revision,
         });
@@ -164,6 +172,7 @@ impl DartIde {
                 editor: keep.editor.clone(),
                 md_mode: keep.md_mode,
                 image: keep.image.clone(),
+                data: keep.data.clone(),
                 is_preview: false,
                 opened_revision: keep.opened_revision,
             };

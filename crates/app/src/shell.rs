@@ -1130,6 +1130,7 @@ impl DartIde {
         let active_tab = self.tabs.get(self.active_tab);
         let active_editor = active_tab.map(|t| t.editor.clone());
         let active_image = active_tab.and_then(|t| t.image.clone());
+        let active_data = active_tab.and_then(|t| t.data.clone());
         let active_md_mode = active_tab
             .filter(|t| t.is_markdown())
             .map(|t| t.md_mode)
@@ -1154,9 +1155,21 @@ impl DartIde {
                 self.render_image_viewer(self.active_tab, active_image.as_ref().unwrap(), cx)
             }
             (Some(editor), MarkdownMode::Code) => editor.into_any_element(),
+            (Some(_), MarkdownMode::Preview) if active_data.is_some() => {
+                active_data.clone().unwrap().into_any_element()
+            }
             (Some(editor), MarkdownMode::Preview) => render_md_pane(&editor, cx).into_any_element(),
             (Some(editor), MarkdownMode::Split) => {
-                let preview = render_md_pane(&editor, cx);
+                let preview: AnyElement = match &active_data {
+                    Some(data) => div()
+                        .flex_1()
+                        .h_full()
+                        .min_w(px(0.))
+                        .min_h(px(0.))
+                        .child(data.clone())
+                        .into_any_element(),
+                    None => render_md_pane(&editor, cx).into_any_element(),
+                };
                 h_flex()
                     .size_full()
                     .min_h(px(0.))

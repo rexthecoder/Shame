@@ -37,6 +37,8 @@ mod simulator;
 mod theme;
 mod toast;
 mod python;
+mod data_file;
+mod data_view;
 #[allow(dead_code)]
 mod tokens;
 
@@ -437,6 +439,8 @@ pub(crate) struct Tab {
     pub(crate) editor: Entity<EditorView>,
     pub(crate) md_mode: MarkdownMode,
     pub(crate) image: Option<ImagePreview>,
+    /// The Table / Preview mode of a CSV, TSV or JSONL tab.
+    pub(crate) data: Option<Entity<data_view::DataView>>,
     /// Zed/VS Code-style preview tab (`true` when opened via single-click in
     /// the file tree, promoted to `false` on double-click or buffer edit).
     pub(crate) is_preview: bool,
@@ -476,6 +480,11 @@ impl Tab {
             .and_then(|p| p.extension())
             .and_then(|e| e.to_str())
             .is_some_and(|ext| matches!(ext.to_ascii_lowercase().as_str(), "md" | "markdown"))
+    }
+
+    /// Markdown and data files have a Code / Split / Preview switch.
+    pub(crate) fn has_preview_mode(&self) -> bool {
+        self.is_markdown() || self.data.is_some()
     }
 
     pub(crate) fn is_pubspec(&self) -> bool {
@@ -1375,7 +1384,7 @@ impl DartIde {
                 cx.notify();
             }
             "markdown-cycle-view" => {
-                let Some(tab) = self.tabs.get_mut(self.active_tab).filter(|t| t.is_markdown()) else {
+                let Some(tab) = self.tabs.get_mut(self.active_tab).filter(|t| t.has_preview_mode()) else {
                     return false;
                 };
                 tab.md_mode = match tab.md_mode {

@@ -229,6 +229,7 @@ dependencies = [
  "core-workspace",
  "editor-view",
  "gpui-kit",
+ "gpui-pre",
  "image",
  "libc",
  "serde",

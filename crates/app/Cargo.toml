@@ -28,3 +28,8 @@ core-dap = { path = "../core-dap" }
 core-workspace = { path = "../core-workspace" }
 editor-view = { path = "../editor-view" }
 trash = "5"
+
+[dev-dependencies]
+# GPUI's headless test platform, for rendering views in tests (same pin as
+# editor-view; gpui-kit's own test-support feature conflicts with the lockfile).
+gpui = { package = "gpui-pre", version = "=0.3.9", features = ["test-support"] }
