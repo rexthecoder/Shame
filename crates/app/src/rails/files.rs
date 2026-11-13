@@ -6,7 +6,7 @@ use gpui_kit::component::{
     button::{Button, ButtonVariants as _},
     h_flex,
     input::{Input, InputState},
-    menu::{ContextMenuExt as _, PopupMenu, PopupMenuItem},
+    menu::{ContextMenuExt as _, PopupMenu},
     tree::TreeItem,
     v_flex,
 };
@@ -631,27 +631,27 @@ fn tree_context_menu(
     let rel = path.strip_prefix(root).unwrap_or(path).to_string_lossy().to_string();
     let reveal = path.to_path_buf();
     menu.item(
-        PopupMenuItem::new("New File\u{2026}")
+        crate::menu_kit::row(gpui_kit::assets::IconName::FilePlus, "New File\u{2026}", None)
             .on_click(later(view.clone(), crate::FileTreeOp::NewFile { parent: dir.clone() })),
     )
     .item(
-        PopupMenuItem::new("New Folder\u{2026}")
+        crate::menu_kit::row(gpui_kit::assets::IconName::FolderPlus, "New Folder\u{2026}", None)
             .on_click(later(view.clone(), crate::FileTreeOp::NewFolder { parent: dir.clone() })),
     )
     .separator()
-    .item(PopupMenuItem::new(if many { format!("Cut {count} Items") } else { "Cut".into() }).on_click({
+    .item(crate::menu_kit::row(gpui_kit::assets::IconName::Scissors, if many { format!("Cut {count} Items") } else { "Cut".to_string() }, None).on_click({
         let (view, targets) = (view.clone(), targets.clone());
         move |_, _, cx| view.update(cx, |this, cx| this.set_tree_clipboard(targets.clone(), true, cx))
     }))
-    .item(PopupMenuItem::new(if many { format!("Copy {count} Items") } else { "Copy".into() }).on_click({
+    .item(crate::menu_kit::row(gpui_kit::assets::IconName::Copy, if many { format!("Copy {count} Items") } else { "Copy".to_string() }, None).on_click({
         let (view, targets) = (view.clone(), targets.clone());
         move |_, _, cx| view.update(cx, |this, cx| this.set_tree_clipboard(targets.clone(), false, cx))
     }))
-    .item(PopupMenuItem::new("Paste").disabled(!can_paste).on_click({
+    .item(crate::menu_kit::row(gpui_kit::assets::IconName::Clipboard, "Paste", None).disabled(!can_paste).on_click({
         let (view, dir) = (view.clone(), dir.clone());
         move |_, _, cx| view.update(cx, |this, cx| this.paste_tree_clipboard_into(dir.clone(), cx))
     }))
-    .item(PopupMenuItem::new("Duplicate").on_click({
+    .item(crate::menu_kit::row(gpui_kit::assets::IconName::CopyPlus, "Duplicate", None).on_click({
         let (view, targets) = (view.clone(), targets.clone());
         let root = root.to_path_buf();
         move |_, _, cx| {
@@ -664,23 +664,35 @@ fn tree_context_menu(
         }
     }))
     .separator()
-    .item(PopupMenuItem::new("Reveal in Finder").on_click(move |_, _, _| {
+    .item(crate::menu_kit::row(gpui_kit::assets::IconName::FolderOpen, "Reveal in Finder", None).on_click(move |_, _, _| {
         let _ = std::process::Command::new("open").arg("-R").arg(&reveal).spawn();
     }))
-    .item(PopupMenuItem::new("Copy Path").on_click(move |_, _, cx| {
+    .item(crate::menu_kit::row(gpui_kit::assets::IconName::Link, "Copy Path", None).on_click(move |_, _, cx| {
         cx.write_to_clipboard(ClipboardItem::new_string(abs.clone()));
     }))
-    .item(PopupMenuItem::new("Copy Relative Path").on_click(move |_, _, cx| {
+    .item(crate::menu_kit::row(gpui_kit::assets::IconName::Link, "Copy Relative Path", None).on_click(move |_, _, cx| {
         cx.write_to_clipboard(ClipboardItem::new_string(rel.clone()));
+    }))
+    .item(crate::menu_kit::row(gpui_kit::assets::IconName::SquareTerminal, "Open in Terminal", None).on_click({
+        let (view, dir) = (view.clone(), dir.clone());
+        move |_, _, cx| {
+            let dir = dir.clone();
+            view.update(cx, |this, cx| {
+                this.terminal_open = true;
+                this.dock_tab = crate::DockTab::Terminal;
+                let quoted = format!("'{}'", dir.to_string_lossy().replace('\'', "'\\''"));
+                this.execute_terminal_command(format!("cd {quoted}"), cx);
+            });
+        }
     }))
     .separator()
     .item(
-        PopupMenuItem::new("Rename\u{2026}")
+        crate::menu_kit::row(gpui_kit::assets::IconName::Pencil, "Rename\u{2026}", None)
             .disabled(many)
             .on_click(later(view.clone(), crate::FileTreeOp::Rename(path.to_path_buf()))),
     )
     .item(
-        PopupMenuItem::new(if many { format!("Move {count} Items to Trash") } else { "Move to Trash".into() })
+        crate::menu_kit::danger(gpui_kit::assets::IconName::Trash, if many { format!("Move {count} Items to Trash") } else { "Move to Trash".to_string() })
             .on_click(move |_, _, cx| {
                 let targets = targets.clone();
                 view.update(cx, |this, cx| this.delete_tree_paths_clicked(targets, cx));

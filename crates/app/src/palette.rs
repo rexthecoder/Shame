@@ -670,6 +670,15 @@ impl DartIde {
                     ed.update(cx, |editor, _cx| editor.request_peek_definition());
                 }
             }
+            "go-to-implementation" | "go-to-type-definition" | "move-line-up" | "move-line-down"
+            | "copy-line-up" | "copy-line-down" | "delete-line" => {
+                if let Some(ed) = self.active_editor().cloned() {
+                    let id = id.to_string();
+                    ed.update(cx, |editor, cx| {
+                        editor.run_command(&id, cx);
+                    });
+                }
+            }
             "find-references" => {
                 if let Some(ed) = self.active_editor().cloned() {
                     ed.update(cx, |editor, _cx| editor.request_references());

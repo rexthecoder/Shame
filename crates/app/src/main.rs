@@ -36,6 +36,7 @@ mod shell;
 mod simulator;
 mod theme;
 mod toast;
+mod menu_kit;
 mod python;
 mod data_file;
 mod data_view;
@@ -363,6 +364,13 @@ const IDE_COMMANDS: &[IdeCommand] = &[
     IdeCommand { id: "refactor", title: "Editor: Refactor\u{2026} (Wrap with Widget, Extract\u{2026})", shortcut: "\u{21e7}\u{2318}R", flutter_only: false },
     IdeCommand { id: "peek-definition", title: "Editor: Peek Definition", shortcut: "\u{2318}Y", flutter_only: false },
     IdeCommand { id: "organize-imports", title: "Editor: Organize Imports", shortcut: "", flutter_only: false },
+    IdeCommand { id: "go-to-implementation", title: "Editor: Go to Implementation", shortcut: "", flutter_only: false },
+    IdeCommand { id: "go-to-type-definition", title: "Editor: Go to Type Definition", shortcut: "", flutter_only: false },
+    IdeCommand { id: "move-line-up", title: "Editor: Move Line Up", shortcut: "\u{2325}\u{2191}", flutter_only: false },
+    IdeCommand { id: "move-line-down", title: "Editor: Move Line Down", shortcut: "\u{2325}\u{2193}", flutter_only: false },
+    IdeCommand { id: "copy-line-up", title: "Editor: Copy Line Up", shortcut: "\u{21e7}\u{2325}\u{2191}", flutter_only: false },
+    IdeCommand { id: "copy-line-down", title: "Editor: Copy Line Down", shortcut: "\u{21e7}\u{2325}\u{2193}", flutter_only: false },
+    IdeCommand { id: "delete-line", title: "Editor: Delete Line", shortcut: "\u{21e7}\u{2318}K", flutter_only: false },
     IdeCommand { id: "find-references", title: "Editor: Find References", shortcut: "\u{21e7}\u{2318}Y", flutter_only: false },
     IdeCommand { id: "goto-workspace-symbol", title: "Editor: Go to Symbol in Workspace\u{2026}", shortcut: "\u{2318}T", flutter_only: false },
     IdeCommand { id: "goto-symbol", title: "Editor: Go to Symbol in File\u{2026}", shortcut: "\u{21e7}\u{2318}O", flutter_only: false },
@@ -1118,6 +1126,9 @@ impl DartIde {
                     // Selected, so typing replaces the name and Enter keeps it.
                     window.dispatch_action(Box::new(gpui_kit::component::input::SelectAll), cx);
                     cx.notify();
+                }
+                EditorEvent::Notice(text) => {
+                    this.show_toast(text.clone(), false, cx);
                 }
                 EditorEvent::RenameUnavailable => {
                     this.show_toast("This symbol can't be renamed.", true, cx);

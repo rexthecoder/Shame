@@ -634,6 +634,13 @@ pub(crate) struct LspState {
     pub(crate) diagnostics: Vec<Diagnostic>,
     pending_hover_id: Option<i64>,
     pending_definition_id: Option<i64>,
+    /// Set for "Go to Implementation" / "Type Definition": several targets
+    /// open as a peek titled this, instead of jumping to the first.
+    goto_title: Option<&'static str>,
+    /// In-flight `documentHighlight`: id, buffer revision, cursor offset.
+    pending_highlight: Option<(i64, u64, usize)>,
+    /// In-flight `documentColor`: id and buffer revision.
+    pending_color: Option<(i64, u64)>,
     /// The next definition reply should open a peek, not jump.
     peek_definition: bool,
     pending_format_id: Option<i64>,
@@ -757,6 +764,9 @@ impl EditorView {
             diagnostics: initial_diagnostics,
             pending_hover_id: None,
             pending_definition_id: None,
+            goto_title: None,
+            pending_highlight: None,
+            pending_color: None,
             peek_definition: false,
             pending_format_id: None,
             pending_rename_id: None,
@@ -961,7 +971,98 @@ impl EditorView {
             lsp.client.request("textDocument/definition", serde_json::to_value(params).unwrap_or_default())
         {
             lsp.pending_definition_id = Some(id);
+            lsp.goto_title = None;
         }
+    }
+
+    /// "Go to Implementation" (`textDocument/implementation`) or "Go to
+    /// Type Definition" (`textDocument/typeDefinition`) for the symbol at
+    /// the cursor: one target jumps there, several open as a peek.
+    pub fn request_goto(&mut self, method: &'static str, title: &'static str) {
+        let head = self.buffer.selections().primary().head;
+        let (line, character) = self.buffer.lsp_position(head);
+        let Some(lsp) = &mut self.lsp else {
+            return;
+        };
+        if !lsp.ready {
+            return;
+        }
+        let params = serde_json::json!({
+            "textDocument": { "uri": lsp.uri.as_str() },
+            "position": { "line": line, "character": character },
+        });
+        if let Ok(id) = lsp.client.request(method, params) {
+            lsp.pending_definition_id = Some(id);
+            lsp.peek_definition = false;
+            lsp.goto_title = Some(title);
+        }
+    }
+
+    /// Ask for the other uses of the symbol under the cursor ~120 ms after
+    /// it settles; the reply replaces plain word matching with the server's
+    /// scope-aware ranges. Cheap to call on every render.
+    pub(crate) fn maybe_request_highlights(&mut self, cx: &mut Context<Self>) {
+        let primary = self.buffer.selections().primary();
+        let key = (self.buffer.revision(), primary.head);
+        if self.doc_highlight_key == Some(key) || !primary.is_empty() {
+            return;
+        }
+        if !self.lsp.as_ref().is_some_and(|lsp| lsp.ready) {
+            return;
+        }
+        self.doc_highlight_key = Some(key);
+        self.doc_highlight_seq += 1;
+        let sequence = self.doc_highlight_seq;
+        cx.spawn(async move |weak, cx| {
+            Timer::after(Duration::from_millis(120)).await;
+            let _ = weak.update(cx, |this, _cx| {
+                if this.doc_highlight_seq != sequence {
+                    return;
+                }
+                let head = this.buffer.selections().primary().head;
+                let revision = this.buffer.revision();
+                let (line, character) = this.buffer.lsp_position(head);
+                let Some(lsp) = &mut this.lsp else { return };
+                let params = serde_json::json!({
+                    "textDocument": { "uri": lsp.uri.as_str() },
+                    "position": { "line": line, "character": character },
+                });
+                if let Ok(id) = lsp.client.request("textDocument/documentHighlight", params) {
+                    lsp.pending_highlight = Some((id, revision, head));
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// Ask for the colour literals in the file (`Color(0xFF…)`,
+    /// `Colors.red`) ~400 ms after the text stops changing.
+    pub(crate) fn maybe_request_colors(&mut self, cx: &mut Context<Self>) {
+        let revision = self.buffer.revision();
+        if self.color_key == Some(revision) {
+            return;
+        }
+        if !self.lsp.as_ref().is_some_and(|lsp| lsp.ready) {
+            return;
+        }
+        self.color_key = Some(revision);
+        self.color_seq += 1;
+        let sequence = self.color_seq;
+        cx.spawn(async move |weak, cx| {
+            Timer::after(Duration::from_millis(400)).await;
+            let _ = weak.update(cx, |this, _cx| {
+                if this.color_seq != sequence {
+                    return;
+                }
+                let revision = this.buffer.revision();
+                let Some(lsp) = &mut this.lsp else { return };
+                let params = serde_json::json!({ "textDocument": { "uri": lsp.uri.as_str() } });
+                if let Ok(id) = lsp.client.request("textDocument/documentColor", params) {
+                    lsp.pending_color = Some((id, revision));
+                }
+            });
+        })
+        .detach();
     }
 
     /// Send `textDocument/references` for the symbol at the cursor. The
@@ -1617,16 +1718,69 @@ impl EditorView {
                     cx.notify();
                 }
             }
+            ServerMessage::Response { id, result }
+                if lsp.pending_highlight.is_some_and(|p| p.0 == id) =>
+            {
+                let Some((_, revision, head)) = lsp.pending_highlight.take() else { return };
+                if revision != self.buffer.revision() {
+                    return;
+                }
+                let found = result
+                    .ok()
+                    .and_then(|v| serde_json::from_value::<Option<Vec<lsp_types::DocumentHighlight>>>(v).ok())
+                    .flatten()
+                    .unwrap_or_default();
+                let ranges = found
+                    .into_iter()
+                    .map(|h| {
+                        let start = self.buffer.offset_from_lsp(h.range.start.line, h.range.start.character);
+                        let end = self.buffer.offset_from_lsp(h.range.end.line, h.range.end.character);
+                        start..end
+                    })
+                    .collect();
+                self.doc_highlights = Some((revision, head, ranges));
+                cx.notify();
+            }
+            ServerMessage::Response { id, result } if lsp.pending_color.is_some_and(|p| p.0 == id) => {
+                lsp.pending_color = None;
+                let found = result
+                    .ok()
+                    .and_then(|v| serde_json::from_value::<Vec<lsp_types::ColorInformation>>(v).ok())
+                    .unwrap_or_default();
+                // One swatch per line (the first colour on it).
+                let mut colors: Vec<(usize, gpui_kit::Hsla)> = Vec::new();
+                for info in found {
+                    let line = info.range.start.line as usize;
+                    if colors.iter().any(|(l, _)| *l == line) {
+                        continue;
+                    }
+                    let c = info.color;
+                    colors.push((line, gpui_kit::Rgba { r: c.red, g: c.green, b: c.blue, a: c.alpha }.into()));
+                }
+                self.doc_colors = colors;
+                cx.notify();
+            }
             ServerMessage::Response { id, result } if lsp.pending_definition_id == Some(id) => {
                 lsp.pending_definition_id = None;
                 let peek = std::mem::take(&mut lsp.peek_definition);
+                let goto_title = lsp.goto_title.take();
                 let own_uri = lsp.uri.clone();
                 let Ok(value) = result else {
                     return;
                 };
                 let Ok(Some(response)) = serde_json::from_value::<Option<GotoDefinitionResponse>>(value) else {
+                    if let Some(title) = goto_title {
+                        cx.emit(EditorEvent::Notice(format!("No {} found", title.to_lowercase())));
+                    }
                     return;
                 };
+                if let Some(title) = goto_title {
+                    let locations = all_definition_targets(&response);
+                    if locations.len() > 1 {
+                        cx.emit(EditorEvent::ShowPeek { title: title.into(), locations });
+                        return;
+                    }
+                }
                 if peek {
                     let locations = all_definition_targets(&response);
                     if !locations.is_empty() {

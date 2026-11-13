@@ -304,3 +304,55 @@ fn cmd_up_and_down_go_to_the_document_edges(cx: &mut TestAppContext) {
     cx.simulate_keystrokes("cmd-up");
     assert_eq!(cx.update(|_, cx| editor.read(cx).cursor_position()), (1, 1));
 }
+
+#[gpui::test]
+fn option_up_down_move_the_line_and_undo_in_one_step(cx: &mut TestAppContext) {
+    let (editor, cx) = open_editor(cx, "a\nb\nc\n");
+    cx.simulate_keystrokes("alt-down");
+    assert_eq!(text(&editor, cx), "b\na\nc\n");
+    assert_eq!(cx.update(|_, cx| editor.read(cx).cursor_position()).0, 2);
+    cx.simulate_keystrokes("alt-down");
+    assert_eq!(text(&editor, cx), "b\nc\na\n");
+    cx.simulate_keystrokes("alt-up alt-up");
+    assert_eq!(text(&editor, cx), "a\nb\nc\n");
+    // Moving past the top does nothing.
+    cx.simulate_keystrokes("alt-up");
+    assert_eq!(text(&editor, cx), "a\nb\nc\n");
+    cx.simulate_keystrokes("alt-down cmd-z");
+    assert_eq!(text(&editor, cx), "a\nb\nc\n");
+}
+
+#[gpui::test]
+fn moving_lines_across_a_last_line_without_a_break(cx: &mut TestAppContext) {
+    let (editor, cx) = open_editor(cx, "a\nb");
+    cx.simulate_keystrokes("alt-down");
+    assert_eq!(text(&editor, cx), "b\na");
+    cx.simulate_keystrokes("alt-up");
+    assert_eq!(text(&editor, cx), "a\nb");
+}
+
+#[gpui::test]
+fn shift_option_down_copies_the_line_below(cx: &mut TestAppContext) {
+    let (editor, cx) = open_editor(cx, "a\nb\n");
+    cx.simulate_keystrokes("shift-alt-down");
+    assert_eq!(text(&editor, cx), "a\na\nb\n");
+    assert_eq!(cx.update(|_, cx| editor.read(cx).cursor_position()).0, 2);
+}
+
+#[gpui::test]
+fn copying_the_last_line_without_a_break(cx: &mut TestAppContext) {
+    let (editor, cx) = open_editor(cx, "x");
+    cx.simulate_keystrokes("shift-alt-down");
+    assert_eq!(text(&editor, cx), "x\nx");
+}
+
+#[gpui::test]
+fn cmd_shift_k_deletes_the_line(cx: &mut TestAppContext) {
+    let (editor, cx) = open_editor(cx, "a\nb\nc");
+    cx.simulate_keystrokes("cmd-shift-k");
+    assert_eq!(text(&editor, cx), "b\nc");
+    cx.simulate_keystrokes("cmd-down cmd-shift-k");
+    assert_eq!(text(&editor, cx), "b");
+    cx.simulate_keystrokes("cmd-z");
+    assert_eq!(text(&editor, cx), "b\nc");
+}

@@ -122,6 +122,8 @@ pub enum EditorEvent {
     RequestRename { line: u32, column: u32, current_name: String },
     /// The server says the symbol under the cursor can't be renamed.
     RenameUnavailable,
+    /// Something to tell the user that has no better place ("No implementations found").
+    Notice(String),
     /// A set of locations to peek at (references, or a definition's targets).
     ShowPeek { title: String, locations: Vec<lsp_types::Location> },
     ExternalFileEdits { path: PathBuf, edits: Vec<lsp_types::TextEdit> },
@@ -385,6 +387,15 @@ pub struct EditorView {
     code_action_sequence: u64,
     /// `(revision, cursor head)` the last prefetch was scheduled for.
     code_action_scheduled: Option<(u64, usize)>,
+    /// The server's ranges for the symbol under the cursor: revision,
+    /// cursor offset they were asked for, and the byte ranges.
+    doc_highlights: Option<(u64, usize, Vec<Range<usize>>)>,
+    doc_highlight_key: Option<(u64, usize)>,
+    doc_highlight_seq: u64,
+    /// Colour literals, one per line, from `documentColor`.
+    doc_colors: Vec<(usize, Hsla)>,
+    color_key: Option<u64>,
+    color_seq: u64,
 }
 
 impl EditorView {
@@ -484,6 +495,12 @@ impl EditorView {
             code_action_menu: None,
             code_action_sequence: 0,
             code_action_scheduled: None,
+            doc_highlights: None,
+            doc_highlight_key: None,
+            doc_highlight_seq: 0,
+            doc_colors: Vec::new(),
+            color_key: None,
+            color_seq: 0,
         };
         this.refresh_text_measures();
         this.maybe_start_lsp(cx);
@@ -1824,6 +1841,123 @@ impl EditorView {
     }
 
     /// Toggle `// ` line comments across the current line or selected lines (`⌘/`).
+    /// The lines the primary selection covers, as `(first, last)`. A
+    /// selection ending at the very start of a line does not include it.
+    fn selected_line_span(&self) -> (usize, usize) {
+        let range = self.buffer.selections().primary().range();
+        let start = self.buffer.byte_to_line(range.start);
+        let mut end = self.buffer.byte_to_line(range.end);
+        if range.end > range.start && end > start && self.buffer.line_to_byte(end) == range.end {
+            end -= 1;
+        }
+        (start, end)
+    }
+
+    /// Byte range of lines `first..=last`, including the last line's break
+    /// (when it has one).
+    fn line_block(&self, first: usize, last: usize) -> Range<usize> {
+        let start = self.buffer.line_to_byte(first);
+        let end = if last + 1 < self.buffer.line_count() {
+            self.buffer.line_to_byte(last + 1)
+        } else {
+            self.buffer.len_bytes()
+        };
+        start..end
+    }
+
+    /// Move the selected lines one line up (`-1`) or down (`1`), keeping
+    /// the selection on them.
+    pub fn move_lines(&mut self, delta: isize, cx: &mut Context<Self>) {
+        let (first, last) = self.selected_line_span();
+        let count = self.buffer.line_count();
+        let other_line = if delta < 0 {
+            if first == 0 {
+                return;
+            }
+            first - 1
+        } else {
+            if last + 1 >= count {
+                return;
+            }
+            last + 1
+        };
+        let block = self.line_block(first, last);
+        let other = self.line_block(other_line, other_line);
+        let mut block_text = self.buffer.slice(block.clone());
+        let mut other_text = self.buffer.slice(other.clone());
+        // The file's last line has no line break: give the moved text one
+        // and take it off whatever becomes last.
+        if !block_text.ends_with('\n') {
+            block_text.push('\n');
+            other_text = other_text.trim_end_matches('\n').to_string();
+        } else if !other_text.ends_with('\n') {
+            other_text.push('\n');
+            block_text = block_text.trim_end_matches('\n').to_string();
+        }
+        let sel = self.buffer.selections().primary();
+        let region = block.start.min(other.start)..block.end.max(other.end);
+        let (new_text, shift): (String, isize) = if delta < 0 {
+            (format!("{block_text}{other_text}"), -(other_text.len() as isize))
+        } else {
+            (format!("{other_text}{block_text}"), other_text.len() as isize)
+        };
+        self.buffer.begin_transaction();
+        self.buffer.edit(region, &new_text);
+        self.buffer.end_transaction();
+        let max = self.buffer.len_bytes();
+        let move_by = |o: usize| ((o as isize + shift).max(0) as usize).min(max);
+        self.buffer
+            .selections_mut()
+            .set_primary(Selection::new(move_by(sel.anchor), move_by(sel.head)));
+        self.ensure_cursor_visible();
+        cx.notify();
+    }
+
+    /// Copy the selected lines below (`down`) or above them. Copying down
+    /// moves the selection onto the copy; copying up leaves it on the upper one.
+    pub fn duplicate_lines(&mut self, down: bool, cx: &mut Context<Self>) {
+        let (first, last) = self.selected_line_span();
+        let block = self.line_block(first, last);
+        let text = self.buffer.slice(block.clone());
+        let sel = self.buffer.selections().primary();
+        self.buffer.begin_transaction();
+        let shift = if text.ends_with('\n') {
+            self.buffer.insert(block.start, &text);
+            if down { text.len() } else { 0 }
+        } else {
+            // Last line of the file: add the break before the copy.
+            self.buffer.insert(block.end, &format!("\n{text}"));
+            if down { text.len() + 1 } else { 0 }
+        };
+        self.buffer.end_transaction();
+        self.buffer
+            .selections_mut()
+            .set_primary(Selection::new(sel.anchor + shift, sel.head + shift));
+        self.ensure_cursor_visible();
+        cx.notify();
+    }
+
+    /// Delete the selected lines; the cursor lands at the start of the
+    /// line that takes their place.
+    pub fn delete_lines(&mut self, cx: &mut Context<Self>) {
+        let (first, last) = self.selected_line_span();
+        let mut block = self.line_block(first, last);
+        // The file's last line: also take the break before it.
+        if block.end == self.buffer.len_bytes() && block.start > 0 && !self.buffer.slice(block.clone()).ends_with('\n') {
+            block.start -= 1;
+        }
+        let landing = block.start;
+        self.buffer.begin_transaction();
+        self.buffer.remove(block);
+        self.buffer.end_transaction();
+        let landing = landing.min(self.buffer.len_bytes());
+        let line = self.buffer.byte_to_line(landing);
+        let start = self.buffer.line_to_byte(line);
+        self.buffer.selections_mut().set_primary(Selection::cursor(start));
+        self.ensure_cursor_visible();
+        cx.notify();
+    }
+
     pub fn toggle_line_comment(&mut self, cx: &mut Context<Self>) {
         let primary = self.buffer.selections().primary();
         let range = primary.range();
@@ -2034,6 +2168,21 @@ impl EditorView {
         let primary_mod = keystroke.modifiers.platform || keystroke.modifiers.control;
         let command = keymap::resolve(cx, keystroke);
 
+        // ⌥↑/⌥↓ move lines and ⇧⌥↑/⇧⌥↓ copy them, as in VS Code. The editor
+        // takes these itself, so the diff view keeps ⌥↑/⌥↓ for its changes.
+        {
+            let m = &keystroke.modifiers;
+            if m.alt && !m.platform && !m.control && self.completions.is_empty() && self.code_action_menu.is_none() {
+                match (keystroke.key.as_str(), m.shift) {
+                    ("up", false) => return self.move_lines(-1, cx),
+                    ("down", false) => return self.move_lines(1, cx),
+                    ("up", true) => return self.duplicate_lines(false, cx),
+                    ("down", true) => return self.duplicate_lines(true, cx),
+                    _ => {}
+                }
+            }
+        }
+
         // Manual autocomplete (Ctrl-Space by default) works even while a
         // popup is open, so it's checked before the popups take keys.
         if command.as_deref() == Some("trigger-completion") {
@@ -2208,6 +2357,15 @@ impl EditorView {
 
     /// Run an editor-level keymap command. Returns `false` for commands the
     /// editor doesn't own (app-level ones such as `toggle-sidebar`).
+    /// Run an editor command by id (the palette's way in). Returns `false`
+    /// for ids the editor doesn't own.
+    pub fn run_command(&mut self, command: &str, cx: &mut Context<Self>) -> bool {
+        self.buffer.begin_transaction();
+        let handled = self.run_editor_command(command, cx);
+        self.buffer.end_transaction();
+        handled
+    }
+
     fn run_editor_command(&mut self, command: &str, cx: &mut Context<Self>) -> bool {
         match command {
             "copy" => self.copy(cx),
@@ -2227,6 +2385,13 @@ impl EditorView {
                 cx.notify();
             }
             "toggle-comment" => self.toggle_line_comment(cx),
+            "move-line-up" => self.move_lines(-1, cx),
+            "move-line-down" => self.move_lines(1, cx),
+            "copy-line-up" => self.duplicate_lines(false, cx),
+            "copy-line-down" => self.duplicate_lines(true, cx),
+            "delete-line" => self.delete_lines(cx),
+            "go-to-implementation" => self.request_goto("textDocument/implementation", "Implementations"),
+            "go-to-type-definition" => self.request_goto("textDocument/typeDefinition", "Type definition"),
             "select-next-occurrence" => self.select_next_occurrence(cx),
             "add-cursor-above" => self.add_cursor_vertical(-1, cx),
             "add-cursor-below" => self.add_cursor_vertical(1, cx),
@@ -2436,6 +2601,22 @@ impl EditorView {
                     .items_center()
                     .justify_end()
                     .gap(px(3.))
+                    .when_some(
+                        self.doc_colors.iter().find(|(l, _)| *l == index).map(|(_, c)| *c),
+                        |el, color| {
+                            el.child(
+                                div()
+                                    .absolute()
+                                    .left(px(8.))
+                                    .top(px((LINE_HEIGHT - 9.) / 2.))
+                                    .size(px(9.))
+                                    .rounded(px(2.))
+                                    .border_1()
+                                    .border_color(cx.theme().border)
+                                    .bg(color),
+                            )
+                        },
+                    )
                     .when_some(coverage_hit, |el, hits| {
                         el.child(
                             div()
@@ -2668,9 +2849,25 @@ impl EditorView {
             .collect();
 
         // Local byte ranges within `display_text` for word-occurrences and matching brackets.
-        let mut local_word_matches: Vec<Range<usize>> = current_word
-            .map(|word| Self::word_occurrences(display_text, word))
-            .unwrap_or_default();
+        // Other uses of the symbol under the cursor: the server's ranges when
+        // they are for this exact text and cursor, else plain word matches.
+        let head_now = self.buffer.selections().primary().head;
+        let server_marks = current_word.and(self.doc_highlights.as_ref()).filter(|(rev, head, _)| {
+            *rev == self.buffer.revision() && *head == head_now
+        });
+        let mut local_word_matches: Vec<Range<usize>> = match server_marks {
+            Some((_, _, ranges)) => {
+                let line_end = line_start + display_text.len();
+                ranges
+                    .iter()
+                    .filter(|r| r.start < line_end && r.end > line_start)
+                    .map(|r| (r.start.max(line_start) - line_start)..(r.end.min(line_end) - line_start))
+                    .collect()
+            }
+            None => current_word
+                .map(|word| Self::word_occurrences(display_text, word))
+                .unwrap_or_default(),
+        };
         if let Some((b1, b2)) = bracket_pair {
             let line_end = line_start + display_text.len();
             for b in [b1, b2] {
@@ -4661,6 +4858,8 @@ impl Render for EditorView {
         self.maybe_schedule_inlay_hints(cx);
         self.dismiss_stale_signature_help(cx);
         self.maybe_prefetch_code_actions(cx);
+        self.maybe_request_highlights(cx);
+        self.maybe_request_colors(cx);
 
         let primary = self.buffer.selections().primary();
         let head = primary.head;
@@ -5121,6 +5320,26 @@ impl Render for EditorView {
     }
 }
 
+/// One menu row: muted icon, label at the UI size, and the shortcut on the
+/// right. Matches the app's other menus.
+fn menu_row(icon: gpui_kit::assets::IconName, label: &'static str, hint: Option<&'static str>) -> PopupMenuItem {
+    PopupMenuItem::element(move |_window, cx| {
+        let muted = cx.theme().muted_foreground;
+        h_flex()
+            .w_full()
+            .min_w(px(200.))
+            .gap(px(8.))
+            .items_center()
+            .text_size(px(12.5))
+            .text_color(cx.theme().foreground)
+            .child(gpui_kit::component::Icon::new(icon.clone()).with_size(px(13.)).text_color(muted))
+            .child(div().flex_1().child(label))
+            .when_some(hint, |el, hint| {
+                el.child(div().pl(px(16.)).text_size(px(11.)).text_color(muted.opacity(0.8)).child(hint))
+            })
+    })
+}
+
 /// Right-click menu in the text area, in the order VS Code's editor menu
 /// uses. Each entry runs the same command as its keyboard shortcut.
 fn editor_context_menu(
@@ -5129,6 +5348,7 @@ fn editor_context_menu(
     lsp_ready: bool,
     has_selection: bool,
 ) -> PopupMenu {
+    use gpui_kit::assets::IconName as I;
     let run = |view: Entity<EditorView>, command: &'static str| {
         move |_: &ClickEvent, _: &mut Window, cx: &mut App| {
             view.update(cx, |this, cx| {
@@ -5136,7 +5356,7 @@ fn editor_context_menu(
             });
         }
     };
-    menu.item(PopupMenuItem::new("Go to Definition").disabled(!lsp_ready).on_click({
+    menu.item(menu_row(I::ArrowRight, "Go to Definition", Some("\u{2318}click")).disabled(!lsp_ready).on_click({
         let view = view.clone();
         move |_, _, cx| {
             view.update(cx, |this, _cx| {
@@ -5146,17 +5366,23 @@ fn editor_context_menu(
             });
         }
     }))
-    .item(PopupMenuItem::new("Peek Definition").disabled(!lsp_ready).on_click(run(view.clone(), "peek-definition")))
-    .item(PopupMenuItem::new("Find All References").disabled(!lsp_ready).on_click(run(view.clone(), "find-references")))
+    .item(menu_row(I::Layers, "Go to Implementation", None).disabled(!lsp_ready).on_click(run(view.clone(), "go-to-implementation")))
+    .item(menu_row(I::Shapes, "Go to Type Definition", None).disabled(!lsp_ready).on_click(run(view.clone(), "go-to-type-definition")))
+    .item(menu_row(I::Eye, "Peek Definition", Some("\u{2318}Y")).disabled(!lsp_ready).on_click(run(view.clone(), "peek-definition")))
+    .item(menu_row(I::Search, "Find All References", Some("\u{21e7}\u{2318}Y")).disabled(!lsp_ready).on_click(run(view.clone(), "find-references")))
     .separator()
-    .item(PopupMenuItem::new("Rename Symbol").disabled(!lsp_ready).on_click(run(view.clone(), "rename")))
-    .item(PopupMenuItem::new("Refactor\u{2026}").disabled(!lsp_ready).on_click(run(view.clone(), "refactor")))
-    .item(PopupMenuItem::new("Quick Fix\u{2026}").disabled(!lsp_ready).on_click(run(view.clone(), "code-actions")))
-    .item(PopupMenuItem::new("Format Document").disabled(!lsp_ready).on_click(run(view.clone(), "format-doc")))
+    .item(menu_row(I::Pencil, "Rename Symbol", Some("F2")).disabled(!lsp_ready).on_click(run(view.clone(), "rename")))
+    .item(menu_row(I::WandSparkles, "Refactor\u{2026}", Some("\u{21e7}\u{2318}R")).disabled(!lsp_ready).on_click(run(view.clone(), "refactor")))
+    .item(menu_row(I::Lightbulb, "Quick Fix\u{2026}", Some("\u{2318}.")).disabled(!lsp_ready).on_click(run(view.clone(), "code-actions")))
+    .item(menu_row(I::TextAlignStart, "Format Document", Some("\u{2325}\u{21e7}F")).disabled(!lsp_ready).on_click(run(view.clone(), "format-doc")))
     .separator()
-    .item(PopupMenuItem::new("Cut").disabled(!has_selection).on_click(run(view.clone(), "cut")))
-    .item(PopupMenuItem::new("Copy").disabled(!has_selection).on_click(run(view.clone(), "copy")))
-    .item(PopupMenuItem::new("Paste").on_click(run(view.clone(), "paste")))
+    .item(menu_row(I::Scissors, "Cut", Some("\u{2318}X")).disabled(!has_selection).on_click(run(view.clone(), "cut")))
+    .item(menu_row(I::Copy, "Copy", Some("\u{2318}C")).disabled(!has_selection).on_click(run(view.clone(), "copy")))
+    .item(menu_row(I::Clipboard, "Paste", Some("\u{2318}V")).on_click(run(view.clone(), "paste")))
     .separator()
-    .item(PopupMenuItem::new("Select All").on_click(run(view, "select-all")))
+    .item(menu_row(I::MessageSquareCode, "Toggle Comment", Some("\u{2318}/")).on_click(run(view.clone(), "toggle-comment")))
+    .item(menu_row(I::CopyPlus, "Copy Line Down", Some("\u{21e7}\u{2325}\u{2193}")).on_click(run(view.clone(), "copy-line-down")))
+    .item(menu_row(I::Trash, "Delete Line", Some("\u{21e7}\u{2318}K")).on_click(run(view.clone(), "delete-line")))
+    .separator()
+    .item(menu_row(I::SquareDashed, "Select All", Some("\u{2318}A")).on_click(run(view, "select-all")))
 }

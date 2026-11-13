@@ -45,18 +45,18 @@ fn git_file_context_menu(
     let staged = section == Section::Staged;
     let mut menu = menu;
     if section != Section::Conflicts {
-        menu = menu.item(PopupMenuItem::new("Open Changes").on_click({
+        menu = menu.item(crate::menu_kit::row(IconName::GitCompare, "Open Changes", None).on_click({
             let (view, file) = (view.clone(), file.clone());
             move |_, _, cx| view.update(cx, |this, cx| this.open_git_diff(file.clone(), staged, cx))
         }));
     }
-    menu = menu.item(PopupMenuItem::new("Open File").disabled(!can_open_file).on_click({
+    menu = menu.item(crate::menu_kit::row(IconName::FileCode, "Open File", None).disabled(!can_open_file).on_click({
         let (view, full) = (view.clone(), full.clone());
         move |_, window, cx| view.update(cx, |this, cx| this.open_path(full.clone(), window, cx))
     }));
     match section {
         Section::Changes => {
-            menu = menu.separator().item(PopupMenuItem::new("Stage Changes").on_click({
+            menu = menu.separator().item(crate::menu_kit::row(IconName::Plus, "Stage Changes", None).on_click({
                 let (view, file) = (view.clone(), file.clone());
                 move |_, window, cx| {
                     view.update(cx, |this, cx| this.git_stage(std::slice::from_ref(&file), window, cx))
@@ -64,7 +64,7 @@ fn git_file_context_menu(
             }));
         }
         Section::Staged => {
-            menu = menu.separator().item(PopupMenuItem::new("Unstage Changes").on_click({
+            menu = menu.separator().item(crate::menu_kit::row(IconName::Minus, "Unstage Changes", None).on_click({
                 let (view, file) = (view.clone(), file.clone());
                 move |_, window, cx| {
                     view.update(cx, |this, cx| this.git_unstage(std::slice::from_ref(&file), window, cx))
@@ -74,13 +74,13 @@ fn git_file_context_menu(
         Section::Conflicts => {}
     }
     menu.separator()
-        .item(PopupMenuItem::new("Copy Path").on_click(move |_, _, cx| {
+        .item(crate::menu_kit::row(IconName::Link, "Copy Path", None).on_click(move |_, _, cx| {
             cx.write_to_clipboard(ClipboardItem::new_string(abs.clone()));
         }))
-        .item(PopupMenuItem::new("Copy Relative Path").on_click(move |_, _, cx| {
+        .item(crate::menu_kit::row(IconName::Link, "Copy Relative Path", None).on_click(move |_, _, cx| {
             cx.write_to_clipboard(ClipboardItem::new_string(rel.clone()));
         }))
-        .item(PopupMenuItem::new("Reveal in Finder").on_click(move |_, _, _| {
+        .item(crate::menu_kit::row(IconName::FolderOpen, "Reveal in Finder", None).on_click(move |_, _, _| {
             let _ = std::process::Command::new("open").arg("-R").arg(&full).spawn();
         }))
 }
@@ -97,23 +97,23 @@ fn git_commit_context_menu(
     let view_for_revert = view.clone();
     let short: String = commit.hash.chars().take(7).collect();
     let subject = commit.subject.clone();
-    menu.item(PopupMenuItem::new(if expanded { "Hide Files" } else { "Show Files" }).on_click({
+    menu.item(crate::menu_kit::row(IconName::List, if expanded { "Hide Files" } else { "Show Files" }, None).on_click({
         let hash = hash.clone();
         move |_, _, cx| view.update(cx, |this, cx| this.git_toggle_commit(hash.clone(), cx))
     }))
     .separator()
-    .item(PopupMenuItem::new("Copy Commit Hash").on_click({
+    .item(crate::menu_kit::row(IconName::Copy, "Copy Commit Hash", None).on_click({
         let hash = hash.clone();
         move |_, _, cx| cx.write_to_clipboard(ClipboardItem::new_string(hash.clone()))
     }))
-    .item(PopupMenuItem::new(format!("Copy Short Hash ({short})")).on_click(move |_, _, cx| {
+    .item(crate::menu_kit::row(IconName::Hash, format!("Copy Short Hash ({short})"), None).on_click(move |_, _, cx| {
         cx.write_to_clipboard(ClipboardItem::new_string(short.clone()))
     }))
-    .item(PopupMenuItem::new("Copy Message").on_click(move |_, _, cx| {
+    .item(crate::menu_kit::row(IconName::Copy, "Copy Message", None).on_click(move |_, _, cx| {
         cx.write_to_clipboard(ClipboardItem::new_string(subject.clone()))
     }))
     .separator()
-    .item(PopupMenuItem::new("Revert Commit").on_click({
+    .item(crate::menu_kit::row(IconName::Undo2, "Revert Commit", None).on_click({
         let view = view_for_revert;
         move |_, window, cx| view.update(cx, |this, cx| this.git_revert_commit(hash.clone(), window, cx))
     }))
@@ -2041,17 +2041,17 @@ impl DartIde {
                 menu_view.clone(),
             );
             menu.item(
-                PopupMenuItem::new(if ahead > 0 {
+                crate::menu_kit::row(IconName::ArrowUp, if ahead > 0 {
                     format!("Push {ahead} commit{} to {menu_upstream}", plural(ahead as usize))
                 } else if !has_upstream {
                     "Publish branch".to_string()
                 } else {
                     "Push".to_string()
-                })
+                }, None)
                 .on_click(move |_, window, cx| v1.update(cx, |this, cx| this.git_push(window, cx))),
             )
             .item(
-                PopupMenuItem::new("Commit & Push  \u{21e7}\u{2318}\u{21b5}")
+                crate::menu_kit::row(IconName::Check, "Commit & Push", Some("\u{21e7}\u{2318}\u{21b5}"))
                     .disabled(!can_commit)
                     .on_click(move |_, window, cx| {
                         v2.update(cx, |this, cx| this.git_commit_and_push(window, cx))
@@ -2059,13 +2059,13 @@ impl DartIde {
             )
             .separator()
             .item(
-                PopupMenuItem::new(if amend { "Stop amending" } else { "Amend last commit" })
+                crate::menu_kit::row(IconName::Pencil, if amend { "Stop amending" } else { "Amend last commit" }, None)
                     .on_click(move |_, window, cx| {
                         v3.update(cx, |this, cx| this.git_toggle_amend(window, cx))
                     }),
             )
             .item(
-                PopupMenuItem::new("Force push (with lease)")
+                crate::menu_kit::row(IconName::TriangleAlert, "Force push (with lease)", None)
                     .disabled(!has_upstream)
                     .on_click(move |_, window, cx| {
                         v4.update(cx, |this, cx| this.git_force_push(window, cx))

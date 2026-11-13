@@ -147,6 +147,27 @@ impl AgentHarness {
                     id: "opencode-go/gemini-4-argon".into(),
                     label: "Gemini 4 Argon".into(),
                 },
+                // Google provider (needs GEMINI_API_KEY / `opencode auth login` for Google).
+                ModelOption {
+                    id: "google/gemini-3-pro-preview".into(),
+                    label: "Gemini 3 Pro (Google)".into(),
+                },
+                ModelOption {
+                    id: "google/gemini-3-flash-preview".into(),
+                    label: "Gemini 3 Flash (Google)".into(),
+                },
+                ModelOption {
+                    id: "google/gemini-2.5-pro".into(),
+                    label: "Gemini 2.5 Pro (Google)".into(),
+                },
+                ModelOption {
+                    id: "google/gemini-2.5-flash".into(),
+                    label: "Gemini 2.5 Flash (Google)".into(),
+                },
+                ModelOption {
+                    id: "google/gemini-2.5-flash-lite".into(),
+                    label: "Gemini 2.5 Flash Lite (Google)".into(),
+                },
                 ModelOption {
                     id: "opencode-go/deepseek-v4.1-flash".into(),
                     label: "DeepSeek V4.1 Flash".into(),
