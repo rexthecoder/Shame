@@ -107,6 +107,12 @@ fn looks_numeric(s: &str) -> bool {
     !t.is_empty() && t.parse::<f64>().is_ok()
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SortDir {
+    Asc,
+    Desc,
+}
+
 struct Editing {
     row: usize,
     col: usize,
@@ -126,6 +132,11 @@ pub(crate) struct DataView {
     /// Show a chat dataset as raw columns instead.
     chat_as_table: bool,
     csv_header: bool,
+    filter_query: String,
+    filter_input: Option<(Entity<InputState>, Subscription)>,
+    sort: Option<(usize, SortDir)>,
+    /// Underlying `grid` row indices after filtering and sorting, or `None` when unfiltered & unsorted.
+    visible_rows: Option<Rc<Vec<usize>>>,
     table_scroll: UniformListScrollHandle,
     hscroll: ScrollHandle,
     chat_list: ListState,
@@ -153,6 +164,10 @@ impl DataView {
             chat: None,
             chat_as_table: false,
             csv_header: true,
+            filter_query: String::new(),
+            filter_input: None,
+            sort: None,
+            visible_rows: None,
             table_scroll: UniformListScrollHandle::new(),
             hscroll: ScrollHandle::new(),
             chat_list: ListState::new(0, ListAlignment::Top, px(400.)),
@@ -209,6 +224,7 @@ impl DataView {
             }
         }
         self.measure_columns();
+        self.rebuild_visible_rows();
         if matches!(self.grid, Grid::Jsonl { .. }) {
             let rows = self.grid.row_count();
             match self.selected {
@@ -216,6 +232,126 @@ impl DataView {
                 _ => self.selected = (rows > 0).then_some((0, 0)),
             }
         }
+    }
+
+    fn ensure_filter_input(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Entity<InputState> {
+        if let Some((input, _)) = &self.filter_input {
+            return input.clone();
+        }
+        let input = cx.new(|cx| InputState::new(window, cx).placeholder("Filter rows\u{2026}"));
+        let sub = cx.subscribe_in(&input, window, |this, input, event: &InputEvent, _, cx| {
+            if matches!(event, InputEvent::Change) {
+                let q = input.read(cx).value().to_string();
+                this.set_filter(q, cx);
+            }
+        });
+        self.filter_input = Some((input.clone(), sub));
+        input
+    }
+
+    fn set_filter(&mut self, query: String, cx: &mut Context<Self>) {
+        if self.filter_query == query {
+            return;
+        }
+        self.filter_query = query;
+        self.rebuild_visible_rows();
+        cx.notify();
+    }
+
+    fn clear_filter(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some((input, _)) = &self.filter_input {
+            input.update(cx, |s, cx| s.set_value("", window, cx));
+        }
+        self.set_filter(String::new(), cx);
+    }
+
+    fn toggle_sort(&mut self, col: usize, cx: &mut Context<Self>) {
+        self.sort = match self.sort {
+            Some((c, SortDir::Asc)) if c == col => Some((col, SortDir::Desc)),
+            Some((c, SortDir::Desc)) if c == col => None,
+            _ => Some((col, SortDir::Asc)),
+        };
+        self.rebuild_visible_rows();
+        cx.notify();
+    }
+
+    fn visible_row_count(&self) -> usize {
+        self.visible_rows.as_ref().map_or_else(|| self.grid.row_count(), |v| v.len())
+    }
+
+    fn rebuild_visible_rows(&mut self) {
+        let total = self.grid.row_count();
+        let needle = self.filter_query.trim().to_ascii_lowercase();
+        let sort = self.sort.filter(|&(c, _)| c < self.grid.column_count());
+        if needle.is_empty() && sort.is_none() {
+            self.visible_rows = None;
+            if let Some(chat) = &self.chat {
+                if self.chat_list.item_count() != chat.len() {
+                    self.chat_list.reset(chat.len());
+                }
+            }
+            return;
+        }
+        let cols = self.grid.column_count();
+        let mut rows: Vec<usize> = if needle.is_empty() {
+            (0..total).collect()
+        } else if let (Some(chat), false) = (&self.chat, self.chat_as_table) {
+            (0..total)
+                .filter(|&r| {
+                    chat.get(r).and_then(Option::as_ref).is_some_and(|turns| {
+                        turns.iter().any(|t| {
+                            t.role.to_ascii_lowercase().contains(&needle)
+                                || t.content.to_ascii_lowercase().contains(&needle)
+                        })
+                    })
+                })
+                .collect()
+        } else {
+            (0..total)
+                .filter(|&r| {
+                    (0..cols).any(|c| self.grid.cell(r, c).to_ascii_lowercase().contains(&needle))
+                })
+                .collect()
+        };
+
+        if let Some((col, dir)) = sort {
+            let numeric = self.numeric_cols.get(col).copied().unwrap_or(false);
+            let mut keyed: Vec<(usize, String)> = rows
+                .into_iter()
+                .map(|r| {
+                    let v = self.grid.cell(r, col);
+                    (r, v)
+                })
+                .collect();
+            keyed.sort_by(|(_, a), (_, b)| {
+                let a_empty = a.trim().is_empty();
+                let b_empty = b.trim().is_empty();
+                match (a_empty, b_empty) {
+                    (true, true) => return std::cmp::Ordering::Equal,
+                    (true, false) => return std::cmp::Ordering::Greater,
+                    (false, true) => return std::cmp::Ordering::Less,
+                    (false, false) => {}
+                }
+                let ord = if numeric {
+                    match (a.trim().parse::<f64>(), b.trim().parse::<f64>()) {
+                        (Ok(na), Ok(nb)) => na.total_cmp(&nb),
+                        _ => a.to_ascii_lowercase().cmp(&b.to_ascii_lowercase()),
+                    }
+                } else {
+                    a.to_ascii_lowercase().cmp(&b.to_ascii_lowercase())
+                };
+                match dir {
+                    SortDir::Asc => ord,
+                    SortDir::Desc => ord.reverse(),
+                }
+            });
+            rows = keyed.into_iter().map(|(r, _)| r).collect();
+        }
+
+        if self.chat.is_some() {
+            self.chat_list.reset(rows.len());
+        }
+        self.visible_rows = Some(Rc::new(rows));
     }
 
     fn measure_columns(&mut self) {
@@ -302,7 +438,7 @@ impl DataView {
         cx.notify();
     }
 
-    fn toolbar(&self, cx: &mut Context<Self>) -> Div {
+    fn toolbar(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Div {
         let muted = cx.theme().muted_foreground;
         let border = cx.theme().border;
         let dirty = self.editor.read(cx).buffer().is_dirty();
@@ -310,17 +446,31 @@ impl DataView {
             Grid::Csv { table, .. } => table.truncated,
             Grid::Jsonl { file, .. } => file.truncated,
         };
+        let total = self.grid.row_count();
+        let shown = self.visible_row_count();
+        let filtered = !self.filter_query.trim().is_empty();
         let mut summary = match (&self.chat, self.chat_as_table) {
             (Some(chat), false) => {
                 let turns: usize = chat.iter().flatten().map(Vec::len).sum();
-                format!("{} conversations · {} turns", fmt_count(chat.len()), fmt_count(turns))
+                if filtered {
+                    format!("{} of {} conversations · {} turns", fmt_count(shown), fmt_count(chat.len()), fmt_count(turns))
+                } else {
+                    format!("{} conversations · {} turns", fmt_count(chat.len()), fmt_count(turns))
+                }
             }
-            _ => format!("{} rows · {} columns", fmt_count(self.grid.row_count()), self.grid.column_count()),
+            _ => {
+                if filtered {
+                    format!("{} of {} rows · {} columns", fmt_count(shown), fmt_count(total), self.grid.column_count())
+                } else {
+                    format!("{} rows · {} columns", fmt_count(total), self.grid.column_count())
+                }
+            }
         };
         if truncated {
             summary.push_str(&format!(" · first {} shown", fmt_count(data_file::MAX_ROWS)));
         }
 
+        let filter_input = self.ensure_filter_input(window, cx);
         let mut bar = h_flex()
             .w_full()
             .h(px(tokens::PANEL_BAR_H))
@@ -331,7 +481,22 @@ impl DataView {
             .border_b_1()
             .border_color(border)
             .child(div().text_size(px(tokens::UI_SM)).text_color(muted).child(summary))
-            .child(div().flex_1());
+            .child(div().flex_1())
+            .child(
+                div()
+                    .w(px(180.))
+                    .child(Input::new(&filter_input).small().cleanable(true)),
+            );
+
+        if self.sort.is_some() {
+            bar = bar.child(chip("data-clear-sort", "Clear sort", true, cx).on_click(cx.listener(
+                |this, _, _, cx| {
+                    this.sort = None;
+                    this.rebuild_visible_rows();
+                    cx.notify();
+                },
+            )));
+        }
 
         if matches!(self.kind, DataKind::Csv(_)) {
             let header = self.csv_header;
@@ -360,6 +525,7 @@ impl DataView {
             bar = bar.child(chip("data-raw", "Columns", as_table, cx).on_click(cx.listener(
                 move |this, _, _, cx| {
                     this.chat_as_table = !as_table;
+                    this.rebuild_visible_rows();
                     cx.notify();
                 },
             )));
@@ -378,6 +544,7 @@ impl DataView {
         let total_w: f32 = GUTTER_W + widths.iter().sum::<f32>();
         let numeric = self.numeric_cols.clone();
 
+        let sort = self.sort;
         let header = h_flex()
             .h(px(ROW_H))
             .flex_none()
@@ -388,34 +555,51 @@ impl DataView {
             .child(div().w(px(GUTTER_W)).flex_none())
             .children((0..grid.column_count()).map(|c| {
                 let num = numeric.get(c).copied().unwrap_or(false);
+                let arrow = match sort {
+                    Some((sc, SortDir::Asc)) if sc == c => Some(" \u{2191}"),
+                    Some((sc, SortDir::Desc)) if sc == c => Some(" \u{2193}"),
+                    _ => None,
+                };
                 div()
+                    .id(("data-col", c))
                     .w(px(widths.get(c).copied().unwrap_or(COL_MIN)))
                     .flex_none()
                     .h_full()
                     .px(px(tokens::SPACE_4))
                     .flex()
                     .items_center()
+                    .gap(px(tokens::SPACE_1))
                     .when(num, |d| d.justify_end())
                     .border_l_1()
                     .border_color(border)
                     .font_weight(FontWeight::MEDIUM)
-                    .text_color(cx.theme().foreground)
+                    .text_color(if arrow.is_some() { cx.theme().primary } else { cx.theme().foreground })
+                    .cursor_pointer()
+                    .hover(|s| s.bg(tokens::line_active()))
                     .child(div().truncate().child(grid.header(c)))
+                    .when_some(arrow, |d, a| d.child(div().flex_none().child(a)))
+                    .on_click(cx.listener(move |this, _, _, cx| this.toggle_sort(c, cx)))
             }));
 
         let editable = matches!(grid, Grid::Csv { .. });
         let selected = self.selected;
         let editing_cell = self.editing.as_ref().map(|e| (e.row, e.col, e.input.clone()));
+        let visible = self.visible_rows.clone();
+        let row_count = visible.as_ref().map_or_else(|| grid.row_count(), |v| v.len());
         let rows = uniform_list(
             "data-rows",
-            grid.row_count(),
+            row_count,
             cx.processor(move |_this, range: std::ops::Range<usize>, _window, cx| {
                 let fg = cx.theme().foreground;
                 let muted = cx.theme().muted_foreground;
                 let border = cx.theme().border;
                 let accent = cx.theme().primary;
                 range
-                    .map(|r| {
+                    .map(|display_r| {
+                        let r = visible
+                            .as_ref()
+                            .and_then(|v| v.get(display_r).copied())
+                            .unwrap_or(display_r);
                         let cells: Vec<AnyElement> = (0..grid.column_count())
                             .map(|c| {
                                 let w = widths.get(c).copied().unwrap_or(COL_MIN);
@@ -506,7 +690,12 @@ impl DataView {
         let expanded = self.expanded.clone();
         let list_state = self.chat_list.clone();
         let view = cx.entity().downgrade();
-        list(self.chat_list.clone(), move |ix, _window, cx| {
+        let visible = self.visible_rows.clone();
+        list(self.chat_list.clone(), move |display_ix, _window, cx| {
+            let ix = visible
+                .as_ref()
+                .and_then(|v| v.get(display_ix).copied())
+                .unwrap_or(display_ix);
             let muted = cx.theme().muted_foreground;
             let is_open = expanded.borrow().contains(&ix);
             let mut card = v_flex()
@@ -795,7 +984,7 @@ impl DataView {
 }
 
 impl Render for DataView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.reparse_if_needed(cx);
         let body = match (&self.chat, self.chat_as_table) {
             (Some(chat), false) => self.render_chat(chat.clone(), cx),
@@ -815,17 +1004,22 @@ impl Render for DataView {
             }
         };
         v_flex()
-            .on_key_down(cx.listener(|this, ev: &KeyDownEvent, _, cx| {
-                if ev.keystroke.key == "escape" && this.editing.take().is_some() {
-                    cx.stop_propagation();
-                    cx.notify();
+            .on_key_down(cx.listener(|this, ev: &KeyDownEvent, window, cx| {
+                if ev.keystroke.key == "escape" {
+                    if this.editing.take().is_some() {
+                        cx.stop_propagation();
+                        cx.notify();
+                    } else if !this.filter_query.is_empty() {
+                        this.clear_filter(window, cx);
+                        cx.stop_propagation();
+                    }
                 }
             }))
             .size_full()
             .min_w(px(0.))
             .min_h(px(0.))
             .bg(cx.theme().background)
-            .child(self.toolbar(cx))
+            .child(self.toolbar(window, cx))
             .child(body)
     }
 }
@@ -946,9 +1140,39 @@ mod ui_tests {
         // Switching to columns renders the raw grid.
         cx.update(|_, cx| view.update(cx, |v, cx| {
             v.chat_as_table = true;
+            v.rebuild_visible_rows();
             cx.notify();
         }));
         cx.run_until_parked();
         cx.update(|_, cx| assert_eq!(view.read(cx).grid.header(0), "messages"));
+    }
+
+    #[::gpui::test]
+    fn filtering_and_sorting_preserve_underlying_row_indices(cx: &mut ::gpui::TestAppContext) {
+        let (view, cx) = open(cx, "name,score\nada,10\nbob,2\ncara,\ndave,25\n", DataKind::Csv(b','));
+        // Numeric sort ascending on column 1 ("score"): bob (2), ada (10), dave (25), cara (empty last).
+        cx.update(|_, cx| view.update(cx, |v, cx| v.toggle_sort(1, cx)));
+        cx.update(|_, cx| {
+            let v = view.read(cx);
+            assert_eq!(v.visible_rows.as_deref(), Some(&vec![1, 0, 3, 2]));
+        });
+        // Descending: dave (25), ada (10), bob (2), cara (empty last).
+        cx.update(|_, cx| view.update(cx, |v, cx| v.toggle_sort(1, cx)));
+        cx.update(|_, cx| {
+            let v = view.read(cx);
+            assert_eq!(v.visible_rows.as_deref(), Some(&vec![3, 0, 1, 2]));
+        });
+        // Filter for "a" (matches ada, cara, dave) while sorted desc: dave (3), ada (0), cara (2).
+        cx.update(|_, cx| view.update(cx, |v, cx| v.set_filter("a".into(), cx)));
+        cx.update(|_, cx| {
+            let v = view.read(cx);
+            assert_eq!(v.visible_rows.as_deref(), Some(&vec![3, 0, 2]));
+        });
+        // Third click clears sort; filter remains.
+        cx.update(|_, cx| view.update(cx, |v, cx| v.toggle_sort(1, cx)));
+        cx.update(|_, cx| {
+            let v = view.read(cx);
+            assert_eq!(v.visible_rows.as_deref(), Some(&vec![0, 2, 3]));
+        });
     }
 }

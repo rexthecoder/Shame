@@ -31,6 +31,21 @@ impl HighlightKind {
         if name == "variable.builtin" {
             return Self::Keyword;
         }
+        if name == "string.special.key" {
+            return Self::Property;
+        }
+        if name == "text.title" {
+            return Self::Function;
+        }
+        if name == "text.literal" {
+            return Self::String;
+        }
+        if name == "text.uri" || name == "text.reference" {
+            return Self::Attribute;
+        }
+        if name == "text.strong" || name == "text.emphasis" {
+            return Self::Constant;
+        }
         let base = name.split('.').next().unwrap_or(name);
         match base {
             "keyword" => Self::Keyword,

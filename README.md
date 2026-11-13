@@ -1,11 +1,12 @@
 # Shame IDE
 
-A small, fast code editor, first-class for Dart and Flutter. Built for daily
-use first; open-sourced from day one.
+A small, fast code editor, first-class for Dart, Flutter, and Python/AI
+workflows. Built for daily use first; open-sourced from day one.
 
-The core (text buffer, syntax highlighting, LSP/DAP clients, Flutter runner)
-and the editor view are written from scratch. The window, panels, and
-general-purpose widgets come from [GPUI] via [gpui-kit] and [gpui-component].
+The core (text buffer, syntax highlighting, LSP/DAP clients, Flutter runner,
+Jupyter client) and the editor view are written from scratch. The window,
+panels, and general-purpose widgets come from [GPUI] via [gpui-kit] and
+[gpui-component].
 
 [GPUI]: https://github.com/zed-industries/zed
 [gpui-kit]: https://github.com/longbridge/gpui-kit
@@ -39,13 +40,19 @@ Prefer to build it yourself? See [Building and running](#building-and-running).
 ## Status
 
 Daily-usable. Implemented: rope buffer with undo tree and multi-cursor,
-tree-sitter highlighting, LSP (completion, hover, definition, references,
-signature help, rename, formatting, code actions, organize imports,
-diagnostics), DAP debugging, Flutter run / hot reload / devices / tests,
-creating a Flutter project from the welcome screen or the command palette,
-git panel and diff view, terminal dock, iOS simulator rail, web preview,
-and an agent rail whose thread is saved per workspace. See
-[`docs/benchmarks.md`](docs/benchmarks.md) for performance numbers.
+tree-sitter highlighting (Dart, Python, JSON, YAML, TOML, Markdown, plus
+lexical highlighting for other languages), LSP (completion, hover, definition,
+references, signature help, rename, formatting, code actions, organize imports,
+diagnostics), DAP debugging (Dart/Flutter), Flutter run / hot reload / devices /
+tests, creating a Flutter project from the welcome screen or the command
+palette, Python interpreter detection and `python`/`pytest` runs, `.ipynb`
+Jupyter notebooks against local or remote Jupyter servers (see
+[`docs/colab.md`](docs/colab.md)), CSV/TSV/JSONL data viewer with filtering,
+sorting, chat-dataset preview, and record inspector, an AI panel rail for
+Python ML projects, a Runs dock tab for project commands, git panel and diff
+view, terminal dock, iOS simulator rail, web preview, and an agent rail whose
+thread is saved per workspace. See [`docs/benchmarks.md`](docs/benchmarks.md)
+for performance numbers.
 
 ## Crate layout
 
@@ -56,9 +63,11 @@ and an agent rail whose thread is saved per workspace. See
   core-lsp        JSON-RPC, LSP client, capability handling
   core-dap        DAP client
   core-flutter    flutter run --machine, devices, hot reload
+  core-jupyter    Jupyter Server REST/WebSocket client, .ipynb parser
   core-workspace  file tree, watcher, search, settings
   editor-view     GPUI editor element built on core-buffer + core-syntax
   app             window, panels, actions, wiring
+  bench           headless benchmarks
 ```
 
 The `core-*` crates have no UI dependency, so the GPUI-based UI layer

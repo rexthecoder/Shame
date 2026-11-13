@@ -13,14 +13,23 @@ use crate::highlight::{Highlight, HighlightKind};
 pub enum SyntaxLanguage {
     Dart,
     Python,
+    Json,
+    Yaml,
+    Toml,
+    Markdown,
 }
 
 impl SyntaxLanguage {
-    /// Map an LSP language id (`"dart"`, `"python"`) to a grammar.
+    /// Map an LSP language id (`"dart"`, `"python"`, `"json"`, `"yaml"`,
+    /// `"toml"`, `"markdown"`) to a grammar.
     pub fn from_language_id(id: &str) -> Option<Self> {
         match id {
             "dart" => Some(Self::Dart),
             "python" => Some(Self::Python),
+            "json" | "jsonc" => Some(Self::Json),
+            "yaml" | "yml" => Some(Self::Yaml),
+            "toml" => Some(Self::Toml),
+            "markdown" | "md" => Some(Self::Markdown),
             _ => None,
         }
     }
@@ -29,12 +38,20 @@ impl SyntaxLanguage {
         match self {
             Self::Dart => tree_sitter_dart::LANGUAGE.into(),
             Self::Python => tree_sitter_python::LANGUAGE.into(),
+            Self::Json => tree_sitter_json::LANGUAGE.into(),
+            Self::Yaml => tree_sitter_yaml::LANGUAGE.into(),
+            Self::Toml => tree_sitter_toml_ng::LANGUAGE.into(),
+            Self::Markdown => tree_sitter_md::LANGUAGE.into(),
         }
     }
 
     fn query(self) -> &'static Query {
         static DART: OnceLock<Query> = OnceLock::new();
         static PYTHON: OnceLock<Query> = OnceLock::new();
+        static JSON: OnceLock<Query> = OnceLock::new();
+        static YAML: OnceLock<Query> = OnceLock::new();
+        static TOML: OnceLock<Query> = OnceLock::new();
+        static MARKDOWN: OnceLock<Query> = OnceLock::new();
         match self {
             Self::Dart => DART.get_or_init(|| {
                 Query::new(&self.language(), tree_sitter_dart::HIGHLIGHTS_QUERY)
@@ -48,6 +65,22 @@ impl SyntaxLanguage {
                 );
                 Query::new(&self.language(), &source)
                     .expect("the Python highlights query is valid for tree-sitter-python")
+            }),
+            Self::Json => JSON.get_or_init(|| {
+                Query::new(&self.language(), tree_sitter_json::HIGHLIGHTS_QUERY)
+                    .expect("tree-sitter-json ships a highlights query valid for its own grammar")
+            }),
+            Self::Yaml => YAML.get_or_init(|| {
+                Query::new(&self.language(), tree_sitter_yaml::HIGHLIGHTS_QUERY)
+                    .expect("tree-sitter-yaml ships a highlights query valid for its own grammar")
+            }),
+            Self::Toml => TOML.get_or_init(|| {
+                Query::new(&self.language(), tree_sitter_toml_ng::HIGHLIGHTS_QUERY)
+                    .expect("tree-sitter-toml-ng ships a highlights query valid for its own grammar")
+            }),
+            Self::Markdown => MARKDOWN.get_or_init(|| {
+                Query::new(&self.language(), tree_sitter_md::HIGHLIGHT_QUERY_BLOCK)
+                    .expect("tree-sitter-md ships a block highlights query valid for its own grammar")
             }),
         }
     }
@@ -283,8 +316,11 @@ impl SyntaxTree {
     pub fn fold_ranges(&self) -> Vec<FoldRange> {
         let mut ranges = Vec::new();
         match self.language {
-            SyntaxLanguage::Dart => collect_fold_ranges(self.tree.root_node(), &mut ranges),
+            SyntaxLanguage::Dart | SyntaxLanguage::Json => {
+                collect_fold_ranges(self.tree.root_node(), &mut ranges)
+            }
             SyntaxLanguage::Python => collect_block_folds(self.tree.root_node(), &mut ranges),
+            SyntaxLanguage::Yaml | SyntaxLanguage::Toml | SyntaxLanguage::Markdown => {}
         }
         ranges.sort_by_key(|r| r.start_byte);
         ranges
@@ -413,7 +449,41 @@ mod tests {
     fn language_ids_map_to_grammars() {
         assert_eq!(SyntaxLanguage::from_language_id("python"), Some(SyntaxLanguage::Python));
         assert_eq!(SyntaxLanguage::from_language_id("dart"), Some(SyntaxLanguage::Dart));
+        assert_eq!(SyntaxLanguage::from_language_id("json"), Some(SyntaxLanguage::Json));
+        assert_eq!(SyntaxLanguage::from_language_id("jsonc"), Some(SyntaxLanguage::Json));
+        assert_eq!(SyntaxLanguage::from_language_id("yaml"), Some(SyntaxLanguage::Yaml));
+        assert_eq!(SyntaxLanguage::from_language_id("yml"), Some(SyntaxLanguage::Yaml));
+        assert_eq!(SyntaxLanguage::from_language_id("toml"), Some(SyntaxLanguage::Toml));
+        assert_eq!(SyntaxLanguage::from_language_id("markdown"), Some(SyntaxLanguage::Markdown));
+        assert_eq!(SyntaxLanguage::from_language_id("md"), Some(SyntaxLanguage::Markdown));
         assert_eq!(SyntaxLanguage::from_language_id("rust"), None);
+    }
+
+    #[test]
+    fn config_and_markdown_grammars_highlight_and_fold() {
+        let json = "{\n  \"name\": \"shame\",\n  \"count\": 42,\n  \"ok\": true\n}\n";
+        let json_tree = SyntaxTree::parse_as(SyntaxLanguage::Json, json);
+        let json_hs = json_tree.highlights(json);
+        assert!(json_hs.iter().any(|h| h.kind == HighlightKind::Property && &json[h.range.clone()] == "\"name\""));
+        assert!(json_hs.iter().any(|h| h.kind == HighlightKind::Number && &json[h.range.clone()] == "42"));
+        assert_eq!(json_tree.fold_ranges().len(), 1);
+
+        let yaml = "name: shame\n# comment\ncount: 3\n";
+        let yaml_tree = SyntaxTree::parse_as(SyntaxLanguage::Yaml, yaml);
+        let yaml_hs = yaml_tree.highlights(yaml);
+        assert!(yaml_hs.iter().any(|h| h.kind == HighlightKind::Comment));
+        assert!(yaml_hs.iter().any(|h| h.kind == HighlightKind::Number));
+
+        let toml = "[package]\nname = \"shame\"\nversion = 1\n";
+        let toml_tree = SyntaxTree::parse_as(SyntaxLanguage::Toml, toml);
+        let toml_hs = toml_tree.highlights(toml);
+        assert!(toml_hs.iter().any(|h| h.kind == HighlightKind::String));
+        assert!(toml_hs.iter().any(|h| h.kind == HighlightKind::Number));
+
+        let md = "# Heading\n\n```rust\nfn main() {}\n```\n";
+        let md_tree = SyntaxTree::parse_as(SyntaxLanguage::Markdown, md);
+        let md_hs = md_tree.highlights(md);
+        assert!(!md_hs.is_empty());
     }
 
     #[test]
