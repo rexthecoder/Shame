@@ -326,15 +326,29 @@ const DOC_STYLE: MdStyle = MdStyle { body: 14., line: 23., gap: 11., h1: 21., h2
 /// Render a reply. `id` namespaces element ids so several messages can show
 /// code blocks at once.
 pub(crate) fn render_markdown(text: &str, id: usize, cx: &App) -> Div {
-    render_markdown_with(text, id, &CHAT_STYLE, cx)
+    render_markdown_with(text, id, &CHAT_STYLE, None, cx)
+}
+
+/// What a code block's Insert button does with the code.
+pub(crate) type InsertCode = std::rc::Rc<dyn Fn(String, &mut Window, &mut App)>;
+
+/// Chat markdown whose code blocks also offer "Insert" (at the editor cursor).
+pub(crate) fn render_markdown_insertable(text: &str, id: usize, on_insert: InsertCode, cx: &App) -> Div {
+    render_markdown_with(text, id, &CHAT_STYLE, Some(on_insert), cx)
 }
 
 /// Render a document (a plan): larger text, more air, underlined headings.
 pub(crate) fn render_markdown_doc(text: &str, id: usize, cx: &App) -> Div {
-    render_markdown_with(text, id, &DOC_STYLE, cx)
+    render_markdown_with(text, id, &DOC_STYLE, None, cx)
 }
 
-fn render_markdown_with(text: &str, id: usize, style: &MdStyle, cx: &App) -> Div {
+fn render_markdown_with(
+    text: &str,
+    id: usize,
+    style: &MdStyle,
+    on_insert: Option<InsertCode>,
+    cx: &App,
+) -> Div {
     let fg = cx.theme().foreground;
     let muted = cx.theme().muted_foreground;
     let border = cx.theme().border;
@@ -435,6 +449,7 @@ fn render_markdown_with(text: &str, id: usize, style: &MdStyle, cx: &App) -> Div
             Block::Rule => div().w_full().h(px(1.)).my(px(4.)).bg(border).into_any_element(),
             Block::Code { lang, code } => {
                 let to_copy = code.clone();
+                let insert = on_insert.clone().map(|f| (f, code.clone()));
                 v_flex()
                     .w_full()
                     .rounded(px(tokens::RADIUS_SM))
@@ -455,6 +470,23 @@ fn render_markdown_with(text: &str, id: usize, style: &MdStyle, cx: &App) -> Div
                             .text_color(muted)
                             .child(if lang.is_empty() { "code".to_string() } else { lang })
                             .child(
+                                h_flex()
+                                    .gap(px(2.))
+                                    .when_some(insert, |row, (insert, code)| {
+                                        row.child(
+                                            div()
+                                                .id(("md-insert", id * 10_000 + ix))
+                                                .cursor_pointer()
+                                                .px(px(4.))
+                                                .rounded(px(3.))
+                                                .hover(|s| s.bg(rgba(0xffffff12)))
+                                                .child("Insert")
+                                                .on_click(move |_event, window, cx| {
+                                                    insert(code.clone(), window, cx);
+                                                }),
+                                        )
+                                    })
+                                    .child(
                                 div()
                                     .id(("md-copy", id * 10_000 + ix))
                                     .cursor_pointer()
@@ -467,6 +499,7 @@ fn render_markdown_with(text: &str, id: usize, style: &MdStyle, cx: &App) -> Div
                                             to_copy.clone(),
                                         ));
                                     }),
+                                    ),
                             ),
                     )
                     .child(

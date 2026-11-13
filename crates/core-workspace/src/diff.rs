@@ -102,6 +102,23 @@ pub fn file_diff(root: &Path, file: &ChangedFile, staged: bool) -> Result<FileDi
 
 /// The diff of `file` introduced by a specific commit `hash`.
 pub fn commit_file_diff(root: &Path, hash: &str, file: &ChangedFile) -> Result<FileDiff, String> {
+    // `before..after`: the change between two trees (an agent turn's checkpoints).
+    if let Some((before, after)) = hash.split_once("..") {
+        let args = [
+            "-c",
+            "core.quotepath=off",
+            "diff",
+            "-U1000000",
+            "--no-color",
+            "--no-ext-diff",
+            "--no-renames",
+            before,
+            after,
+            "--",
+            file.path.as_str(),
+        ];
+        return parse_unified(&git(root, &args, None)?);
+    }
     let mut args = vec![
         "-c",
         "core.quotepath=off",

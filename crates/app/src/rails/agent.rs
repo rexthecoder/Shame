@@ -272,23 +272,112 @@ pub(crate) fn filter_models(models: &[ModelOption], query: &str) -> Vec<usize> {
         .collect()
 }
 
-#[derive(Clone)]
+/// One entry of the agent's own task list (Claude's `TodoWrite`, Codex's
+/// `todo_list`), shown pinned above the composer while it works.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct AgentTask {
     pub(crate) label: String,
     pub(crate) done: bool,
+    /// What it is doing right now ("Running the tests"), for the one in progress.
+    pub(crate) active: Option<String>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) enum AgentToolKind {
+    #[default]
     File,
     Terminal,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// How a tool call ended, once the CLI reports its result.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum ToolStatus {
+    #[default]
+    Running,
+    Done,
+    Failed,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct AgentToolCall {
     pub(crate) kind: AgentToolKind,
     pub(crate) label: String,
     pub(crate) target_path: Option<String>,
+    /// The CLI's id for the call, to match its result and its helper's calls.
+    pub(crate) id: Option<String>,
+    /// Set on calls made by a helper agent: the id of the `Task` call that started it.
+    pub(crate) parent_id: Option<String>,
+    pub(crate) status: ToolStatus,
+}
+
+/// Why a turn failed, so the card can offer the right way out.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ErrorKind {
+    RateLimit,
+    Auth,
+    Overloaded,
+    Network,
+    Other,
+}
+
+impl ErrorKind {
+    pub(crate) fn classify(message: &str) -> Self {
+        let m = message.to_ascii_lowercase();
+        let has = |words: &[&str]| words.iter().any(|w| m.contains(w));
+        if has(&["rate limit", "rate_limit", "429", "usage limit", "quota", "too many requests"]) {
+            ErrorKind::RateLimit
+        } else if has(&[
+            "not logged in",
+            "authentication",
+            "unauthorized",
+            "401",
+            "api key",
+            "invalid_api_key",
+            "/login",
+        ]) {
+            ErrorKind::Auth
+        } else if has(&["overloaded", "529", "503", "capacity"]) {
+            ErrorKind::Overloaded
+        } else if has(&["network", "connection", "timed out", "timeout", "econn", "dns", "offline"]) {
+            ErrorKind::Network
+        } else {
+            ErrorKind::Other
+        }
+    }
+
+    pub(crate) fn title(self) -> &'static str {
+        match self {
+            ErrorKind::RateLimit => "Rate limit reached",
+            ErrorKind::Auth => "Not signed in",
+            ErrorKind::Overloaded => "The model is overloaded",
+            ErrorKind::Network => "Connection problem",
+            ErrorKind::Other => "The agent stopped with an error",
+        }
+    }
+
+    pub(crate) fn hint(self, harness: AgentHarness) -> String {
+        match self {
+            ErrorKind::RateLimit => "Wait a moment and retry, or switch to another model.".to_string(),
+            ErrorKind::Auth => format!(
+                "Sign in to {} in a terminal (run `{}` and use /login), then retry.",
+                harness.label(),
+                harness.short_label()
+            ),
+            ErrorKind::Overloaded => "Retry in a few seconds, or pick a different model.".to_string(),
+            ErrorKind::Network => "Check your connection, then retry.".to_string(),
+            ErrorKind::Other => "Retry, or switch the model or tool.".to_string(),
+        }
+    }
+}
+
+/// Token use the CLI reported, for the context meter.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct TokenUsage {
+    /// Tokens the model read on its latest request: how full the context is.
+    pub(crate) context: Option<u64>,
+    pub(crate) output: Option<u64>,
+    /// The model's context window, when the CLI says.
+    pub(crate) window: Option<u64>,
 }
 
 /// What the app sends to a running Claude Code process on its stdin.
@@ -300,11 +389,32 @@ pub(crate) enum AgentInput {
 
 #[derive(Clone)]
 pub(crate) enum AgentItem {
+    /// One turn's work: the tools it used, what it thought, and the state of
+    /// the workspace before it started.
     ToolGroup {
         id: usize,
         header: String,
         collapsed: bool,
         calls: Vec<AgentToolCall>,
+        /// The model's reasoning, when the CLI shares it.
+        thinking: String,
+        thinking_open: bool,
+        /// The workspace before this turn, to undo it or rewind to it.
+        checkpoint: Option<crate::agent_checkpoint::Checkpoint>,
+    },
+    /// What one turn changed in the workspace, with undo.
+    Changes {
+        before: crate::agent_checkpoint::Checkpoint,
+        after: String,
+        files: Vec<crate::agent_checkpoint::TurnFile>,
+        collapsed: bool,
+    },
+    /// A turn that failed, with a way to retry it.
+    Error {
+        kind: ErrorKind,
+        message: String,
+        /// The user message that started the failed turn.
+        prompt_ix: Option<usize>,
     },
     Message {
         is_user: bool,
@@ -348,6 +458,51 @@ pub(crate) enum StreamFragment {
     Permission(crate::agent_permission::PermissionRequest),
     /// What the CLI reported about the finished turn (Claude Code only).
     Stats { cost_usd: Option<f64>, duration_ms: Option<u64> },
+    /// More of the model's reasoning.
+    Thinking(String),
+    /// The agent's task list, in full, as it stands now.
+    Todos(Vec<AgentTask>),
+    /// Tokens used so far.
+    Usage(TokenUsage),
+    /// A tool call finished (matched by id).
+    ToolResult { id: String, is_error: bool },
+    /// The CLI reported the turn failed.
+    TurnError(String),
+    /// Something worth a line in the transcript ("Conversation compacted").
+    Notice(String),
+}
+
+fn u64_at(val: &serde_json::Value, key: &str) -> Option<u64> {
+    val.get(key).and_then(|v| v.as_u64())
+}
+
+/// Context tokens from an Anthropic-style `usage` object: everything the
+/// model read, cached or not.
+fn claude_context_tokens(usage: &serde_json::Value) -> Option<u64> {
+    let total = u64_at(usage, "input_tokens").unwrap_or(0)
+        + u64_at(usage, "cache_creation_input_tokens").unwrap_or(0)
+        + u64_at(usage, "cache_read_input_tokens").unwrap_or(0);
+    (total > 0).then_some(total)
+}
+
+fn claude_todos(input: Option<&serde_json::Value>) -> Option<Vec<AgentTask>> {
+    let todos = input?.get("todos")?.as_array()?;
+    Some(
+        todos
+            .iter()
+            .filter_map(|t| {
+                let label = t.get("content").and_then(|v| v.as_str())?.to_string();
+                let status = t.get("status").and_then(|v| v.as_str()).unwrap_or("pending");
+                let active = (status == "in_progress").then(|| {
+                    t.get("activeForm")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or(&label)
+                        .to_string()
+                });
+                Some(AgentTask { label, done: status == "completed", active })
+            })
+            .collect(),
+    )
 }
 
 /// Parse one line of output (either `claude --output-format stream-json`, `opencode run --format json`,
@@ -380,21 +535,43 @@ pub(crate) fn parse_agent_stream_line(raw: &str) -> Vec<StreamFragment> {
         out.push(StreamFragment::SessionId(id.to_string()));
     }
 
+    // A helper agent's messages carry the id of the `Task` call that started it.
+    let parent_id = val
+        .get("parent_tool_use_id")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+
     match ty {
         // 1. Claude Code `stream-json` assistant message
         "assistant" => {
-            if let Some(content) = val
-                .get("message")
-                .and_then(|m| m.get("content"))
-                .and_then(|c| c.as_array())
+            let message = val.get("message");
+            if parent_id.is_none()
+                && let Some(usage) = message.and_then(|m| m.get("usage"))
+                && let Some(context) = claude_context_tokens(usage)
             {
+                out.push(StreamFragment::Usage(TokenUsage {
+                    context: Some(context),
+                    output: u64_at(usage, "output_tokens"),
+                    window: None,
+                }));
+            }
+            if let Some(content) = message.and_then(|m| m.get("content")).and_then(|c| c.as_array()) {
                 for part in content {
                     match part.get("type").and_then(|v| v.as_str()).unwrap_or("") {
-                        "text" => {
+                        // A helper's narration is not the answer: only its tool calls show.
+                        "text" if parent_id.is_none() => {
                             if let Some(t) = part.get("text").and_then(|v| v.as_str()) {
                                 if !t.trim().is_empty() {
                                     out.push(StreamFragment::ReplaceText(t.to_string()));
                                 }
+                            }
+                        }
+                        "thinking" if parent_id.is_none() => {
+                            if let Some(t) = part.get("thinking").and_then(|v| v.as_str())
+                                && !t.trim().is_empty()
+                            {
+                                out.push(StreamFragment::Thinking(t.to_string()));
                             }
                         }
                         "tool_use" => {
@@ -412,13 +589,50 @@ pub(crate) fn parse_agent_stream_line(raw: &str) -> Vec<StreamFragment> {
                                     out.push(StreamFragment::Plan(plan.to_string()));
                                 }
                             }
-                            out.push(StreamFragment::Tool(tool_call_from_name_and_input(
-                                name, input,
-                            )));
+                            if name == "TodoWrite" && parent_id.is_none() {
+                                if let Some(todos) = claude_todos(input) {
+                                    out.push(StreamFragment::Todos(todos));
+                                }
+                                continue; // the checklist shows it; a tool row would be noise
+                            }
+                            let mut call = tool_call_from_name_and_input(name, input);
+                            call.id = part.get("id").and_then(|v| v.as_str()).map(str::to_string);
+                            call.parent_id = parent_id.clone();
+                            out.push(StreamFragment::Tool(call));
                         }
                         _ => {}
                     }
                 }
+            }
+        }
+        // Claude Code tool results come back as a `user` message.
+        "user" => {
+            if let Some(content) = val
+                .get("message")
+                .and_then(|m| m.get("content"))
+                .and_then(|c| c.as_array())
+            {
+                for part in content {
+                    if part.get("type").and_then(|v| v.as_str()) == Some("tool_result")
+                        && let Some(id) = part.get("tool_use_id").and_then(|v| v.as_str())
+                    {
+                        out.push(StreamFragment::ToolResult {
+                            id: id.to_string(),
+                            is_error: part.get("is_error").and_then(|v| v.as_bool()).unwrap_or(false),
+                        });
+                    }
+                }
+            }
+        }
+        "system" => {
+            if val.get("subtype").and_then(|v| v.as_str()) == Some("compact_boundary") {
+                let before = val
+                    .get("compact_metadata")
+                    .and_then(|m| u64_at(m, "pre_tokens"))
+                    .map(|t| format!(" (was {})", crate::agent_ctx::format_tokens(t)))
+                    .unwrap_or_default();
+                out.push(StreamFragment::Notice(format!("Conversation compacted{before}")));
+                out.push(StreamFragment::Usage(TokenUsage { context: Some(0), ..Default::default() }));
             }
         }
         // Claude Code asking permission to use a tool (`--permission-prompt-tool stdio`)
@@ -437,13 +651,88 @@ pub(crate) fn parse_agent_stream_line(raw: &str) -> Vec<StreamFragment> {
             if cost_usd.is_some() || duration_ms.is_some() {
                 out.push(StreamFragment::Stats { cost_usd, duration_ms });
             }
-            if let Some(res) = val.get("result").and_then(|v| v.as_str()) {
-                if !res.trim().is_empty() {
-                    out.push(StreamFragment::ReplaceText(res.to_string()));
-                }
+            // `modelUsage` names each model's context window.
+            let window = val
+                .get("modelUsage")
+                .and_then(|m| m.as_object())
+                .and_then(|models| models.values().filter_map(|m| u64_at(m, "contextWindow")).max());
+            if window.is_some() {
+                out.push(StreamFragment::Usage(TokenUsage { window, ..Default::default() }));
+            }
+            let text = val.get("result").and_then(|v| v.as_str()).unwrap_or("");
+            if val.get("is_error").and_then(|v| v.as_bool()).unwrap_or(false) {
+                let reason = val
+                    .get("terminal_reason")
+                    .or_else(|| val.get("subtype"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("error");
+                let message = if text.trim().is_empty() {
+                    match reason {
+                        "error_max_turns" => "It reached the maximum number of turns.".to_string(),
+                        "api_error" => "The model API returned an error.".to_string(),
+                        other => other.replace('_', " "),
+                    }
+                } else {
+                    text.trim().to_string()
+                };
+                out.push(StreamFragment::TurnError(message));
+            } else if !text.trim().is_empty() {
+                out.push(StreamFragment::ReplaceText(text.to_string()));
             }
         }
         // 2. OpenCode `--format json` events
+        "reasoning" => {
+            if let Some(t) = val
+                .get("part")
+                .and_then(|p| p.get("text"))
+                .or_else(|| val.get("text"))
+                .and_then(|v| v.as_str())
+                .filter(|t| !t.trim().is_empty())
+            {
+                out.push(StreamFragment::Thinking(t.to_string()));
+            }
+        }
+        "step_finish" => {
+            if let Some(tokens) = val.get("part").and_then(|p| p.get("tokens")) {
+                let cache = tokens.get("cache");
+                let context = u64_at(tokens, "input").unwrap_or(0)
+                    + cache.and_then(|c| u64_at(c, "read")).unwrap_or(0)
+                    + cache.and_then(|c| u64_at(c, "write")).unwrap_or(0);
+                if context > 0 {
+                    out.push(StreamFragment::Usage(TokenUsage {
+                        context: Some(context),
+                        output: u64_at(tokens, "output"),
+                        window: None,
+                    }));
+                }
+            }
+        }
+        "error" => {
+            let message = val
+                .get("message")
+                .or_else(|| val.get("error").and_then(|e| e.get("message").or(Some(e))))
+                .and_then(|v| v.as_str())
+                .unwrap_or("The agent reported an error.");
+            out.push(StreamFragment::TurnError(message.to_string()));
+        }
+        // Codex
+        "turn.failed" => {
+            let message = val
+                .get("error")
+                .and_then(|e| e.get("message"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("The turn failed.");
+            out.push(StreamFragment::TurnError(message.to_string()));
+        }
+        "turn.completed" => {
+            if let Some(usage) = val.get("usage") {
+                out.push(StreamFragment::Usage(TokenUsage {
+                    context: u64_at(usage, "input_tokens"),
+                    output: u64_at(usage, "output_tokens"),
+                    window: None,
+                }));
+            }
+        }
         "text" => {
             if let Some(t) = val
                 .get("part")
@@ -472,10 +761,38 @@ pub(crate) fn parse_agent_stream_line(raw: &str) -> Vec<StreamFragment> {
             )));
         }
         // 3. Codex `--json` events (`item.started` / `item.completed`)
-        "item.started" | "item.completed" => {
+        "item.started" | "item.updated" | "item.completed" => {
             if let Some(item) = val.get("item") {
                 let item_ty = item.get("type").and_then(|v| v.as_str()).unwrap_or("");
                 match item_ty {
+                    "reasoning" if ty == "item.completed" => {
+                        if let Some(t) = item.get("text").and_then(|v| v.as_str())
+                            && !t.trim().is_empty()
+                        {
+                            out.push(StreamFragment::Thinking(t.to_string()));
+                        }
+                    }
+                    "todo_list" => {
+                        if let Some(items) = item.get("items").and_then(|v| v.as_array()) {
+                            let mut first_open = true;
+                            let todos = items
+                                .iter()
+                                .filter_map(|t| {
+                                    let label = t.get("text").and_then(|v| v.as_str())?.to_string();
+                                    let done = t.get("completed").and_then(|v| v.as_bool()).unwrap_or(false);
+                                    // Codex has no "in progress": the first open item is it.
+                                    let active = (!done && std::mem::take(&mut first_open)).then(|| label.clone());
+                                    Some(AgentTask { label, done, active })
+                                })
+                                .collect();
+                            out.push(StreamFragment::Todos(todos));
+                        }
+                    }
+                    "error" if ty == "item.completed" => {
+                        if let Some(m) = item.get("message").and_then(|v| v.as_str()) {
+                            out.push(StreamFragment::Notice(m.to_string()));
+                        }
+                    }
                     "agent_message" | "message" if ty == "item.completed" => {
                         if let Some(t) = item.get("text").and_then(|v| v.as_str()) {
                             if !t.trim().is_empty() {
@@ -492,6 +809,7 @@ pub(crate) fn parse_agent_stream_line(raw: &str) -> Vec<StreamFragment> {
                             kind: AgentToolKind::Terminal,
                             label: cmd.to_string(),
                             target_path: None,
+                            ..Default::default()
                         }));
                     }
                     "file_change" if ty == "item.completed" => {
@@ -504,6 +822,7 @@ pub(crate) fn parse_agent_stream_line(raw: &str) -> Vec<StreamFragment> {
                             kind: AgentToolKind::File,
                             label: format!("Edit {path}"),
                             target_path: Some(path.to_string()),
+                            ..Default::default()
                         }));
                     }
                     _ => {}
@@ -560,6 +879,7 @@ fn parse_antigravity_event(event: &str, val: &serde_json::Value) -> Vec<StreamFr
                             kind: AgentToolKind::Terminal,
                             label: cmd.lines().next().unwrap_or(cmd).to_string(),
                             target_path: None,
+                            ..Default::default()
                         }));
                     } else if let Some(path) = param(&[
                         "AbsolutePath",
@@ -585,6 +905,7 @@ fn parse_antigravity_event(event: &str, val: &serde_json::Value) -> Vec<StreamFr
                             kind: AgentToolKind::File,
                             label: format!("{verb} {short}"),
                             target_path: Some(path.to_string()),
+                            ..Default::default()
                         }));
                     } else {
                         out.push(StreamFragment::Tool(tool_call_from_name_and_input(name, params)));
@@ -622,6 +943,7 @@ fn tool_call_from_name_and_input(
             kind: AgentToolKind::Terminal,
             label: cmd.lines().next().unwrap_or(cmd).to_string(),
             target_path: None,
+            ..Default::default()
         };
     }
     let file_path = input
@@ -655,6 +977,7 @@ fn tool_call_from_name_and_input(
         kind: AgentToolKind::File,
         label,
         target_path: file_path,
+        ..Default::default()
     }
 }
 
@@ -679,6 +1002,14 @@ pub(crate) fn activity_label(call: Option<&AgentToolCall>) -> String {
 
 pub(crate) enum AgentStreamEvent {
     Started { pid: u32 },
+    /// The workspace as it was before the turn (git repositories only).
+    Checkpoint(crate::agent_checkpoint::Checkpoint),
+    /// What the turn changed, measured once it ended.
+    TurnChanges {
+        before: crate::agent_checkpoint::Checkpoint,
+        after: String,
+        files: Vec<crate::agent_checkpoint::TurnFile>,
+    },
     Fragment(StreamFragment),
     StderrLine(String),
     Finished { error: Option<String> },
@@ -760,6 +1091,29 @@ pub(crate) struct AgentState {
     /// The history panel: whether it is open, and the rows last read from disk.
     pub(crate) history_open: bool,
     pub(crate) threads: Vec<crate::agent_store::ThreadSummary>,
+    /// How full the model's context is, from the latest usage the CLI reported.
+    pub(crate) usage: TokenUsage,
+    /// What each user message asked, with its attachments, by item index, so
+    /// it can be edited or retried exactly.
+    pub(crate) turn_inputs: std::collections::HashMap<usize, TurnInput>,
+    /// The conversation was rewound or edited: the CLI's session still holds
+    /// the turns that were removed, so the next message starts a new session
+    /// and carries the remaining conversation as text.
+    pub(crate) replay_transcript: bool,
+    /// Send the next prompt to the CLI as typed (`/compact`), without the IDE context.
+    pub(crate) raw_next: bool,
+    /// The user pressed Stop: the run ending is not an error.
+    pub(crate) stop_requested: bool,
+    pub(crate) tasks_collapsed: bool,
+    /// Helper-agent (`Task`) calls whose own calls are shown, by call id.
+    pub(crate) open_subagents: std::collections::HashSet<String>,
+}
+
+/// A sent message, as typed, with what was attached to it.
+#[derive(Clone, Debug)]
+pub(crate) struct TurnInput {
+    pub(crate) prompt: String,
+    pub(crate) attachments: Vec<Attachment>,
 }
 
 impl AgentState {
@@ -825,6 +1179,13 @@ impl AgentState {
             thread_id: None,
             history_open: false,
             threads: Vec::new(),
+            usage: TokenUsage::default(),
+            turn_inputs: std::collections::HashMap::new(),
+            replay_transcript: false,
+            raw_next: false,
+            stop_requested: false,
+            tasks_collapsed: false,
+            open_subagents: std::collections::HashSet::new(),
         }
     }
 
@@ -922,6 +1283,8 @@ pub(crate) fn conversation_transcript(
                 Some(format!("{}: {clipped}{ellipsis}", if *is_user { "User" } else { "Assistant" }))
             }
             AgentItem::ToolGroup { .. }
+            | AgentItem::Changes { .. }
+            | AgentItem::Error { .. }
             | AgentItem::Plan { .. }
             | AgentItem::Permission { .. }
             | AgentItem::Question { .. } => None,
@@ -962,6 +1325,9 @@ impl DartIde {
     pub(crate) fn stop_agent_run(&mut self, cx: &mut Context<Self>) {
         // Stopping means "stop", not "go on to the next queued message".
         self.agent.queue.clear();
+        if self.agent.running_pid.is_some() {
+            self.agent.stop_requested = true;
+        }
         self.cancel_pending_permissions();
         if let Some(tx) = self.agent.control_tx.take() {
             let _ = tx.send_blocking(AgentInput::Close);
@@ -1135,13 +1501,18 @@ impl DartIde {
         self.agent.model_picker_open = false;
         // Claude Code and Codex resume their own conversation by id. OpenCode
         // is stateless per run here, so it gets the earlier turns as text.
+        let replay = std::mem::take(&mut self.agent.replay_transcript);
+        let raw = std::mem::take(&mut self.agent.raw_next);
         let resume_id = match self.agent.harness {
+            _ if replay => None,
             AgentHarness::ClaudeCode | AgentHarness::Codex | AgentHarness::Antigravity => {
                 self.agent.session_id.clone()
             }
             AgentHarness::OpenCode => None,
         };
-        let prior_transcript = if self.agent.harness == AgentHarness::OpenCode {
+        let prior_transcript = if replay {
+            conversation_transcript(&self.agent.items, 16, 4000)
+        } else if self.agent.harness == AgentHarness::OpenCode {
             conversation_transcript(&self.agent.items, 8, 1500)
         } else {
             String::new()
@@ -1158,6 +1529,15 @@ impl DartIde {
             format!("{prompt}\n\n_Attached:_ {}", names.join(", "))
         };
         self.agent.attach_open = false;
+        let user_ix = self.agent.items.len();
+        self.agent.turn_inputs.insert(
+            user_ix,
+            TurnInput {
+                prompt: prompt.clone(),
+                attachments: attachments.iter().chain(mentions.iter()).cloned().collect(),
+            },
+        );
+        self.agent.stop_requested = false;
         self.agent.items.push(AgentItem::Message {
             is_user: true,
             text: shown_prompt,
@@ -1303,7 +1683,8 @@ impl DartIde {
             sections.push(format!("[Conversation so far]\n{prior_transcript}"));
         }
         sections.push(format!("[User Request]\n{prompt}"));
-        let full_prompt = sections.join("\n\n");
+        // `/compact` and friends go to the CLI exactly as typed.
+        let full_prompt = if raw { prompt.clone() } else { sections.join("\n\n") };
 
         let Some(bin_path) = harness.resolve_binary() else {
             self.agent.items.push(AgentItem::Message {
@@ -1336,6 +1717,9 @@ impl DartIde {
             header: format!("{} is working\u{2026}", harness.label()),
             collapsed: false,
             calls: Vec::new(),
+            thinking: String::new(),
+            thinking_open: false,
+            checkpoint: None,
         });
         let msg_ix = self.agent.items.len();
         self.agent.items.push(AgentItem::Message {
@@ -1434,6 +1818,12 @@ impl DartIde {
                 }
             }
 
+            // The workspace before the agent touches it: what an undo goes back to.
+            let before = crate::agent_checkpoint::snapshot(&root);
+            if let Some(cp) = &before {
+                let _ = tx.send_blocking(AgentStreamEvent::Checkpoint(cp.clone()));
+            }
+
             let mut child = match cmd.spawn() {
                 Ok(c) => c,
                 Err(err) => {
@@ -1502,6 +1892,15 @@ impl DartIde {
                 Ok(s) => Some(format!("{} exited with {s}", harness.label())),
                 Err(e) => Some(e.to_string()),
             };
+            if let Some(before) = before
+                && let Some(after) = crate::agent_checkpoint::snapshot(&root)
+                && after.tree != before.tree
+            {
+                let files = crate::agent_checkpoint::changed_files(&before.repo, &before.tree, &after.tree);
+                if !files.is_empty() {
+                    let _ = tx.send_blocking(AgentStreamEvent::TurnChanges { before, after: after.tree, files });
+                }
+            }
             let _ = tx.send_blocking(AgentStreamEvent::Finished { error: err_msg });
         });
 
@@ -1515,6 +1914,7 @@ impl DartIde {
             let mut streamed_text = String::new();
             let mut stderr_lines: Vec<String> = Vec::new();
             let mut reported_cost: Option<f64> = None;
+            let mut turn_error: Option<String> = None;
             while let Ok(evt) = rx.recv().await {
                 let alive = weak
                     .update(cx, |this, cx| {
@@ -1522,6 +1922,28 @@ impl DartIde {
                         match evt {
                             AgentStreamEvent::Started { pid } => {
                                 this.agent.running_pid = Some(pid);
+                            }
+                            AgentStreamEvent::Checkpoint(cp) => {
+                                if let Some(AgentItem::ToolGroup { checkpoint, .. }) =
+                                    this.agent.items.get_mut(group_id)
+                                {
+                                    *checkpoint = Some(cp);
+                                }
+                            }
+                            AgentStreamEvent::TurnChanges { before, after, files } => {
+                                for f in &files {
+                                    if !crate::agent_ctx::is_plan_file(&f.path)
+                                        && !this.agent.ai_touched_paths.contains(&f.path)
+                                    {
+                                        this.agent.ai_touched_paths.push(f.path.clone());
+                                    }
+                                }
+                                this.agent.items.push(AgentItem::Changes {
+                                    before,
+                                    after,
+                                    files,
+                                    collapsed: false,
+                                });
                             }
                             AgentStreamEvent::StderrLine(line) => {
                                 stderr_lines.push(line);
@@ -1537,6 +1959,53 @@ impl DartIde {
                                 }
                                 StreamFragment::Plan(plan) => {
                                     tool_plan = Some(plan);
+                                }
+                                StreamFragment::Thinking(more) => {
+                                    this.agent.indicator.update(cx, |i, cx| i.set_label("Thinking", cx));
+                                    if let Some(AgentItem::ToolGroup { thinking, .. }) =
+                                        this.agent.items.get_mut(group_id)
+                                    {
+                                        if !thinking.is_empty() {
+                                            thinking.push_str("\n\n");
+                                        }
+                                        thinking.push_str(more.trim());
+                                    }
+                                }
+                                StreamFragment::Todos(todos) => {
+                                    if let Some(active) = todos.iter().find_map(|t| t.active.clone()) {
+                                        this.agent.indicator.update(cx, |i, cx| i.set_label(&active, cx));
+                                    }
+                                    this.agent.tasks = todos;
+                                }
+                                StreamFragment::Usage(usage) => {
+                                    if usage.context.is_some() {
+                                        this.agent.usage.context = usage.context;
+                                    }
+                                    if usage.output.is_some() {
+                                        this.agent.usage.output = usage.output;
+                                    }
+                                    if usage.window.is_some() {
+                                        this.agent.usage.window = usage.window;
+                                    }
+                                }
+                                StreamFragment::ToolResult { id, is_error } => {
+                                    if let Some(AgentItem::ToolGroup { calls, .. }) =
+                                        this.agent.items.get_mut(group_id)
+                                        && let Some(call) =
+                                            calls.iter_mut().find(|c| c.id.as_deref() == Some(id.as_str()))
+                                    {
+                                        call.status =
+                                            if is_error { ToolStatus::Failed } else { ToolStatus::Done };
+                                    }
+                                }
+                                StreamFragment::TurnError(message) => {
+                                    turn_error = Some(message);
+                                }
+                                StreamFragment::Notice(text) => {
+                                    this.agent.items.push(AgentItem::Message {
+                                        is_user: false,
+                                        text: format!("_{text}_"),
+                                    });
                                 }
                                 StreamFragment::Permission(request) => {
                                     if request.tool_name == "ExitPlanMode" {
@@ -1618,6 +2087,15 @@ impl DartIde {
                                     if let Some(AgentItem::ToolGroup { header, calls, .. }) =
                                         this.agent.items.get_mut(group_id)
                                     {
+                                        // CLIs that don't report results: a call is over
+                                        // once the next one starts.
+                                        if call.id.is_none() {
+                                            for prev in calls.iter_mut().filter(|c| c.id.is_none()) {
+                                                if prev.status == ToolStatus::Running {
+                                                    prev.status = ToolStatus::Done;
+                                                }
+                                            }
+                                        }
                                         calls.push(call);
                                         let n = calls.len();
                                         *header = format!(
@@ -1672,7 +2150,32 @@ impl DartIde {
                                     };
                                     notify_desktop("Shame", &body);
                                 }
-                                let failed = error.is_some();
+                                let stopped = std::mem::take(&mut this.agent.stop_requested);
+                                // A stop is the user's choice, not a failure to report.
+                                let error = if stopped { None } else { error };
+                                let failure = if stopped {
+                                    None
+                                } else {
+                                    turn_error.take().or_else(|| {
+                                        error.as_ref().map(|e| {
+                                            if stderr_lines.is_empty() {
+                                                e.clone()
+                                            } else {
+                                                let joined = stderr_lines.join("\n");
+                                                crate::agent_ctx::clip_text(&joined, 1200).0.to_string()
+                                            }
+                                        })
+                                    })
+                                };
+                                let failed = failure.is_some();
+                                // A rate limit or a dropped connection leaves the CLI's
+                                // session intact; anything else may mean it is gone.
+                                let session_suspect = failure.as_deref().is_some_and(|m| {
+                                    !matches!(
+                                        ErrorKind::classify(m),
+                                        ErrorKind::RateLimit | ErrorKind::Overloaded | ErrorKind::Network
+                                    )
+                                });
                                 // A finished plan becomes a card to read and approve.
                                 if was_plan_mode && !failed {
                                     let file_text = plan_file.as_ref().and_then(|p| std::fs::read_to_string(p).ok());
@@ -1689,13 +2192,18 @@ impl DartIde {
                                         }
                                     }
                                 }
-                                if error.is_some() && was_resumed {
+                                if session_suspect && was_resumed {
                                     // The session may be gone; start fresh next time.
                                     this.agent.session_id = None;
                                 }
                                 if let Some(AgentItem::ToolGroup { header, calls, .. }) =
                                     this.agent.items.get_mut(group_id)
                                 {
+                                    for call in calls.iter_mut() {
+                                        if call.status == ToolStatus::Running {
+                                            call.status = ToolStatus::Done;
+                                        }
+                                    }
                                     let n = calls.len();
                                     *header = if n == 0 {
                                         format!("{} completed", harness.label())
@@ -1706,19 +2214,39 @@ impl DartIde {
                                         )
                                     };
                                 }
-                                if streamed_text.trim().is_empty() {
-                                    let fallback = if !stderr_lines.is_empty() {
-                                        Some(stderr_lines.join(" "))
-                                    } else {
-                                        error
+                                let prompt_ix = msg_ix.checked_sub(2).filter(|ix| {
+                                    matches!(this.agent.items.get(*ix), Some(AgentItem::Message { is_user: true, .. }))
+                                });
+                                let prompt_ix = prompt_ix.or_else(|| {
+                                    this.agent.items[..msg_ix].iter().rposition(|item| {
+                                        matches!(item, AgentItem::Message { is_user: true, .. })
+                                    })
+                                });
+                                let empty_reply = streamed_text.trim().is_empty();
+                                if let Some(message) = failure {
+                                    let card = AgentItem::Error {
+                                        kind: ErrorKind::classify(&message),
+                                        message,
+                                        prompt_ix,
                                     };
-                                    if let Some(msg) = fallback {
-                                        if let Some(AgentItem::Message { text, .. }) =
-                                            this.agent.items.get_mut(msg_ix)
-                                        {
-                                            *text = msg;
-                                        }
+                                    // The card replaces an empty reply; a partial one stays.
+                                    if empty_reply
+                                        && matches!(this.agent.items.get(msg_ix), Some(AgentItem::Message { .. }))
+                                    {
+                                        this.agent.items[msg_ix] = card;
+                                    } else {
+                                        this.agent.items.push(card);
                                     }
+                                } else if empty_reply
+                                    && let Some(AgentItem::Message { text, .. }) = this.agent.items.get_mut(msg_ix)
+                                {
+                                    *text = if stopped {
+                                        "_Stopped._".to_string()
+                                    } else if !stderr_lines.is_empty() {
+                                        stderr_lines.join(" ")
+                                    } else {
+                                        "_Done._".to_string()
+                                    };
                                 }
                                 if let Some(post_status) = core_workspace::repo_status(&this.root) {
                                     for f in &post_status.unstaged {
@@ -1952,7 +2480,7 @@ impl DartIde {
                     .p(px(tokens::SPACE_4))
                     .gap(px(tokens::SPACE_4))
                     // Live empty state when no messages have been sent yet
-                    .when(self.agent.items.is_empty() && self.agent.tasks.is_empty(), |el| {
+                    .when(self.agent.items.is_empty(), |el| {
                         let cli_ready = bin_resolved.is_some();
                         let cli_status = match &bin_resolved {
                             Some(p) => p.to_string_lossy().to_string(),
@@ -2148,65 +2676,6 @@ impl DartIde {
                                 )),
                         )
                     })
-                    // 25. TaskChecklist card
-                    .when(!self.agent.tasks.is_empty(), |el| {
-                        el.child(
-                            v_flex()
-                                .w_full()
-                                .p(px(tokens::SPACE_4))
-                                .gap(px(tokens::SPACE_1))
-                                .rounded(px(tokens::RADIUS_CARD))
-                                .bg(card_bg)
-                                .border_1()
-                                .border_color(border)
-                                .children(self.agent.tasks.iter().enumerate().map(|(ix, task)| {
-                                    let done = task.done;
-                                    h_flex()
-                                        .id(("agent-task", ix))
-                                        .w_full()
-                                        .h(px(26.))
-                                        .px(px(tokens::SPACE_2))
-                                        .items_center()
-                                        .gap(px(tokens::SPACE_3))
-                                        .rounded(px(tokens::RADIUS_SM))
-                                        .cursor_pointer()
-                                        .hover(move |s| s.bg(list_hover))
-                                        .child(
-                                            div()
-                                                .size(px(15.))
-                                                .rounded(px(tokens::RADIUS_PILL))
-                                                .border_1()
-                                                .border_color(if done { primary } else { muted })
-                                                .flex()
-                                                .items_center()
-                                                .justify_center()
-                                                .when(done, |c| {
-                                                    c.child(
-                                                        Icon::new(IconName::Check)
-                                                            .with_size(px(9.5))
-                                                            .text_color(primary),
-                                                    )
-                                                }),
-                                        )
-                                        .child(
-                                            div()
-                                                .flex_1()
-                                                .min_w(px(0.))
-                                                .truncate()
-                                                .text_size(px(12.))
-                                                .text_color(if done { muted } else { fg })
-                                                .when(done, |s| s.line_through())
-                                                .child(task.label.clone()),
-                                        )
-                                        .on_click(cx.listener(move |this, _e, _w, cx| {
-                                            if let Some(t) = this.agent.tasks.get_mut(ix) {
-                                                t.done = !t.done;
-                                                cx.notify();
-                                            }
-                                        }))
-                                })),
-                        )
-                    })
                     // 26–28. ToolCallCard, CollapsedGroup, MessageBubble
                     .when_some(restored_note, |el, note| {
                         el.child(
@@ -2232,13 +2701,35 @@ impl DartIde {
                                 header,
                                 collapsed,
                                 calls,
+                                thinking,
+                                thinking_open,
+                                ..
                             } => {
                                 let is_collapsed = *collapsed;
                                 let group_id = *id;
+                                // Still thinking: this turn is running and has no reply text yet.
+                                let live_thinking = is_running
+                                    && self.agent.items[item_ix + 1..]
+                                        .iter()
+                                        .all(|it| !matches!(it, AgentItem::Message { text, .. } if text != "Thinking\u{2026}"));
+                                if calls.is_empty() && thinking.is_empty() && !is_running {
+                                    // A turn that used no tools has nothing to show here.
+                                    return div().into_any_element();
+                                }
                                 v_flex()
                                     .w_full()
                                     .gap(px(tokens::SPACE_2))
-                                    .child(
+                                    .when(!thinking.is_empty(), |el| {
+                                        el.child(self.render_turn_thinking(
+                                            item_ix,
+                                            thinking,
+                                            *thinking_open,
+                                            live_thinking,
+                                            cx,
+                                        ))
+                                    })
+                                    .when(!calls.is_empty(), |el| {
+                                        el.child(
                                         h_flex()
                                             .id(("agent-tool-group", group_id))
                                             .items_center()
@@ -2271,81 +2762,18 @@ impl DartIde {
                                                     cx.notify();
                                                 }
                                             })),
-                                    )
+                                        )
+                                    })
                                     .when(!is_collapsed, |el| {
-                                        el.children(calls.iter().enumerate().map(
-                                            |(call_ix, call)| {
-                                                let target = call.target_path.clone();
-                                                let is_term = matches!(
-                                                    call.kind,
-                                                    AgentToolKind::Terminal
-                                                );
-                                                h_flex()
-                                                    .id((
-                                                        "agent-tool-card",
-                                                        item_ix * 32 + call_ix,
-                                                    ))
-                                                    .w_full()
-                                                    .min_h(px(32.))
-                                                    .px(px(tokens::SPACE_4))
-                                                    .py(px(tokens::SPACE_2))
-                                                    .items_center()
-                                                    .gap(px(tokens::SPACE_3))
-                                                    .rounded(px(tokens::RADIUS_CARD))
-                                                    .bg(card_bg)
-                                                    .border_1()
-                                                    .border_color(border)
-                                                    .when(target.is_some(), |s| {
-                                                        s.cursor_pointer()
-                                                            .hover(move |h| h.bg(list_hover))
-                                                    })
-                                                    .child(if is_term {
-                                                        div()
-                                                            .font_family(
-                                                                cx.theme()
-                                                                    .mono_font_family
-                                                                    .clone(),
-                                                            )
-                                                            .text_size(px(tokens::UI_XS))
-                                                            .text_color(primary)
-                                                            .child(">_")
-                                                            .into_any_element()
-                                                    } else {
-                                                        Icon::new(IconName::FileCode)
-                                                            .with_size(px(13.))
-                                                            .text_color(cx.theme().info)
-                                                            .into_any_element()
-                                                    })
-                                                    .child(
-                                                        div()
-                                                            .flex_1()
-                                                            .min_w(px(0.))
-                                                            .truncate()
-                                                            .text_size(px(tokens::UI_SM))
-                                                            .text_color(fg)
-                                                            .child(call.label.clone()),
-                                                    )
-                                                    .when_some(target, |s, rel_path| {
-                                                        s.on_click(cx.listener(
-                                                            move |this, _e, window, cx| {
-                                                                let p = Path::new(&rel_path);
-                                                                let full = if p.is_absolute() {
-                                                                    p.to_path_buf()
-                                                                } else {
-                                                                    this.root.join(p)
-                                                                };
-                                                                if full.exists() {
-                                                                    this.open_path(
-                                                                        full, window, cx,
-                                                                    );
-                                                                }
-                                                            },
-                                                        ))
-                                                    })
-                                            },
-                                        ))
+                                        el.children(self.render_tool_rows(item_ix, calls, cx))
                                     })
                                     .into_any_element()
+                            }
+                            AgentItem::Changes { files, collapsed, .. } => {
+                                self.render_changes_card(item_ix, files, *collapsed, cx)
+                            }
+                            AgentItem::Error { kind, message, prompt_ix } => {
+                                self.render_error_card(item_ix, *kind, message, *prompt_ix, cx)
                             }
                             AgentItem::Question { questions, choices, state, .. } => {
                                 self.render_question_card(item_ix, questions, choices, *state, cx)
@@ -2368,13 +2796,33 @@ impl DartIde {
                                     && item_ix + 1 == self.agent.items.len();
                                 let can_copy = !*is_user && !streaming && !text.trim().is_empty();
                                 let to_copy = text.clone();
+                                // Retry the latest reply: the user message that started it.
+                                let retry_from = (!*is_user && !is_running)
+                                    .then(|| {
+                                        let later_reply = self.agent.items[item_ix + 1..].iter().any(|it| {
+                                            matches!(it, AgentItem::Message { .. } | AgentItem::Error { .. })
+                                        });
+                                        (!later_reply).then(|| {
+                                            self.agent.items[..item_ix].iter().rposition(|it| {
+                                                matches!(it, AgentItem::Message { is_user: true, .. })
+                                            })
+                                        })
+                                    })
+                                    .flatten()
+                                    .flatten();
+                                let msg_group: SharedString = format!("agent-msg-{item_ix}").into();
+                                let weak = cx.entity().downgrade();
+                                let on_insert: crate::markdown::InsertCode =
+                                    std::rc::Rc::new(move |code, window, cx| {
+                                        let _ = weak.update(cx, |this, cx| this.agent_insert_code(code, window, cx));
+                                    });
                                 let stats_text = (!*is_user && !streaming)
                                     .then(|| self.agent.turn_stats.get(&item_ix))
                                     .flatten()
                                     .map(|st| {
                                         crate::agent_ctx::format_turn_stats(st.duration_ms, st.cost_usd)
                                     });
-                                v_flex()
+                                let bubble = v_flex()
                                     .w_full()
                                     .px(px(tokens::SPACE_5))
                                     .py(px(10.))
@@ -2396,17 +2844,20 @@ impl DartIde {
                                             .text_size(px(tokens::UI))
                                             .text_color(muted)
                                             .child("Thinking\u{2026}")
-                                    } else {
+                                    } else if *is_user {
                                         crate::markdown::render_markdown(text, item_ix, cx)
+                                    } else {
+                                        crate::markdown::render_markdown_insertable(text, item_ix, on_insert, cx)
                                     })
                                     .when(can_copy, |el| {
                                         el.child(
                                             h_flex()
                                                 .w_full()
                                                 .items_center()
-                                                .justify_between()
+                                                .gap(px(2.))
                                                 .child(
                                                     div()
+                                                        .flex_1()
                                                         .text_size(px(tokens::UI_XS))
                                                         .text_color(muted.opacity(0.8))
                                                         .child(stats_text.unwrap_or_default()),
@@ -2429,10 +2880,43 @@ impl DartIde {
                                                             ),
                                                         );
                                                     }),
-                                            ),
+                                            )
+                                                .when_some(retry_from, |el, user_ix| {
+                                                    el.child(
+                                                        div()
+                                                            .id(("agent-retry-reply", item_ix))
+                                                            .px(px(6.))
+                                                            .py(px(2.))
+                                                            .rounded(px(tokens::RADIUS_SM))
+                                                            .cursor_pointer()
+                                                            .text_size(px(tokens::UI_XS))
+                                                            .text_color(muted)
+                                                            .hover(|s| s.bg(list_hover))
+                                                            .child("Retry")
+                                                            .tooltip(|window, cx| {
+                                                                gpui_kit::component::tooltip::Tooltip::new(
+                                                                    "Ask again with the current model; this reply is replaced",
+                                                                )
+                                                                .build(window, cx)
+                                                            })
+                                                            .on_click(cx.listener(move |this, _e, _w, cx| {
+                                                                this.agent_retry(user_ix, false, cx);
+                                                            })),
+                                                    )
+                                                }),
                                         )
-                                    })
-                                    .into_any_element()
+                                    });
+                                if *is_user && !is_running {
+                                    v_flex()
+                                        .w_full()
+                                        .gap(px(2.))
+                                        .group(msg_group.clone())
+                                        .child(bubble)
+                                        .child(self.render_user_message_actions(item_ix, msg_group, cx))
+                                        .into_any_element()
+                                } else {
+                                    bubble.into_any_element()
+                                }
                             }
                         }
                     }))
@@ -2550,14 +3034,11 @@ impl DartIde {
                                                 .on_click(cx.listener({
                                                     let to_revert = all_ai_files.clone();
                                                     move |this, _e, window, cx| {
+                                                        // Each file goes back to before the agent
+                                                        // touched it; the user's own edits stay.
                                                         for f in &to_revert {
-                                                            this.git_discard_clicked(
-                                                                f.clone(),
-                                                                window,
-                                                                cx,
-                                                            );
+                                                            this.agent_reject_file(f.clone(), window, cx);
                                                         }
-                                                        this.agent.ai_touched_paths.clear();
                                                         cx.notify();
                                                     }
                                                 })),
@@ -2654,15 +3135,7 @@ impl DartIde {
                                                     )
                                                     .on_click(cx.listener(
                                                         move |this, _e, window, cx| {
-                                                            this.agent
-                                                                .ai_touched_paths
-                                                                .retain(|p| p != &discard_file.path);
-                                                            this.git_discard_clicked(
-                                                                discard_file.clone(),
-                                                                window,
-                                                                cx,
-                                                            );
-                                                            cx.notify();
+                                                            this.agent_reject_file(discard_file.clone(), window, cx);
                                                         },
                                                     )),
                                             )
@@ -2705,6 +3178,8 @@ impl DartIde {
                         }),
                 )
             })
+            // The agent's own task list, pinned where it stays in view.
+            .when_some(self.render_agent_tasks(cx), |el, tasks| el.child(tasks))
             // 30. Composer: mode switch, context chips, input, tool / model pickers
             .child(self.render_agent_composer(cx))
             .into_any_element()
@@ -2905,6 +3380,9 @@ mod tests {
                 header: "Agent used 1 tool".into(),
                 collapsed: false,
                 calls: vec![],
+                thinking: String::new(),
+                thinking_open: false,
+                checkpoint: None,
             },
             AgentItem::Message {
                 is_user: false,
@@ -2970,6 +3448,7 @@ mod tests {
                     kind: AgentToolKind::File,
                     label: "Edit main.dart".into(),
                     target_path: Some("lib/main.dart".into()),
+                    ..Default::default()
                 }),
                 StreamFragment::ReplaceText("Updated `main.dart`.".into()),
             ]
@@ -2982,6 +3461,7 @@ mod tests {
                 kind: AgentToolKind::Terminal,
                 label: "cargo test".into(),
                 target_path: None,
+                ..Default::default()
             })]
         );
 
@@ -3005,7 +3485,7 @@ mod tests {
 
     #[core::prelude::v1::test]
     fn the_indicator_says_what_the_agent_is_doing() {
-        let tool = |kind, label: &str| AgentToolCall { kind, label: label.into(), target_path: None };
+        let tool = |kind, label: &str| AgentToolCall { kind, label: label.into(), ..Default::default() };
         assert_eq!(activity_label(None), "Thinking");
         assert_eq!(activity_label(Some(&tool(AgentToolKind::File, "Read main.dart"))), "Reading main.dart");
         assert_eq!(activity_label(Some(&tool(AgentToolKind::File, "Edit lib/a.dart"))), "Editing lib/a.dart");
@@ -3053,7 +3533,15 @@ mod tests {
         let items = vec![
             msg(true, "first question"),
             msg(false, "first answer"),
-            AgentItem::ToolGroup { id: 1, header: String::new(), collapsed: false, calls: vec![] },
+            AgentItem::ToolGroup {
+                id: 1,
+                header: String::new(),
+                collapsed: false,
+                calls: vec![],
+                thinking: String::new(),
+                thinking_open: false,
+                checkpoint: None,
+            },
             msg(true, "second question"),
             msg(false, "Thinking\u{2026}"),
         ];
@@ -3074,6 +3562,57 @@ mod tests {
         assert!(near_bottom(-500.0, 500.0, 40.0), "exactly at the end");
         assert!(near_bottom(-470.0, 500.0, 40.0), "within the slack");
         assert!(!near_bottom(-200.0, 500.0, 40.0), "scrolled up to read");
+    }
+
+    #[core::prelude::v1::test]
+    fn parses_thinking_todos_usage_results_and_helpers() {
+        let line = r#"{"type":"assistant","parent_tool_use_id":null,"message":{"usage":{"input_tokens":10,"cache_read_input_tokens":40000,"cache_creation_input_tokens":2000,"output_tokens":300},"content":[{"type":"thinking","thinking":"Check the tests first."},{"type":"tool_use","id":"t1","name":"TodoWrite","input":{"todos":[{"content":"Run tests","status":"in_progress","activeForm":"Running tests"},{"content":"Fix bug","status":"pending","activeForm":"Fixing bug"}]}},{"type":"tool_use","id":"t2","name":"Bash","input":{"command":"cargo test"}}]}}"#;
+        let frags = parse_agent_stream_line(line);
+        assert_eq!(
+            frags[0],
+            StreamFragment::Usage(TokenUsage { context: Some(42_010), output: Some(300), window: None })
+        );
+        assert_eq!(frags[1], StreamFragment::Thinking("Check the tests first.".into()));
+        let StreamFragment::Todos(todos) = &frags[2] else { panic!("{:?}", frags[2]) };
+        assert_eq!(todos[0].active.as_deref(), Some("Running tests"));
+        assert!(!todos[1].done && todos[1].active.is_none());
+        let StreamFragment::Tool(call) = &frags[3] else { panic!() };
+        assert_eq!((call.id.as_deref(), call.label.as_str()), (Some("t2"), "cargo test"));
+        assert_eq!(frags.len(), 4, "TodoWrite becomes the checklist, not a tool row");
+
+        // A helper agent's text is not the answer; its tool calls are nested.
+        let helper = r#"{"type":"assistant","parent_tool_use_id":"task1","message":{"content":[{"type":"text","text":"Looking around"},{"type":"tool_use","id":"t9","name":"Read","input":{"file_path":"/p/a.rs"}}]}}"#;
+        let frags = parse_agent_stream_line(helper);
+        assert_eq!(frags.len(), 1);
+        let StreamFragment::Tool(call) = &frags[0] else { panic!() };
+        assert_eq!(call.parent_id.as_deref(), Some("task1"));
+
+        let result = r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t2","is_error":true,"content":"failed"}]}}"#;
+        assert_eq!(
+            parse_agent_stream_line(result),
+            vec![StreamFragment::ToolResult { id: "t2".into(), is_error: true }]
+        );
+    }
+
+    #[core::prelude::v1::test]
+    fn failed_turns_become_errors_not_replies() {
+        let claude = r#"{"type":"result","is_error":true,"subtype":"success","terminal_reason":"api_error","result":"API Error: 429 rate_limit_error","session_id":"s","modelUsage":{"m":{"contextWindow":200000}}}"#;
+        let frags = parse_agent_stream_line(claude);
+        assert!(frags.contains(&StreamFragment::TurnError("API Error: 429 rate_limit_error".into())));
+        assert!(frags.contains(&StreamFragment::Usage(TokenUsage { window: Some(200_000), ..Default::default() })));
+        assert!(!frags.iter().any(|f| matches!(f, StreamFragment::ReplaceText(_))));
+
+        let codex = r#"{"type":"turn.failed","error":{"message":"stream disconnected"}}"#;
+        assert_eq!(parse_agent_stream_line(codex), vec![StreamFragment::TurnError("stream disconnected".into())]);
+        let codex_usage = r#"{"type":"turn.completed","usage":{"input_tokens":5000,"cached_input_tokens":4000,"output_tokens":20}}"#;
+        assert_eq!(
+            parse_agent_stream_line(codex_usage),
+            vec![StreamFragment::Usage(TokenUsage { context: Some(5000), output: Some(20), window: None })]
+        );
+        let codex_todo = r#"{"type":"item.updated","item":{"type":"todo_list","items":[{"text":"a","completed":true},{"text":"b","completed":false},{"text":"c","completed":false}]}}"#;
+        let StreamFragment::Todos(todos) = &parse_agent_stream_line(codex_todo)[0] else { panic!() };
+        assert_eq!(todos.iter().filter(|t| t.active.is_some()).count(), 1);
+        assert_eq!(todos[1].active.as_deref(), Some("b"));
     }
 
     #[core::prelude::v1::test]

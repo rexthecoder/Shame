@@ -75,6 +75,13 @@ fn load_diff_images(
         .to_ascii_uppercase();
     let old_path = file.orig_path.as_deref().unwrap_or(&file.path);
     let (old_bytes, new_bytes) = match commit {
+        Some(range) if range.contains("..") => {
+            let (before, after) = range.split_once("..").unwrap_or((range, range));
+            (
+                git_show_bytes(root, &format!("{before}:{old_path}")),
+                git_show_bytes(root, &format!("{after}:{}", file.path)),
+            )
+        }
         Some(hash) => (
             git_show_bytes(root, &format!("{hash}^:{old_path}")),
             git_show_bytes(root, &format!("{hash}:{}", file.path)),
@@ -446,6 +453,9 @@ impl DartIde {
 
     /// Every file shown in the active list (either the expanded commit's files, or Staged + Changes).
     fn diff_file_list(&self) -> Vec<(ChangedFile, bool)> {
+        if let Some(range) = self.diff.as_ref().and_then(|d| d.commit.as_deref()).filter(|c| c.contains("..")) {
+            return self.agent_turn_changed_files(range).into_iter().map(|f| (f, false)).collect();
+        }
         if self.diff.as_ref().is_some_and(|d| d.commit.is_some()) {
             return self
                 .git
@@ -513,6 +523,16 @@ impl DartIde {
     pub(crate) fn diff_ai_reject(&mut self, window: &Window, cx: &mut Context<Self>) {
         let Some(open) = &self.diff else { return };
         let file = open.file.clone();
+        // With a checkpoint the file goes back to before the agent touched it
+        // (keeping the user's own edits), and the turn card can redo it.
+        if self.agent_base_checkpoint(&file.path).is_some() {
+            self.agent_reject_file(file.clone(), window, cx);
+            match self.next_ai_file(&file.path) {
+                Some(next) => self.open_git_diff(next, false, cx),
+                None => self.close_diff(cx),
+            }
+            return;
+        }
         let armed = self.git.confirm_discard.as_deref() == Some(file.path.as_str());
         self.git_discard_clicked(file.clone(), window, cx);
         if armed {
@@ -650,7 +670,9 @@ impl DartIde {
             .and_then(|p| p.to_str())
             .filter(|p| !p.is_empty())
             .map(str::to_string);
-        let (label, tone) = if let Some(hash) = &state.commit {
+        let (label, tone) = if state.commit.as_deref().is_some_and(|c| c.contains("..")) {
+            ("Agent turn".to_string(), cx.theme().primary)
+        } else if let Some(hash) = &state.commit {
             (format!("Commit {hash}"), cx.theme().magenta)
         } else {
             match (state.file.kind, state.staged) {

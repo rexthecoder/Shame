@@ -430,6 +430,12 @@ pub(crate) enum SlashCommand {
     SetMode(ModeId),
     PickModel,
     AddContext,
+    /// Summarize the conversation so far to free up context.
+    Compact,
+    /// Run the last message again.
+    Retry,
+    /// Put back the files the last turn changed.
+    Undo,
 }
 
 pub(crate) fn parse_slash_command(input: &str) -> Option<SlashCommand> {
@@ -442,6 +448,9 @@ pub(crate) fn parse_slash_command(input: &str) -> Option<SlashCommand> {
         "auto" => SlashCommand::SetMode(ModeId::Auto),
         "model" => SlashCommand::PickModel,
         "file" | "files" | "context" => SlashCommand::AddContext,
+        "compact" => SlashCommand::Compact,
+        "retry" | "regenerate" => SlashCommand::Retry,
+        "undo" => SlashCommand::Undo,
         _ => return None,
     })
 }
@@ -499,6 +508,16 @@ pub(crate) fn format_turn_stats(duration_ms: u64, cost_usd: Option<f64>) -> Stri
         Some(c) if c < 1.0 => format!("{time} \u{b7} ${c:.3}"),
         Some(c) => format!("{time} \u{b7} ${c:.2}"),
         None => time,
+    }
+}
+
+/// A token count the way people say it: `950`, `12.4k`, `200k`, `1.2M`.
+pub(crate) fn format_tokens(tokens: u64) -> String {
+    match tokens {
+        0..=999 => tokens.to_string(),
+        1_000..=9_999 => format!("{:.1}k", tokens as f64 / 1000.0),
+        10_000..=999_999 => format!("{}k", (tokens as f64 / 1000.0).round() as u64),
+        _ => format!("{:.1}M", tokens as f64 / 1_000_000.0),
     }
 }
 
@@ -777,6 +796,9 @@ mod tests {
         assert_eq!(parse_slash_command("/files"), Some(SlashCommand::AddContext));
         assert_eq!(parse_slash_command("/etc/hosts is odd"), None);
         assert_eq!(parse_slash_command("/unknown"), None);
+        assert_eq!(parse_slash_command("/compact"), Some(SlashCommand::Compact));
+        assert_eq!(parse_slash_command("/retry"), Some(SlashCommand::Retry));
+        assert_eq!(parse_slash_command("/undo"), Some(SlashCommand::Undo));
         assert_eq!(parse_slash_command("clear"), None);
     }
 
@@ -806,6 +828,14 @@ mod tests {
     }
 
     #[core::prelude::v1::test]
+    fn token_counts_read_naturally() {
+        assert_eq!(format_tokens(950), "950");
+        assert_eq!(format_tokens(12_400), "12k");
+        assert_eq!(format_tokens(4_300), "4.3k");
+        assert_eq!(format_tokens(1_200_000), "1.2M");
+    }
+
+    #[test]
     fn turn_stats_read_naturally() {
         assert_eq!(format_turn_stats(400, None), "<1s");
         assert_eq!(format_turn_stats(4_200, None), "4.2s");

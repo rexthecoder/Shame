@@ -254,6 +254,9 @@ impl DartIde {
             SlashCommand::SetMode(mode) => self.agent.mode_ix = mode.index(),
             SlashCommand::PickModel => self.open_model_picker(window, cx),
             SlashCommand::AddContext => self.open_attach_picker(window, cx),
+            SlashCommand::Compact => self.agent_compact(cx),
+            SlashCommand::Retry => self.agent_retry_last(cx),
+            SlashCommand::Undo => self.agent_undo_last(cx),
         }
         cx.notify();
     }
@@ -1005,7 +1008,8 @@ impl DartIde {
                                     this.open_model_picker(window, cx);
                                 }
                             })),
-                    ),
+                    )
+                    .when_some(self.render_context_meter(cx), |row, meter| row.child(meter)),
             )
             .child(actions);
 

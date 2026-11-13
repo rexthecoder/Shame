@@ -24,8 +24,9 @@ use gpui_kit::Context;
 use crate::DartIde;
 use crate::agent_ctx::ModeId;
 use crate::agent_plan::PlanState;
+use crate::agent_checkpoint::{Checkpoint, FileChange, TurnFile};
 use crate::rails::agent::{
-    AgentHarness, AgentItem, AgentState, AgentTask, AgentToolCall, AgentToolKind,
+    AgentHarness, AgentItem, AgentState, AgentTask, AgentToolCall, AgentToolKind, ToolStatus,
 };
 
 /// Bumped when the on-disk shape changes; older files are still read, newer
@@ -76,6 +77,8 @@ pub(crate) struct StoredConversation {
 pub(crate) struct StoredTask {
     pub(crate) label: String,
     pub(crate) done: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) active: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -89,6 +92,18 @@ pub(crate) enum StoredItem {
         header: String,
         collapsed: bool,
         calls: Vec<StoredToolCall>,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        thinking: String,
+        /// The workspace before the turn: `(repository, tree)`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        checkpoint: Option<(String, String)>,
+    },
+    /// What one turn changed, so it can still be undone after a restart.
+    Changes {
+        repo: String,
+        before: String,
+        after: String,
+        files: Vec<StoredTurnFile>,
     },
     Plan {
         text: String,
@@ -104,6 +119,49 @@ pub(crate) struct StoredToolCall {
     pub(crate) file: bool,
     pub(crate) label: String,
     pub(crate) target_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) parent_id: Option<String>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub(crate) failed: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct StoredTurnFile {
+    pub(crate) path: String,
+    /// `"A"`, `"M"` or `"D"`.
+    pub(crate) change: String,
+    pub(crate) added: u32,
+    pub(crate) removed: u32,
+    #[serde(default)]
+    pub(crate) reverted: bool,
+}
+
+impl StoredTurnFile {
+    fn from_file(f: &TurnFile) -> Self {
+        Self {
+            path: f.path.clone(),
+            change: f.change.letter().to_string(),
+            added: f.added,
+            removed: f.removed,
+            reverted: f.reverted,
+        }
+    }
+
+    fn into_file(self) -> TurnFile {
+        TurnFile {
+            path: self.path,
+            change: match self.change.as_str() {
+                "A" => FileChange::Added,
+                "D" => FileChange::Deleted,
+                _ => FileChange::Modified,
+            },
+            added: self.added,
+            removed: self.removed,
+            reverted: self.reverted,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -143,6 +201,9 @@ impl StoredToolCall {
             file: call.kind == AgentToolKind::File,
             label: call.label.clone(),
             target_path: call.target_path.clone(),
+            id: call.id.clone(),
+            parent_id: call.parent_id.clone(),
+            failed: call.status == ToolStatus::Failed,
         }
     }
 
@@ -155,6 +216,10 @@ impl StoredToolCall {
             },
             label: self.label,
             target_path: self.target_path,
+            id: self.id,
+            parent_id: self.parent_id,
+            // A call still running when the thread was saved never finished.
+            status: if self.failed { ToolStatus::Failed } else { ToolStatus::Done },
         }
     }
 }
@@ -172,11 +237,28 @@ impl StoredItem {
                 header,
                 collapsed,
                 calls,
+                thinking,
+                checkpoint,
                 ..
             } => Some(StoredItem::ToolGroup {
                 header: header.clone(),
                 collapsed: *collapsed,
                 calls: calls.iter().map(StoredToolCall::from_call).collect(),
+                thinking: thinking.clone(),
+                checkpoint: checkpoint
+                    .as_ref()
+                    .map(|c| (c.repo.to_string_lossy().to_string(), c.tree.clone())),
+            }),
+            AgentItem::Changes { before, after, files, .. } => Some(StoredItem::Changes {
+                repo: before.repo.to_string_lossy().to_string(),
+                before: before.tree.clone(),
+                after: after.clone(),
+                files: files.iter().map(StoredTurnFile::from_file).collect(),
+            }),
+            // An error is kept as what it said; retrying belongs to the live thread.
+            AgentItem::Error { kind, message, .. } => Some(StoredItem::Message {
+                user: false,
+                text: format!("**{}.** {message}", kind.title()),
             }),
             AgentItem::Plan {
                 text,
@@ -203,11 +285,22 @@ impl StoredItem {
                 header,
                 collapsed,
                 calls,
+                thinking,
+                checkpoint,
             } => AgentItem::ToolGroup {
                 id: 0,
                 header,
                 collapsed,
                 calls: calls.into_iter().map(StoredToolCall::into_call).collect(),
+                thinking,
+                thinking_open: false,
+                checkpoint: checkpoint.map(|(repo, tree)| Checkpoint { repo: PathBuf::from(repo), tree }),
+            },
+            StoredItem::Changes { repo, before, after, files } => AgentItem::Changes {
+                before: Checkpoint { repo: PathBuf::from(repo), tree: before },
+                after,
+                files: files.into_iter().map(StoredTurnFile::into_file).collect(),
+                collapsed: true,
             },
             StoredItem::Plan {
                 text,
@@ -247,6 +340,7 @@ impl StoredConversation {
                 .map(|t| StoredTask {
                     label: t.label.clone(),
                     done: t.done,
+                    active: t.active.clone(),
                 })
                 .collect(),
             touched_paths: agent.ai_touched_paths.clone(),
@@ -568,6 +662,7 @@ impl DartIde {
             .map(|t| AgentTask {
                 label: t.label,
                 done: t.done,
+                active: t.active,
             })
             .collect();
         self.agent.ai_touched_paths = conv.touched_paths;
@@ -686,16 +781,24 @@ mod tests {
                 StoredItem::ToolGroup {
                     header: "Agent used 2 tools".into(),
                     collapsed: true,
+                    thinking: String::new(),
+                    checkpoint: None,
                     calls: vec![
                         StoredToolCall {
                             file: true,
                             label: "Edit theme.dart".into(),
                             target_path: Some("lib/theme.dart".into()),
+                            id: None,
+                            parent_id: None,
+                            failed: false,
                         },
                         StoredToolCall {
                             file: false,
                             label: "Run flutter test".into(),
                             target_path: None,
+                            id: None,
+                            parent_id: None,
+                            failed: false,
                         },
                     ],
                 },
@@ -709,6 +812,7 @@ mod tests {
             tasks: vec![StoredTask {
                 label: "Add the toggle".into(),
                 done: true,
+                active: None,
             }],
             touched_paths: vec!["lib/theme.dart".into()],
             prompts: vec!["add a dark mode".into()],
@@ -737,10 +841,15 @@ mod tests {
         let group = StoredItem::ToolGroup {
             header: "Agent used 1 tool".into(),
             collapsed: false,
+            thinking: String::new(),
+            checkpoint: None,
             calls: vec![StoredToolCall {
                 file: true,
                 label: "Write a.dart".into(),
                 target_path: Some("a.dart".into()),
+                id: None,
+                parent_id: None,
+                failed: false,
             }],
         };
         let item = group.clone().into_item();

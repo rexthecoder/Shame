@@ -1336,6 +1336,12 @@ impl EditorView {
         self.ensure_cursor_visible();
     }
 
+    /// Insert `text` at the cursor (replacing any selection), as if typed.
+    pub fn insert_text(&mut self, text: &str, cx: &mut Context<Self>) {
+        self.insert_at_cursor(text, cx);
+        cx.notify();
+    }
+
     fn insert_at_cursor(&mut self, text: &str, cx: &mut Context<Self>) {
         if self.has_multiple_cursors() {
             self.multi_insert(text, cx);

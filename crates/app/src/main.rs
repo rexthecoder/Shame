@@ -5,7 +5,9 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+mod agent_checkpoint;
 mod agent_composer;
+mod agent_turn;
 mod agent_bridge;
 mod agent_ctx;
 mod agent_indicator;
