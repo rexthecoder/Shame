@@ -441,6 +441,7 @@ impl DartIde {
                 "claude": AgentHarnessProbe::found(crate::rails::agent::AgentHarness::ClaudeCode),
                 "codex": AgentHarnessProbe::found(crate::rails::agent::AgentHarness::Codex),
                 "opencode": AgentHarnessProbe::found(crate::rails::agent::AgentHarness::OpenCode),
+                "antigravity": AgentHarnessProbe::found(crate::rails::agent::AgentHarness::Antigravity),
             },
         })
     }

@@ -298,6 +298,7 @@ pub(crate) fn harness_key(harness: AgentHarness) -> &'static str {
         AgentHarness::ClaudeCode => "claude",
         AgentHarness::OpenCode => "opencode",
         AgentHarness::Codex => "codex",
+        AgentHarness::Antigravity => "antigravity",
     }
 }
 
@@ -306,6 +307,7 @@ pub(crate) fn harness_from_key(key: &str) -> Option<AgentHarness> {
         "claude" => Some(AgentHarness::ClaudeCode),
         "opencode" => Some(AgentHarness::OpenCode),
         "codex" => Some(AgentHarness::Codex),
+        "antigravity" => Some(AgentHarness::Antigravity),
         _ => None,
     }
 }
@@ -939,6 +941,7 @@ mod tests {
             AgentHarness::ClaudeCode,
             AgentHarness::OpenCode,
             AgentHarness::Codex,
+            AgentHarness::Antigravity,
         ] {
             assert_eq!(harness_from_key(harness_key(harness)), Some(harness));
         }

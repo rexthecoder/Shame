@@ -30,6 +30,7 @@ pub(crate) enum AgentHarness {
     ClaudeCode,
     OpenCode,
     Codex,
+    Antigravity,
 }
 
 #[derive(Clone, Debug)]
@@ -43,6 +44,7 @@ impl AgentHarness {
         AgentHarness::ClaudeCode,
         AgentHarness::OpenCode,
         AgentHarness::Codex,
+        AgentHarness::Antigravity,
     ];
 
     pub(crate) fn label(self) -> &'static str {
@@ -50,6 +52,7 @@ impl AgentHarness {
             AgentHarness::ClaudeCode => "Claude Code",
             AgentHarness::OpenCode => "OpenCode",
             AgentHarness::Codex => "Codex",
+            AgentHarness::Antigravity => "Gemini (Antigravity)",
         }
     }
 
@@ -58,6 +61,7 @@ impl AgentHarness {
             AgentHarness::ClaudeCode => "Claude",
             AgentHarness::OpenCode => "OpenCode",
             AgentHarness::Codex => "Codex",
+            AgentHarness::Antigravity => "Gemini",
         }
     }
 
@@ -100,6 +104,17 @@ impl AgentHarness {
                 v.push(PathBuf::from("/usr/local/bin/codex"));
                 v
             }
+            AgentHarness::Antigravity => {
+                let mut v = Vec::new();
+                if let Some(h) = &home {
+                    // Google's installer drops `agy` here and does not always put it on PATH.
+                    v.push(h.join(".gemini/bin/agy"));
+                    v.push(h.join(".local/bin/agy"));
+                }
+                v.push(PathBuf::from("/opt/homebrew/bin/agy"));
+                v.push(PathBuf::from("/usr/local/bin/agy"));
+                v
+            }
         };
         for p in candidates {
             if p.is_file() {
@@ -110,6 +125,7 @@ impl AgentHarness {
             AgentHarness::ClaudeCode => "claude",
             AgentHarness::OpenCode => "opencode",
             AgentHarness::Codex => "codex",
+            AgentHarness::Antigravity => "agy",
         };
         std::env::var_os("PATH").and_then(|paths| {
             std::env::split_paths(&paths)
@@ -147,27 +163,6 @@ impl AgentHarness {
                     id: "opencode-go/gemini-4-argon".into(),
                     label: "Gemini 4 Argon".into(),
                 },
-                // Google provider (needs GEMINI_API_KEY / `opencode auth login` for Google).
-                ModelOption {
-                    id: "google/gemini-3-pro-preview".into(),
-                    label: "Gemini 3 Pro (Google)".into(),
-                },
-                ModelOption {
-                    id: "google/gemini-3-flash-preview".into(),
-                    label: "Gemini 3 Flash (Google)".into(),
-                },
-                ModelOption {
-                    id: "google/gemini-2.5-pro".into(),
-                    label: "Gemini 2.5 Pro (Google)".into(),
-                },
-                ModelOption {
-                    id: "google/gemini-2.5-flash".into(),
-                    label: "Gemini 2.5 Flash (Google)".into(),
-                },
-                ModelOption {
-                    id: "google/gemini-2.5-flash-lite".into(),
-                    label: "Gemini 2.5 Flash Lite (Google)".into(),
-                },
                 ModelOption {
                     id: "opencode-go/deepseek-v4.1-flash".into(),
                     label: "DeepSeek V4.1 Flash".into(),
@@ -185,6 +180,23 @@ impl AgentHarness {
                     label: "Big Pickle".into(),
                 },
             ],
+            AgentHarness::Antigravity => [
+                // Ids as printed by `agy models`.
+                ("gemini-4-argon-medium", "Gemini 4 Argon (Medium)"),
+                ("gemini-4-argon-high", "Gemini 4 Argon (High)"),
+                ("gemini-4-argon-low", "Gemini 4 Argon (Low)"),
+                ("gemini-4-hydrogen-high", "Gemini 4 Hydrogen (High)"),
+                ("gemini-4-hydrogen-xhigh", "Gemini 4 Hydrogen (XHigh)"),
+                ("gemini-4-hydrogen-medium", "Gemini 4 Hydrogen (Medium)"),
+                ("gemini-4-hydrogen-low", "Gemini 4 Hydrogen (Low)"),
+                ("gemini-3.8-flash-high", "Gemini 3.8 Flash (High)"),
+                ("gemini-3.8-flash-medium", "Gemini 3.8 Flash (Medium)"),
+                ("gemini-3.8-flash-low", "Gemini 3.8 Flash (Low)"),
+                ("gemini-pro-orchestrator-g1-pro", "Orchestrator (Argon)"),
+            ]
+            .into_iter()
+            .map(|(id, label)| ModelOption { id: id.into(), label: label.into() })
+            .collect(),
             AgentHarness::Codex => {
                 let mut list = load_codex_cached_models();
                 if list.is_empty() {
@@ -349,6 +361,11 @@ pub(crate) fn parse_agent_stream_line(raw: &str) -> Vec<StreamFragment> {
         return vec![StreamFragment::TextDelta(format!("{trimmed}\n"))];
     };
 
+    // Antigravity (`agy --output-format stream-json`) keys its events by `event`, not `type`.
+    if let Some(event) = val.get("event").and_then(|v| v.as_str()) {
+        return parse_antigravity_event(event, &val);
+    }
+
     let mut out = Vec::new();
     let ty = val.get("type").and_then(|v| v.as_str()).unwrap_or("");
 
@@ -491,6 +508,99 @@ pub(crate) fn parse_agent_stream_line(raw: &str) -> Vec<StreamFragment> {
                     }
                     _ => {}
                 }
+            }
+        }
+        _ => {}
+    }
+    out
+}
+
+/// One NDJSON line from `agy --output-format stream-json`: `init`, `step_update`, `result`.
+fn parse_antigravity_event(event: &str, val: &serde_json::Value) -> Vec<StreamFragment> {
+    let mut out = Vec::new();
+    match event {
+        "init" => {
+            if let Some(id) = val
+                .get("conversation_id")
+                .and_then(|v| v.as_str())
+                .filter(|id| !id.is_empty())
+            {
+                out.push(StreamFragment::SessionId(id.to_string()));
+            }
+        }
+        "step_update" => {
+            let Some(step) = val.get("step_update") else {
+                return out;
+            };
+            let state = step.get("state").and_then(|v| v.as_str()).unwrap_or("");
+            match step.get("step_type").and_then(|v| v.as_str()).unwrap_or("") {
+                "agent_response" => {
+                    if let Some(t) = step.get("text_delta").and_then(|v| v.as_str()) {
+                        if !t.is_empty() {
+                            out.push(StreamFragment::TextDelta(t.to_string()));
+                        }
+                    }
+                }
+                // Report each tool once, when it starts.
+                "tool" if state == "ACTIVE" => {
+                    let info = step.get("tool_info");
+                    let name = step
+                        .get("tool_name")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("tool");
+                    let params = info.and_then(|i| i.get("parameters"));
+                    let param = |keys: &[&str]| {
+                        params.and_then(|p| {
+                            keys.iter().find_map(|k| p.get(*k).and_then(|v| v.as_str()))
+                        })
+                    };
+                    if name == "run_command" {
+                        let cmd = param(&["CommandLine", "command"]).unwrap_or(name);
+                        out.push(StreamFragment::Tool(AgentToolCall {
+                            kind: AgentToolKind::Terminal,
+                            label: cmd.lines().next().unwrap_or(cmd).to_string(),
+                            target_path: None,
+                        }));
+                    } else if let Some(path) = param(&[
+                        "AbsolutePath",
+                        "TargetFile",
+                        "file_path",
+                        "path",
+                        "DirectoryPath",
+                    ]) {
+                        let short = Path::new(path)
+                            .file_name()
+                            .and_then(|n| n.to_str())
+                            .unwrap_or(path);
+                        let verb = match name {
+                            "view_file" => "Read",
+                            "list_dir" => "List",
+                            "write_to_file" => "Write",
+                            "replace_file_content" | "multi_replace_file_content" | "sed_file" => {
+                                "Edit"
+                            }
+                            _ => name,
+                        };
+                        out.push(StreamFragment::Tool(AgentToolCall {
+                            kind: AgentToolKind::File,
+                            label: format!("{verb} {short}"),
+                            target_path: Some(path.to_string()),
+                        }));
+                    } else {
+                        out.push(StreamFragment::Tool(tool_call_from_name_and_input(name, params)));
+                    }
+                }
+                _ => {}
+            }
+        }
+        "result" => {
+            let duration_ms = val
+                .get("result")
+                .and_then(|r| r.get("duration_seconds"))
+                .and_then(|v| v.as_f64())
+                .map(|s| (s * 1000.0) as u64);
+            if duration_ms.is_some() {
+                out.push(StreamFragment::Stats { cost_usd: None, duration_ms });
             }
         }
         _ => {}
@@ -1026,7 +1136,9 @@ impl DartIde {
         // Claude Code and Codex resume their own conversation by id. OpenCode
         // is stateless per run here, so it gets the earlier turns as text.
         let resume_id = match self.agent.harness {
-            AgentHarness::ClaudeCode | AgentHarness::Codex => self.agent.session_id.clone(),
+            AgentHarness::ClaudeCode | AgentHarness::Codex | AgentHarness::Antigravity => {
+                self.agent.session_id.clone()
+            }
             AgentHarness::OpenCode => None,
         };
         let prior_transcript = if self.agent.harness == AgentHarness::OpenCode {
@@ -1294,6 +1406,15 @@ impl DartIde {
                         cmd.args(["-m", &model_id]);
                     }
                     cmd.arg(&full_prompt);
+                }
+                AgentHarness::Antigravity => {
+                    cmd.args(["-p", &full_prompt, "--output-format", "stream-json"]);
+                    if let Some(id) = &resume_id {
+                        cmd.args(["--conversation", id]);
+                    }
+                    if !model_id.is_empty() && model_id != "default" {
+                        cmd.args(["--model", &model_id]);
+                    }
                 }
                 AgentHarness::Codex => {
                     cmd.arg("exec");
@@ -2810,6 +2931,32 @@ mod tests {
             }]),
             None
         );
+    }
+
+    #[core::prelude::v1::test]
+    fn parses_antigravity_stream_json_events() {
+        assert_eq!(
+            parse_agent_stream_line(r#"{"event":"init","conversation_id":"abc","init":{}}"#),
+            vec![StreamFragment::SessionId("abc".into())]
+        );
+        assert_eq!(
+            parse_agent_stream_line(
+                r#"{"event":"step_update","step_update":{"state":"ACTIVE","step_type":"agent_response","text_delta":"hi"}}"#
+            ),
+            vec![StreamFragment::TextDelta("hi".into())]
+        );
+        let started = parse_agent_stream_line(
+            r#"{"event":"step_update","step_update":{"state":"ACTIVE","step_type":"tool","tool_name":"run_command","tool_info":{"parameters":{"CommandLine":"ls -la"}}}}"#,
+        );
+        assert!(matches!(
+            started.as_slice(),
+            [StreamFragment::Tool(t)] if t.kind == AgentToolKind::Terminal && t.label == "ls -la"
+        ));
+        // The same tool finishing must not be reported twice.
+        assert!(parse_agent_stream_line(
+            r#"{"event":"step_update","step_update":{"state":"DONE","step_type":"tool","tool_name":"run_command","tool_info":{"parameters":{"CommandLine":"ls -la"}}}}"#
+        )
+        .is_empty());
     }
 
     #[core::prelude::v1::test]
