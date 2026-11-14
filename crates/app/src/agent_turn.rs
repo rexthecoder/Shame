@@ -399,6 +399,40 @@ impl DartIde {
         self.show_toast(format!("Inserted into {name}"), false, cx);
     }
 
+    /// Run a shell code block from an agent reply in the dock terminal.
+    pub(crate) fn agent_run_code_in_terminal(&mut self, code: String, cx: &mut Context<Self>) {
+        let trimmed = code.trim().to_string();
+        if trimmed.is_empty() {
+            return;
+        }
+        self.terminal_open = true;
+        self.dock_tab = crate::DockTab::Terminal;
+        self.execute_terminal_command(trimmed, cx);
+        self.show_toast("Running command in Terminal", false, cx);
+    }
+
+    /// Open a markdown link from an agent reply: workspace files open at the
+    /// target line in the editor; web URLs open in the system browser.
+    pub(crate) fn agent_open_markdown_link(&mut self, raw_url: String, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some((path_str, line_1)) = crate::markdown::parse_file_link_target(&raw_url) {
+            let p = Path::new(&path_str);
+            let full = if p.is_absolute() { p.to_path_buf() } else { self.root.join(p) };
+            if full.exists() {
+                self.open_path(full, window, cx);
+                if let Some(line) = line_1
+                    && let Some(editor) = self.active_editor().cloned()
+                {
+                    let line_0 = line.saturating_sub(1) as u32;
+                    editor.update(cx, |ed, cx| ed.set_cursor_to_position(line_0, 0, cx));
+                }
+                return;
+            }
+        }
+        if raw_url.starts_with("http://") || raw_url.starts_with("https://") {
+            let _ = std::process::Command::new("open").arg(&raw_url).spawn();
+        }
+    }
+
     // ----- rendering ---------------------------------------------------------
 
     /// The reasoning row at the top of a turn: collapsed to one line, opens to
@@ -506,89 +540,259 @@ impl DartIde {
         let fg = cx.theme().foreground;
         let muted = cx.theme().muted_foreground;
         let primary = cx.theme().primary;
+        let info = cx.theme().info;
+        let green = cx.theme().green;
+        let warning = cx.theme().warning;
         let border = cx.theme().border;
         let card_bg = cx.theme().muted;
         let list_hover = cx.theme().list_hover;
         let red = cx.theme().red;
+        let mono_font = cx.theme().mono_font_family.clone();
+
         let target = call.target_path.clone();
         let is_term = call.kind == AgentToolKind::Terminal;
         let (sub_count, sub_open) = sub.unwrap_or((0, false));
         let toggle_id = call.id.clone().filter(|_| sub_count > 0);
-        h_flex()
-            .id(("agent-tool-card", item_ix * 512 + call_ix))
+
+        let (badge_text, badge_color, subject) = if is_term {
+            ("RUN", primary, call.label.as_str())
+        } else if sub_count > 0 || call.label.starts_with("Start a helper") || call.label.starts_with("Task") {
+            let rest = call
+                .label
+                .strip_prefix("Task ")
+                .or_else(|| call.label.strip_prefix("Start a helper: "))
+                .unwrap_or(call.label.as_str());
+            ("AGENT", primary, rest)
+        } else if let Some((verb, rest)) = call.label.split_once(' ') {
+            let (b, col) = match verb {
+                "Read" => ("READ", info),
+                "Edit" => ("EDIT", warning),
+                "Write" => ("WRITE", green),
+                "List" => ("LIST", info),
+                "Grep" | "Glob" | "Search" => ("SEARCH", primary),
+                _ => (verb, muted),
+            };
+            (b, col, rest)
+        } else {
+            ("TOOL", muted, call.label.as_str())
+        };
+
+        let parent_dir = target.as_deref().and_then(|rel| {
+            let p = Path::new(rel);
+            let stripped = p.strip_prefix(&self.root).unwrap_or(p);
+            stripped
+                .parent()
+                .and_then(|d| d.to_str())
+                .filter(|s| !s.is_empty() && *s != ".")
+                .map(str::to_string)
+        });
+
+        let detail_str = call.detail.clone();
+        let is_multiline_detail = detail_str.as_ref().is_some_and(|d| d.contains('\n'));
+        let inline_detail = detail_str.as_ref().filter(|d| !d.contains('\n')).cloned();
+        let detail_open = is_multiline_detail && self.agent.open_tool_details.contains(&(item_ix, call_ix));
+
+        v_flex()
             .w_full()
-            .min_h(px(if nested { 26. } else { 32. }))
-            .when(nested, |el| el.ml(px(tokens::SPACE_5)))
-            .px(px(tokens::SPACE_4))
-            .py(px(if nested { 3. } else { tokens::SPACE_2 }))
-            .items_center()
-            .gap(px(tokens::SPACE_3))
-            .rounded(px(tokens::RADIUS_CARD))
-            .bg(if nested { card_bg.opacity(0.5) } else { card_bg })
-            .border_1()
-            .border_color(if call.status == ToolStatus::Failed { red.opacity(0.5) } else { border })
-            .when(target.is_some() || toggle_id.is_some(), |s| {
-                s.cursor_pointer().hover(move |h| h.bg(list_hover))
-            })
-            .child(if is_term {
-                div()
-                    .font_family(cx.theme().mono_font_family.clone())
-                    .text_size(px(tokens::UI_XS))
-                    .text_color(primary)
-                    .child(">_")
-                    .into_any_element()
-            } else if sub_count > 0 || call.label.starts_with("Start a helper") || call.label.starts_with("Task") {
-                Icon::new(IconName::Bot).with_size(px(13.)).text_color(primary).into_any_element()
-            } else {
-                Icon::new(IconName::FileCode).with_size(px(13.)).text_color(cx.theme().info).into_any_element()
-            })
+            .when(nested, |el| el. pl(px(tokens::SPACE_5)))
+            .gap(px(3.))
             .child(
-                div()
-                    .flex_1()
-                    .min_w(px(0.))
-                    .truncate()
-                    .text_size(px(if nested { tokens::UI_XS } else { tokens::UI_SM }))
-                    .text_color(if call.status == ToolStatus::Failed { red } else { fg })
-                    .when(is_term, |el| el.font_family(cx.theme().mono_font_family.clone()))
-                    .child(call.label.clone()),
-            )
-            .when(sub_count > 0, |el| {
-                el.child(
-                    h_flex()
-                        .flex_shrink_0()
-                        .items_center()
-                        .gap(px(2.))
-                        .text_size(px(tokens::UI_XS))
-                        .text_color(muted)
-                        .child(format!("{sub_count} step{}", if sub_count == 1 { "" } else { "s" }))
-                        .child(
-                            Icon::new(if sub_open { IconName::ChevronDown } else { IconName::ChevronRight })
-                                .with_size(px(10.))
-                                .text_color(muted),
-                        ),
-                )
-            })
-            .when(call.status == ToolStatus::Failed, |el| {
-                el.child(Icon::new(IconName::CircleX).with_size(px(12.)).text_color(red))
-            })
-            .when_some(toggle_id, |el, id| {
-                el.on_click(cx.listener(move |this, _e, _w, cx| {
-                    if !this.agent.open_subagents.remove(&id) {
-                        this.agent.open_subagents.insert(id.clone());
-                    }
-                    cx.notify();
-                }))
-            })
-            .when(sub_count == 0, |el| {
-                el.when_some(target, |s, rel_path| {
-                    s.on_click(cx.listener(move |this, _e, window, cx| {
-                        let p = Path::new(&rel_path);
-                        let full = if p.is_absolute() { p.to_path_buf() } else { this.root.join(p) };
-                        if full.exists() {
-                            this.open_path(full, window, cx);
+                h_flex()
+                    .id(("agent-tool-card", item_ix * 512 + call_ix))
+                    .w_full()
+                    .min_h(px(if nested { 26. } else { 32. }))
+                    .px(px(tokens::SPACE_3))
+                    .py(px(if nested { 3. } else { tokens::SPACE_2 }))
+                    .items_center()
+                    .gap(px(tokens::SPACE_2))
+                    .rounded(px(tokens::RADIUS_CARD))
+                    .bg(if nested { card_bg.opacity(0.5) } else { card_bg })
+                    .border_1()
+                    .border_color(if call.status == ToolStatus::Failed { red.opacity(0.5) } else { border })
+                    .when(target.is_some() || toggle_id.is_some() || is_multiline_detail, |s| {
+                        s.cursor_pointer().hover(move |h| h.bg(list_hover))
+                    })
+                    .child(if is_term {
+                        div()
+                            .font_family(mono_font.clone())
+                            .text_size(px(tokens::UI_XS))
+                            .text_color(primary)
+                            .child(">_")
+                            .into_any_element()
+                    } else if badge_text == "AGENT" {
+                        Icon::new(IconName::Bot).with_size(px(13.)).text_color(primary).into_any_element()
+                    } else if badge_text == "SEARCH" {
+                        Icon::new(IconName::Search).with_size(px(12.5)).text_color(primary).into_any_element()
+                    } else if badge_text == "LIST" {
+                        Icon::new(IconName::Folder).with_size(px(13.)).text_color(info).into_any_element()
+                    } else if target.is_some() {
+                        crate::rails::files::render_file_icon_sized(subject, 13.).into_any_element()
+                    } else {
+                        Icon::new(IconName::FileCode).with_size(px(13.)).text_color(info).into_any_element()
+                    })
+                    .child(
+                        div()
+                            .flex_shrink_0()
+                            .px(px(5.))
+                            .py(px(1.))
+                            .rounded(px(3.))
+                            .bg(badge_color.opacity(0.14))
+                            .font_family(mono_font.clone())
+                            .text_size(px(9.5))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(badge_color)
+                            .child(badge_text.to_string()),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.))
+                            .truncate()
+                            .text_size(px(if nested { tokens::UI_XS } else { tokens::UI_SM }))
+                            .text_color(if call.status == ToolStatus::Failed { red } else { fg })
+                            .when(is_term, |el| el.font_family(mono_font.clone()))
+                            .child(subject.to_string()),
+                    )
+                    .when_some(parent_dir, |el, dir| {
+                        el.child(
+                            div()
+                                .max_w(px(130.))
+                                .truncate()
+                                .text_size(px(tokens::UI_XS))
+                                .text_color(muted.opacity(0.8))
+                                .child(dir),
+                        )
+                    })
+                    .when_some(inline_detail, |el, info_lbl| {
+                        el.child(
+                            div()
+                                .flex_shrink_0()
+                                .px(px(5.))
+                                .py(px(1.))
+                                .rounded(px(3.))
+                                .bg(border.opacity(0.45))
+                                .font_family(mono_font.clone())
+                                .text_size(px(10.))
+                                .text_color(muted)
+                                .child(info_lbl),
+                        )
+                    })
+                    .when(is_multiline_detail, |el| {
+                        el.child(
+                            h_flex()
+                                .id(("agent-tool-detail-btn", item_ix * 512 + call_ix))
+                                .flex_shrink_0()
+                                .items_center()
+                                .gap(px(2.))
+                                .px(px(5.))
+                                .py(px(1.))
+                                .rounded(px(3.))
+                                .bg(border.opacity(0.45))
+                                .text_size(px(10.))
+                                .text_color(muted)
+                                .hover(move |s| s.text_color(fg))
+                                .child(if badge_text == "EDIT" { "diff" } else { "details" })
+                                .child(
+                                    Icon::new(if detail_open { IconName::ChevronDown } else { IconName::ChevronRight })
+                                        .with_size(px(9.5))
+                                        .text_color(muted),
+                                )
+                                .on_click(cx.listener(move |this, _e, _w, cx| {
+                                    let key = (item_ix, call_ix);
+                                    if !this.agent.open_tool_details.remove(&key) {
+                                        this.agent.open_tool_details.insert(key);
+                                    }
+                                    cx.notify();
+                                })),
+                        )
+                    })
+                    .when(sub_count > 0, |el| {
+                        el.child(
+                            h_flex()
+                                .flex_shrink_0()
+                                .items_center()
+                                .gap(px(2.))
+                                .text_size(px(tokens::UI_XS))
+                                .text_color(muted)
+                                .child(format!("{sub_count} step{}", if sub_count == 1 { "" } else { "s" }))
+                                .child(
+                                    Icon::new(if sub_open { IconName::ChevronDown } else { IconName::ChevronRight })
+                                        .with_size(px(10.))
+                                        .text_color(muted),
+                                ),
+                        )
+                    })
+                    .child(match call.status {
+                        ToolStatus::Running => div()
+                            .w(px(7.))
+                            .h(px(7.))
+                            .rounded_full()
+                            .bg(primary)
+                            .into_any_element(),
+                        ToolStatus::Done => Icon::new(IconName::Check)
+                            .with_size(px(11.))
+                            .text_color(green.opacity(0.85))
+                            .into_any_element(),
+                        ToolStatus::Failed => Icon::new(IconName::CircleX)
+                            .with_size(px(12.))
+                            .text_color(red)
+                            .into_any_element(),
+                    })
+                    .when_some(toggle_id, |el, id| {
+                        el.on_click(cx.listener(move |this, _e, _w, cx| {
+                            if !this.agent.open_subagents.remove(&id) {
+                                this.agent.open_subagents.insert(id.clone());
+                            }
+                            cx.notify();
+                        }))
+                    })
+                    .when(sub_count == 0, |el| {
+                        if let Some(rel_path) = target {
+                            el.on_click(cx.listener(move |this, _e, window, cx| {
+                                let p = Path::new(&rel_path);
+                                let full = if p.is_absolute() { p.to_path_buf() } else { this.root.join(p) };
+                                if full.exists() {
+                                    this.open_path(full, window, cx);
+                                }
+                            }))
+                        } else if is_multiline_detail {
+                            el.on_click(cx.listener(move |this, _e, _w, cx| {
+                                let key = (item_ix, call_ix);
+                                if !this.agent.open_tool_details.remove(&key) {
+                                    this.agent.open_tool_details.insert(key);
+                                }
+                                cx.notify();
+                            }))
+                        } else {
+                            el
                         }
-                    }))
-                })
+                    }),
+            )
+            .when_some(detail_str.filter(|_| detail_open), |el, detail| {
+                el.child(
+                    v_flex()
+                        .w_full()
+                        .px(px(tokens::SPACE_3))
+                        .py(px(tokens::SPACE_2))
+                        .rounded(px(tokens::RADIUS_SM))
+                        .bg(card_bg.opacity(0.65))
+                        .border_1()
+                        .border_color(border)
+                        .font_family(mono_font)
+                        .text_size(px(11.))
+                        .line_height(px(15.5))
+                        .gap(px(1.))
+                        .children(detail.lines().map(|line| {
+                            let color = if line.starts_with("+ ") {
+                                green
+                            } else if line.starts_with("- ") {
+                                red
+                            } else {
+                                muted
+                            };
+                            div().w_full().truncate().text_color(color).child(line.to_string())
+                        })),
+                )
             })
             .into_any_element()
     }

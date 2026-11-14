@@ -24,6 +24,7 @@ pub(crate) struct Span {
     pub italic: bool,
     pub code: bool,
     pub link: bool,
+    pub link_url: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -229,9 +230,16 @@ pub(crate) fn parse_inline(text: &str) -> Vec<Span> {
             i += 1;
             continue;
         } else if c == '[' {
-            if let Some((label, end)) = link_at(&chars, i) {
+            if let Some((label, url, end)) = link_at(&chars, i) {
                 push_plain(&mut plain, &mut spans, bold, italic);
-                spans.push(Span { text: label, bold, italic, link: true, ..Span::default() });
+                spans.push(Span {
+                    text: label,
+                    bold,
+                    italic,
+                    link: true,
+                    link_url: Some(url),
+                    ..Span::default()
+                });
                 i = end;
                 continue;
             }
@@ -270,15 +278,16 @@ fn is_emphasis_edge(chars: &[char], i: usize, italic: bool) -> bool {
     opens && chars[i + 1..].iter().any(|&x| x == marker)
 }
 
-/// `[label](url)` starting at `chars[i] == '['`: the label and the index after `)`.
-fn link_at(chars: &[char], i: usize) -> Option<(String, usize)> {
+/// `[label](url)` starting at `chars[i] == '['`: the label, URL, and the index after `)`.
+fn link_at(chars: &[char], i: usize) -> Option<(String, String, usize)> {
     let close = chars[i + 1..].iter().position(|&c| c == ']')? + i + 1;
     if chars.get(close + 1) != Some(&'(') {
         return None;
     }
     let paren = chars[close + 2..].iter().position(|&c| c == ')')? + close + 2;
     let label: String = chars[i + 1..close].iter().collect();
-    (!label.is_empty()).then_some((label, paren + 1))
+    let url: String = chars[close + 2..paren].iter().collect();
+    (!label.is_empty()).then_some((label, url.trim().to_string(), paren + 1))
 }
 
 /// Text of `spans` joined, and the highlight ranges for it.
@@ -323,30 +332,129 @@ pub(crate) struct MdStyle {
 const CHAT_STYLE: MdStyle = MdStyle { body: tokens::UI, line: 19., gap: 6., h1: tokens::UI + 3., h2: tokens::UI + 1.5, h3: tokens::UI, rules: false };
 const DOC_STYLE: MdStyle = MdStyle { body: 14., line: 23., gap: 11., h1: 21., h2: 17.5, h3: 15., rules: true };
 
-/// Render a reply. `id` namespaces element ids so several messages can show
-/// code blocks at once.
-pub(crate) fn render_markdown(text: &str, id: usize, cx: &App) -> Div {
-    render_markdown_with(text, id, &CHAT_STYLE, None, cx)
-}
-
 /// What a code block's Insert button does with the code.
 pub(crate) type InsertCode = std::rc::Rc<dyn Fn(String, &mut Window, &mut App)>;
+/// What a shell code block's Run button does with the command.
+pub(crate) type RunCode = std::rc::Rc<dyn Fn(String, &mut Window, &mut App)>;
+/// What clicking a markdown `[label](url)` link does.
+pub(crate) type OpenLink = std::rc::Rc<dyn Fn(String, &mut Window, &mut App)>;
 
-/// Chat markdown whose code blocks also offer "Insert" (at the editor cursor).
-pub(crate) fn render_markdown_insertable(text: &str, id: usize, on_insert: InsertCode, cx: &App) -> Div {
-    render_markdown_with(text, id, &CHAT_STYLE, Some(on_insert), cx)
+#[derive(Clone, Default)]
+pub(crate) struct MdCallbacks {
+    pub on_insert: Option<InsertCode>,
+    pub on_run: Option<RunCode>,
+    pub on_link: Option<OpenLink>,
+}
+
+/// Chat markdown with full interactive callbacks (Insert, Run in Terminal, and Open Link).
+pub(crate) fn render_markdown_interactive(
+    text: &str,
+    id: usize,
+    callbacks: MdCallbacks,
+    cx: &App,
+) -> Div {
+    render_markdown_with(text, id, &CHAT_STYLE, callbacks, cx)
 }
 
 /// Render a document (a plan): larger text, more air, underlined headings.
 pub(crate) fn render_markdown_doc(text: &str, id: usize, cx: &App) -> Div {
-    render_markdown_with(text, id, &DOC_STYLE, None, cx)
+    render_markdown_with(text, id, &DOC_STYLE, MdCallbacks::default(), cx)
+}
+
+/// Whether `lang` is an interactive shell fence that can be executed in the terminal dock.
+pub(crate) fn is_shell_lang(lang: &str) -> bool {
+    matches!(
+        lang.trim().to_ascii_lowercase().as_str(),
+        "sh" | "bash" | "zsh" | "shell" | "console"
+    )
+}
+
+/// Map a markdown code-fence tag to a tree-sitter grammar and produce disjoint
+/// `StyledText` highlight ranges.
+pub(crate) fn code_syntax_highlights(
+    lang: &str,
+    code: &str,
+) -> Vec<(Range<usize>, HighlightStyle)> {
+    if code.is_empty() || code.len() > 64 * 1024 {
+        return Vec::new();
+    }
+    let tag = lang
+        .split_whitespace()
+        .next()
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let syntax_lang = match tag.as_str() {
+        "dart" | "flutter" => core_syntax::SyntaxLanguage::Dart,
+        "rs" | "rust" => core_syntax::SyntaxLanguage::Rust,
+        "ts" | "typescript" => core_syntax::SyntaxLanguage::TypeScript,
+        "tsx" => core_syntax::SyntaxLanguage::Tsx,
+        "js" | "javascript" | "jsx" | "mjs" | "cjs" => core_syntax::SyntaxLanguage::JavaScript,
+        "py" | "python" => core_syntax::SyntaxLanguage::Python,
+        _ => return Vec::new(),
+    };
+    let mut spans = core_syntax::SyntaxTree::parse_as(syntax_lang, code).highlights(code);
+    spans.sort_by_key(|s| (s.range.start, s.range.end));
+    let mut runs = Vec::with_capacity(spans.len());
+    let mut cursor = 0;
+    for span in spans {
+        let start = span.range.start.max(cursor);
+        let end = span.range.end;
+        if start < end && end <= code.len() {
+            cursor = end;
+            runs.push((
+                start..end,
+                HighlightStyle {
+                    color: Some(editor_view::highlight_color(span.kind).into()),
+                    ..HighlightStyle::default()
+                },
+            ));
+        }
+    }
+    runs
+}
+
+/// Parse a markdown link target (`file:///path/to/file.rs#L42-L50` or `src/main.rs:42`)
+/// into `(file_path, optional_1_based_line)`. Returns `None` for web URLs (`http://`, `https://`).
+pub(crate) fn parse_file_link_target(url: &str) -> Option<(String, Option<u32>)> {
+    let trimmed = url.trim();
+    if trimmed.is_empty()
+        || trimmed.starts_with("http://")
+        || trimmed.starts_with("https://")
+        || trimmed.starts_with("mailto:")
+        || trimmed.starts_with("conversation://")
+    {
+        return None;
+    }
+    let without_scheme = trimmed.strip_prefix("file://").unwrap_or(trimmed);
+    if let Some((path_part, frag)) = without_scheme.split_once('#') {
+        let line = frag
+            .strip_prefix('L')
+            .or_else(|| frag.strip_prefix('l'))
+            .unwrap_or(frag)
+            .split(|c: char| !c.is_ascii_digit())
+            .next()
+            .and_then(|digits| digits.parse::<u32>().ok())
+            .filter(|&n| n >= 1);
+        return (!path_part.is_empty()).then(|| (path_part.to_string(), line));
+    }
+    if let Some((path_part, tail)) = without_scheme.rsplit_once(':') {
+        let line = tail
+            .split(|c: char| !c.is_ascii_digit())
+            .next()
+            .and_then(|digits| digits.parse::<u32>().ok())
+            .filter(|&n| n >= 1);
+        if line.is_some() && !path_part.is_empty() {
+            return Some((path_part.to_string(), line));
+        }
+    }
+    Some((without_scheme.to_string(), None))
 }
 
 fn render_markdown_with(
     text: &str,
     id: usize,
     style: &MdStyle,
-    on_insert: Option<InsertCode>,
+    callbacks: MdCallbacks,
     cx: &App,
 ) -> Div {
     let fg = cx.theme().foreground;
@@ -354,6 +462,7 @@ fn render_markdown_with(
     let border = cx.theme().border;
     let primary = cx.theme().primary;
     let code_bg = cx.theme().background;
+    let list_hover = cx.theme().list_hover;
     let mono = cx.theme().mono_font_family.clone();
 
     let base = HighlightStyle::default();
@@ -366,16 +475,66 @@ fn render_markdown_with(
         let (text, runs) = flatten(spans, &base, &code_style, primary);
         StyledText::new(text).with_highlights(runs)
     };
+    let render_links = |spans: &[Span], block_ix: usize| -> Option<Div> {
+        let on_link = callbacks.on_link.as_ref()?;
+        let links: Vec<(String, String)> = spans
+            .iter()
+            .filter_map(|s| {
+                let url = s.link_url.as_ref()?.trim();
+                (!url.is_empty()).then(|| (s.text.clone(), url.to_string()))
+            })
+            .collect();
+        if links.is_empty() {
+            return None;
+        }
+        Some(
+            h_flex()
+                .flex_wrap()
+                .gap(px(4.))
+                .mt(px(2.))
+                .children(links.into_iter().enumerate().map(|(link_ix, (label, url))| {
+                    let on_link = on_link.clone();
+                    h_flex()
+                        .id(("md-link", id * 100_000 + block_ix * 100 + link_ix))
+                        .px(px(6.))
+                        .py(px(1.5))
+                        .gap(px(4.))
+                        .items_center()
+                        .rounded(px(tokens::RADIUS_BADGE))
+                        .bg(code_bg)
+                        .border_1()
+                        .border_color(border)
+                        .cursor_pointer()
+                        .text_size(px(tokens::UI_XS))
+                        .text_color(primary)
+                        .hover(move |s| s.bg(list_hover).border_color(primary.opacity(0.45)))
+                        .child("\u{2197}")
+                        .child(label)
+                        .on_click(move |_event, window, cx| {
+                            on_link(url.clone(), window, cx);
+                        })
+                })),
+        )
+    };
 
     let mut column = v_flex().w_full().gap(px(style.gap)).text_color(fg);
     for (ix, block) in parse_markdown(text).into_iter().enumerate() {
         column = column.child(match block {
-            Block::Paragraph(spans) => div()
-                .w_full()
-                .text_size(px(style.body))
-                .line_height(px(style.line))
-                .child(styled(&spans))
-                .into_any_element(),
+            Block::Paragraph(spans) => {
+                let link_row = render_links(&spans, ix);
+                v_flex()
+                    .w_full()
+                    .gap(px(2.))
+                    .child(
+                        div()
+                            .w_full()
+                            .text_size(px(style.body))
+                            .line_height(px(style.line))
+                            .child(styled(&spans)),
+                    )
+                    .when_some(link_row, |el, row| el.child(row))
+                    .into_any_element()
+            }
             Block::Heading { level, spans } => {
                 let size = match level {
                     1 => style.h1,
@@ -392,16 +551,26 @@ fn render_markdown_with(
                     .child(styled(&spans))
                     .into_any_element()
             }
-            Block::ListItem { marker, indent, spans } => h_flex()
-                .w_full()
-                .items_start()
-                .gap(px(6.))
-                .pl(px(indent as f32 * 16.))
-                .text_size(px(style.body))
-                .line_height(px(style.line))
-                .child(div().flex_shrink_0().min_w(px(18.)).text_color(muted).child(marker))
-                .child(div().flex_1().min_w(px(0.)).child(styled(&spans)))
-                .into_any_element(),
+            Block::ListItem { marker, indent, spans } => {
+                let link_row = render_links(&spans, ix);
+                h_flex()
+                    .w_full()
+                    .items_start()
+                    .gap(px(6.))
+                    .pl(px(indent as f32 * 16.))
+                    .text_size(px(style.body))
+                    .line_height(px(style.line))
+                    .child(div().flex_shrink_0().min_w(px(18.)).text_color(muted).child(marker))
+                    .child(
+                        v_flex()
+                            .flex_1()
+                            .min_w(px(0.))
+                            .gap(px(2.))
+                            .child(div().w_full().child(styled(&spans)))
+                            .when_some(link_row, |el, row| el.child(row)),
+                    )
+                    .into_any_element()
+            }
             Block::Quote(spans) => div()
                 .w_full()
                 .pl(px(8.))
@@ -449,7 +618,20 @@ fn render_markdown_with(
             Block::Rule => div().w_full().h(px(1.)).my(px(4.)).bg(border).into_any_element(),
             Block::Code { lang, code } => {
                 let to_copy = code.clone();
-                let insert = on_insert.clone().map(|f| (f, code.clone()));
+                let insert = callbacks.on_insert.clone().map(|f| (f, code.clone()));
+                let run = callbacks
+                    .on_run
+                    .clone()
+                    .filter(|_| is_shell_lang(&lang))
+                    .map(|f| (f, code.clone()));
+                let highlights = code_syntax_highlights(&lang, &code);
+                let line_count = code.lines().count();
+                let header_label = match (lang.is_empty(), line_count > 1) {
+                    (true, true) => format!("code \u{b7} {line_count} lines"),
+                    (true, false) => "code".to_string(),
+                    (false, true) => format!("{lang} \u{b7} {line_count} lines"),
+                    (false, false) => lang,
+                };
                 v_flex()
                     .w_full()
                     .rounded(px(tokens::RADIUS_SM))
@@ -468,10 +650,25 @@ fn render_markdown_with(
                             .border_color(border)
                             .text_size(px(tokens::UI_XS))
                             .text_color(muted)
-                            .child(if lang.is_empty() { "code".to_string() } else { lang })
+                            .child(header_label)
                             .child(
                                 h_flex()
-                                    .gap(px(2.))
+                                    .gap(px(4.))
+                                    .when_some(run, |row, (run, code)| {
+                                        row.child(
+                                            div()
+                                                .id(("md-run", id * 10_000 + ix))
+                                                .cursor_pointer()
+                                                .px(px(5.))
+                                                .rounded(px(3.))
+                                                .text_color(primary)
+                                                .hover(|s| s.bg(rgba(0xffffff12)))
+                                                .child("\u{25b6} Run")
+                                                .on_click(move |_event, window, cx| {
+                                                    run(code.clone(), window, cx);
+                                                }),
+                                        )
+                                    })
                                     .when_some(insert, |row, (insert, code)| {
                                         row.child(
                                             div()
@@ -487,18 +684,18 @@ fn render_markdown_with(
                                         )
                                     })
                                     .child(
-                                div()
-                                    .id(("md-copy", id * 10_000 + ix))
-                                    .cursor_pointer()
-                                    .px(px(4.))
-                                    .rounded(px(3.))
-                                    .hover(|s| s.bg(rgba(0xffffff12)))
-                                    .child("Copy")
-                                    .on_click(move |_event, _window, cx| {
-                                        cx.write_to_clipboard(ClipboardItem::new_string(
-                                            to_copy.clone(),
-                                        ));
-                                    }),
+                                        div()
+                                            .id(("md-copy", id * 10_000 + ix))
+                                            .cursor_pointer()
+                                            .px(px(4.))
+                                            .rounded(px(3.))
+                                            .hover(|s| s.bg(rgba(0xffffff12)))
+                                            .child("Copy")
+                                            .on_click(move |_event, _window, cx| {
+                                                cx.write_to_clipboard(ClipboardItem::new_string(
+                                                    to_copy.clone(),
+                                                ));
+                                            }),
                                     ),
                             ),
                     )
@@ -514,7 +711,7 @@ fn render_markdown_with(
                             .line_height(px(17.))
                             .text_color(fg)
                             .whitespace_nowrap()
-                            .child(code),
+                            .child(StyledText::new(code).with_highlights(highlights)),
                     )
                     .into_any_element()
             }
@@ -584,7 +781,30 @@ mod tests {
     fn links_show_their_label() {
         let spans = parse_inline("see [the docs](https://example.com) now");
         assert_eq!(plain(&spans), "see the docs now");
-        assert!(spans.iter().any(|s| s.link && s.text == "the docs"));
+        assert!(spans.iter().any(|s| {
+            s.link && s.text == "the docs" && s.link_url.as_deref() == Some("https://example.com")
+        }));
+    }
+
+    #[core::prelude::v1::test]
+    fn parses_file_links_and_highlights_code_blocks() {
+        assert_eq!(
+            parse_file_link_target("file:///Users/me/project/src/main.rs#L42-L50"),
+            Some(("/Users/me/project/src/main.rs".to_string(), Some(42)))
+        );
+        assert_eq!(
+            parse_file_link_target("crates/app/src/main.rs:120"),
+            Some(("crates/app/src/main.rs".to_string(), Some(120)))
+        );
+        assert_eq!(parse_file_link_target("https://example.com/a.rs"), None);
+        assert!(is_shell_lang("bash") && is_shell_lang("zsh") && !is_shell_lang("rust"));
+
+        let rust_runs = code_syntax_highlights("rust", "pub fn greet() -> usize { 42 }");
+        assert!(!rust_runs.is_empty(), "rust code blocks get tree-sitter highlights");
+        // Ranges must be strictly disjoint and ordered for StyledText.
+        for pair in rust_runs.windows(2) {
+            assert!(pair[0].0.end <= pair[1].0.start);
+        }
     }
 
     #[core::prelude::v1::test]

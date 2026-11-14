@@ -438,6 +438,92 @@ pub(crate) enum SlashCommand {
     Undo,
 }
 
+pub(crate) struct SlashCommandEntry {
+    pub name: &'static str,
+    pub description: &'static str,
+    pub command: SlashCommand,
+}
+
+pub(crate) const SLASH_COMMANDS: &[SlashCommandEntry] = &[
+    SlashCommandEntry {
+        name: "new",
+        description: "Start a fresh conversation thread",
+        command: SlashCommand::NewThread,
+    },
+    SlashCommandEntry {
+        name: "clear",
+        description: "Clear the current conversation",
+        command: SlashCommand::NewThread,
+    },
+    SlashCommandEntry {
+        name: "ask",
+        description: "Switch to Ask mode (read-only / manual approval)",
+        command: SlashCommand::SetMode(ModeId::Ask),
+    },
+    SlashCommandEntry {
+        name: "plan",
+        description: "Switch to Plan mode (step-by-step plan before editing)",
+        command: SlashCommand::SetMode(ModeId::Plan),
+    },
+    SlashCommandEntry {
+        name: "edit",
+        description: "Switch to Edit mode (auto-accept file edits)",
+        command: SlashCommand::SetMode(ModeId::Edit),
+    },
+    SlashCommandEntry {
+        name: "auto",
+        description: "Switch to Auto mode (edit and run commands freely)",
+        command: SlashCommand::SetMode(ModeId::Auto),
+    },
+    SlashCommandEntry {
+        name: "model",
+        description: "Choose the AI model",
+        command: SlashCommand::PickModel,
+    },
+    SlashCommandEntry {
+        name: "context",
+        description: "Attach files, folders, symbols or live context",
+        command: SlashCommand::AddContext,
+    },
+    SlashCommandEntry {
+        name: "compact",
+        description: "Summarize the conversation to free context window",
+        command: SlashCommand::Compact,
+    },
+    SlashCommandEntry {
+        name: "retry",
+        description: "Re-run the last prompt",
+        command: SlashCommand::Retry,
+    },
+    SlashCommandEntry {
+        name: "undo",
+        description: "Revert file changes from the last turn",
+        command: SlashCommand::Undo,
+    },
+];
+
+/// Matching `/commands` when the composer input begins with `/` and has no spaces.
+pub(crate) fn slash_candidates(input: &str) -> Vec<&'static SlashCommandEntry> {
+    let Some(rest) = input.strip_prefix('/') else {
+        return Vec::new();
+    };
+    if rest.chars().any(char::is_whitespace) {
+        return Vec::new();
+    }
+    let q = rest.to_ascii_lowercase();
+    let mut prefix_hits = Vec::new();
+    let mut substr_hits = Vec::new();
+    for entry in SLASH_COMMANDS {
+        if entry.name.starts_with(&q) {
+            prefix_hits.push(entry);
+        } else if entry.name.contains(&q) {
+            substr_hits.push(entry);
+        }
+    }
+    prefix_hits.extend(substr_hits);
+    prefix_hits
+}
+
 pub(crate) fn parse_slash_command(input: &str) -> Option<SlashCommand> {
     let word = input.trim().strip_prefix('/')?;
     Some(match word.to_ascii_lowercase().as_str() {

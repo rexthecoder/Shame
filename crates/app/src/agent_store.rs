@@ -125,6 +125,8 @@ pub(crate) struct StoredToolCall {
     pub(crate) parent_id: Option<String>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub(crate) failed: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) detail: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -204,6 +206,7 @@ impl StoredToolCall {
             id: call.id.clone(),
             parent_id: call.parent_id.clone(),
             failed: call.status == ToolStatus::Failed,
+            detail: call.detail.clone(),
         }
     }
 
@@ -220,6 +223,7 @@ impl StoredToolCall {
             parent_id: self.parent_id,
             // A call still running when the thread was saved never finished.
             status: if self.failed { ToolStatus::Failed } else { ToolStatus::Done },
+            detail: self.detail,
         }
     }
 }
@@ -791,6 +795,7 @@ mod tests {
                             id: None,
                             parent_id: None,
                             failed: false,
+                            detail: None,
                         },
                         StoredToolCall {
                             file: false,
@@ -799,6 +804,7 @@ mod tests {
                             id: None,
                             parent_id: None,
                             failed: false,
+                            detail: None,
                         },
                     ],
                 },
@@ -850,6 +856,7 @@ mod tests {
                 id: None,
                 parent_id: None,
                 failed: false,
+                detail: None,
             }],
         };
         let item = group.clone().into_item();

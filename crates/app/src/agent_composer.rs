@@ -17,7 +17,7 @@ use gpui_kit::*;
 
 use crate::agent_ctx::{
     AGENT_MODES, Attachment, ContextKind, ModeId, SlashCommand, active_mention, add_attachment,
-    classify_path, history_step,
+    classify_path, history_step, slash_candidates,
 };
 use crate::rails::agent::{AgentHarness, ModelOption, filter_models};
 use crate::{DartIde, tokens};
@@ -302,6 +302,7 @@ impl DartIde {
     pub(crate) fn open_attach_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.agent.mention_range = None;
         self.agent.attach_open = true;
+        self.agent.slash_open = false;
         self.ensure_symbol_index(cx);
         self.agent.tool_picker_open = false;
         self.agent.model_picker_open = false;
@@ -316,6 +317,7 @@ impl DartIde {
     pub(crate) fn close_agent_pickers(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.agent.mention_range = None;
         self.agent.attach_open = false;
+        self.agent.slash_open = false;
         self.agent.tool_picker_open = false;
         self.agent.model_picker_open = false;
         self.agent.input.update(cx, |state, cx| state.focus(window, cx));
@@ -386,8 +388,8 @@ impl DartIde {
         }
     }
 
-    /// Track an `@query` being typed: open the live picker while there is one,
-    /// close it when there isn't.
+    /// Track an `@query` or `/command` being typed: open the live picker while
+    /// there is one, close it when there isn't.
     pub(crate) fn update_mention_state(&mut self, cx: &mut Context<Self>) {
         let (text, cursor, tokens) = {
             let input = self.agent.input.read(cx);
@@ -407,12 +409,27 @@ impl DartIde {
                 self.agent.mention_range = Some(range);
                 self.ensure_symbol_index(cx);
                 self.agent.attach_open = true;
+                self.agent.slash_open = false;
                 self.agent.tool_picker_open = false;
                 self.agent.model_picker_open = false;
             }
             None => {
                 if self.agent.mention_range.take().is_some() {
                     self.agent.attach_open = false;
+                }
+                let slashes = slash_candidates(&text);
+                if !slashes.is_empty() {
+                    self.agent.slash_open = true;
+                    self.agent.slash_selected = self
+                        .agent
+                        .slash_selected
+                        .min(slashes.len().saturating_sub(1));
+                    self.agent.attach_open = false;
+                    self.agent.tool_picker_open = false;
+                    self.agent.model_picker_open = false;
+                } else {
+                    self.agent.slash_open = false;
+                    self.agent.slash_selected = 0;
                 }
             }
         }
@@ -536,6 +553,7 @@ impl DartIde {
         self.agent.model_picker_open = true;
         self.agent.tool_picker_open = false;
         self.agent.attach_open = false;
+        self.agent.slash_open = false;
         self.agent.model_selected = self.agent.model_ix;
         self.agent.model_search.update(cx, |state, cx| {
             state.set_value("", window, cx);
@@ -570,7 +588,18 @@ impl DartIde {
 
     /// Enter in an open picker: take the highlighted row.
     fn accept_picker_selection(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.agent.attach_open {
+        if self.agent.slash_open {
+            let text = self.agent.input.read(cx).value().to_string();
+            let slashes = slash_candidates(&text);
+            if let Some(entry) = slashes.get(self.agent.slash_selected).copied() {
+                self.agent.slash_open = false;
+                self.agent.slash_selected = 0;
+                self.agent
+                    .input
+                    .update(cx, |state, cx| state.set_value("", window, cx));
+                self.run_slash_command(entry.command, window, cx);
+            }
+        } else if self.agent.attach_open {
             let candidates = self.attach_candidates(cx);
             if let Some(candidate) = candidates.get(self.agent.attach_selected).cloned() {
                 self.insert_mention(candidate.into_attachment(), window, cx);
@@ -587,7 +616,9 @@ impl DartIde {
     }
 
     fn picker_row_count(&self, cx: &App) -> usize {
-        if self.agent.attach_open {
+        if self.agent.slash_open {
+            slash_candidates(&self.agent.input.read(cx).value()).len()
+        } else if self.agent.attach_open {
             self.attach_candidates(cx).len()
         } else if self.agent.model_picker_open {
             let (matches, custom) = self.model_candidates(cx);
@@ -602,7 +633,8 @@ impl DartIde {
     fn agent_composer_key(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         let key = event.keystroke.key.as_str();
         let shift = event.keystroke.modifiers.shift;
-        let any_picker = self.agent.attach_open
+        let any_picker = self.agent.slash_open
+            || self.agent.attach_open
             || self.agent.model_picker_open
             || self.agent.tool_picker_open;
 
@@ -614,7 +646,9 @@ impl DartIde {
                 }
                 "down" | "up" => {
                     let count = self.picker_row_count(cx);
-                    let sel = if self.agent.attach_open {
+                    let sel = if self.agent.slash_open {
+                        &mut self.agent.slash_selected
+                    } else if self.agent.attach_open {
                         &mut self.agent.attach_selected
                     } else {
                         &mut self.agent.model_selected
@@ -631,7 +665,7 @@ impl DartIde {
                     self.accept_picker_selection(window, cx);
                     true
                 }
-                "tab" if self.agent.mention_range.is_some() => {
+                "tab" if self.agent.mention_range.is_some() || self.agent.slash_open => {
                     self.accept_picker_selection(window, cx);
                     true
                 }
@@ -1530,6 +1564,65 @@ impl DartIde {
                     ),
             );
         }
+
+        if self.agent.slash_open {
+            let text = self.agent.input.read(cx).value().to_string();
+            let slashes = slash_candidates(&text);
+            if !slashes.is_empty() {
+                let selected = self.agent.slash_selected;
+                return Some(
+                    panel()
+                        .child(
+                            div()
+                                .px(px(tokens::SPACE_2))
+                                .py(px(2.))
+                                .text_size(px(tokens::UI_XS))
+                                .font_medium()
+                                .text_color(muted)
+                                .child("SLASH COMMANDS"),
+                        )
+                        .child(
+                            v_flex()
+                                .id("agent-slash-list")
+                                .w_full()
+                                .min_h(px(0.))
+                                .overflow_y_scroll()
+                                .gap(px(1.))
+                                .children(slashes.into_iter().enumerate().map(|(ix, entry)| {
+                                    let cmd = entry.command;
+                                    row(("agent-slash-opt", ix).into(), ix == selected)
+                                        .child(
+                                            div()
+                                                .flex_shrink_0()
+                                                .font_family(mono.clone())
+                                                .text_size(px(tokens::UI_SM))
+                                                .font_medium()
+                                                .text_color(primary)
+                                                .child(format!("/{}", entry.name)),
+                                        )
+                                        .child(
+                                            div()
+                                                .flex_1()
+                                                .min_w(px(0.))
+                                                .truncate()
+                                                .text_right()
+                                                .text_size(px(tokens::UI_XS))
+                                                .text_color(muted)
+                                                .child(entry.description),
+                                        )
+                                        .on_click(cx.listener(move |this, _e, window, cx| {
+                                            this.agent.slash_open = false;
+                                            this.agent.slash_selected = 0;
+                                            this.agent
+                                                .input
+                                                .update(cx, |s, cx| s.set_value("", window, cx));
+                                            this.run_slash_command(cmd, window, cx);
+                                        }))
+                                })),
+                        ),
+                );
+            }
+        }
         None
     }
 }
@@ -1537,7 +1630,18 @@ impl DartIde {
 #[cfg(test)]
 mod tests {
     use super::{Candidate, attach_matches, attachment_sub, mention_candidates};
-    use crate::agent_ctx::{Attachment, ContextKind};
+    use crate::agent_ctx::{Attachment, ContextKind, ModeId, SlashCommand, slash_candidates};
+
+    #[core::prelude::v1::test]
+    fn slash_candidates_filter_by_prefix_and_ignore_sentences() {
+        let all = slash_candidates("/");
+        assert!(all.len() >= 10);
+        let plan = slash_candidates("/pl");
+        assert_eq!(plan.len(), 1);
+        assert_eq!(plan[0].command, SlashCommand::SetMode(ModeId::Plan));
+        assert!(slash_candidates("/plan something").is_empty());
+        assert!(slash_candidates("hello /plan").is_empty());
+    }
 
     #[core::prelude::v1::test]
     fn tile_subtitles_place_the_file_or_selection() {

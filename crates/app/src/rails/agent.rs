@@ -308,6 +308,8 @@ pub(crate) struct AgentToolCall {
     /// Set on calls made by a helper agent: the id of the `Task` call that started it.
     pub(crate) parent_id: Option<String>,
     pub(crate) status: ToolStatus,
+    /// Optional detail or snippet (e.g. multi-line command, edit diff preview, line range).
+    pub(crate) detail: Option<String>,
 }
 
 /// Why a turn failed, so the card can offer the right way out.
@@ -879,6 +881,7 @@ fn parse_antigravity_event(event: &str, val: &serde_json::Value) -> Vec<StreamFr
                             kind: AgentToolKind::Terminal,
                             label: cmd.lines().next().unwrap_or(cmd).to_string(),
                             target_path: None,
+                            detail: extract_tool_detail(name, params),
                             ..Default::default()
                         }));
                     } else if let Some(path) = param(&[
@@ -887,24 +890,27 @@ fn parse_antigravity_event(event: &str, val: &serde_json::Value) -> Vec<StreamFr
                         "file_path",
                         "path",
                         "DirectoryPath",
+                        "Path",
                     ]) {
                         let short = Path::new(path)
                             .file_name()
                             .and_then(|n| n.to_str())
                             .unwrap_or(path);
                         let verb = match name {
-                            "view_file" => "Read",
+                            "view_file" | "read_file" => "Read",
                             "list_dir" => "List",
-                            "write_to_file" => "Write",
-                            "replace_file_content" | "multi_replace_file_content" | "sed_file" => {
-                                "Edit"
-                            }
+                            "write_to_file" | "write_file" => "Write",
+                            "replace_file_content"
+                            | "multi_replace_file_content"
+                            | "sed_file"
+                            | "edit_file" => "Edit",
                             _ => name,
                         };
                         out.push(StreamFragment::Tool(AgentToolCall {
                             kind: AgentToolKind::File,
                             label: format!("{verb} {short}"),
                             target_path: Some(path.to_string()),
+                            detail: extract_tool_detail(name, params),
                             ..Default::default()
                         }));
                     } else {
@@ -929,11 +935,82 @@ fn parse_antigravity_event(event: &str, val: &serde_json::Value) -> Vec<StreamFr
     out
 }
 
+fn extract_tool_detail(name: &str, input: Option<&serde_json::Value>) -> Option<String> {
+    let input = input?;
+    let lower = name.to_ascii_lowercase();
+    if lower.contains("bash")
+        || lower.contains("shell")
+        || lower.contains("exec")
+        || name == "run_command"
+    {
+        let cmd = input
+            .get("command")
+            .or_else(|| input.get("cmd"))
+            .or_else(|| input.get("CommandLine"))
+            .and_then(|v| v.as_str())?;
+        if cmd.lines().count() > 1 {
+            let preview: Vec<&str> = cmd.lines().take(12).collect();
+            return Some(preview.join("\n"));
+        }
+        return None;
+    }
+    if lower.contains("edit")
+        || lower.contains("replace")
+        || lower.contains("patch")
+    {
+        let old = input
+            .get("old_string")
+            .or_else(|| input.get("Target"))
+            .or_else(|| input.get("TargetContent"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let new = input
+            .get("new_string")
+            .or_else(|| input.get("Replacement"))
+            .or_else(|| input.get("ReplacementContent"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        if !old.is_empty() || !new.is_empty() {
+            let mut lines = Vec::new();
+            for l in old.lines().take(4) {
+                lines.push(format!("- {l}"));
+            }
+            for l in new.lines().take(4) {
+                lines.push(format!("+ {l}"));
+            }
+            if !lines.is_empty() {
+                return Some(lines.join("\n"));
+            }
+        }
+    }
+    if lower.contains("read") || lower == "view_file" {
+        let start = input
+            .get("offset")
+            .or_else(|| input.get("StartLine"))
+            .and_then(|v| v.as_u64());
+        let end = input
+            .get("EndLine")
+            .and_then(|v| v.as_u64())
+            .or_else(|| {
+                let s = start?;
+                let limit = input.get("limit").and_then(|v| v.as_u64())?;
+                Some(s + limit.saturating_sub(1))
+            });
+        if let (Some(s), Some(e)) = (start, end) {
+            return Some(format!("lines {s}\u{2013}{e}"));
+        } else if let Some(s) = start {
+            return Some(format!("from line {s}"));
+        }
+    }
+    None
+}
+
 fn tool_call_from_name_and_input(
     name: &str,
     input: Option<&serde_json::Value>,
 ) -> AgentToolCall {
     let lower = name.to_ascii_lowercase();
+    let detail = extract_tool_detail(name, input);
     if lower.contains("bash") || lower.contains("shell") || lower.contains("exec") {
         let cmd = input
             .and_then(|i| i.get("command").or_else(|| i.get("cmd")))
@@ -943,6 +1020,7 @@ fn tool_call_from_name_and_input(
             kind: AgentToolKind::Terminal,
             label: cmd.lines().next().unwrap_or(cmd).to_string(),
             target_path: None,
+            detail,
             ..Default::default()
         };
     }
@@ -950,6 +1028,7 @@ fn tool_call_from_name_and_input(
         .and_then(|i| {
             i.get("file_path")
                 .or_else(|| i.get("path"))
+                .or_else(|| i.get("Path"))
                 .or_else(|| i.get("pattern"))
         })
         .and_then(|v| v.as_str())
@@ -977,7 +1056,61 @@ fn tool_call_from_name_and_input(
         kind: AgentToolKind::File,
         label,
         target_path: file_path,
+        detail,
         ..Default::default()
+    }
+}
+
+/// Human-readable summary of a turn's tool calls (e.g. `"Read 3 files · Edited 1 file · Ran 1 command"`).
+pub(crate) fn summarize_tool_group(calls: &[AgentToolCall]) -> String {
+    if calls.is_empty() {
+        return String::new();
+    }
+    let mut reads = 0usize;
+    let mut edits = 0usize;
+    let mut searches = 0usize;
+    let mut commands = 0usize;
+    let mut helpers = 0usize;
+    let mut other = 0usize;
+    for call in calls.iter().filter(|c| c.parent_id.is_none()) {
+        if call.kind == AgentToolKind::Terminal {
+            commands += 1;
+        } else {
+            let verb = call.label.split_whitespace().next().unwrap_or(call.label.as_str());
+            match verb {
+                "Read" | "List" => reads += 1,
+                "Edit" | "Write" => edits += 1,
+                "Grep" | "Glob" | "Search" | "grep_search" | "find_by_name" => searches += 1,
+                "Task" | "invoke_subagent" => helpers += 1,
+                _ => other += 1,
+            }
+        }
+    }
+    let mut parts = Vec::new();
+    if reads > 0 {
+        parts.push(format!("Read {reads} file{}", if reads == 1 { "" } else { "s" }));
+    }
+    if edits > 0 {
+        parts.push(format!("Edited {edits} file{}", if edits == 1 { "" } else { "s" }));
+    }
+    if searches > 0 {
+        parts.push(format!("Searched {searches} time{}", if searches == 1 { "" } else { "s" }));
+    }
+    if commands > 0 {
+        parts.push(format!("Ran {commands} command{}", if commands == 1 { "" } else { "s" }));
+    }
+    if helpers > 0 {
+        parts.push(format!("Ran {helpers} helper{}", if helpers == 1 { "" } else { "s" }));
+    }
+    if other > 0 && parts.is_empty() {
+        let n = calls.len();
+        parts.push(format!("Agent used {n} tool{}", if n == 1 { "" } else { "s" }));
+    }
+    if parts.is_empty() {
+        let n = calls.len();
+        format!("Agent used {n} tool{}", if n == 1 { "" } else { "s" })
+    } else {
+        parts.join(" \u{b7} ")
     }
 }
 
@@ -1107,6 +1240,13 @@ pub(crate) struct AgentState {
     pub(crate) tasks_collapsed: bool,
     /// Helper-agent (`Task`) calls whose own calls are shown, by call id.
     pub(crate) open_subagents: std::collections::HashSet<String>,
+    /// Tool calls whose detail/output snippet is expanded, by `(item_ix, call_ix)`.
+    pub(crate) open_tool_details: std::collections::HashSet<(usize, usize)>,
+    /// `/` slash-command autocomplete menu state.
+    pub(crate) slash_open: bool,
+    pub(crate) slash_selected: usize,
+    /// Search input for filtering saved threads in the History panel.
+    pub(crate) history_search: Entity<InputState>,
 }
 
 /// A sent message, as typed, with what was attached to it.
@@ -1128,6 +1268,8 @@ impl AgentState {
         let model_search = cx.new(|cx| {
             InputState::new(window, cx).placeholder("Search models, or type a model id\u{2026}")
         });
+        let history_search =
+            cx.new(|cx| InputState::new(window, cx).placeholder("Filter threads\u{2026}"));
         let default_harness = if AgentHarness::ClaudeCode.resolve_binary().is_some() {
             AgentHarness::ClaudeCode
         } else if AgentHarness::OpenCode.resolve_binary().is_some() {
@@ -1186,6 +1328,10 @@ impl AgentState {
             stop_requested: false,
             tasks_collapsed: false,
             open_subagents: std::collections::HashSet::new(),
+            open_tool_details: std::collections::HashSet::new(),
+            slash_open: false,
+            slash_selected: 0,
+            history_search,
         }
     }
 
@@ -1295,6 +1441,41 @@ pub(crate) fn conversation_transcript(
     turns.join("\n\n")
 }
 
+/// Export a thread's conversation and tool-use summaries as clean Markdown.
+pub(crate) fn export_thread_markdown(
+    items: &[AgentItem],
+    harness: AgentHarness,
+    title: Option<&str>,
+) -> String {
+    let heading = title.filter(|t| !t.is_empty()).unwrap_or("Agent Conversation");
+    let mut out = format!("# {heading}\n\n_Agent: {}_\n\n", harness.label());
+    for item in items {
+        match item {
+            AgentItem::Message { is_user, text } => {
+                let text = text.trim();
+                if text.is_empty() || text == "Thinking\u{2026}" {
+                    continue;
+                }
+                let speaker = if *is_user { "## User" } else { "## Assistant" };
+                out.push_str(&format!("{speaker}\n\n{text}\n\n"));
+            }
+            AgentItem::ToolGroup { calls, .. } if !calls.is_empty() => {
+                let summary = summarize_tool_group(calls);
+                out.push_str(&format!("> **Tools ({summary})**\n"));
+                for c in calls {
+                    out.push_str(&format!("> - `{}`\n", c.label));
+                }
+                out.push('\n');
+            }
+            AgentItem::Error { message, .. } => {
+                out.push_str(&format!("> **Error:** {message}\n\n"));
+            }
+            _ => {}
+        }
+    }
+    out.trim_end().to_string()
+}
+
 /// The bundle id of the `.app` this process runs from, read from its
 /// Info.plist. `None` for an unbundled build (`cargo run`).
 fn app_bundle_id() -> Option<String> {
@@ -1345,6 +1526,16 @@ impl DartIde {
             // Opening the rail shows the thread, not whichever panel was up.
             self.agent.history_open = false;
         }
+    }
+
+    pub(crate) fn agent_export_markdown(&mut self, cx: &mut Context<Self>) {
+        if self.agent.items.is_empty() {
+            return;
+        }
+        let title = self.agent.thread_title();
+        let md = export_thread_markdown(&self.agent.items, self.agent.harness, title.as_deref());
+        cx.write_to_clipboard(ClipboardItem::new_string(md));
+        self.show_toast("Copied thread as Markdown", false, cx);
     }
 
     pub(crate) fn stop_agent_run(&mut self, cx: &mut Context<Self>) {
@@ -2122,11 +2313,7 @@ impl DartIde {
                                             }
                                         }
                                         calls.push(call);
-                                        let n = calls.len();
-                                        *header = format!(
-                                            "Agent used {n} tool{}",
-                                            if n == 1 { "" } else { "s" }
-                                        );
+                                        *header = summarize_tool_group(calls);
                                     }
                                 }
                                 StreamFragment::TextDelta(delta) => {
@@ -2150,6 +2337,15 @@ impl DartIde {
                             },
                             AgentStreamEvent::Finished { error } => {
                                 this.agent.running_pid = None;
+                                if let Some(AgentItem::ToolGroup { calls, .. }) =
+                                    this.agent.items.get_mut(group_id)
+                                {
+                                    for c in calls.iter_mut() {
+                                        if c.status == ToolStatus::Running {
+                                            c.status = ToolStatus::Done;
+                                        }
+                                    }
+                                }
                                 this.agent.last_activity_ms = Some(crate::agent_store::now_ms());
                                 if !this.agent_open {
                                     // A reply landed while the rail was hidden.
@@ -2457,6 +2653,18 @@ impl DartIde {
                                         }
                                     })),
                             )
+                            .when(!self.agent.items.is_empty(), |el| {
+                                el.child(
+                                    Button::new("agent-export-md")
+                                        .ghost()
+                                        .small()
+                                        .icon(Icon::new(IconName::Copy).xsmall().text_color(muted))
+                                        .tooltip("Copy thread as Markdown")
+                                        .on_click(cx.listener(|this, _e, _w, cx| {
+                                            this.agent_export_markdown(cx);
+                                        })),
+                                )
+                            })
                             .child(
                                 Button::new("agent-new-thread")
                                     .ghost()
@@ -2754,39 +2962,79 @@ impl DartIde {
                                         ))
                                     })
                                     .when(!calls.is_empty(), |el| {
+                                        let summary = {
+                                            let s = summarize_tool_group(calls);
+                                            if s.is_empty() { header.clone() } else { s }
+                                        };
+                                        let any_failed =
+                                            calls.iter().any(|c| c.status == ToolStatus::Failed);
+                                        let any_running = is_running
+                                            && calls.iter().any(|c| c.status == ToolStatus::Running);
+                                        let total_calls = calls.len();
                                         el.child(
-                                        h_flex()
-                                            .id(("agent-tool-group", group_id))
-                                            .items_center()
-                                            .gap(px(tokens::SPACE_2))
-                                            .cursor_pointer()
-                                            .text_size(px(tokens::UI_SM))
-                                            .text_color(muted)
-                                            .hover(move |s| s.text_color(fg))
-                                            .child(
-                                                Icon::new(IconName::Settings)
-                                                    .with_size(px(11.5))
-                                                    .text_color(muted),
-                                            )
-                                            .child(header.clone())
-                                            .child(
-                                                Icon::new(if is_collapsed {
-                                                    IconName::ChevronRight
+                                            h_flex()
+                                                .id(("agent-tool-group", group_id))
+                                                .items_center()
+                                                .gap(px(tokens::SPACE_2))
+                                                .cursor_pointer()
+                                                .text_size(px(tokens::UI_SM))
+                                                .text_color(muted)
+                                                .hover(move |s| s.text_color(fg))
+                                                .child(if any_running {
+                                                    div()
+                                                        .size(px(7.))
+                                                        .rounded(px(3.5))
+                                                        .bg(primary)
+                                                        .into_any_element()
+                                                } else if any_failed {
+                                                    Icon::new(IconName::CircleX)
+                                                        .with_size(px(12.))
+                                                        .text_color(red)
+                                                        .into_any_element()
                                                 } else {
-                                                    IconName::ChevronDown
+                                                    Icon::new(IconName::Check)
+                                                        .with_size(px(12.))
+                                                        .text_color(green.opacity(0.85))
+                                                        .into_any_element()
                                                 })
-                                                .with_size(px(11.))
-                                                .text_color(muted),
-                                            )
-                                            .on_click(cx.listener(move |this, _e, _w, cx| {
-                                                if let Some(AgentItem::ToolGroup {
-                                                    collapsed, ..
-                                                }) = this.agent.items.get_mut(item_ix)
-                                                {
-                                                    *collapsed = !*collapsed;
-                                                    cx.notify();
-                                                }
-                                            })),
+                                                .child(
+                                                    div()
+                                                        .min_w(px(0.))
+                                                        .truncate()
+                                                        .child(summary),
+                                                )
+                                                .child(
+                                                    div()
+                                                        .flex_shrink_0()
+                                                        .px(px(5.))
+                                                        .py(px(1.))
+                                                        .rounded(px(tokens::RADIUS_BADGE))
+                                                        .bg(cx.theme().background)
+                                                        .border_1()
+                                                        .border_color(border)
+                                                        .font_family(cx.theme().mono_font_family.clone())
+                                                        .text_size(px(10.))
+                                                        .text_color(muted)
+                                                        .child(total_calls.to_string()),
+                                                )
+                                                .child(
+                                                    Icon::new(if is_collapsed {
+                                                        IconName::ChevronRight
+                                                    } else {
+                                                        IconName::ChevronDown
+                                                    })
+                                                    .with_size(px(11.))
+                                                    .text_color(muted),
+                                                )
+                                                .on_click(cx.listener(move |this, _e, _w, cx| {
+                                                    if let Some(AgentItem::ToolGroup {
+                                                        collapsed, ..
+                                                    }) = this.agent.items.get_mut(item_ix)
+                                                    {
+                                                        *collapsed = !*collapsed;
+                                                        cx.notify();
+                                                    }
+                                                })),
                                         )
                                     })
                                     .when(!is_collapsed, |el| {
@@ -2836,10 +3084,26 @@ impl DartIde {
                                     .flatten()
                                     .flatten();
                                 let msg_group: SharedString = format!("agent-msg-{item_ix}").into();
-                                let weak = cx.entity().downgrade();
+                                let weak_insert = cx.entity().downgrade();
                                 let on_insert: crate::markdown::InsertCode =
                                     std::rc::Rc::new(move |code, window, cx| {
-                                        let _ = weak.update(cx, |this, cx| this.agent_insert_code(code, window, cx));
+                                        let _ = weak_insert.update(cx, |this, cx| {
+                                            this.agent_insert_code(code, window, cx)
+                                        });
+                                    });
+                                let weak_run = cx.entity().downgrade();
+                                let on_run: crate::markdown::RunCode =
+                                    std::rc::Rc::new(move |code, _window, cx| {
+                                        let _ = weak_run.update(cx, |this, cx| {
+                                            this.agent_run_code_in_terminal(code, cx)
+                                        });
+                                    });
+                                let weak_link = cx.entity().downgrade();
+                                let on_link: crate::markdown::OpenLink =
+                                    std::rc::Rc::new(move |url, window, cx| {
+                                        let _ = weak_link.update(cx, |this, cx| {
+                                            this.agent_open_markdown_link(url, window, cx)
+                                        });
                                     });
                                 let stats_text = (!*is_user && !streaming)
                                     .then(|| self.agent.turn_stats.get(&item_ix))
@@ -2870,9 +3134,26 @@ impl DartIde {
                                             .text_color(muted)
                                             .child("Thinking\u{2026}")
                                     } else if *is_user {
-                                        crate::markdown::render_markdown(text, item_ix, cx)
+                                        crate::markdown::render_markdown_interactive(
+                                            text,
+                                            item_ix,
+                                            crate::markdown::MdCallbacks {
+                                                on_link: Some(on_link),
+                                                ..Default::default()
+                                            },
+                                            cx,
+                                        )
                                     } else {
-                                        crate::markdown::render_markdown_insertable(text, item_ix, on_insert, cx)
+                                        crate::markdown::render_markdown_interactive(
+                                            text,
+                                            item_ix,
+                                            crate::markdown::MdCallbacks {
+                                                on_insert: Some(on_insert),
+                                                on_run: Some(on_run),
+                                                on_link: Some(on_link),
+                                            },
+                                            cx,
+                                        )
                                     })
                                     .when(can_copy, |el| {
                                         el.child(
@@ -3221,12 +3502,23 @@ impl DartIde {
         let red = cx.theme().red;
         let now = crate::agent_store::now_ms();
         let running = self.agent.running_pid.is_some();
+        let filter_query = self.agent.history_search.read(cx).value().trim().to_lowercase();
+        let has_threads = !self.agent.threads.is_empty();
 
         let rows: Vec<AnyElement> = self
             .agent
             .threads
             .iter()
             .enumerate()
+            .filter(|(_, thread)| {
+                if filter_query.is_empty() {
+                    return true;
+                }
+                thread.title.to_lowercase().contains(&filter_query)
+                    || thread
+                        .harness
+                        .is_some_and(|h| h.label().to_lowercase().contains(&filter_query))
+            })
             .map(|(ix, thread)| {
                 let is_current = self.agent.thread_id.as_deref() == Some(thread.id.as_str());
                 let title = if thread.title.is_empty() {
@@ -3369,6 +3661,38 @@ impl DartIde {
                         .child("Switching stops the current run"),
                 )
             })
+            .when(has_threads, |el| {
+                el.child(
+                    div()
+                        .w_full()
+                        .px(px(tokens::SPACE_3))
+                        .pt(px(tokens::SPACE_2))
+                        .child(
+                            h_flex()
+                                .w_full()
+                                .h(px(28.))
+                                .px(px(tokens::SPACE_2))
+                                .items_center()
+                                .gap(px(tokens::SPACE_2))
+                                .rounded(px(tokens::RADIUS_SM))
+                                .bg(cx.theme().background)
+                                .border_1()
+                                .border_color(border)
+                                .child(
+                                    Icon::new(IconName::Search)
+                                        .with_size(px(12.))
+                                        .text_color(muted),
+                                )
+                                .child(
+                                    gpui_kit::component::input::Input::new(
+                                        &self.agent.history_search,
+                                    )
+                                    .appearance(false)
+                                    .small(),
+                                ),
+                        ),
+                )
+            })
             .child(
                 v_flex()
                     .id("agent-history-list")
@@ -3385,7 +3709,11 @@ impl DartIde {
                                 .py(px(tokens::SPACE_6))
                                 .text_size(px(tokens::UI_SM))
                                 .text_color(muted)
-                                .child("No earlier threads yet."),
+                                .child(if has_threads {
+                                    "No matching threads."
+                                } else {
+                                    "No earlier threads yet."
+                                }),
                         )
                     })
                     .children(rows),
@@ -3396,6 +3724,55 @@ impl DartIde {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[core::prelude::v1::test]
+    fn summarizes_tool_groups_and_exports_markdown() {
+        let calls = vec![
+            AgentToolCall {
+                kind: AgentToolKind::File,
+                label: "Read main.rs".into(),
+                target_path: Some("src/main.rs".into()),
+                detail: Some("lines 1\u{2013}50".into()),
+                ..Default::default()
+            },
+            AgentToolCall {
+                kind: AgentToolKind::File,
+                label: "Edit main.rs".into(),
+                target_path: Some("src/main.rs".into()),
+                detail: Some("- old\n+ new".into()),
+                ..Default::default()
+            },
+            AgentToolCall {
+                kind: AgentToolKind::Terminal,
+                label: "cargo test".into(),
+                target_path: None,
+                ..Default::default()
+            },
+        ];
+        assert_eq!(
+            summarize_tool_group(&calls),
+            "Read 1 file \u{b7} Edited 1 file \u{b7} Ran 1 command"
+        );
+
+        let items = vec![
+            AgentItem::Message { is_user: true, text: "Fix the test".into() },
+            AgentItem::ToolGroup {
+                id: 1,
+                header: "Used 3 tools".into(),
+                collapsed: false,
+                calls,
+                thinking: String::new(),
+                thinking_open: false,
+                checkpoint: None,
+            },
+            AgentItem::Message { is_user: false, text: "All tests pass now.".into() },
+        ];
+        let md = export_thread_markdown(&items, AgentHarness::ClaudeCode, Some("Fix the test"));
+        assert!(md.contains("# Fix the test"));
+        assert!(md.contains("## User\n\nFix the test"));
+        assert!(md.contains("> **Tools (Read 1 file \u{b7} Edited 1 file \u{b7} Ran 1 command)**"));
+        assert!(md.contains("## Assistant\n\nAll tests pass now."));
+    }
 
     #[core::prelude::v1::test]
     fn thread_title_comes_from_the_first_question() {
