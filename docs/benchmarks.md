@@ -18,49 +18,50 @@ design. A 120 Hz frame is ~8.3 ms.
 
 | Row | Runs when |
 |---|---|
-| buffer: load, syntax: full parse | opening a file |
-| buffer insert, `text()` copy, `diff_as_edit`, incremental reparse, `fold_ranges`, `closing_labels`, LSP `didChange` JSON | every edit (`sync_buffer_state`) |
-| highlights for ~60 visible lines | every frame while scrolling or typing |
+| buffer: load, syntax: full parse | opening a file (files > 128 KB parse on a background thread) |
+| buffer insert, `text()` copy, `take_edits()`, incremental reparse, `update_fold_ranges`, LSP `didChange` JSON | every edit (`sync_buffer_state`) |
+| highlights & `closing_labels_in_range` for ~60 visible lines | every frame while scrolling or typing |
 
-Syntax parsing is disabled above `MAX_SYNTAX_BYTES` (256 KB), so the 1000 KB
-column is a stress test of the algorithms, not a size the app parses today.
+Syntax parsing is enabled up to `MAX_SYNTAX_BYTES` (2 MB, up from 256 KB), with
+files above `SYNC_PARSE_BYTES` (128 KB) parsed asynchronously on a background
+thread when opened.
 
 ## Results (release build, this machine)
 
 | Step (ms, median) | 100 KB | 1000 KB |
 |---|---:|---:|
-| buffer: load from string | 0.04 | 0.16 |
-| syntax: full parse | 16.4 | 151 |
+| buffer: load from string | 0.05 | 0.16 |
+| syntax: full parse | 14.5 | 141.7 |
 | buffer: insert 1 char | ~0 | ~0 |
-| buffer: `text()` full copy | 0.005 | 0.04 |
-| `diff_as_edit` (prefix/suffix scan) | 0.10 | 0.94 |
-| syntax: incremental reparse (1 char) | 0.26 | 2.2 |
-| syntax: `fold_ranges` | **0.59** (was 3.35) | **6.6** (was 33.1) |
-| language: `closing_labels` | 0.38 | 3.6 |
-| LSP `didChange` JSON (full document) | 0.05 | 0.47 |
+| buffer: `text()` full copy | 0.005 | 0.037 |
+| buffer: `take_edits()` -> `InputEdit` (was `diff_as_edit` 0.10 / 0.97) | **~0** | **~0** |
+| syntax: incremental reparse (1 char) | 0.20 | 2.1 |
+| syntax: `update_fold_ranges` (was whole-tree 0.59 / 5.87) | **0.022** | **0.20** |
+| language: `closing_labels_in_range` (~60 lines, was whole-text 0.42 / 4.14) | **0.12** | **0.12** |
+| LSP `didChange` JSON (incremental 1 char, was full doc 0.05 / 0.47) | **~0** | **~0** |
 | syntax: highlights, ~60 visible lines | 0.21 | 0.21 |
-| syntax: `matching_bracket` (cursor on `{`) | 1.42 | — |
+| syntax: `matching_bracket` (cursor on `{`) | 1.40 | 1.40 |
 
 `matching_bracket` ran on every `render()` (hover, drag, cursor blink), up
 to twice per frame. `EditorView` now caches the pair per cursor position
 and text revision, so it only runs when the cursor moves or the text edits.
 
-Sum of the per-edit rows: about 1.5 ms at 100 KB and about 14 ms at 1000 KB.
+Sum of the per-edit rows: about **0.28 ms** at 100 KB (was 1.5 ms) and about **2.8 ms** at 1000 KB (was 14 ms) — well inside a 120 Hz frame (~8.3 ms) even at 1 MB.
 
 ## What the numbers showed
 
 - The full-buffer `text()` copy and the whole-document `didChange` JSON are
-  **cheap** (well under 1 ms at 1 MB). Replacing them with incremental
-  edits is not the first priority.
-- `fold_ranges` walked every node of the syntax tree on each edit. Skipping
-  single-line nodes (a fold can only live in a multi-line node) made it
-  about 5x faster with identical output; a test compares it with the old
-  walk.
-- Remaining size-proportional costs are `fold_ranges`, `closing_labels`
-  (both whole-document) and the incremental reparse itself. The next step
-  for large files is to recompute folds and closing labels only for the
-  edited region, or debounce them.
-- Visible-range highlighting is flat in file size, as it should be.
+  **cheap** (well under 1 ms at 1 MB).
+- `Buffer::take_edits()` records exact `(row, col)` byte positions from the
+  rope on each edit in `O(log N)`, eliminating the `O(N)` `diff_as_edit`
+  prefix/suffix scan.
+- `SyntaxTree::update_fold_ranges` shifts untouched folds in `O(K)` and only
+  re-walks syntax subtrees overlapping the edited lines (`0.022 ms` at 100 KB,
+  `0.20 ms` at 1 MB — a **~30x speedup** over walking the whole tree).
+- `LanguageAdapter::closing_labels_in_range` computes closing widget/list
+  annotations for the visible viewport with a bounded 32 KB lookback window,
+  staying flat at **0.12 ms** regardless of file size.
+- Visible-range highlighting and closing labels are both flat in file size.
 
 ## Project search: warm index vs. disk walk
 

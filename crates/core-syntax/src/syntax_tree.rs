@@ -13,6 +13,10 @@ use crate::highlight::{Highlight, HighlightKind};
 pub enum SyntaxLanguage {
     Dart,
     Python,
+    Rust,
+    TypeScript,
+    Tsx,
+    JavaScript,
     Json,
     Yaml,
     Toml,
@@ -20,12 +24,16 @@ pub enum SyntaxLanguage {
 }
 
 impl SyntaxLanguage {
-    /// Map an LSP language id (`"dart"`, `"python"`, `"json"`, `"yaml"`,
-    /// `"toml"`, `"markdown"`) to a grammar.
+    /// Map an LSP language id (`"dart"`, `"python"`, `"rust"`, `"typescript"`,
+    /// `"tsx"`, `"javascript"`, `"json"`, `"yaml"`, `"toml"`, `"markdown"`) to a grammar.
     pub fn from_language_id(id: &str) -> Option<Self> {
         match id {
             "dart" => Some(Self::Dart),
             "python" => Some(Self::Python),
+            "rust" | "rs" => Some(Self::Rust),
+            "typescript" | "ts" => Some(Self::TypeScript),
+            "typescriptreact" | "tsx" => Some(Self::Tsx),
+            "javascript" | "javascriptreact" | "js" | "jsx" => Some(Self::JavaScript),
             "json" | "jsonc" => Some(Self::Json),
             "yaml" | "yml" => Some(Self::Yaml),
             "toml" => Some(Self::Toml),
@@ -38,6 +46,10 @@ impl SyntaxLanguage {
         match self {
             Self::Dart => tree_sitter_dart::LANGUAGE.into(),
             Self::Python => tree_sitter_python::LANGUAGE.into(),
+            Self::Rust => tree_sitter_rust::LANGUAGE.into(),
+            Self::TypeScript => tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
+            Self::Tsx => tree_sitter_typescript::LANGUAGE_TSX.into(),
+            Self::JavaScript => tree_sitter_javascript::LANGUAGE.into(),
             Self::Json => tree_sitter_json::LANGUAGE.into(),
             Self::Yaml => tree_sitter_yaml::LANGUAGE.into(),
             Self::Toml => tree_sitter_toml_ng::LANGUAGE.into(),
@@ -48,6 +60,10 @@ impl SyntaxLanguage {
     fn query(self) -> &'static Query {
         static DART: OnceLock<Query> = OnceLock::new();
         static PYTHON: OnceLock<Query> = OnceLock::new();
+        static RUST: OnceLock<Query> = OnceLock::new();
+        static TYPESCRIPT: OnceLock<Query> = OnceLock::new();
+        static TSX: OnceLock<Query> = OnceLock::new();
+        static JAVASCRIPT: OnceLock<Query> = OnceLock::new();
         static JSON: OnceLock<Query> = OnceLock::new();
         static YAML: OnceLock<Query> = OnceLock::new();
         static TOML: OnceLock<Query> = OnceLock::new();
@@ -65,6 +81,38 @@ impl SyntaxLanguage {
                 );
                 Query::new(&self.language(), &source)
                     .expect("the Python highlights query is valid for tree-sitter-python")
+            }),
+            Self::Rust => RUST.get_or_init(|| {
+                Query::new(&self.language(), tree_sitter_rust::HIGHLIGHTS_QUERY)
+                    .expect("tree-sitter-rust ships a highlights query valid for its own grammar")
+            }),
+            Self::TypeScript => TYPESCRIPT.get_or_init(|| {
+                let source = format!(
+                    "{}\n{}",
+                    tree_sitter_javascript::HIGHLIGHT_QUERY,
+                    tree_sitter_typescript::HIGHLIGHTS_QUERY
+                );
+                Query::new(&self.language(), &source)
+                    .expect("the TypeScript highlights query is valid for tree-sitter-typescript")
+            }),
+            Self::Tsx => TSX.get_or_init(|| {
+                let source = format!(
+                    "{}\n{}\n{}",
+                    tree_sitter_javascript::HIGHLIGHT_QUERY,
+                    tree_sitter_javascript::JSX_HIGHLIGHT_QUERY,
+                    tree_sitter_typescript::HIGHLIGHTS_QUERY
+                );
+                Query::new(&self.language(), &source)
+                    .expect("the TSX highlights query is valid for tree-sitter-tsx")
+            }),
+            Self::JavaScript => JAVASCRIPT.get_or_init(|| {
+                let source = format!(
+                    "{}\n{}",
+                    tree_sitter_javascript::HIGHLIGHT_QUERY,
+                    tree_sitter_javascript::JSX_HIGHLIGHT_QUERY
+                );
+                Query::new(&self.language(), &source)
+                    .expect("the JavaScript highlights query is valid for tree-sitter-javascript")
             }),
             Self::Json => JSON.get_or_init(|| {
                 Query::new(&self.language(), tree_sitter_json::HIGHLIGHTS_QUERY)
@@ -143,6 +191,20 @@ impl SyntaxTree {
         }
     }
 
+    /// Apply one or more text edits in sequence and re-parse once against
+    /// `new_source`.
+    pub fn reparse_edits(&mut self, new_source: &str, edits: &[InputEdit]) {
+        if edits.is_empty() {
+            return;
+        }
+        for edit in edits {
+            self.tree.edit(edit);
+        }
+        if let Some(tree) = self.parser.parse(new_source, Some(&self.tree)) {
+            self.tree = tree;
+        }
+    }
+
     pub fn root(&self) -> Node<'_> {
         self.tree.root_node()
     }
@@ -172,9 +234,17 @@ impl SyntaxTree {
                 let name = capture_names[capture.index as usize];
                 let range = capture.node.start_byte()..capture.node.end_byte();
                 let mut kind = HighlightKind::from_capture_name(name);
-                // Python's query tags PascalCase identifiers `constructor`:
-                // they are classes.
-                if language == SyntaxLanguage::Python && name == "constructor" {
+                // Python/Rust/JS/TS queries tag PascalCase identifiers `constructor`:
+                // they are classes, structs, or enum variants.
+                if matches!(
+                    language,
+                    SyntaxLanguage::Python
+                        | SyntaxLanguage::Rust
+                        | SyntaxLanguage::TypeScript
+                        | SyntaxLanguage::Tsx
+                        | SyntaxLanguage::JavaScript
+                ) && name == "constructor"
+                {
                     kind = HighlightKind::Type;
                 }
                 // In Dart, PascalCase function calls (`Divider(...)`, `StatelessWidget(...)`)
@@ -221,10 +291,17 @@ impl SyntaxTree {
                 }
             }
         }
-        if language == SyntaxLanguage::Python {
+        if matches!(
+            language,
+            SyntaxLanguage::Python
+                | SyntaxLanguage::Rust
+                | SyntaxLanguage::TypeScript
+                | SyntaxLanguage::Tsx
+                | SyntaxLanguage::JavaScript
+        ) {
             // The editor paints spans in order, later ones on top: outer
             // spans first, and for the same span the most specific (last)
-            // query pattern last. Python adds no extra spans, so `patterns`
+            // query pattern last. These grammars add no extra spans, so `patterns`
             // lines up with `highlights`.
             let mut tagged: Vec<(usize, Highlight)> = patterns.into_iter().zip(highlights).collect();
             tagged.sort_by_key(|(p, h)| (h.range.start, std::cmp::Reverse(h.range.end), *p));
@@ -314,16 +391,75 @@ impl SyntaxTree {
     /// Python has no braces: a compound statement (`def`, `class`, `if`,
     /// `with`, ...) folds from its header line to the end of its `block`.
     pub fn fold_ranges(&self) -> Vec<FoldRange> {
+        self.fold_ranges_in_range(0..usize::MAX)
+    }
+
+    /// Fold candidates that overlap `line_range` (`start_line..end_line`),
+    /// pruning subtrees outside `line_range` so updating folds for an
+    /// edited region or viewport is `O(log N + K)` instead of `O(N)`.
+    pub fn fold_ranges_in_range(&self, line_range: Range<usize>) -> Vec<FoldRange> {
         let mut ranges = Vec::new();
+        if line_range.is_empty() {
+            return ranges;
+        }
         match self.language {
-            SyntaxLanguage::Dart | SyntaxLanguage::Json => {
-                collect_fold_ranges(self.tree.root_node(), &mut ranges)
+            SyntaxLanguage::Dart
+            | SyntaxLanguage::Rust
+            | SyntaxLanguage::TypeScript
+            | SyntaxLanguage::Tsx
+            | SyntaxLanguage::JavaScript
+            | SyntaxLanguage::Json => {
+                collect_fold_ranges(self.tree.root_node(), &line_range, &mut ranges)
             }
-            SyntaxLanguage::Python => collect_block_folds(self.tree.root_node(), &mut ranges),
+            SyntaxLanguage::Python => {
+                collect_block_folds(self.tree.root_node(), &line_range, &mut ranges)
+            }
             SyntaxLanguage::Yaml | SyntaxLanguage::Toml | SyntaxLanguage::Markdown => {}
         }
         ranges.sort_by_key(|r| r.start_byte);
         ranges
+    }
+
+    /// Incrementally update `folds` in place after `edits`, re-walking only
+    /// the syntax subtrees overlapping the edited lines while shifting all
+    /// untouched folds after the edit by the line/byte deltas in `O(K)`.
+    pub fn update_fold_ranges(&self, folds: &mut Vec<FoldRange>, edits: &[InputEdit]) {
+        if edits.is_empty() {
+            return;
+        }
+        // Multiple edits in one transaction (e.g. format or replace-all):
+        // fall back to a clean pass if there are many disjoint edits.
+        if edits.len() > 1 {
+            *folds = self.fold_ranges();
+            return;
+        }
+        let edit = &edits[0];
+        let old_start_line = edit.start_position.row;
+        let old_end_line = edit.old_end_position.row;
+        let new_end_line = edit.new_end_position.row;
+        let line_delta = new_end_line as isize - old_end_line as isize;
+        let byte_delta = edit.new_end_byte as isize - edit.old_end_byte as isize;
+
+        // Remove any fold that overlapped `old_start_line..=old_end_line`, and
+        // shift folds strictly after `old_end_line`.
+        folds.retain_mut(|f| {
+            if f.end_line < old_start_line {
+                true
+            } else if f.start_line > old_end_line {
+                f.start_line = (f.start_line as isize + line_delta) as usize;
+                f.end_line = (f.end_line as isize + line_delta) as usize;
+                f.start_byte = (f.start_byte as isize + byte_delta) as usize;
+                f.end_byte = (f.end_byte as isize + byte_delta) as usize;
+                true
+            } else {
+                false
+            }
+        });
+
+        let fresh = self.fold_ranges_in_range(old_start_line..(new_end_line + 1));
+        folds.extend(fresh);
+        folds.sort_by_key(|r| r.start_byte);
+        folds.dedup_by_key(|r| (r.start_byte, r.end_byte));
     }
 }
 
@@ -341,11 +477,12 @@ pub fn point_at(source: &str, byte: usize) -> Point {
     Point { row, column }
 }
 
-fn collect_fold_ranges(node: Node, out: &mut Vec<FoldRange>) {
+fn collect_fold_ranges(node: Node, line_range: &Range<usize>, out: &mut Vec<FoldRange>) {
     // A fold must span several lines, and so must every ancestor of it:
-    // skipping single-line nodes prunes the vast majority of the tree.
+    // skipping single-line nodes and subtrees outside `line_range` prunes
+    // the vast majority of the tree.
     let (start_line, end_line) = (node.start_position().row, node.end_position().row);
-    if end_line == start_line {
+    if end_line == start_line || end_line < line_range.start || start_line >= line_range.end {
         return;
     }
 
@@ -365,7 +502,7 @@ fn collect_fold_ranges(node: Node, out: &mut Vec<FoldRange>) {
 
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
-        collect_fold_ranges(child, out);
+        collect_fold_ranges(child, line_range, out);
     }
 }
 
@@ -373,16 +510,16 @@ fn collect_fold_ranges(node: Node, out: &mut Vec<FoldRange>) {
 /// folds from its own first line to the block's last line. Decorated
 /// definitions fold from the `def`/`class` line, so sticky scroll shows the
 /// signature rather than the decorator.
-fn collect_block_folds(node: Node, out: &mut Vec<FoldRange>) {
+fn collect_block_folds(node: Node, line_range: &Range<usize>, out: &mut Vec<FoldRange>) {
     let (start_line, end_line) = (node.start_position().row, node.end_position().row);
-    if end_line == start_line {
+    if end_line == start_line || end_line < line_range.start || start_line >= line_range.end {
         return;
     }
     let mut cursor = node.walk();
     if node.kind() != "decorated_definition" {
         if let Some(block) = node.children(&mut cursor).find(|c| c.kind() == "block") {
             let block_end = block.end_position().row;
-            if block_end > start_line {
+            if block_end > start_line && block_end >= line_range.start {
                 out.push(FoldRange {
                     start_line,
                     end_line: block_end,
@@ -394,7 +531,7 @@ fn collect_block_folds(node: Node, out: &mut Vec<FoldRange>) {
     }
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
-        collect_block_folds(child, out);
+        collect_block_folds(child, line_range, out);
     }
 }
 
@@ -449,6 +586,15 @@ mod tests {
     fn language_ids_map_to_grammars() {
         assert_eq!(SyntaxLanguage::from_language_id("python"), Some(SyntaxLanguage::Python));
         assert_eq!(SyntaxLanguage::from_language_id("dart"), Some(SyntaxLanguage::Dart));
+        assert_eq!(SyntaxLanguage::from_language_id("rust"), Some(SyntaxLanguage::Rust));
+        assert_eq!(SyntaxLanguage::from_language_id("rs"), Some(SyntaxLanguage::Rust));
+        assert_eq!(SyntaxLanguage::from_language_id("typescript"), Some(SyntaxLanguage::TypeScript));
+        assert_eq!(SyntaxLanguage::from_language_id("ts"), Some(SyntaxLanguage::TypeScript));
+        assert_eq!(SyntaxLanguage::from_language_id("tsx"), Some(SyntaxLanguage::Tsx));
+        assert_eq!(SyntaxLanguage::from_language_id("typescriptreact"), Some(SyntaxLanguage::Tsx));
+        assert_eq!(SyntaxLanguage::from_language_id("javascript"), Some(SyntaxLanguage::JavaScript));
+        assert_eq!(SyntaxLanguage::from_language_id("js"), Some(SyntaxLanguage::JavaScript));
+        assert_eq!(SyntaxLanguage::from_language_id("jsx"), Some(SyntaxLanguage::JavaScript));
         assert_eq!(SyntaxLanguage::from_language_id("json"), Some(SyntaxLanguage::Json));
         assert_eq!(SyntaxLanguage::from_language_id("jsonc"), Some(SyntaxLanguage::Json));
         assert_eq!(SyntaxLanguage::from_language_id("yaml"), Some(SyntaxLanguage::Yaml));
@@ -456,7 +602,43 @@ mod tests {
         assert_eq!(SyntaxLanguage::from_language_id("toml"), Some(SyntaxLanguage::Toml));
         assert_eq!(SyntaxLanguage::from_language_id("markdown"), Some(SyntaxLanguage::Markdown));
         assert_eq!(SyntaxLanguage::from_language_id("md"), Some(SyntaxLanguage::Markdown));
-        assert_eq!(SyntaxLanguage::from_language_id("rust"), None);
+        assert_eq!(SyntaxLanguage::from_language_id("go"), None);
+    }
+
+    #[test]
+    fn rust_typescript_tsx_and_js_grammars_highlight_and_fold() {
+        let rust_src = "// Rust sample\n#[derive(Debug)]\npub struct Widget {\n    pub count: usize,\n}\n\nimpl Widget {\n    pub fn compute(&self, delta: usize) -> usize {\n        self.count + delta\n    }\n}\n";
+        let rust_tree = SyntaxTree::parse_as(SyntaxLanguage::Rust, rust_src);
+        let rust_hs = rust_tree.highlights(rust_src);
+        assert!(rust_hs.iter().any(|h| h.kind == HighlightKind::Comment));
+        assert!(rust_hs.iter().any(|h| h.kind == HighlightKind::Keyword && &rust_src[h.range.clone()] == "fn"));
+        assert!(rust_hs.iter().any(|h| h.kind == HighlightKind::Type && &rust_src[h.range.clone()] == "Widget"));
+        assert!(rust_hs.iter().any(|h| h.kind == HighlightKind::Function && &rust_src[h.range.clone()] == "compute"));
+        assert!(rust_tree.fold_ranges().len() >= 2);
+
+        let ts_src = "interface Props {\n  title: string;\n  count: number;\n}\n\nexport function formatTitle(p: Props): string {\n  return \"hello\";\n}\n";
+        let ts_tree = SyntaxTree::parse_as(SyntaxLanguage::TypeScript, ts_src);
+        let ts_hs = ts_tree.highlights(ts_src);
+        assert!(ts_hs.iter().any(|h| h.kind == HighlightKind::Keyword && &ts_src[h.range.clone()] == "interface"));
+        assert!(ts_hs.iter().any(|h| h.kind == HighlightKind::Type && &ts_src[h.range.clone()] == "Props"));
+        assert!(ts_hs.iter().any(|h| h.kind == HighlightKind::Function && &ts_src[h.range.clone()] == "formatTitle"));
+        assert!(ts_hs.iter().any(|h| h.kind == HighlightKind::String && &ts_src[h.range.clone()] == "\"hello\""));
+        assert_eq!(ts_tree.fold_ranges().len(), 2);
+
+        let tsx_src = "export function Card({ label }: { label: string }) {\n  return (\n    <div className=\"card\">\n      <span>{label}</span>\n    </div>\n  );\n}\n";
+        let tsx_tree = SyntaxTree::parse_as(SyntaxLanguage::Tsx, tsx_src);
+        let tsx_hs = tsx_tree.highlights(tsx_src);
+        assert!(tsx_hs.iter().any(|h| h.kind == HighlightKind::Function && &tsx_src[h.range.clone()] == "Card"));
+        assert!(tsx_hs.iter().any(|h| h.kind == HighlightKind::String && &tsx_src[h.range.clone()] == "\"card\""));
+        assert!(!tsx_tree.fold_ranges().is_empty());
+
+        let js_src = "// JS module\nexport class Counter {\n  increment(step) {\n    return step + 1;\n  }\n}\n";
+        let js_tree = SyntaxTree::parse_as(SyntaxLanguage::JavaScript, js_src);
+        let js_hs = js_tree.highlights(js_src);
+        assert!(js_hs.iter().any(|h| h.kind == HighlightKind::Comment));
+        assert!(js_hs.iter().any(|h| h.kind == HighlightKind::Keyword && &js_src[h.range.clone()] == "class"));
+        assert!(js_hs.iter().any(|h| h.kind == HighlightKind::Number && &js_src[h.range.clone()] == "1"));
+        assert_eq!(js_tree.fold_ranges().len(), 2);
     }
 
     #[test]
@@ -589,5 +771,28 @@ mod tests {
         expected.sort_by_key(|r| r.start_byte);
         assert!(!expected.is_empty());
         assert_eq!(tree.fold_ranges(), expected);
+    }
+
+    #[test]
+    fn incremental_update_fold_ranges_matches_full_walk() {
+        let source = "class A {\n  int g() {\n    if (x) {\n      y();\n    }\n    return 1;\n  }\n}\nclass B {\n  void h() {\n    z();\n  }\n}\n";
+        let mut tree = SyntaxTree::parse(source);
+        let mut folds = tree.fold_ranges();
+
+        let insert_at = source.find("return 1;").unwrap();
+        let inserted = "if (w) {\n      k();\n    }\n    ";
+        let new_source = format!("{}{}{}", &source[..insert_at], inserted, &source[insert_at..]);
+        let edit = InputEdit {
+            start_byte: insert_at,
+            old_end_byte: insert_at,
+            new_end_byte: insert_at + inserted.len(),
+            start_position: point_at(source, insert_at),
+            old_end_position: point_at(source, insert_at),
+            new_end_position: point_at(&new_source, insert_at + inserted.len()),
+        };
+        tree.reparse(&new_source, edit);
+        tree.update_fold_ranges(&mut folds, &[edit]);
+
+        assert_eq!(folds, tree.fold_ranges());
     }
 }

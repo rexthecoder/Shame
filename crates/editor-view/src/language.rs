@@ -13,7 +13,7 @@ use std::sync::{Arc, OnceLock};
 
 use core_buffer::Buffer;
 use core_lsp::lsp_types::{
-    CodeAction, CodeActionOrCommand, Position, Range, TextEdit, Uri, WorkspaceEdit,
+    CodeAction, CodeActionKind, CodeActionOrCommand, Position, Range, TextEdit, Uri, WorkspaceEdit,
 };
 
 use crate::lsp_integration::{CompletionEntry, CompletionKindBadge};
@@ -95,6 +95,23 @@ pub trait LanguageAdapter: Send + Sync {
     /// multi-line constructor lines). Returns `0-indexed line -> label`.
     fn closing_labels(&self, _text: &str) -> HashMap<usize, String> {
         HashMap::new()
+    }
+
+    /// Viewport-scoped closing annotations for lines in `line_range` (`start_line..end_line`),
+    /// given `byte_range` (`start_byte..end_byte` of those lines in `text`).
+    /// Scans back a bounded window (~32 KB) before `byte_range.start` so enclosing
+    /// widget/list headers opened above the viewport still label their closing `)` / `]`
+    /// inside the viewport in `O(1)` time regardless of file size.
+    fn closing_labels_in_range(
+        &self,
+        text: &str,
+        line_range: std::ops::Range<usize>,
+        _byte_range: std::ops::Range<usize>,
+    ) -> HashMap<usize, String> {
+        self.closing_labels(text)
+            .into_iter()
+            .filter(|(line, _)| line_range.contains(line))
+            .collect()
     }
 
     /// Detect if `line_text` in `file_path` is a test entry point (`void main(`,
@@ -514,6 +531,64 @@ impl LanguageAdapter for RustLanguageAdapter {
             },
         ]
     }
+
+    fn builtin_code_actions(
+        &self,
+        _text: &str,
+        buffer: &Buffer,
+        line: u32,
+        _indent_width: usize,
+        uri: &Uri,
+    ) -> Vec<CodeActionOrCommand> {
+        let Some((target_range, expr, line_start_pos, indent_str)) =
+            selection_or_line_expr(buffer, line)
+        else {
+            return Vec::new();
+        };
+        vec![
+            make_refactor_action(
+                "Extract local variable",
+                uri,
+                vec![
+                    TextEdit {
+                        range: Range {
+                            start: line_start_pos,
+                            end: line_start_pos,
+                        },
+                        new_text: format!("{indent_str}let extracted = {expr};\n"),
+                    },
+                    TextEdit {
+                        range: target_range,
+                        new_text: "extracted".to_string(),
+                    },
+                ],
+            ),
+            make_refactor_action(
+                "Wrap in Some(...)",
+                uri,
+                vec![TextEdit {
+                    range: target_range,
+                    new_text: format!("Some({expr})"),
+                }],
+            ),
+            make_refactor_action(
+                "Wrap in Ok(...)",
+                uri,
+                vec![TextEdit {
+                    range: target_range,
+                    new_text: format!("Ok({expr})"),
+                }],
+            ),
+            make_refactor_action(
+                "Wrap in Arc::new(...)",
+                uri,
+                vec![TextEdit {
+                    range: target_range,
+                    new_text: format!("Arc::new({expr})"),
+                }],
+            ),
+        ]
+    }
 }
 
 // ============================================================================
@@ -554,6 +629,38 @@ impl LanguageAdapter for TypeScriptLanguageAdapter {
             "throw", "true", "try", "type", "typeof", "undefined", "var", "void", "while",
             "Promise", "Record", "Array", "Map", "Set",
         ]
+    }
+
+    fn builtin_code_actions(
+        &self,
+        _text: &str,
+        buffer: &Buffer,
+        line: u32,
+        _indent_width: usize,
+        uri: &Uri,
+    ) -> Vec<CodeActionOrCommand> {
+        let Some((target_range, expr, line_start_pos, indent_str)) =
+            selection_or_line_expr(buffer, line)
+        else {
+            return Vec::new();
+        };
+        vec![make_refactor_action(
+            "Extract const variable",
+            uri,
+            vec![
+                TextEdit {
+                    range: Range {
+                        start: line_start_pos,
+                        end: line_start_pos,
+                    },
+                    new_text: format!("{indent_str}const extracted = {expr};\n"),
+                },
+                TextEdit {
+                    range: target_range,
+                    new_text: "extracted".to_string(),
+                },
+            ],
+        )]
     }
 }
 
@@ -869,31 +976,17 @@ impl LanguageAdapter for DartLanguageAdapter {
             .join("\n");
 
         let make_action = |title: &str, new_text: String| -> CodeActionOrCommand {
-            let mut changes = HashMap::new();
-            changes.insert(
-                uri.clone(),
+            make_refactor_action(
+                title,
+                uri,
                 vec![TextEdit {
                     range: target_range,
                     new_text,
                 }],
-            );
-            CodeActionOrCommand::CodeAction(CodeAction {
-                title: title.to_string(),
-                kind: None,
-                diagnostics: None,
-                edit: Some(WorkspaceEdit {
-                    changes: Some(changes),
-                    document_changes: None,
-                    change_annotations: None,
-                }),
-                command: None,
-                is_preferred: None,
-                disabled: None,
-                data: None,
-            })
+            )
         };
 
-        vec![
+        let mut actions = vec![
             make_action(
                 "Wrap with Padding",
                 format!(
@@ -938,23 +1031,84 @@ impl LanguageAdapter for DartLanguageAdapter {
                     "StreamBuilder<Object>(\n{inner_indent}stream: null,\n{inner_indent}builder: (context, snapshot) {{\n{child_indent}return {reindented_list};\n{inner_indent}}},\n{indent_str})"
                 ),
             ),
-        ]
+        ];
+
+        if let Some(unwrapped) = extract_child_argument(&expr_text, &step) {
+            actions.push(make_action("Remove this widget", unwrapped));
+        }
+
+        let line_start_pos = Position {
+            line: line_idx as u32,
+            character: 0,
+        };
+        actions.push(make_refactor_action(
+            "Extract local variable",
+            uri,
+            vec![
+                TextEdit {
+                    range: Range {
+                        start: line_start_pos,
+                        end: line_start_pos,
+                    },
+                    new_text: format!("{indent_str}final extracted = {expr_text};\n"),
+                },
+                TextEdit {
+                    range: target_range,
+                    new_text: "extracted".to_string(),
+                },
+            ],
+        ));
+
+        actions
     }
 
     fn closing_labels(&self, text: &str) -> HashMap<usize, String> {
-        let mut labels_by_line: HashMap<usize, Vec<String>> = HashMap::new();
+        let total_lines = text.bytes().filter(|&b| b == b'\n').count() + 1;
+        self.closing_labels_in_range(text, 0..total_lines, 0..text.len())
+    }
+
+    fn closing_labels_in_range(
+        &self,
+        text: &str,
+        line_range: std::ops::Range<usize>,
+        byte_range: std::ops::Range<usize>,
+    ) -> HashMap<usize, String> {
+        if line_range.is_empty() || byte_range.start >= text.len() {
+            return HashMap::new();
+        }
+        const LOOKBACK_BYTES: usize = 32 * 1024;
         let bytes = text.as_bytes();
+        let end_byte = byte_range.end.min(bytes.len());
+        let raw_start = byte_range.start.saturating_sub(LOOKBACK_BYTES);
+        // Align `scan_start` to the start of a line so `line` counting from
+        // `line_range.start` minus the newlines in `scan_start..byte_range.start` is exact.
+        let scan_start = if raw_start == 0 {
+            0
+        } else {
+            text[raw_start..byte_range.start]
+                .find('\n')
+                .map_or(byte_range.start, |rel| raw_start + rel + 1)
+        };
+        let lookback_newlines = bytes[scan_start..byte_range.start]
+            .iter()
+            .filter(|&&b| b == b'\n')
+            .count();
+        let mut line = line_range.start.saturating_sub(lookback_newlines);
+
+        let mut labels_by_line: HashMap<usize, Vec<String>> = HashMap::new();
         let mut stack: Vec<(usize, Option<String>, u8)> = Vec::new();
-        let mut line = 0usize;
-        let mut i = 0usize;
+        let mut i = scan_start;
         let mut in_single = false;
         let mut in_double = false;
         let mut in_line_comment = false;
 
-        while i < bytes.len() {
+        while i < end_byte {
             let b = bytes[i];
             if b == b'\n' {
                 line += 1;
+                if line >= line_range.end {
+                    break;
+                }
                 in_line_comment = false;
                 i += 1;
                 continue;
@@ -963,7 +1117,7 @@ impl LanguageAdapter for DartLanguageAdapter {
                 i += 1;
                 continue;
             }
-            if b == b'/' && i + 1 < bytes.len() && bytes[i + 1] == b'/' {
+            if b == b'/' && i + 1 < end_byte && bytes[i + 1] == b'/' {
                 in_line_comment = true;
                 i += 2;
                 continue;
@@ -989,10 +1143,10 @@ impl LanguageAdapter for DartLanguageAdapter {
 
             if b == b'(' {
                 let mut end = i;
-                if end > 0 && bytes[end - 1] == b'>' {
+                if end > scan_start && bytes[end - 1] == b'>' {
                     let mut angle = 1i32;
                     end -= 1;
-                    while end > 0 && angle > 0 {
+                    while end > scan_start && angle > 0 {
                         end -= 1;
                         if bytes[end] == b'>' {
                             angle += 1;
@@ -1003,7 +1157,7 @@ impl LanguageAdapter for DartLanguageAdapter {
                 }
                 let ident_end = end;
                 let mut start = ident_end;
-                while start > 0
+                while start > scan_start
                     && (bytes[start - 1].is_ascii_alphanumeric()
                         || bytes[start - 1] == b'_'
                         || bytes[start - 1] == b'.')
@@ -1019,13 +1173,14 @@ impl LanguageAdapter for DartLanguageAdapter {
                     && first_seg.bytes().any(|c| c.is_ascii_lowercase());
                 stack.push((line, is_pascal_call.then(|| raw_name.to_string()), b'('));
             } else if b == b'[' {
-                let before = text[..i].trim_end();
+                let slice_start = i.saturating_sub(32).max(scan_start);
+                let before = text[slice_start..i].trim_end();
                 let is_children = before.ends_with("children:");
                 stack.push((line, is_children.then(|| "[]".to_string()), b'['));
             } else if b == b')' || b == b']' {
                 let expected = if b == b')' { b'(' } else { b'[' };
                 if let Some((open_line, maybe_name, open_ch)) = stack.pop() {
-                    if open_ch == expected && line > open_line + 1 {
+                    if open_ch == expected && line >= line_range.start && line > open_line + 1 {
                         if let Some(name) = maybe_name {
                             labels_by_line.entry(line).or_default().push(name);
                         }
@@ -1189,6 +1344,199 @@ fn find_call_expression_range(
     )
 }
 
+fn make_refactor_action(
+    title: &str,
+    uri: &Uri,
+    edits: Vec<TextEdit>,
+) -> CodeActionOrCommand {
+    let mut changes = HashMap::new();
+    changes.insert(uri.clone(), edits);
+    CodeActionOrCommand::CodeAction(CodeAction {
+        title: title.to_string(),
+        kind: Some(CodeActionKind::REFACTOR),
+        diagnostics: None,
+        edit: Some(WorkspaceEdit {
+            changes: Some(changes),
+            document_changes: None,
+            change_annotations: None,
+        }),
+        command: None,
+        is_preferred: None,
+        disabled: None,
+        data: None,
+    })
+}
+
+/// Extract the `(target_lsp_range, expr_text, line_start_pos, indent_str)` for
+/// either a non-empty primary selection or the right-hand expression on `line`.
+fn selection_or_line_expr(buffer: &Buffer, line: u32) -> Option<(Range, String, Position, String)> {
+    let line_idx = line as usize;
+    if line_idx >= buffer.line_count() {
+        return None;
+    }
+    let raw_line = buffer.line(line_idx);
+    let display = raw_line.trim_end_matches(['\n', '\r']);
+    let indent_len = display.len() - display.trim_start().len();
+    let indent_str = display[..indent_len].to_string();
+    let line_start_pos = Position {
+        line: line_idx as u32,
+        character: 0,
+    };
+
+    let sel = buffer.selections().primary();
+    if !sel.is_empty() {
+        let range = sel.range();
+        let text = buffer.slice(range.clone());
+        let trimmed = text.trim();
+        if !trimmed.is_empty() {
+            let (sl, sc) = buffer.lsp_position(range.start);
+            let (el, ec) = buffer.lsp_position(range.end);
+            let start_line_raw = buffer.line(sl as usize);
+            let start_display = start_line_raw.trim_end_matches(['\n', '\r']);
+            let start_indent_len = start_display.len() - start_display.trim_start().len();
+            return Some((
+                Range {
+                    start: Position { line: sl, character: sc },
+                    end: Position { line: el, character: ec },
+                },
+                trimmed.trim_end_matches([';', ',']).to_string(),
+                Position { line: sl, character: 0 },
+                start_display[..start_indent_len].to_string(),
+            ));
+        }
+    }
+
+    let trimmed = display[indent_len..].trim_end();
+    if trimmed.is_empty()
+        || trimmed.starts_with("//")
+        || trimmed.starts_with('#')
+        || trimmed.starts_with("use ")
+        || trimmed.starts_with("import ")
+        || trimmed.ends_with('{')
+        || trimmed == "}"
+    {
+        return None;
+    }
+
+    let mut expr_offset_in_trimmed = 0usize;
+    if let Some(rest) = trimmed.strip_prefix("return ") {
+        expr_offset_in_trimmed = trimmed.len() - rest.trim_start().len();
+    } else if (trimmed.starts_with("let ")
+        || trimmed.starts_with("const ")
+        || trimmed.starts_with("final ")
+        || trimmed.starts_with("var "))
+        && let Some(eq) = trimmed.find('=')
+        && trimmed.as_bytes().get(eq + 1) != Some(&b'=')
+    {
+        let after_eq = &trimmed[eq + 1..];
+        expr_offset_in_trimmed = eq + 1 + (after_eq.len() - after_eq.trim_start().len());
+    }
+
+    let candidate = trimmed[expr_offset_in_trimmed..]
+        .trim_end_matches([';', ','])
+        .trim_end();
+    if candidate.is_empty() {
+        return None;
+    }
+    let line_start_byte = buffer.line_to_byte(line_idx);
+    let start_byte = line_start_byte + indent_len + expr_offset_in_trimmed;
+    let end_byte = start_byte + candidate.len();
+    let (sl, sc) = buffer.lsp_position(start_byte);
+    let (el, ec) = buffer.lsp_position(end_byte);
+    Some((
+        Range {
+            start: Position { line: sl, character: sc },
+            end: Position { line: el, character: ec },
+        },
+        candidate.to_string(),
+        line_start_pos,
+        indent_str,
+    ))
+}
+
+/// If `expr_text` is a Dart widget call with a top-level `child: <inner>` argument,
+/// return `<inner>` unindented by one `step_indent` for "Remove this widget".
+fn extract_child_argument(expr_text: &str, step_indent: &str) -> Option<String> {
+    let open = expr_text.find('(')?;
+    let close = expr_text.rfind(')')?;
+    if close <= open {
+        return None;
+    }
+    let body = &expr_text[open + 1..close];
+    let bytes = body.as_bytes();
+    let mut depth = 0i32;
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut i = 0usize;
+    let mut child_val_start: Option<usize> = None;
+
+    while i < bytes.len() {
+        let b = bytes[i];
+        if (in_single || in_double) && b == b'\\' {
+            i += 2;
+            continue;
+        }
+        if !in_double && b == b'\'' {
+            in_single = !in_single;
+            i += 1;
+            continue;
+        }
+        if !in_single && b == b'"' {
+            in_double = !in_double;
+            i += 1;
+            continue;
+        }
+        if in_single || in_double {
+            i += 1;
+            continue;
+        }
+        match b {
+            b'(' | b'[' | b'{' => depth += 1,
+            b')' | b']' | b'}' => depth -= 1,
+            _ => {}
+        }
+        if depth == 0 && child_val_start.is_none() && body[i..].starts_with("child:") {
+            let prev_ok = i == 0 || !(bytes[i - 1].is_ascii_alphanumeric() || bytes[i - 1] == b'_');
+            if prev_ok {
+                let after = i + "child:".len();
+                let ws = body[after..].len() - body[after..].trim_start().len();
+                child_val_start = Some(after + ws);
+                i = after + ws;
+                continue;
+            }
+        }
+        if let Some(start) = child_val_start
+            && depth == 0
+            && b == b','
+        {
+            let raw = body[start..i].trim();
+            return (!raw.is_empty()).then(|| unindent_multiline(raw, step_indent));
+        }
+        i += 1;
+    }
+
+    let start = child_val_start?;
+    let raw = body[start..].trim().trim_end_matches(',').trim();
+    (!raw.is_empty()).then(|| unindent_multiline(raw, step_indent))
+}
+
+fn unindent_multiline(text: &str, step_indent: &str) -> String {
+    if step_indent.is_empty() {
+        return text.to_string();
+    }
+    text.lines()
+        .enumerate()
+        .map(|(ix, line)| {
+            if ix == 0 {
+                line.to_string()
+            } else {
+                line.strip_prefix(step_indent).unwrap_or(line).to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 /// One language server this build knows how to start. Used by the Settings
 /// diagnostics list so a missing binary reads as an install step instead of
 /// silently degrading to lexical highlighting.
@@ -1317,5 +1665,84 @@ mod snippet_tests {
         for mirror in &parsed.mirrors[0] {
             assert_eq!(&parsed.text[mirror.clone()], "MyWidget");
         }
+    }
+
+    #[test]
+    fn closing_labels_in_range_matches_whole_file_closing_labels() {
+        let adapter = DartLanguageAdapter;
+        let code = "Widget build(BuildContext context) {\n  return Scaffold(\n    body: Column(\n      children: [\n        Text(\n          'hi',\n        ),\n      ],\n    ),\n  );\n}\n";
+        let full = adapter.closing_labels(code);
+        assert!(!full.is_empty());
+        // Query just lines 5..10 (the closing lines of Text, children, Column, Scaffold).
+        let lines: Vec<&str> = code.split_inclusive('\n').collect();
+        let start_byte: usize = lines[..5].iter().map(|l| l.len()).sum();
+        let end_byte: usize = lines[..10].iter().map(|l| l.len()).sum();
+        let scoped = adapter.closing_labels_in_range(code, 5..10, start_byte..end_byte);
+        for l in 5..10 {
+            assert_eq!(scoped.get(&l), full.get(&l), "mismatch on line {l}");
+        }
+    }
+
+    #[test]
+    fn dart_builtin_refactors_include_unwrap_child_and_extract_variable() {
+        use std::str::FromStr;
+        let code = "Widget build(BuildContext context) {\n  return Padding(\n    padding: const EdgeInsets.all(8.0),\n    child: Text('hi'),\n  );\n}\n";
+        let buf = Buffer::from_str(code);
+        let uri = Uri::from_str("file:///p/lib/main.dart").unwrap();
+        let actions = DartLanguageAdapter.builtin_code_actions(code, &buf, 1, 2, &uri);
+        let titles: Vec<&str> = actions
+            .iter()
+            .filter_map(|a| match a {
+                CodeActionOrCommand::CodeAction(ca) => {
+                    assert_eq!(ca.kind, Some(CodeActionKind::REFACTOR));
+                    Some(ca.title.as_str())
+                }
+                _ => None,
+            })
+            .collect();
+        assert!(titles.contains(&"Wrap with Padding"));
+        assert!(titles.contains(&"Remove this widget"));
+        assert!(titles.contains(&"Extract local variable"));
+
+        let remove = actions
+            .iter()
+            .find_map(|a| match a {
+                CodeActionOrCommand::CodeAction(ca) if ca.title == "Remove this widget" => Some(ca),
+                _ => None,
+            })
+            .unwrap();
+        let edits = remove.edit.as_ref().unwrap().changes.as_ref().unwrap().get(&uri).unwrap();
+        assert_eq!(edits[0].new_text, "Text('hi')");
+    }
+
+    #[test]
+    fn rust_and_typescript_builtin_refactors_extract_and_wrap() {
+        use std::str::FromStr;
+        let rs_code = "fn compute() -> Option<i32> {\n    let x = 40 + 2;\n    x\n}\n";
+        let rs_buf = Buffer::from_str(rs_code);
+        let rs_uri = Uri::from_str("file:///p/src/lib.rs").unwrap();
+        let rs_actions = RustLanguageAdapter.builtin_code_actions(rs_code, &rs_buf, 1, 4, &rs_uri);
+        let rs_titles: Vec<&str> = rs_actions
+            .iter()
+            .filter_map(|a| match a {
+                CodeActionOrCommand::CodeAction(ca) => Some(ca.title.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            rs_titles,
+            vec![
+                "Extract local variable",
+                "Wrap in Some(...)",
+                "Wrap in Ok(...)",
+                "Wrap in Arc::new(...)"
+            ]
+        );
+
+        let ts_code = "function run() {\n  return fetchItems(42);\n}\n";
+        let ts_buf = Buffer::from_str(ts_code);
+        let ts_uri = Uri::from_str("file:///p/src/index.ts").unwrap();
+        let ts_actions = TypeScriptLanguageAdapter.builtin_code_actions(ts_code, &ts_buf, 1, 2, &ts_uri);
+        assert_eq!(ts_actions.len(), 1);
     }
 }

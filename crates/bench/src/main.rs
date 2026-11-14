@@ -120,6 +120,13 @@ fn bench_size(kb: usize) {
     row("buffer: text() full copy", median(21, || {
         std::hint::black_box(buffer.text());
     }));
+    row("buffer: take_edits() -> InputEdit", median(21, || {
+        buffer.insert(mid, "x");
+        let edits = buffer.take_edits();
+        std::hint::black_box(&edits);
+        buffer.remove(mid..mid + 1);
+        let _ = buffer.take_edits();
+    }) / 2);
     row("diff_as_edit (prefix/suffix scan)", median(21, || {
         std::hint::black_box(diff_as_edit(&before, &after));
     }));
@@ -137,12 +144,25 @@ fn bench_size(kb: usize) {
         times[times.len() / 2]
     });
     tree.reparse(&before, InputEdit { start_byte: 0, old_end_byte: 0, new_end_byte: 0, start_position: Point::new(0, 0), old_end_position: Point::new(0, 0), new_end_position: Point::new(0, 0) });
-    row("syntax: fold_ranges (whole tree)", median(21, || {
+    let base_folds = tree.fold_ranges();
+    row("syntax: fold_ranges (whole tree, open)", median(21, || {
         std::hint::black_box(tree.fold_ranges());
+    }));
+    row("syntax: update_fold_ranges (incremental)", median(21, || {
+        let mut folds = base_folds.clone();
+        tree.update_fold_ranges(&mut folds, &[edit]);
+        std::hint::black_box(folds);
     }));
     let lang = language_for_path(Some(Path::new("main.dart")));
     row("language: closing_labels (whole text)", median(21, || {
         std::hint::black_box(lang.closing_labels(&before));
+    }));
+    let mid_line = buffer.byte_to_line(mid);
+    let view_start = mid;
+    let view_end = (mid + 60 * 60).min(before.len());
+    let view_end = before.floor_char_boundary(view_end);
+    row("language: closing_labels_in_range (~60 lines)", median(21, || {
+        std::hint::black_box(lang.closing_labels_in_range(&before, mid_line..(mid_line + 60), view_start..view_end));
     }));
     row("lsp: didChange JSON (full document)", median(21, || {
         let params = serde_json::json!({
@@ -151,11 +171,21 @@ fn bench_size(kb: usize) {
         });
         std::hint::black_box(serde_json::to_vec(&params).unwrap());
     }));
+    row("lsp: didChange JSON (incremental 1 char)", median(21, || {
+        let params = serde_json::json!({
+            "textDocument": {"uri": "file:///x.dart", "version": 2},
+            "contentChanges": [{
+                "range": {
+                    "start": {"line": mid_line, "character": 4},
+                    "end": {"line": mid_line, "character": 4}
+                },
+                "text": "x"
+            }],
+        });
+        std::hint::black_box(serde_json::to_vec(&params).unwrap());
+    }));
 
     // --- per-frame path ---
-    let view_start = mid;
-    let view_end = (mid + 60 * 60).min(before.len());
-    let view_end = before.floor_char_boundary(view_end);
     row("syntax: highlights for ~60 visible lines", median(21, || {
         std::hint::black_box(tree.highlights_in_range(&before, view_start..view_end));
     }));

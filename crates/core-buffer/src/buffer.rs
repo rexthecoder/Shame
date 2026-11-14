@@ -36,6 +36,25 @@ pub enum DiskState {
     Deleted,
 }
 
+/// A recorded byte-range replacement applied to a [`Buffer`], with its
+/// pre-edit and post-edit `(row, column)` positions (0-indexed, column in
+/// bytes) as well as pre-edit UTF-16 `(line, character)` LSP positions and the
+/// inserted replacement slice, computed in `O(log N)` from the rope so callers
+/// can feed exact edits into tree-sitter, incremental caches, and LSP
+/// `textDocument/didChange` without scanning full strings.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BufferEdit {
+    pub start_byte: usize,
+    pub old_end_byte: usize,
+    pub new_end_byte: usize,
+    pub start_position: (usize, usize),
+    pub old_end_position: (usize, usize),
+    pub new_end_position: (usize, usize),
+    pub start_lsp: (u32, u32),
+    pub old_end_lsp: (u32, u32),
+    pub inserted_text: Option<String>,
+}
+
 /// Write `rope` to `path` without ever leaving a half-written file: write a
 /// temporary file next to it, then rename it over the target. Symlinks are
 /// followed (the link stays a link) and the existing permissions are kept.
@@ -88,6 +107,7 @@ pub struct Buffer {
     /// The file's text as this buffer last read or wrote it: the common
     /// ancestor for merging in changes made on disk meanwhile.
     base: Rope,
+    pending_edits: Vec<BufferEdit>,
 }
 
 impl Default for Buffer {
@@ -101,6 +121,7 @@ impl Default for Buffer {
             revision: 0,
             disk_stamp: None,
             base: Rope::new(),
+            pending_edits: Vec::new(),
         }
     }
 }
@@ -218,11 +239,28 @@ impl Buffer {
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "buffer has no associated path"))?;
         let fresh = Rope::from_reader(BufReader::new(File::open(&path)?))?;
         let head = self.selections.primary().head;
+        let old_end_byte = self.len_bytes();
+        let old_end_position = self.byte_to_point(old_end_byte);
+        let old_end_lsp = self.lsp_position(old_end_byte);
         self.base = fresh.clone();
         self.rope = fresh;
         self.undo_tree = UndoTree::default();
         self.dirty = false;
         self.revision = self.revision.wrapping_add(1);
+        let new_end_byte = self.len_bytes();
+        let new_end_position = self.byte_to_point(new_end_byte);
+        self.pending_edits.clear();
+        self.pending_edits.push(BufferEdit {
+            start_byte: 0,
+            old_end_byte,
+            new_end_byte,
+            start_position: (0, 0),
+            old_end_position,
+            new_end_position,
+            start_lsp: (0, 0),
+            old_end_lsp,
+            inserted_text: None,
+        });
         let head = self.floor_char_boundary(head);
         self.selections = SelectionSet::single(head);
         self.disk_stamp = stamp_of(&path);
@@ -457,9 +495,40 @@ impl Buffer {
         !ops.is_empty()
     }
 
+    /// Drain all [`BufferEdit`] operations recorded since the last call.
+    pub fn take_edits(&mut self) -> Vec<BufferEdit> {
+        std::mem::take(&mut self.pending_edits)
+    }
+
+    /// 0-indexed `(row, byte_column)` of `byte` in `O(log N)` via the rope.
+    pub fn byte_to_point(&self, byte: usize) -> (usize, usize) {
+        let byte = byte.min(self.len_bytes());
+        let row = self.byte_to_line(byte);
+        let col = byte - self.line_to_byte(row);
+        (row, col)
+    }
+
     fn apply(&mut self, op: &EditOp) {
-        self.rope.remove(op.start..op.start + op.removed.len());
+        let old_end_byte = op.start + op.removed.len();
+        let new_end_byte = op.start + op.inserted.len();
+        let start_position = self.byte_to_point(op.start);
+        let old_end_position = self.byte_to_point(old_end_byte);
+        let start_lsp = self.lsp_position(op.start);
+        let old_end_lsp = self.lsp_position(old_end_byte);
+        self.rope.remove(op.start..old_end_byte);
         self.rope.insert(op.start, &op.inserted);
+        let new_end_position = self.byte_to_point(new_end_byte);
+        self.pending_edits.push(BufferEdit {
+            start_byte: op.start,
+            old_end_byte,
+            new_end_byte,
+            start_position,
+            old_end_position,
+            new_end_position,
+            start_lsp,
+            old_end_lsp,
+            inserted_text: Some(op.inserted.clone()),
+        });
         self.selections
             .apply_edit(op.start, op.removed.len(), op.inserted.len());
         self.dirty = true;

@@ -40,8 +40,9 @@ Prefer to build it yourself? See [Building and running](#building-and-running).
 ## Status
 
 Daily-usable. Implemented: rope buffer with undo tree and multi-cursor,
-tree-sitter highlighting (Dart, Python, JSON, YAML, TOML, Markdown, plus
-lexical highlighting for other languages), LSP (completion, hover, definition,
+tree-sitter highlighting (Dart, Python, Rust, TypeScript/TSX, JavaScript, JSON,
+YAML, TOML, Markdown, plus lexical highlighting for other languages), LSP
+(completion, hover, definition,
 references, signature help, rename, formatting, code actions, organize imports,
 diagnostics), DAP debugging (Dart/Flutter), Flutter run / hot reload / devices /
 tests, creating a Flutter project from the welcome screen or the command

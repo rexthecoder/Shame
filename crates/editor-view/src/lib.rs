@@ -37,9 +37,9 @@ use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use core_buffer::{Buffer, Selection};
+use core_buffer::{Buffer, BufferEdit, Selection};
 use core_lsp::lsp_types;
-use core_syntax::{Highlight, HighlightKind, InputEdit, SyntaxLanguage, SyntaxTree, point_at};
+use core_syntax::{Highlight, HighlightKind, InputEdit, Point, SyntaxLanguage, SyntaxTree, point_at};
 use core_workspace::LineChange;
 use gpui_kit::component::menu::{ContextMenuExt as _, PopupMenu, PopupMenuItem};
 use gpui_kit::component::{ActiveTheme as _, Sizable as _, h_flex, v_flex};
@@ -150,9 +150,12 @@ pub enum EditorEvent {
     },
 }
 
-/// Maximum file size (256 KiB) for tree-sitter parsing and syntax queries.
-/// Files above this threshold or non-code lockfiles open in fast plain-text mode.
-const MAX_SYNTAX_BYTES: usize = 256 * 1024;
+/// Maximum file size (2 MiB) for tree-sitter parsing and syntax queries.
+/// Files up to 128 KiB parse synchronously on open; larger files (up to 2 MiB)
+/// parse on a background thread so opening a large file never blocks a frame,
+/// and then update incrementally on every edit.
+const MAX_SYNTAX_BYTES: usize = 2 * 1024 * 1024;
+const SYNC_PARSE_BYTES: usize = 128 * 1024;
 
 fn should_parse_syntax(buffer: &Buffer) -> bool {
     if buffer.len_bytes() > MAX_SYNTAX_BYTES {
@@ -403,9 +406,11 @@ impl EditorView {
         Self::from_buffer(Buffer::new(), cx)
     }
 
-    pub fn from_buffer(buffer: Buffer, cx: &mut Context<Self>) -> Self {
+    pub fn from_buffer(mut buffer: Buffer, cx: &mut Context<Self>) -> Self {
+        let _ = buffer.take_edits();
         let language = language_for_path(buffer.path());
         let parse_syntax = should_parse_syntax(&buffer);
+        let sync_parse = parse_syntax && buffer.len_bytes() <= SYNC_PARSE_BYTES;
         let grammar = syntax_language(language.language_id(), buffer.path());
         let synced_text = if parse_syntax {
             buffer.text()
@@ -413,7 +418,7 @@ impl EditorView {
             String::new()
         };
         let syntax_tree = grammar
-            .filter(|_| parse_syntax)
+            .filter(|_| sync_parse)
             .map(|g| SyntaxTree::parse_as(g, &synced_text));
         let fold_ranges = if let Some(t) = &syntax_tree {
             t.fold_ranges()
@@ -422,11 +427,7 @@ impl EditorView {
         } else {
             Vec::new()
         };
-        let closing_labels = if parse_syntax {
-            language.closing_labels(&synced_text)
-        } else {
-            std::collections::HashMap::new()
-        };
+        let closing_labels = std::collections::HashMap::new();
         let synced_revision = buffer.revision();
         let indent_width = buffer.detect_indent_width();
         // Once per opened file: the widest line decides the horizontal extent.
@@ -502,10 +503,42 @@ impl EditorView {
             color_key: None,
             color_seq: 0,
         };
-        this.refresh_text_measures();
+        this.refresh_text_measures(&this.synced_text.clone());
+        if parse_syntax && !sync_parse {
+            if let Some(g) = grammar {
+                this.spawn_background_parse(g, cx);
+            }
+        }
         this.maybe_start_lsp(cx);
         this.refresh_line_changes(cx);
         this
+    }
+
+    fn spawn_background_parse(&mut self, grammar: SyntaxLanguage, cx: &mut Context<Self>) {
+        let revision = self.buffer.revision();
+        let text = self.synced_text.clone();
+        let (tx, rx) = async_channel::bounded(1);
+        std::thread::spawn(move || {
+            let tree = SyntaxTree::parse_as(grammar, &text);
+            let folds = tree.fold_ranges();
+            let _ = tx.send_blocking((revision, tree, folds));
+        });
+        cx.spawn(async move |weak, cx| {
+            let Ok((rev, tree, folds)) = rx.recv().await else {
+                return;
+            };
+            let _ = weak.update(cx, |this, cx| {
+                if this.buffer.revision() == rev && this.syntax_tree.is_none() {
+                    this.syntax_tree = Some(tree);
+                    this.fold_ranges = folds;
+                    if !this.folded_starts.is_empty() {
+                        this.rebuild_visible_lines();
+                    }
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
     }
 
     fn refresh_line_changes(&mut self, cx: &mut Context<Self>) {
@@ -535,13 +568,17 @@ impl EditorView {
         .detach();
     }
 
-    /// Synchronize `synced_text`, `syntax_tree`, `closing_labels`, and LSP
+    /// Synchronize `synced_text`, `syntax_tree`, `fold_ranges`, and LSP
     /// `didChange` at most once per `buffer.revision()`, avoiding duplicate
     /// full-buffer allocations across keystroke handlers and `render()`.
     /// Bracket depths and indent guides for the whole buffer, rebuilt
     /// whenever the text is (re)synced: on open, and after each edit.
-    fn refresh_text_measures(&mut self) {
-        let text = self.buffer.text();
+    fn refresh_text_measures(&mut self, text: &str) {
+        let text = if !text.is_empty() || self.buffer.is_empty() {
+            std::borrow::Cow::Borrowed(text)
+        } else {
+            std::borrow::Cow::Owned(self.buffer.text())
+        };
         self.bracket_depths = brackets::bracket_depths(&text);
         self.guide_counts = indent_guides::guide_counts(&text, self.indent_width);
     }
@@ -553,14 +590,19 @@ impl EditorView {
         self.synced_revision = self.buffer.revision();
         self.bracket_pair_cache = None;
         self.indent_width = self.buffer.detect_indent_width();
-        self.refresh_text_measures();
+        let buffer_edits = self.buffer.take_edits();
+        let text = self.buffer.text();
+        self.refresh_text_measures(&text);
         if !self.search_query.is_empty() {
             self.recompute_search_matches();
         }
         if should_parse_syntax(&self.buffer) {
-            let text = self.buffer.text();
-            let edit = diff_as_edit(&self.synced_text, &text);
-            if let Some(edit) = &edit {
+            let edits: Vec<InputEdit> = if !buffer_edits.is_empty() {
+                buffer_edits.iter().map(buffer_edit_to_input_edit).collect()
+            } else {
+                diff_as_edit(&self.synced_text, &text).into_iter().collect()
+            };
+            for edit in &edits {
                 inlay_hints::shift_inlay_hints(
                     &mut self.inlay_hints,
                     edit.start_byte,
@@ -572,29 +614,26 @@ impl EditorView {
             if let Some(grammar) = grammar {
                 match &mut self.syntax_tree {
                     Some(tree) if tree.language() == grammar => {
-                        if let Some(edit) = edit {
-                            tree.reparse(&text, edit);
-                        }
+                        tree.reparse_edits(&text, &edits);
+                        tree.update_fold_ranges(&mut self.fold_ranges, &edits);
                     }
-                    _ => self.syntax_tree = Some(SyntaxTree::parse_as(grammar, &text)),
+                    _ => {
+                        let tree = SyntaxTree::parse_as(grammar, &text);
+                        self.fold_ranges = tree.fold_ranges();
+                        self.syntax_tree = Some(tree);
+                    }
                 }
-                self.fold_ranges = self
-                    .syntax_tree
-                    .as_ref()
-                    .map(|t| t.fold_ranges())
-                    .unwrap_or_default();
             } else {
                 self.syntax_tree = None;
                 self.fold_ranges = lexical_fold_ranges(&text);
             }
-            self.closing_labels = self.language.closing_labels(&text);
-            self.sync_lsp_text(&text);
+            self.sync_lsp_text(&text, &buffer_edits);
             self.synced_text = text;
         } else {
             // Too big to parse, but the language server still needs every
             // edit: without this its copy of the file freezes at open time
             // and diagnostics, rename and code actions act on stale text.
-            self.sync_lsp_text(&self.buffer.text());
+            self.sync_lsp_text(&text, &buffer_edits);
             self.syntax_tree = None;
             self.closing_labels.clear();
             self.fold_ranges.clear();
@@ -769,20 +808,27 @@ impl EditorView {
     /// history and resetting the cursor to the start of the file.
     pub fn open_file(&mut self, path: impl AsRef<Path>, cx: &mut Context<Self>) -> io::Result<()> {
         self.buffer = Buffer::open(path)?;
+        let _ = self.buffer.take_edits();
         self.language = language_for_path(self.buffer.path());
         let parse_syntax = should_parse_syntax(&self.buffer);
+        let sync_parse = parse_syntax && self.buffer.len_bytes() <= SYNC_PARSE_BYTES;
         let grammar = syntax_language(self.language.language_id(), self.buffer.path());
         if parse_syntax {
             let text = self.buffer.text();
             if let Some(grammar) = grammar {
-                let tree = SyntaxTree::parse_as(grammar, &text);
-                self.fold_ranges = tree.fold_ranges();
-                self.syntax_tree = Some(tree);
+                if sync_parse {
+                    let tree = SyntaxTree::parse_as(grammar, &text);
+                    self.fold_ranges = tree.fold_ranges();
+                    self.syntax_tree = Some(tree);
+                } else {
+                    self.syntax_tree = None;
+                    self.fold_ranges = lexical_fold_ranges(&text);
+                }
             } else {
                 self.syntax_tree = None;
                 self.fold_ranges = lexical_fold_ranges(&text);
             }
-            self.closing_labels = self.language.closing_labels(&text);
+            self.closing_labels.clear();
             self.synced_text = text;
         } else {
             self.syntax_tree = None;
@@ -795,7 +841,12 @@ impl EditorView {
         self.synced_revision = self.buffer.revision();
         self.bracket_pair_cache = None;
         self.indent_width = self.buffer.detect_indent_width();
-        self.refresh_text_measures();
+        self.refresh_text_measures(&self.synced_text.clone());
+        if parse_syntax && !sync_parse {
+            if let Some(g) = grammar {
+                self.spawn_background_parse(g, cx);
+            }
+        }
         self.line_changes.clear();
         self.inlay_hints.clear();
         self.inlay_scheduled_revision = None;
@@ -1170,95 +1221,7 @@ impl EditorView {
         } else {
             std::borrow::Cow::Owned(self.buffer.text())
         };
-        let mut out = Vec::new();
-        const PREFIXES: &[(&str, &str)] = &[
-            ("class ", "class"),
-            ("abstract class ", "class"),
-            ("sealed class ", "class"),
-            ("mixin ", "mixin"),
-            ("extension ", "ext"),
-            ("enum ", "enum"),
-            ("typedef ", "type"),
-            ("pub struct ", "struct"),
-            ("struct ", "struct"),
-            ("pub enum ", "enum"),
-            ("pub trait ", "trait"),
-            ("trait ", "trait"),
-            ("impl ", "impl"),
-            ("pub fn ", "fn"),
-            ("pub(crate) fn ", "fn"),
-            ("pub async fn ", "fn"),
-            ("async fn ", "fn"),
-            ("fn ", "fn"),
-            ("func ", "func"),
-            ("def ", "def"),
-            ("async def ", "def"),
-            ("export interface ", "iface"),
-            ("interface ", "iface"),
-            ("export type ", "type"),
-            ("export function ", "fn"),
-            ("export async function ", "fn"),
-            ("function ", "fn"),
-            ("export class ", "class"),
-        ];
-
-        for (line_ix, raw_line) in text.lines().enumerate() {
-            let trimmed = raw_line.trim_start();
-            if trimmed.is_empty() || trimmed.starts_with("//") || trimmed.starts_with('#') {
-                continue;
-            }
-            let mut matched = false;
-            for (prefix, kind) in PREFIXES {
-                if let Some(rest) = trimmed.strip_prefix(prefix) {
-                    let sym: String = rest
-                        .trim_start()
-                        .chars()
-                        .take_while(|c| {
-                            c.is_alphanumeric() || *c == '_' || *c == '<' || *c == '>' || *c == ' '
-                        })
-                        .collect();
-                    let sym = sym
-                        .split_whitespace()
-                        .next()
-                        .unwrap_or("")
-                        .trim_matches(|c: char| !c.is_alphanumeric() && c != '_');
-                    if !sym.is_empty() {
-                        out.push((sym.to_string(), *kind, line_ix as u32));
-                        matched = true;
-                        break;
-                    }
-                }
-            }
-            if matched {
-                continue;
-            }
-            // Dart / C-family method signature heuristic (`Widget build(`, `Future<void> load(`, `void main(`)
-            if let Some(open_paren) = trimmed.find('(')
-                && (trimmed.ends_with('{') || trimmed.ends_with(") =>") || trimmed.contains(") async"))
-                && !trimmed.starts_with("if ")
-                && !trimmed.starts_with("for ")
-                && !trimmed.starts_with("while ")
-                && !trimmed.starts_with("switch ")
-                && !trimmed.starts_with("return ")
-            {
-                let before_paren = trimmed[..open_paren].trim();
-                let mut words = before_paren.split_whitespace().rev();
-                if let Some(name_tok) = words.next()
-                    && words.next().is_some()
-                {
-                    let clean = name_tok.trim_matches(|c: char| !c.is_alphanumeric() && c != '_');
-                    if !clean.is_empty()
-                        && clean
-                            .bytes()
-                            .next()
-                            .is_some_and(|b| b.is_ascii_lowercase() || b == b'_')
-                    {
-                        out.push((clean.to_string(), "method", line_ix as u32));
-                    }
-                }
-            }
-        }
-        out
+        extract_document_symbols(&text)
     }
 
     fn recompute_search_matches(&mut self) {
@@ -2404,7 +2367,7 @@ impl EditorView {
             "trigger-completion" => self.trigger_completions(true, cx),
             "code-actions" => self.request_code_actions(cx),
             "refactor" => {
-                self.request_refactors();
+                self.request_refactors(cx);
             }
             "rename" => self.start_rename(cx),
             "peek-definition" => self.request_peek_definition(),
@@ -3752,6 +3715,14 @@ impl EditorView {
             // Fence info strings say which grammar the server meant.
             let grammar = if raw.contains("```python") || raw.contains("```py\n") {
                 SyntaxLanguage::Python
+            } else if raw.contains("```rust") || raw.contains("```rs\n") {
+                SyntaxLanguage::Rust
+            } else if raw.contains("```tsx") {
+                SyntaxLanguage::Tsx
+            } else if raw.contains("```typescript") || raw.contains("```ts\n") {
+                SyntaxLanguage::TypeScript
+            } else if raw.contains("```javascript") || raw.contains("```js\n") || raw.contains("```jsx") {
+                SyntaxLanguage::JavaScript
             } else {
                 SyntaxLanguage::Dart
             };
@@ -4148,6 +4119,118 @@ impl EditorView {
     }
 }
 
+/// Extract document symbols `(symbol_name, kind_badge, 0_indexed_line)` from source text.
+pub fn extract_document_symbols(text: &str) -> Vec<(String, &'static str, u32)> {
+    let mut out = Vec::new();
+    const PREFIXES: &[(&str, &str)] = &[
+        ("class ", "class"),
+        ("abstract class ", "class"),
+        ("sealed class ", "class"),
+        ("mixin ", "mixin"),
+        ("extension ", "ext"),
+        ("enum ", "enum"),
+        ("typedef ", "type"),
+        ("pub struct ", "struct"),
+        ("struct ", "struct"),
+        ("pub enum ", "enum"),
+        ("pub trait ", "trait"),
+        ("trait ", "trait"),
+        ("impl ", "impl"),
+        ("pub fn ", "fn"),
+        ("pub(crate) fn ", "fn"),
+        ("pub async fn ", "fn"),
+        ("async fn ", "fn"),
+        ("fn ", "fn"),
+        ("func ", "func"),
+        ("def ", "def"),
+        ("async def ", "def"),
+        ("export interface ", "iface"),
+        ("interface ", "iface"),
+        ("export type ", "type"),
+        ("export function ", "fn"),
+        ("export async function ", "fn"),
+        ("function ", "fn"),
+        ("export class ", "class"),
+    ];
+
+    for (line_ix, raw_line) in text.lines().enumerate() {
+        let trimmed = raw_line.trim_start();
+        if trimmed.is_empty() || trimmed.starts_with("//") || trimmed.starts_with('#') {
+            continue;
+        }
+        let mut matched = false;
+        for (prefix, kind) in PREFIXES {
+            if let Some(rest) = trimmed.strip_prefix(prefix) {
+                let sym: String = rest
+                    .trim_start()
+                    .chars()
+                    .take_while(|c| {
+                        c.is_alphanumeric() || *c == '_' || *c == '<' || *c == '>' || *c == ' '
+                    })
+                    .collect();
+                let sym = sym
+                    .split_whitespace()
+                    .next()
+                    .unwrap_or("")
+                    .trim_matches(|c: char| !c.is_alphanumeric() && c != '_');
+                if !sym.is_empty() {
+                    out.push((sym.to_string(), *kind, line_ix as u32));
+                    matched = true;
+                    break;
+                }
+            }
+        }
+        if matched {
+            continue;
+        }
+        if let Some(open_paren) = trimmed.find('(')
+            && (trimmed.ends_with('{') || trimmed.ends_with(") =>") || trimmed.contains(") async"))
+            && !trimmed.starts_with("if ")
+            && !trimmed.starts_with("for ")
+            && !trimmed.starts_with("while ")
+            && !trimmed.starts_with("switch ")
+            && !trimmed.starts_with("return ")
+        {
+            let before_paren = trimmed[..open_paren].trim();
+            let mut words = before_paren.split_whitespace().rev();
+            if let Some(name_tok) = words.next()
+                && words.next().is_some()
+            {
+                let clean = name_tok.trim_matches(|c: char| !c.is_alphanumeric() && c != '_');
+                if !clean.is_empty()
+                    && clean
+                        .bytes()
+                        .next()
+                        .is_some_and(|b| b.is_ascii_lowercase() || b == b'_')
+                {
+                    out.push((clean.to_string(), "method", line_ix as u32));
+                }
+            }
+        }
+    }
+    out
+}
+
+fn buffer_edit_to_input_edit(edit: &BufferEdit) -> InputEdit {
+    InputEdit {
+        start_byte: edit.start_byte,
+        old_end_byte: edit.old_end_byte,
+        new_end_byte: edit.new_end_byte,
+        start_position: Point {
+            row: edit.start_position.0,
+            column: edit.start_position.1,
+        },
+        old_end_position: Point {
+            row: edit.old_end_position.0,
+            column: edit.old_end_position.1,
+        },
+        new_end_position: Point {
+            row: edit.new_end_position.0,
+            column: edit.new_end_position.1,
+        },
+    }
+}
+
 /// The smallest [`InputEdit`] that turns `old` into `new`, found by
 /// trimming the common prefix and common suffix and treating whatever's
 /// left in the middle as replaced. This doesn't know *which* edit
@@ -4462,6 +4545,15 @@ fn contains_ascii_ci(haystack: &str, needle_lower: &str) -> bool {
 /// The tree-sitter grammar for a buffer, if `core-syntax` has one. Untitled
 /// buffers without a language hint are Dart, matching the default language.
 fn syntax_language(language_id: &str, path: Option<&Path>) -> Option<SyntaxLanguage> {
+    if let Some(ext) = path.and_then(|p| p.extension()).and_then(|e| e.to_str()) {
+        match ext.to_ascii_lowercase().as_str() {
+            "tsx" => return Some(SyntaxLanguage::Tsx),
+            "js" | "jsx" | "mjs" | "cjs" => return Some(SyntaxLanguage::JavaScript),
+            "ts" | "mts" | "cts" => return Some(SyntaxLanguage::TypeScript),
+            "rs" => return Some(SyntaxLanguage::Rust),
+            _ => {}
+        }
+    }
     SyntaxLanguage::from_language_id(language_id)
         .or_else(|| path.is_none().then_some(SyntaxLanguage::Dart))
 }
@@ -5094,6 +5186,15 @@ impl Render for EditorView {
 
                 let clamped_start = start_byte.min(this.synced_text.len());
                 let clamped_end = end_byte.min(this.synced_text.len()).max(clamped_start);
+                this.closing_labels = if !this.synced_text.is_empty() {
+                    this.language.closing_labels_in_range(
+                        &this.synced_text,
+                        start_line..end_line,
+                        clamped_start..clamped_end,
+                    )
+                } else {
+                    std::collections::HashMap::new()
+                };
                 let highlights = if let Some(tree) = &this.syntax_tree {
                     tree.highlights_in_range(&this.synced_text, clamped_start..clamped_end)
                 } else if !this.synced_text.is_empty() {

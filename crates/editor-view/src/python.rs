@@ -395,7 +395,11 @@ mod tests {
             crate::syntax_language(lang.language_id(), Some(Path::new("/p/model.py"))),
             Some(SyntaxLanguage::Python)
         );
-        assert_eq!(crate::syntax_language("rust", Some(Path::new("/p/a.rs"))), None);
+        assert_eq!(crate::syntax_language("rust", Some(Path::new("/p/a.rs"))), Some(SyntaxLanguage::Rust));
+        assert_eq!(crate::syntax_language("typescript", Some(Path::new("/p/a.ts"))), Some(SyntaxLanguage::TypeScript));
+        assert_eq!(crate::syntax_language("typescript", Some(Path::new("/p/a.tsx"))), Some(SyntaxLanguage::Tsx));
+        assert_eq!(crate::syntax_language("typescript", Some(Path::new("/p/a.js"))), Some(SyntaxLanguage::JavaScript));
+        assert_eq!(crate::syntax_language("go", Some(Path::new("/p/a.go"))), None);
         // Notebook cells: no path, but a Python language hint.
         assert_eq!(crate::syntax_language("python", None), Some(SyntaxLanguage::Python));
         assert_eq!(crate::syntax_language("plaintext", None), Some(SyntaxLanguage::Dart));

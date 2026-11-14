@@ -136,20 +136,38 @@ fn write_reply(stream: &mut UnixStream, ok: bool, body: Value) -> std::io::Resul
 
 /// True when this process was launched by an agent as the bridge client.
 pub(crate) fn is_cli_invocation() -> bool {
-    std::env::args().nth(1).as_deref() == Some("--ide-bridge")
+    matches!(
+        std::env::args().nth(1).as_deref(),
+        Some("--ide-bridge" | "--version" | "-v" | "--help" | "-h")
+    )
 }
 
-/// Run `dart-ide --ide-bridge <tool> [args]` and print the editor's answer.
+/// Run `shame --ide-bridge <tool> [args]` (or `--version` / `--help`) and print the answer.
 /// Returns the process exit code, or `None` when this is a normal GUI launch.
 #[cfg(unix)]
 pub(crate) fn run_cli_if_requested() -> Option<i32> {
     if !is_cli_invocation() {
         return None;
     }
+    match std::env::args().nth(1).as_deref() {
+        Some("--version" | "-v") => {
+            println!("shame {}", env!("CARGO_PKG_VERSION"));
+            return Some(0);
+        }
+        Some("--help" | "-h") => {
+            println!(
+                "Shame {}\n\nUsage:\n  shame [path]                        Open workspace folder\n  shame --ide-bridge <tool> [args]    Query or drive the live editor\n  shame --version                     Print version\n  shame --help                        Print this help\n\nBridge tools:\n  context | diagnostics [path] | symbols [path] | outline [path]\n  read <path> [start] [end] | diff [--staged] | terminal [lines]\n  preview | open <path> [line] | format | hot-reload | hot-restart",
+                env!("CARGO_PKG_VERSION")
+            );
+            return Some(0);
+        }
+        Some("--ide-bridge") => {}
+        _ => return None,
+    }
     let argv: Vec<String> = std::env::args().skip(2).collect();
     let Some(tool) = argv.first().filter(|t| !t.is_empty()).cloned() else {
         eprintln!(
-            "usage: dart-ide --ide-bridge <context|diagnostics|read|diff|terminal|preview|open> [args]"
+            "usage: shame --ide-bridge <context|diagnostics|symbols|outline|read|diff|terminal|preview|open|format|hot-reload|hot-restart> [args]"
         );
         return Some(2);
     };
@@ -262,14 +280,21 @@ impl DartIde {
          The editor is live. Ask it before guessing what the user is looking at, with one of:\n  \
          \"$SHAME_IDE_BIN\" --ide-bridge context\n  \
          \"$SHAME_IDE_BIN\" --ide-bridge diagnostics [path]\n  \
+         \"$SHAME_IDE_BIN\" --ide-bridge symbols [path]\n  \
+         \"$SHAME_IDE_BIN\" --ide-bridge outline [path]\n  \
          \"$SHAME_IDE_BIN\" --ide-bridge read <path> [start] [end]\n  \
          \"$SHAME_IDE_BIN\" --ide-bridge diff\n  \
          \"$SHAME_IDE_BIN\" --ide-bridge terminal [lines]\n  \
          \"$SHAME_IDE_BIN\" --ide-bridge preview\n  \
-         \"$SHAME_IDE_BIN\" --ide-bridge open <path> [line]\n\
+         \"$SHAME_IDE_BIN\" --ide-bridge open <path> [line]\n  \
+         \"$SHAME_IDE_BIN\" --ide-bridge format [path]\n  \
+         \"$SHAME_IDE_BIN\" --ide-bridge hot-reload\n  \
+         \"$SHAME_IDE_BIN\" --ide-bridge hot-restart\n\
          `context` returns JSON with the active file, the exact selection text, cursor, open tabs, \
-         diagnostics, preview URL and simulator; the read tools print raw text. Use `open` when you \
-         point the user at a file or line. Keep using your normal tools to edit files."
+         diagnostics, Flutter session status, preview URL and simulator; `symbols` and `outline` inspect \
+         file declarations; `hot-reload` / `hot-restart` refresh a running Flutter app; the read tools \
+         print raw text. Use `open` when you point the user at a file or line. Keep using your normal \
+         tools to edit files."
             .to_string()
     }
 
@@ -297,6 +322,14 @@ impl DartIde {
                 true,
                 self.bridge_diagnostics(argv.first().map(String::as_str), cx),
             ),
+            "symbols" => match self.bridge_symbols(argv.first().map(String::as_str), cx) {
+                Ok(value) => answer(reply, true, value),
+                Err(err) => answer(reply, false, json!(err)),
+            },
+            "outline" => match self.bridge_outline(argv.first().map(String::as_str), cx) {
+                Ok(text) => answer(reply, true, json!({ "text": text })),
+                Err(err) => answer(reply, false, json!(err)),
+            },
             "terminal" => {
                 let lines = argv
                     .first()
@@ -315,6 +348,18 @@ impl DartIde {
                 answer(reply, true, json!({ "url": url }))
             }
             "open" => match self.bridge_open(&argv, window, cx) {
+                Ok(value) => answer(reply, true, value),
+                Err(err) => answer(reply, false, json!(err)),
+            },
+            "format" => match self.bridge_format(argv.first().map(String::as_str), cx) {
+                Ok(value) => answer(reply, true, value),
+                Err(err) => answer(reply, false, json!(err)),
+            },
+            "hot-reload" => match self.bridge_flutter_reload(false, cx) {
+                Ok(value) => answer(reply, true, value),
+                Err(err) => answer(reply, false, json!(err)),
+            },
+            "hot-restart" => match self.bridge_flutter_reload(true, cx) {
                 Ok(value) => answer(reply, true, value),
                 Err(err) => answer(reply, false, json!(err)),
             },
@@ -435,6 +480,11 @@ impl DartIde {
             "selection": selection,
             "open_tabs": tabs,
             "diagnostics": { "errors": errors, "warnings": warnings },
+            "flutter": {
+                "running": self.flutter_app_id.is_some(),
+                "app_id": self.flutter_app_id,
+                "status": self.flutter_status,
+            },
             "preview_url": self.web_preview_url.read(cx).value(),
             "simulator": simulator,
             "harnesses": {
@@ -444,6 +494,84 @@ impl DartIde {
                 "antigravity": AgentHarnessProbe::found(crate::rails::agent::AgentHarness::Antigravity),
             },
         })
+    }
+
+    fn bridge_symbols(&self, raw_path: Option<&str>, cx: &App) -> Result<Value, String> {
+        let (rel, symbols) = self.resolve_file_symbols(raw_path, cx)?;
+        let items: Vec<Value> = symbols
+            .into_iter()
+            .map(|(name, kind, line0)| json!({ "name": name, "kind": kind, "line": line0 + 1 }))
+            .collect();
+        Ok(json!({ "path": rel, "symbols": items }))
+    }
+
+    fn bridge_outline(&self, raw_path: Option<&str>, cx: &App) -> Result<String, String> {
+        let (rel, symbols) = self.resolve_file_symbols(raw_path, cx)?;
+        Ok(format_outline(&rel, &symbols))
+    }
+
+    fn resolve_file_symbols(
+        &self,
+        raw_path: Option<&str>,
+        cx: &App,
+    ) -> Result<(String, Vec<(String, &'static str, u32)>), String> {
+        if let Some(raw) = raw_path {
+            let path = workspace_path(&self.root, raw)?;
+            let rel = relative_path(&self.root, &path);
+            if let Some(tab) = self.tabs.iter().find(|t| t.path.as_deref() == Some(path.as_path())) {
+                return Ok((rel, tab.editor.read(cx).document_symbols()));
+            }
+            return bridge_symbols_from_disk(&self.root, raw);
+        }
+        let tab = self
+            .tabs
+            .get(self.active_tab)
+            .ok_or_else(|| "no active file; pass a path to symbols/outline".to_string())?;
+        let rel = tab
+            .path
+            .as_deref()
+            .map(|p| relative_path(&self.root, p))
+            .unwrap_or_else(|| "untitled".to_string());
+        Ok((rel, tab.editor.read(cx).document_symbols()))
+    }
+
+    fn bridge_format(&mut self, raw_path: Option<&str>, cx: &mut Context<Self>) -> Result<Value, String> {
+        let target_tab = if let Some(raw) = raw_path {
+            let path = workspace_path(&self.root, raw)?;
+            self.tabs
+                .iter()
+                .find(|t| t.path.as_deref() == Some(path.as_path()))
+                .ok_or_else(|| format!("{raw} is not open in an editor tab"))?
+        } else {
+            self.tabs
+                .get(self.active_tab)
+                .ok_or_else(|| "no active editor tab to format".to_string())?
+        };
+        let rel = target_tab
+            .path
+            .as_deref()
+            .map(|p| relative_path(&self.root, p))
+            .unwrap_or_else(|| "untitled".to_string());
+        let ed = target_tab.editor.clone();
+        let requested = ed.update(cx, |editor, _cx| editor.request_format());
+        Ok(json!({ "path": rel, "format_requested": requested }))
+    }
+
+    fn bridge_flutter_reload(
+        &mut self,
+        full_restart: bool,
+        cx: &mut Context<Self>,
+    ) -> Result<Value, String> {
+        let Some(app_id) = self.flutter_app_id.clone() else {
+            return Err("no running Flutter session".to_string());
+        };
+        if full_restart {
+            self.trigger_hot_restart(cx);
+            Ok(json!({ "action": "hot-restart", "app_id": app_id }))
+        } else {
+            self.trigger_hot_reload(cx);
+            Ok(json!({ "action": "hot-reload", "app_id": app_id }))
+        }
     }
 
     fn bridge_diagnostics(&self, only: Option<&str>, cx: &App) -> Value {
@@ -582,6 +710,33 @@ pub(crate) fn bridge_diff(root: &Path, staged: bool) -> Result<String, String> {
     Ok(text)
 }
 
+/// Extract document symbols from a workspace file on disk.
+pub(crate) fn bridge_symbols_from_disk(
+    root: &Path,
+    raw: &str,
+) -> Result<(String, Vec<(String, &'static str, u32)>), String> {
+    let path = workspace_path(root, raw)?;
+    if !path.is_file() {
+        return Err(format!("{raw} is not a file"));
+    }
+    let text = std::fs::read_to_string(&path).map_err(|e| format!("{raw}: {e}"))?;
+    let canon_root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+    let rel = relative_path(&canon_root, &path);
+    Ok((rel, editor_view::extract_document_symbols(&text)))
+}
+
+/// Format document symbols into a compact 1-based outline string.
+pub(crate) fn format_outline(rel: &str, symbols: &[(String, &'static str, u32)]) -> String {
+    if symbols.is_empty() {
+        return format!("{rel} (no symbols found)\n");
+    }
+    let mut out = format!("# {rel} ({} symbols)\n", symbols.len());
+    for (name, kind, line0) in symbols {
+        out.push_str(&format!("{:>5}: [{kind}] {name}\n", line0 + 1));
+    }
+    out
+}
+
 fn clip_text(text: &str, max: usize) -> (String, bool) {
     if text.len() <= max {
         return (text.to_string(), false);
@@ -650,6 +805,30 @@ mod tests {
         let root = Path::new("/work/project");
         assert_eq!(relative_path(root, Path::new("/work/project/src/a.rs")), "src/a.rs");
         assert_eq!(relative_path(root, Path::new("/elsewhere/a.rs")), "/elsewhere/a.rs");
+    }
+
+    #[test]
+    fn symbols_and_outline_extract_from_workspace_file() {
+        let root = temp_root("symbols");
+        std::fs::write(
+            root.join("sample.rs"),
+            "pub struct Counter {\n    value: i32,\n}\n\npub fn increment(c: &mut Counter) {\n    c.value += 1;\n}\n",
+        )
+        .unwrap();
+        let (rel, symbols) = bridge_symbols_from_disk(&root, "sample.rs").unwrap();
+        assert_eq!(rel, "sample.rs");
+        assert_eq!(
+            symbols,
+            vec![
+                ("Counter".to_string(), "struct", 0),
+                ("increment".to_string(), "fn", 4),
+            ]
+        );
+        let outline = format_outline(&rel, &symbols);
+        assert!(outline.contains("# sample.rs (2 symbols)"));
+        assert!(outline.contains("    1: [struct] Counter"));
+        assert!(outline.contains("    5: [fn] increment"));
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[cfg(unix)]

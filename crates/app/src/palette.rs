@@ -660,8 +660,8 @@ impl DartIde {
             }
             "refactor" => {
                 if let Some(ed) = self.active_editor().cloned() {
-                    ed.update(cx, |editor, _cx| {
-                        editor.request_refactors();
+                    ed.update(cx, |editor, cx| {
+                        editor.request_refactors(cx);
                     });
                 }
             }
@@ -684,9 +684,9 @@ impl DartIde {
                     ed.update(cx, |editor, _cx| editor.request_references());
                 }
             }
-            "goto-symbol" => self.open_symbol_outline(window, cx),
-            "goto-workspace-symbol" => self.open_workspace_symbols(window, cx),
-            "goto-line" => self.open_go_to_line(window, cx),
+            "symbol-outline" | "goto-symbol" => self.open_symbol_outline(window, cx),
+            "workspace-symbols" | "goto-workspace-symbol" => self.open_workspace_symbols(window, cx),
+            "go-to-line" | "goto-line" => self.open_go_to_line(window, cx),
             "new-file" => self.new_scratch_tab(window, cx),
             "open-folder" => self.open_folder(window, cx),
             "close-folder" => self.request_close_workspace(cx),

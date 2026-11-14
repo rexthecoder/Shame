@@ -1,4 +1,4 @@
-# Dart/Flutter IDE — development & release tasks.
+# Shame IDE — development & release tasks.
 #
 #   make run             foreground debug run (logs in this terminal)
 #   make restart         rebuild debug, stop old window, relaunch in background
@@ -6,10 +6,10 @@
 #   make check           clippy across workspace
 #   make icon            generate assets/icon.png + assets/icon.icns from assets/icon.svg
 #   make release-build   optimized LTO release binary (target/release/dart-ide)
-#   make bundle          package macOS app bundle (dist/Dart IDE.app) with icon.icns
+#   make bundle          package macOS app bundle (dist/Shame.app) with icon.icns
 #   make dmg             create distributable macOS disk image (dist/Shame-0.0.1+1-macos.dmg)
 #   make release         full v0.0.1+1 release pipeline (test + release-build + bundle + dmg)
-#   make install         install dist/Dart IDE.app into /Applications
+#   make install         install dist/Shame.app into /Applications
 #   scripts/build-mac.sh app + dmg for arm64, x86_64 or universal, with optional
 #                        Developer ID signing and a checksum (see its header)
 #   make dev-app         debug build wrapped as target/debug/Shame Dev.app and
@@ -112,11 +112,12 @@ icon:
 release-build:
 	cargo build --release -p $(CRATE)
 
-# Assemble signed macOS .app bundle in dist/Dart IDE.app
+# Assemble signed macOS .app bundle in dist/Shame.app
 bundle: icon release-build
 	@rm -rf "$(APP_DIR)"
 	@mkdir -p "$(APP_DIR)/Contents/MacOS" "$(APP_DIR)/Contents/Resources"
 	@cp "target/release/$(BIN)" "$(APP_DIR)/Contents/MacOS/$(BIN)"
+	@ln -sf "$(BIN)" "$(APP_DIR)/Contents/MacOS/shame"
 	@HELPER=$$(ls -t target/release/build/*/out/shame-sim 2>/dev/null | head -1); \
 		if [ -n "$$HELPER" ]; then cp "$$HELPER" "$(APP_DIR)/Contents/MacOS/shame-sim"; fi
 	@cp "assets/icon.icns" "$(APP_DIR)/Contents/Resources/icon.icns"

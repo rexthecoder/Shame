@@ -87,6 +87,9 @@ pub struct CompletionEntry {
 
 struct SharedLspInner {
     ready: bool,
+    /// Whether the server advertised `TextDocumentSyncKind::INCREMENTAL` (2)
+    /// during `initialize`.
+    incremental_sync: bool,
     /// When `initialize` finished; a server this new may still be indexing.
     ready_at: Option<std::time::Instant>,
     /// Dart's `$/analyzerStatus`: `Some(false)` once the first analysis is done.
@@ -113,6 +116,13 @@ impl SharedLspServer {
 
     fn notify(&self, method: &str, params: serde_json::Value) -> std::io::Result<()> {
         self.client.notify(method, params)
+    }
+
+    fn supports_incremental_sync(&self) -> bool {
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .incremental_sync
     }
 
     fn register_document(
@@ -289,6 +299,7 @@ fn shared_lsp_server(
         client,
         inner: Mutex::new(SharedLspInner {
             ready: false,
+            incremental_sync: false,
             ready_at: None,
             analyzing: None,
             exited: false,
@@ -303,7 +314,8 @@ fn shared_lsp_server(
         while let Ok(message) = events.recv_blocking() {
             match &message {
                 ServerMessage::Response { id, result } if *id == initialize_id => {
-                    if result.is_ok() {
+                    if let Ok(init_val) = result {
+                        let incremental = supports_incremental_sync(init_val);
                         let _ = server_bg.client.notify("initialized", serde_json::json!({}));
                         let opens = {
                             let mut guard = server_bg
@@ -311,6 +323,7 @@ fn shared_lsp_server(
                                 .lock()
                                 .unwrap_or_else(|e| e.into_inner());
                             guard.ready = true;
+                            guard.incremental_sync = incremental;
                             guard.ready_at = Some(std::time::Instant::now());
                             std::mem::take(&mut guard.pending_opens)
                         };
@@ -397,6 +410,52 @@ fn shared_lsp_server(
 
 fn file_uri(path: &std::path::Path) -> String {
     format!("file://{}", path.display())
+}
+
+/// Whether the server's `InitializeResult` advertised `TextDocumentSyncKind::INCREMENTAL` (2),
+/// either directly (`capabilities.textDocumentSync == 2`) or inside
+/// `TextDocumentSyncOptions` (`capabilities.textDocumentSync.change == 2`).
+pub(crate) fn supports_incremental_sync(init_result: &serde_json::Value) -> bool {
+    let Some(sync) = init_result.get("capabilities").and_then(|c| c.get("textDocumentSync")) else {
+        return false;
+    };
+    let kind = sync.as_i64().or_else(|| sync.get("change").and_then(|v| v.as_i64()));
+    kind == Some(2)
+}
+
+/// Build `textDocument/didChange` content changes: ranged incremental deltas when
+/// `incremental` is true and every `BufferEdit` has `inserted_text`, or a single
+/// full-document replacement otherwise.
+pub(crate) fn build_did_change_changes(
+    edits: &[core_buffer::BufferEdit],
+    full_text: &str,
+    incremental: bool,
+) -> Vec<TextDocumentContentChangeEvent> {
+    if incremental && !edits.is_empty() && edits.iter().all(|e| e.inserted_text.is_some()) {
+        edits
+            .iter()
+            .map(|edit| TextDocumentContentChangeEvent {
+                range: Some(Range {
+                    start: Position {
+                        line: edit.start_lsp.0,
+                        character: edit.start_lsp.1,
+                    },
+                    end: Position {
+                        line: edit.old_end_lsp.0,
+                        character: edit.old_end_lsp.1,
+                    },
+                }),
+                range_length: None,
+                text: edit.inserted_text.clone().unwrap_or_default(),
+            })
+            .collect()
+    } else {
+        vec![TextDocumentContentChangeEvent {
+            range: None,
+            range_length: None,
+            text: full_text.to_string(),
+        }]
+    }
 }
 
 fn rename_params(renames: &[(PathBuf, PathBuf)]) -> serde_json::Value {
@@ -1307,8 +1366,12 @@ impl EditorView {
     pub fn request_code_actions(&mut self, cx: &mut Context<Self>) {
         let head = self.buffer.selections().primary().head;
         let revision = self.buffer.revision();
+        let line = self.buffer.byte_to_line(head) as u32;
         if let Some(set) = self.code_actions.as_ref().filter(|s| s.revision == revision && s.head == head) {
-            let items = set.items.clone();
+            let mut actions: Vec<CodeActionOrCommand> =
+                set.items.iter().map(|i| i.action.clone()).collect();
+            actions.extend(self.builtin_language_code_actions(line));
+            let items = code_actions::organize(actions);
             self.open_code_action_menu(items, cx);
             return;
         }
@@ -1327,7 +1390,6 @@ impl EditorView {
         if self.send_code_action_request(true) {
             return;
         }
-        let line = self.buffer.byte_to_line(head) as u32;
         let items = code_actions::organize(self.builtin_language_code_actions(line));
         self.open_code_action_menu(items, cx);
     }
@@ -1417,9 +1479,11 @@ impl EditorView {
 
     /// Ask the server for refactorings (wrap with a widget, extract widget or method,
     /// and so on) for the selection, or the cursor if nothing is selected. They come
-    /// back through the same picker as quick fixes.
-    pub fn request_refactors(&mut self) -> bool {
+    /// back through the same picker as quick fixes; falls back to the language
+    /// adapter's built-in refactorings when no language server is ready.
+    pub fn request_refactors(&mut self, cx: &mut Context<Self>) -> bool {
         let selection = self.buffer.selections().primary();
+        let head = selection.head;
         let revision = self.buffer.revision();
         let position = |buffer: &core_buffer::Buffer, offset: usize| {
             let (line, character) = buffer.lsp_position(offset);
@@ -1429,32 +1493,38 @@ impl EditorView {
             start: position(&self.buffer, selection.start()),
             end: position(&self.buffer, selection.end()),
         };
-        let Some(lsp) = &mut self.lsp else {
-            return false;
-        };
-        if !lsp.ready {
-            return false;
-        }
-        let params = CodeActionParams {
-            text_document: TextDocumentIdentifier { uri: lsp.uri.clone() },
-            range,
-            context: CodeActionContext {
-                diagnostics: Vec::new(),
-                only: Some(vec![CodeActionKind::REFACTOR]),
-                trigger_kind: None,
-            },
-            work_done_progress_params: Default::default(),
-            partial_result_params: Default::default(),
-        };
-        match lsp.client.request("textDocument/codeAction", serde_json::to_value(params).unwrap_or_default()) {
-            Ok(id) => {
-                lsp.pending_code_action_id = Some(id);
-                lsp.code_action_request =
-                    Some(CodeActionRequest { revision, head: selection.head, open_menu: true, cache: false });
-                true
+        let sent = if let Some(lsp) = &mut self.lsp
+            && lsp.ready
+        {
+            let params = CodeActionParams {
+                text_document: TextDocumentIdentifier { uri: lsp.uri.clone() },
+                range,
+                context: CodeActionContext {
+                    diagnostics: Vec::new(),
+                    only: Some(vec![CodeActionKind::REFACTOR]),
+                    trigger_kind: None,
+                },
+                work_done_progress_params: Default::default(),
+                partial_result_params: Default::default(),
+            };
+            match lsp.client.request("textDocument/codeAction", serde_json::to_value(params).unwrap_or_default()) {
+                Ok(id) => {
+                    lsp.pending_code_action_id = Some(id);
+                    lsp.code_action_request =
+                        Some(CodeActionRequest { revision, head, open_menu: true, cache: false });
+                    true
+                }
+                Err(_) => false,
             }
-            Err(_) => false,
+        } else {
+            false
+        };
+        if !sent {
+            let line = self.buffer.byte_to_line(head) as u32;
+            let items = code_actions::organize(self.builtin_language_code_actions(line));
+            self.open_code_action_menu(items, cx);
         }
+        sent
     }
 
     /// Ask the server to organize (sort and prune) imports via a
@@ -1662,7 +1732,12 @@ impl EditorView {
     /// `buffer.revision()` so calling `sync_lsp_text` in `trigger_completions`
     /// never triggers a second `didChange` on the next `render()` frame that
     /// would cause `dart language-server` to cancel the in-flight completion!
-    pub(crate) fn sync_lsp_text(&mut self, text: &str) {
+    ///
+    /// When the server negotiated `TextDocumentSyncKind::INCREMENTAL` (2) and
+    /// `edits` are available from `Buffer::take_edits()`, sends compact ranged
+    /// `TextDocumentContentChangeEvent` deltas instead of re-sending the whole
+    /// buffer.
+    pub(crate) fn sync_lsp_text(&mut self, text: &str, edits: &[core_buffer::BufferEdit]) {
         let rev = self.buffer.revision();
         let Some(lsp) = &mut self.lsp else {
             return;
@@ -1672,16 +1747,14 @@ impl EditorView {
         }
         lsp.last_synced_revision = rev;
         lsp.version += 1;
+        let incremental = lsp.client.supports_incremental_sync();
+        let content_changes = build_did_change_changes(edits, text, incremental);
         let params = DidChangeTextDocumentParams {
             text_document: VersionedTextDocumentIdentifier {
                 uri: lsp.uri.clone(),
                 version: lsp.version,
             },
-            content_changes: vec![TextDocumentContentChangeEvent {
-                range: None,
-                range_length: None,
-                text: text.to_string(),
-            }],
+            content_changes,
         };
         let _ = lsp
             .client
@@ -1903,17 +1976,21 @@ impl EditorView {
                     .and_then(|v| serde_json::from_value::<Option<Vec<CodeActionOrCommand>>>(v).ok())
                     .flatten()
                     .unwrap_or_default();
-                let items = code_actions::organize(actions);
+                let line = self.buffer.byte_to_line(head);
                 if request.cache {
+                    let cached_items = code_actions::organize(actions.clone());
                     self.code_actions = Some(code_actions::CodeActionSet {
                         revision: request.revision,
                         head,
-                        line: self.buffer.byte_to_line(head),
-                        items: items.clone(),
+                        line,
+                        items: cached_items,
                     });
                     cx.notify();
                 }
                 if request.open_menu {
+                    let mut menu_actions = actions;
+                    menu_actions.extend(self.builtin_language_code_actions(line as u32));
+                    let items = code_actions::organize(menu_actions);
                     self.open_code_action_menu(items, cx);
                 }
             }
@@ -2563,5 +2640,47 @@ mod tests {
         let targets = all_definition_targets(&link);
         assert_eq!(targets[0].uri.as_str(), "file:///b.dart");
         assert_eq!(targets[0].range.start.line, 5, "the symbol's name, not the whole declaration");
+    }
+
+    #[test]
+    fn detects_incremental_text_document_sync_from_both_capability_shapes() {
+        assert!(supports_incremental_sync(&serde_json::json!({
+            "capabilities": { "textDocumentSync": 2 }
+        })));
+        assert!(supports_incremental_sync(&serde_json::json!({
+            "capabilities": { "textDocumentSync": { "openClose": true, "change": 2 } }
+        })));
+        assert!(!supports_incremental_sync(&serde_json::json!({
+            "capabilities": { "textDocumentSync": 1 }
+        })));
+        assert!(!supports_incremental_sync(&serde_json::json!({
+            "capabilities": { "textDocumentSync": { "openClose": true, "change": 1 } }
+        })));
+        assert!(!supports_incremental_sync(&serde_json::json!({ "capabilities": {} })));
+    }
+
+    #[test]
+    fn incremental_did_change_sends_utf16_ranged_deltas_and_falls_back_when_needed() {
+        let mut buf = core_buffer::Buffer::from_str("void main() {\n  print('🔥');\n}\n");
+        let _ = buf.take_edits();
+        // Insert after the 4-byte emoji (2 UTF-16 code units) on line 1.
+        let at = buf.text().find("');").unwrap();
+        buf.insert(at, "!");
+        let edits = buf.take_edits();
+        let text = buf.text();
+
+        let changes = build_did_change_changes(&edits, &text, true);
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].text, "!");
+        let range = changes[0].range.expect("incremental range");
+        // "  print('🔥" is 9 ASCII chars + 2 UTF-16 code units for 🔥 = column 11.
+        assert_eq!(range.start, Position { line: 1, character: 11 });
+        assert_eq!(range.end, Position { line: 1, character: 11 });
+
+        // Full-sync server gets the full document with `range: None`.
+        let full = build_did_change_changes(&edits, &text, false);
+        assert_eq!(full.len(), 1);
+        assert!(full[0].range.is_none());
+        assert_eq!(full[0].text, text);
     }
 }

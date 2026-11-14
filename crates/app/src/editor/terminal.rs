@@ -213,7 +213,8 @@ impl TerminalSession {
         let mut env = HashMap::new();
         env.insert("TERM".to_string(), "xterm-256color".to_string());
         env.insert("COLORTERM".to_string(), "truecolor".to_string());
-        env.insert("TERM_PROGRAM".to_string(), "dart-ide".to_string());
+        env.insert("TERM_PROGRAM".to_string(), "shame".to_string());
+        env.insert("TERM_PROGRAM_VERSION".to_string(), env!("CARGO_PKG_VERSION").to_string());
         // Apps launched from the Dock get no locale; without one zsh mangles UTF-8.
         if std::env::var("LANG").map_or(true, |l| l.is_empty()) {
             env.insert("LANG".to_string(), "en_US.UTF-8".to_string());

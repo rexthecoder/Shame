@@ -1295,19 +1295,44 @@ pub(crate) fn conversation_transcript(
     turns.join("\n\n")
 }
 
-/// A macOS notification, fire and forget.
+/// The bundle id of the `.app` this process runs from, read from its
+/// Info.plist. `None` for an unbundled build (`cargo run`).
+fn app_bundle_id() -> Option<String> {
+    let exe = std::env::current_exe().ok()?;
+    let plist = exe.parent()?.parent()?.join("Info.plist");
+    let text = std::fs::read_to_string(plist).ok()?;
+    let after = &text[text.find("CFBundleIdentifier</key>")?..];
+    let start = after.find("<string>")? + "<string>".len();
+    let end = after[start..].find("</string>")? + start;
+    Some(after[start..end].trim().to_string())
+}
+
+/// A macOS notification, fire and forget. Sent natively under the app's own
+/// bundle id so it shows as Shame; `osascript` (which macOS attributes to
+/// "Script Editor") is only the fallback for unbundled dev runs.
 fn notify_desktop(title: &str, body: &str) {
-    let script = format!(
-        "display notification \"{}\" with title \"{}\"",
-        applescript_escape(body),
-        applescript_escape(title)
-    );
-    let _ = Command::new("osascript")
-        .args(["-e", &script])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn();
+    let (title, body) = (title.to_string(), body.to_string());
+    std::thread::spawn(move || {
+        #[cfg(target_os = "macos")]
+        if let Some(id) = app_bundle_id() {
+            if mac_notification_sys::set_application(&id).is_ok()
+                && mac_notification_sys::send_notification(&title, None, &body, None).is_ok()
+            {
+                return;
+            }
+        }
+        let script = format!(
+            "display notification \"{}\" with title \"{}\"",
+            applescript_escape(&body),
+            applescript_escape(&title)
+        );
+        let _ = Command::new("osascript")
+            .args(["-e", &script])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    });
 }
 
 impl DartIde {
