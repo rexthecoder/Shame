@@ -47,7 +47,8 @@ references, signature help, rename, formatting, code actions, organize imports,
 diagnostics), DAP debugging (Dart/Flutter), Flutter run / hot reload / devices /
 tests, creating a Flutter project from the welcome screen or the command
 palette, Python interpreter detection and `python`/`pytest` runs, `.ipynb`
-Jupyter notebooks against local or remote Jupyter servers (see
+Jupyter notebooks against local or remote Jupyter servers, with DataFrame and
+other HTML table outputs drawn as tables (see
 [`docs/colab.md`](docs/colab.md)), CSV/TSV/JSONL data viewer with filtering,
 sorting, chat-dataset preview, and record inspector, an AI panel rail for
 Python ML projects, a Runs dock tab for project commands, git panel and diff

@@ -1,5 +1,6 @@
 //! The notebook mode of an `.ipynb` tab: cells you edit and run against a
-//! Jupyter kernel, with their outputs (text, errors, images) underneath.
+//! Jupyter kernel, with their outputs (text, errors, images, tables)
+//! underneath.
 //!
 //! The tab's `EditorView` keeps the notebook JSON and stays the source of
 //! truth for saving: every cell edit or new output is written back to it
@@ -10,10 +11,11 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 use std::sync::{Arc, Mutex, Weak};
 
 use base64::Engine as _;
-use core_jupyter::notebook::{self, Cell, CellKind, Notebook, OutputPart};
+use core_jupyter::notebook::{self, Cell, CellKind, Notebook, OutputPart, OutputTable};
 use core_jupyter::{KernelEvent, KernelSession, LocalServer, ServerInfo};
 use editor_view::EditorView;
 use gpui_kit::component::input::{Input, InputEvent, InputState};
@@ -22,6 +24,7 @@ use gpui_kit::component::{ActiveTheme as _, Sizable as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
+use crate::data_view::{fmt_count, looks_numeric};
 use crate::tokens;
 
 /// The run-count column left of each cell.
@@ -30,6 +33,12 @@ const PROMPT_W: f32 = 52.;
 const CELL_MAX_W: f32 = 900.;
 /// Output lines shown before the rest is folded.
 const OUTPUT_MAX_LINES: usize = 400;
+/// Columns drawn for a table output before the rest are summarised.
+const TABLE_MAX_COLS: usize = 12;
+/// Tallest table body before it scrolls inside the cell.
+const TABLE_MAX_H: f32 = 340.;
+/// Widest column, in characters, used to weigh table columns.
+const TABLE_COL_CHARS: usize = 28;
 /// Delay before cell edits are written back to the notebook JSON.
 const SYNC_DELAY_MS: u64 = 300;
 
@@ -163,6 +172,10 @@ pub(crate) struct NotebookView {
     /// Cells waiting for the kernel to come up or for the one before.
     queue: Vec<u64>,
     images: HashMap<u64, Arc<RenderImage>>,
+    /// Outputs already reduced to what the view draws, per cell, so a big
+    /// DataFrame's HTML isn't re-read on every frame. Dropped whenever any
+    /// cell's outputs change.
+    parts: HashMap<u64, Rc<Vec<Vec<OutputPart>>>>,
     url_input: Option<Entity<InputState>>,
     _subs: Vec<Subscription>,
 }
@@ -187,6 +200,7 @@ impl NotebookView {
             kernel: Kernel::Idle,
             queue: Vec::new(),
             images: HashMap::new(),
+            parts: HashMap::new(),
             url_input: None,
             _subs: vec![observe],
         };
@@ -209,6 +223,7 @@ impl NotebookView {
                 self.notebook = nb;
                 self.cells = (0..self.notebook.cells.len()).map(|i| self.make_cell_ui(i, cx)).collect();
                 self.images.clear();
+                self.parts.clear();
             }
             Err(e) => self.parse_error = Some(e),
         }
@@ -293,6 +308,7 @@ impl NotebookView {
         let Some(ix) = self.index_of(uid) else { return };
         self.cells.remove(ix);
         self.notebook.cells.remove(ix);
+        self.parts.remove(&uid);
         self.queue.retain(|q| *q != uid);
         if self.cells.is_empty() {
             self.notebook.cells.push(Cell::new(CellKind::Code, ""));
@@ -324,6 +340,7 @@ impl NotebookView {
         cell.kind = kind;
         cell.outputs.clear();
         cell.execution_count = None;
+        self.parts.clear();
         let hint = if kind == CellKind::Code { "cell.py" } else { "cell.md" };
         self.cells[ix].editor.update(cx, |ed, cx| ed.set_language_hint(hint, cx));
         self.cells[ix].editing = true;
@@ -337,6 +354,7 @@ impl NotebookView {
             cell.execution_count = None;
         }
         self.images.clear();
+        self.parts.clear();
         self.schedule_sync(cx);
         cx.notify();
     }
@@ -412,6 +430,7 @@ impl NotebookView {
             self.cells[ix].running = true;
             self.cells[ix].show_all_output = false;
             self.notebook.cells[ix].outputs.clear();
+            self.parts.clear();
             break;
         }
         cx.notify();
@@ -523,6 +542,7 @@ impl NotebookView {
             }
         }
         if changed {
+            self.parts.clear();
             self.schedule_sync(cx);
         }
         cx.notify();
@@ -680,11 +700,19 @@ impl NotebookView {
     }
 
     fn render_outputs(&mut self, ix: usize, cx: &mut Context<Self>) -> Option<Div> {
-        let outputs = self.notebook.cells[ix].outputs.clone();
-        if outputs.is_empty() {
+        let uid = self.cells[ix].uid;
+        let parts: Rc<Vec<Vec<OutputPart>>> = match self.parts.get(&uid) {
+            Some(parts) => parts.clone(),
+            None => {
+                let parts: Rc<Vec<Vec<OutputPart>>> =
+                    Rc::new(self.notebook.cells[ix].outputs.iter().map(notebook::output_parts).collect());
+                self.parts.insert(uid, parts.clone());
+                parts
+            }
+        };
+        if parts.iter().all(Vec::is_empty) {
             return None;
         }
-        let uid = self.cells[ix].uid;
         let show_all = self.cells[ix].show_all_output;
         let theme = cx.theme();
         let (fg, muted, red, primary) = (theme.foreground, theme.muted_foreground, theme.red, theme.primary);
@@ -692,7 +720,7 @@ impl NotebookView {
         let mut col = v_flex().w_full().gap(px(tokens::SPACE_3)).py(px(tokens::SPACE_3)).font_family(mono);
         let mut shown = 0usize;
         let mut hidden = 0usize;
-        let mut text_block = |text: String, color: Hsla| {
+        let mut text_block = |text: &str, color: Hsla| {
             let all: Vec<&str> = text.trim_end_matches('\n').lines().collect();
             let room = if show_all { usize::MAX } else { OUTPUT_MAX_LINES.saturating_sub(shown) };
             let take = all.len().min(room);
@@ -706,11 +734,12 @@ impl NotebookView {
                 .child(all[..take].join("\n"))
         };
         let max_img_w = CELL_MAX_W - PROMPT_W;
-        for output in &outputs {
-            for part in notebook::output_parts(output) {
+        for output in parts.iter() {
+            for part in output.iter() {
                 col = match part {
-                    OutputPart::Stream { stderr, text } => col.child(text_block(text, if stderr { red } else { fg })),
+                    OutputPart::Stream { stderr, text } => col.child(text_block(text, if *stderr { red } else { fg })),
                     OutputPart::Text(text) => col.child(text_block(text, fg)),
+                    OutputPart::Table(table) => col.child(render_table(table, uid, cx)),
                     OutputPart::Error { ename, evalue, traceback } => col.child(
                         v_flex()
                             .w_full()
@@ -729,7 +758,7 @@ impl NotebookView {
                             )
                             .child(text_block(traceback, muted)),
                     ),
-                    OutputPart::Image { base64, .. } => match self.image_for(&base64) {
+                    OutputPart::Image { base64, .. } => match self.image_for(base64) {
                         Some(image) => {
                             let size = image.size(0);
                             let (w, h) = (size.width.0 as f32, size.height.0 as f32);
@@ -957,6 +986,114 @@ impl Drop for NotebookView {
     }
 }
 
+/// A table output drawn as a compact grid: columns weighed by their widest
+/// cell, numbers right-aligned, a scrollable body, and the frame's shape.
+fn render_table(table: &OutputTable, uid: u64, cx: &App) -> Div {
+    let theme = cx.theme();
+    let (fg, muted, border, raised) = (theme.foreground, theme.muted_foreground, theme.border, theme.secondary);
+    let columns = table.columns();
+    let shown_cols = columns.min(TABLE_MAX_COLS);
+    let (weights, numeric) = table_layout(table, columns);
+    let row_h = tokens::CODE_LINE_H + tokens::SPACE_2;
+    let total_rows = table.rows.len() + table.dropped_rows;
+    let cell = |c: usize, text: String, strong: bool| {
+        let num = numeric.get(c).copied().unwrap_or(false);
+        div()
+            .flex_grow(weights.get(c).copied().unwrap_or(1.))
+            .flex_basis(px(0.))
+            .min_w(px(0.))
+            .px(px(tokens::SPACE_4))
+            .flex()
+            .items_center()
+            .overflow_hidden()
+            .when(c > 0, |d| d.border_l_1().border_color(border.opacity(0.5)))
+            .text_size(px(tokens::UI_XS))
+            .when(strong, |d| d.font_weight(FontWeight::MEDIUM).text_color(muted))
+            .when(!strong, |d| d.text_color(fg))
+            .child(div().w_full().min_w(px(0.)).truncate().when(num, |d| d.text_right()).child(text))
+    };
+
+    let header = h_flex()
+        .w_full()
+        .h(px(row_h))
+        .flex_none()
+        .bg(raised)
+        .border_b_1()
+        .border_color(border)
+        .children((0..shown_cols).map(|c| cell(c, table.headers.get(c).cloned().unwrap_or_default(), true)));
+
+    let last = table.rows.len().saturating_sub(1);
+    let body = div()
+        .id(("nb-table-rows", uid as usize))
+        .w_full()
+        // Long frames scroll inside the cell instead of pushing the rest of
+        // the notebook down.
+        .when(table.rows.len() > 10, |d| d.max_h(px(TABLE_MAX_H)).overflow_y_scroll())
+        .children(table.rows.iter().enumerate().map(|(r, row)| {
+            h_flex()
+                .w_full()
+                .min_h(px(row_h))
+                .when(r % 2 == 1, |d| d.bg(raised.opacity(0.35)))
+                .when(r < last, |d| d.border_b_1().border_color(border.opacity(0.5)))
+                .children((0..shown_cols).map(|c| cell(c, row.get(c).cloned().unwrap_or_default(), false)))
+        }));
+
+    let mut caption = format!("{} rows × {} columns", fmt_count(total_rows), columns);
+    match (table.dropped_rows > 0, shown_cols < columns) {
+        (false, false) => {}
+        (true, false) => caption.push_str(&format!(" · first {} shown", fmt_count(table.rows.len()))),
+        (false, true) => caption.push_str(&format!(" · first {shown_cols} columns")),
+        (true, true) => {
+            caption.push_str(&format!(" · first {} rows, {shown_cols} columns", fmt_count(table.rows.len())))
+        }
+    }
+
+    v_flex()
+        .w_full()
+        .rounded(px(tokens::RADIUS_SM))
+        .border_1()
+        .border_color(border)
+        .overflow_hidden()
+        .child(header)
+        .child(body)
+        .child(
+            h_flex()
+                .w_full()
+                .px(px(tokens::SPACE_4))
+                .py(px(tokens::SPACE_2))
+                .border_t_1()
+                .border_color(border.opacity(0.5))
+                .text_size(px(tokens::UI_XS))
+                .text_color(muted)
+                .child(caption),
+        )
+}
+
+/// Column grow factors, from the widest cell (bounded), and which columns
+/// read as numbers so they can be right-aligned like a DataFrame.
+fn table_layout(table: &OutputTable, columns: usize) -> (Vec<f32>, Vec<bool>) {
+    let mut widest = vec![0usize; columns];
+    let mut numeric = vec![0usize; columns];
+    let mut filled = vec![0usize; columns];
+    for (c, header) in table.headers.iter().enumerate().take(columns) {
+        widest[c] = header.chars().count();
+    }
+    for row in &table.rows {
+        for c in 0..columns {
+            let Some(text) = row.get(c).map(String::as_str) else { continue };
+            if text.is_empty() {
+                continue;
+            }
+            widest[c] = widest[c].max(text.chars().count());
+            filled[c] += 1;
+            numeric[c] += usize::from(looks_numeric(text));
+        }
+    }
+    let weights = widest.iter().map(|&w| w.clamp(3, TABLE_COL_CHARS) as f32).collect();
+    let numeric = (0..columns).map(|c| filled[c] > 0 && numeric[c] * 2 > filled[c]).collect();
+    (weights, numeric)
+}
+
 fn chip(id: &'static str, label: &'static str, cx: &App) -> Stateful<Div> {
     let theme = cx.theme();
     let (border, muted, fg, raised) = (theme.border, theme.muted_foreground, theme.foreground, theme.secondary);
@@ -1054,7 +1191,8 @@ impl Render for NotebookView {
 /// The notebook view in a headless GPUI window.
 #[cfg(test)]
 mod ui_tests {
-    use super::{CellKind, NotebookView};
+    use super::{CellKind, NotebookView, OutputTable, table_layout};
+    use core_jupyter::notebook::OutputPart;
     use editor_view::EditorView;
     use gpui_kit::{AppContext as _, Entity, VisualTestContext};
     use std::time::Duration;
@@ -1155,5 +1293,58 @@ mod ui_tests {
             assert!(json.contains("\"42\\n\""), "{json}");
             assert!(!json.contains("stray"));
         });
+    }
+
+    /// A DataFrame's HTML repr reaches the view as a table, and its parse is
+    /// cached until the output changes.
+    #[::gpui::test]
+    fn dataframe_outputs_are_parsed_once_as_tables(cx: &mut ::gpui::TestAppContext) {
+        use core_jupyter::KernelEvent;
+        let (view, _file, cx) = open(cx, "table");
+        let uid = cx.update(|_, cx| view.read(cx).cells[1].uid);
+        let req = uid.to_string();
+        let html = "<table><tr><th></th><th>name</th><th>score</th></tr>\
+                    <tr><th>0</th><td>Ada</td><td>9.5</td></tr></table>";
+        cx.update(|_, cx| {
+            view.update(cx, |v, cx| {
+                v.handle_kernel_events(
+                    vec![KernelEvent::Output {
+                        req: req.clone(),
+                        output: serde_json::json!({"output_type": "display_data", "data": {
+                            "text/plain": "   name  score\n0  Ada     9.5",
+                            "text/html": html,
+                        }}),
+                    }],
+                    cx,
+                );
+                assert!(v.parts.is_empty(), "a new output drops the parsed parts");
+                let outputs = v.render_outputs(1, cx).expect("the table renders");
+                drop(outputs);
+                let parts = v.parts.get(&uid).expect("parsed on first render");
+                assert!(matches!(&parts[0][0], OutputPart::Table(t) if t.rows[0][1] == "Ada"));
+
+                // Rendering again reuses the cache rather than re-parsing.
+                let cached = parts.clone();
+                drop(v.render_outputs(1, cx));
+                assert!(std::rc::Rc::ptr_eq(&cached, &v.parts[&uid]));
+            });
+        });
+    }
+
+    #[test]
+    fn table_columns_weigh_by_content_and_numbers_align_right() {
+        let table = OutputTable {
+            headers: vec!["city".into(), "visits".into(), "note".into()],
+            rows: vec![
+                vec!["Nairobi".into(), "12".into(), "first".into()],
+                vec!["Kyiv".into(), "3".into(), "second".into()],
+                vec!["Oslo".into(), "128".into(), "third".into()],
+            ],
+            dropped_rows: 0,
+        };
+        let (weights, numeric) = table_layout(&table, 3);
+        assert_eq!(numeric, [false, true, false]);
+        assert!(weights[0] > weights[1], "the seven-letter city column is widest: {weights:?}");
+        assert!(weights.iter().all(|w| *w >= 3.), "{weights:?}");
     }
 }

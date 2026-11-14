@@ -102,7 +102,7 @@ fn column_letter(mut col: usize) -> String {
     s
 }
 
-fn looks_numeric(s: &str) -> bool {
+pub(crate) fn looks_numeric(s: &str) -> bool {
     let t = s.trim();
     !t.is_empty() && t.parse::<f64>().is_ok()
 }
@@ -847,7 +847,7 @@ fn empty_state(title: &'static str, body: &'static str, cx: &App) -> Div {
         .child(div().text_size(px(tokens::UI_SM)).text_color(theme.muted_foreground).child(body))
 }
 
-fn fmt_count(n: usize) -> String {
+pub(crate) fn fmt_count(n: usize) -> String {
     let s = n.to_string();
     let mut out = String::new();
     for (i, ch) in s.chars().enumerate() {

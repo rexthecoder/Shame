@@ -249,6 +249,32 @@ pub enum OutputPart {
     /// A base64-encoded PNG or JPEG.
     Image { mime: String, base64: String },
     Error { ename: String, evalue: String, traceback: String },
+    /// A `text/html` table (a pandas/Polars frame, `df.to_html()`), with its
+    /// markup reduced to cells so it can be drawn as a table rather than
+    /// as the plain-text repr.
+    Table(OutputTable),
+}
+
+/// Rows read from an HTML table before the rest is dropped. Big frames are
+/// truncated by pandas itself; this only guards against unbounded output.
+pub const TABLE_MAX_ROWS: usize = 200;
+
+/// An HTML table reduced to header and body cells.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct OutputTable {
+    /// Header labels, one per column (`""` where the table had none, e.g. a
+    /// DataFrame's index column).
+    pub headers: Vec<String>,
+    pub rows: Vec<Vec<String>>,
+    /// Rows present in the output but not read past `TABLE_MAX_ROWS`.
+    pub dropped_rows: usize,
+}
+
+impl OutputTable {
+    /// Columns to draw: the widest of the header and any row.
+    pub fn columns(&self) -> usize {
+        self.headers.len().max(self.rows.iter().map(Vec::len).max().unwrap_or(0))
+    }
 }
 
 /// The richest part of an output this UI can show.
@@ -281,6 +307,11 @@ pub fn output_parts(output: &Value) -> Vec<OutputPart> {
                     return vec![OutputPart::Image { mime: mime.into(), base64 }];
                 }
             }
+            // A DataFrame's `text/html` repr is the readable one: draw its
+            // table instead of the ASCII `text/plain` figure underneath.
+            if let Some(table) = data.get("text/html").and_then(|h| html_table(&multiline(Some(h)))) {
+                return vec![OutputPart::Table(table)];
+            }
             for mime in ["text/plain", "text/markdown", "text/html"] {
                 if let Some(t) = data.get(mime) {
                     return vec![OutputPart::Text(strip_ansi(&multiline(Some(t))))];
@@ -289,6 +320,221 @@ pub fn output_parts(output: &Value) -> Vec<OutputPart> {
             Vec::new()
         }
         _ => Vec::new(),
+    }
+}
+
+/// The first `<table>` in an HTML fragment, as headers and rows.
+///
+/// This is not an HTML parser: it walks tags far enough to read `table`,
+/// `tr`, `th` and `td` nesting, which is all a `_repr_html_` frame uses.
+/// Cell text is unescaped and whitespace-collapsed; a nested table ends the
+/// walk, keeping whatever was read so far. `None` when there is no table
+/// with any cells, so other HTML falls back to its text repr.
+pub fn html_table(html: &str) -> Option<OutputTable> {
+    let mut at = 0;
+    let body = loop {
+        let tag = next_tag(html, at)?;
+        at = tag.end;
+        if tag.name == "table" && !tag.close && !tag.self_closing {
+            break tag.end;
+        }
+    };
+
+    // Rows as (every cell was a `<th>`, cells).
+    let mut rows: Vec<(bool, Vec<String>)> = Vec::new();
+    let mut row: Option<(bool, Vec<String>)> = None;
+    let mut cell: Option<(bool, String)> = None;
+    let mut depth = 1usize;
+    let mut text_from = body;
+    at = body;
+    while let Some(tag) = next_tag(html, at) {
+        if let Some((_, raw)) = cell.as_mut() {
+            raw.push_str(&html[text_from..tag.start]);
+        }
+        text_from = tag.end;
+        at = tag.end;
+        match (tag.name.as_str(), tag.close) {
+            ("table", false) => {
+                if cell.is_some() {
+                    break;
+                }
+                depth += 1;
+            }
+            ("table", true) => {
+                depth -= 1;
+                if depth == 0 {
+                    break;
+                }
+            }
+            ("tr", false) => row = Some((true, Vec::new())),
+            ("tr", true) => {
+                if let Some(r) = row.take() {
+                    rows.push(r);
+                }
+            }
+            ("td" | "th", false) => cell = Some((tag.name == "th", String::new())),
+            ("td" | "th", true) => {
+                if let (Some((th, raw)), Some((all_th, cells))) = (cell.take(), row.as_mut()) {
+                    cells.push(html_text(&raw));
+                    *all_th &= th;
+                }
+            }
+            ("br", _) => {
+                if let Some((_, raw)) = cell.as_mut() {
+                    raw.push(' ');
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let mut rows: Vec<(bool, Vec<String>)> = rows.into_iter().filter(|(_, cells)| !cells.is_empty()).collect();
+    if rows.is_empty() {
+        return None;
+    }
+    // Consecutive all-`<th>` rows are headers; a MultiIndex has several.
+    let mut header_rows: Vec<Vec<String>> = Vec::new();
+    while rows.first().is_some_and(|(all_th, _)| *all_th) {
+        header_rows.push(rows.remove(0).1);
+    }
+    let columns = header_rows
+        .iter()
+        .map(Vec::len)
+        .chain(rows.iter().map(|(_, cells)| cells.len()))
+        .max()
+        .unwrap_or(0);
+    let mut headers = vec![String::new(); columns];
+    for header in &header_rows {
+        for (col, label) in header.iter().enumerate() {
+            let label = label.trim();
+            if label.is_empty() {
+                continue;
+            }
+            let slot = &mut headers[col];
+            if !slot.is_empty() {
+                slot.push_str(" / ");
+            }
+            slot.push_str(label);
+        }
+    }
+    for (_, cells) in rows.iter_mut() {
+        cells.resize(columns, String::new());
+    }
+    let dropped_rows = rows.len().saturating_sub(TABLE_MAX_ROWS);
+    rows.truncate(TABLE_MAX_ROWS);
+    Some(OutputTable { headers, rows: rows.into_iter().map(|(_, cells)| cells).collect(), dropped_rows })
+}
+
+/// One tag and where it sits in the HTML.
+struct Tag {
+    start: usize,
+    /// Lowercased tag name.
+    name: String,
+    close: bool,
+    self_closing: bool,
+    /// Byte offset just past the closing `>`.
+    end: usize,
+}
+
+fn next_tag(html: &str, from: usize) -> Option<Tag> {
+    let mut at = from;
+    while let Some(off) = html[at..].find('<') {
+        let start = at + off;
+        let rest = &html[start + 1..];
+        let end = start + 1 + rest.find('>')?;
+        // Comments, doctypes and processing instructions aren't tags.
+        if rest.starts_with('!') || rest.starts_with('?') {
+            at = end + 1;
+            continue;
+        }
+        let close = rest.starts_with('/');
+        let body = if close { &rest[1..] } else { rest };
+        let name_len = body.find(|c: char| !c.is_ascii_alphanumeric()).unwrap_or(body.len());
+        if name_len == 0 {
+            at = start + 1;
+            continue;
+        }
+        return Some(Tag {
+            start,
+            name: body[..name_len].to_ascii_lowercase(),
+            close,
+            self_closing: html[start..end].trim_end().ends_with('/'),
+            end: end + 1,
+        });
+    }
+    None
+}
+
+/// Cell markup (`<span>`, `<b>`, `<a href>`) as plain, unescaped text.
+fn html_text(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    let mut chars = raw.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '<' => {
+                let closed = chars.by_ref().any(|c| c == '>');
+                if !closed {
+                    out.push('<');
+                }
+            }
+            '&' => {
+                let mut entity = String::new();
+                let mut closed = false;
+                while entity.len() < 10 {
+                    match chars.peek() {
+                        Some(';') => {
+                            chars.next();
+                            closed = true;
+                            break;
+                        }
+                        Some(c) => {
+                            entity.push(*c);
+                            chars.next();
+                        }
+                        None => break,
+                    }
+                }
+                match decode_entity(&entity) {
+                    Some(decoded) if closed => out.push(decoded),
+                    _ => {
+                        out.push('&');
+                        out.push_str(&entity);
+                        if closed {
+                            out.push(';');
+                        }
+                    }
+                }
+            }
+            c if c.is_whitespace() => {
+                if !out.ends_with(' ') && !out.is_empty() {
+                    out.push(' ');
+                }
+            }
+            c => out.push(c),
+        }
+    }
+    out.trim().to_string()
+}
+
+fn decode_entity(entity: &str) -> Option<char> {
+    match entity {
+        "amp" => Some('&'),
+        "lt" => Some('<'),
+        "gt" => Some('>'),
+        "quot" => Some('"'),
+        "apos" => Some('\''),
+        "nbsp" => Some(' '),
+        "ndash" => Some('–'),
+        "mdash" => Some('—'),
+        "hellip" => Some('…'),
+        _ => {
+            let code = entity.strip_prefix('#')?;
+            let n = match code.strip_prefix(['x', 'X']) {
+                Some(hex) => u32::from_str_radix(hex, 16).ok()?,
+                None => code.parse::<u32>().ok()?,
+            };
+            char::from_u32(n)
+        }
     }
 }
 
@@ -380,5 +626,85 @@ mod tests {
         );
         let img = json!({"output_type": "display_data", "data": {"image/png": "iVBO\nRw==", "text/plain": "<Figure>"}});
         assert_eq!(output_parts(&img), vec![OutputPart::Image { mime: "image/png".into(), base64: "iVBORw==".into() }]);
+    }
+
+    /// A pandas `_repr_html_`, cut down but with its shape: a style block
+    /// before the table, `<th>` index cells inside `<tbody>`, and escaped text.
+    const FRAME_HTML: &str = r##"<div>
+<style scoped>
+    .dataframe tbody tr th:only-of-type { vertical-align: middle; }
+</style>
+<table border="1" class="dataframe">
+  <thead>
+    <tr style="text-align: right;">
+      <th></th>
+      <th>name</th>
+      <th>score</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <th>0</th>
+      <td>Ada &amp; co</td>
+      <td>9.5</td>
+    </tr>
+    <tr>
+      <th>1</th>
+      <td>Grace<br>Hopper</td>
+      <td>1</td>
+    </tr>
+  </tbody>
+</table>
+</div>"##;
+
+    #[test]
+    fn a_dataframe_html_repr_becomes_a_table() {
+        let table = html_table(FRAME_HTML).expect("a table");
+        assert_eq!(table.headers, ["", "name", "score"]);
+        assert_eq!(table.rows.len(), 2);
+        assert_eq!(table.rows[0], ["0", "Ada & co", "9.5"]);
+        // `<br>` separates words; the index cell stays a cell, not a header.
+        assert_eq!(table.rows[1], ["1", "Grace Hopper", "1"]);
+        assert_eq!(table.columns(), 3);
+        assert_eq!(table.dropped_rows, 0);
+    }
+
+    #[test]
+    fn table_outputs_beat_the_plain_text_repr_and_other_html_falls_back() {
+        let frame = json!({"output_type": "execute_result", "execution_count": 2, "metadata": {},
+            "data": {"text/plain": "   name  score\n0  Ada    9.5", "text/html": FRAME_HTML}});
+        let parts = output_parts(&frame);
+        assert!(matches!(parts.as_slice(), [OutputPart::Table(_)]), "{parts:?}");
+
+        // HTML that isn't a table (a plotly div, say) keeps its text repr.
+        let plot = json!({"output_type": "display_data",
+            "data": {"text/html": "<div id=\"plot\"></div>", "text/plain": "<Figure>"}});
+        assert_eq!(output_parts(&plot), vec![OutputPart::Text("<Figure>".into())]);
+        assert_eq!(html_table("<div id=\"plot\"></div>"), None);
+        assert_eq!(html_table("<table><tr><td></td></tr></table>").unwrap().rows, [[""]]);
+    }
+
+    #[test]
+    fn table_cells_are_plain_text_and_headers_merge() {
+        let html = "<table><tr><th>a</th><th>b</th><th>c</th></tr>\
+                    <tr><th>x</th><th>y</th><th>z</th></tr>\
+                    <tr><td><b>1</b></td><td>&lt;2&gt;</td><td>&#65;&#x42;</td></tr></table>";
+        let table = html_table(html).unwrap();
+        // Two header rows (a MultiIndex) join per column.
+        assert_eq!(table.headers, ["a / x", "b / y", "c / z"]);
+        assert_eq!(table.rows, [["1", "<2>", "AB"]]);
+    }
+
+    #[test]
+    fn huge_tables_keep_a_row_cap_and_record_the_rest() {
+        let html: String = (0..TABLE_MAX_ROWS + 5)
+            .map(|i| format!("<tr><td>{i}</td></tr>"))
+            .collect::<Vec<_>>()
+            .join("");
+        let table = html_table(&format!("<table>{html}</table>")).unwrap();
+        assert_eq!(table.rows.len(), TABLE_MAX_ROWS);
+        assert_eq!(table.dropped_rows, 5);
+        assert_eq!(table.rows[0], ["0"]);
+        assert_eq!(table.rows[TABLE_MAX_ROWS - 1], [(TABLE_MAX_ROWS - 1).to_string()]);
     }
 }
