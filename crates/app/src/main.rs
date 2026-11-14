@@ -352,6 +352,7 @@ const IDE_COMMANDS: &[IdeCommand] = &[
     IdeCommand { id: "toggle-problems", title: "View: Toggle Problems Panel", shortcut: "\u{2318}\u{21e7}M", flutter_only: false },
     IdeCommand { id: "toggle-terminal", title: "View: Toggle Terminal Dock", shortcut: "\u{2318}J", flutter_only: false },
     IdeCommand { id: "toggle-sidebar", title: "View: Toggle Left Sidebar", shortcut: "\u{2318}B", flutter_only: false },
+    IdeCommand { id: "toggle-word-wrap", title: "View: Toggle Word Wrap", shortcut: "", flutter_only: false },
     IdeCommand { id: "toggle-web-preview", title: "View: Toggle Web Preview Rail", shortcut: "", flutter_only: false },
     IdeCommand { id: "toggle-agent", title: "View: Toggle Agent Rail", shortcut: "", flutter_only: false },
     IdeCommand { id: "format-doc", title: "Editor: Format Document", shortcut: "\u{2325}\u{21e7}F", flutter_only: false },

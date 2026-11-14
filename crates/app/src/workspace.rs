@@ -887,6 +887,7 @@ impl DartIde {
             "indent_guides": self.editor_options.indent_guides,
             "preview_keep_logins": self.web_preview_keep_logins,
             "bracket_colors": self.editor_options.bracket_colors,
+            "soft_wrap": self.editor_options.soft_wrap,
         });
         if let Ok(json) = serde_json::to_vec_pretty(&val) {
             let _ = std::fs::write(path, json);
@@ -962,6 +963,9 @@ impl DartIde {
         }
         if let Some(v) = val.get("bracket_colors").and_then(|v| v.as_bool()) {
             self.editor_options.bracket_colors = v;
+        }
+        if let Some(v) = val.get("soft_wrap").and_then(|v| v.as_bool()) {
+            self.editor_options.soft_wrap = v;
         }
         self.apply_save_options(cx);
         self.apply_editor_options(cx);

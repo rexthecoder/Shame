@@ -452,6 +452,26 @@ impl DartIde {
                 .into_any_element(),
             );
         }
+        if show_cat(2, "editor word wrap soft wrap long lines") {
+            let on = self.editor_options.soft_wrap;
+            let v1 = view.clone();
+            let ctrl = toggle_switch("settings-soft-wrap", on)
+                .on_click(move |_e, _w, cx| {
+                    v1.update(cx, |this, cx| {
+                        this.update_editor_options(|o| o.soft_wrap = !o.soft_wrap, cx)
+                    });
+                })
+                .into_any_element();
+            rows.push(
+                setting_row(
+                    "Word Wrap",
+                    "Break long lines at the editor's width instead of scrolling sideways."
+                        .to_string(),
+                    ctrl,
+                )
+                .into_any_element(),
+            );
+        }
         if show_cat(2, "editor split pane side by side") {
             let is_split = self.split_tab.is_some();
             let v1 = view.clone();

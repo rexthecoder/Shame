@@ -38,6 +38,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
+use crate::intel;
 use core_lsp::{LspClient, ServerMessage, lsp_types};
 use gpui_kit::Context;
 use smol::Timer;
@@ -90,6 +91,8 @@ struct SharedLspInner {
     /// Whether the server advertised `TextDocumentSyncKind::INCREMENTAL` (2)
     /// during `initialize`.
     incremental_sync: bool,
+    /// The `capabilities` object from the `initialize` result (null until then).
+    capabilities: serde_json::Value,
     /// When `initialize` finished; a server this new may still be indexing.
     ready_at: Option<std::time::Instant>,
     /// Dart's `$/analyzerStatus`: `Some(false)` once the first analysis is done.
@@ -116,6 +119,15 @@ impl SharedLspServer {
 
     fn notify(&self, method: &str, params: serde_json::Value) -> std::io::Result<()> {
         self.client.notify(method, params)
+    }
+
+    /// The server's `capabilities` from `initialize` (null before it answers).
+    fn capabilities(&self) -> serde_json::Value {
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .capabilities
+            .clone()
     }
 
     fn supports_incremental_sync(&self) -> bool {
@@ -180,7 +192,8 @@ pub(crate) fn set_inlay_hints_setting(enabled: bool) {
 }
 
 /// The reply to a `workspace/configuration` request: one entry per item
-/// asked for. We set the `dart` section (inlay hints) and point Python
+/// asked for. We set the `dart` section (inlay hints), turn on gopls's
+/// semantic tokens, and point Python
 /// servers at the project's interpreter (`python`, `pylsp`); anything else
 /// gets `null`, meaning "use your defaults".
 fn configuration_response(params: &serde_json::Value) -> serde_json::Value {
@@ -193,6 +206,8 @@ fn configuration_response(params: &serde_json::Value) -> serde_json::Value {
                 // `updateImportsOnRename` is the server's default; said
                 // explicitly because file moves in the tree rely on it.
                 Some("dart") => serde_json::json!({ "inlayHints": inlay, "updateImportsOnRename": true }),
+                // gopls ships semantic tokens switched off.
+                Some("gopls") => serde_json::json!({ "semanticTokens": true }),
                 Some(section @ ("python" | "pylsp")) => {
                     let scope = item
                         .get("scopeUri")
@@ -280,6 +295,42 @@ fn shared_lsp_server(
                     ..Default::default()
                 }),
                 inlay_hint: Some(InlayHintClientCapabilities::default()),
+                semantic_tokens: Some(lsp_types::SemanticTokensClientCapabilities {
+                    dynamic_registration: Some(false),
+                    requests: lsp_types::SemanticTokensClientCapabilitiesRequests {
+                        range: Some(false),
+                        full: Some(lsp_types::SemanticTokensFullOptions::Bool(true)),
+                    },
+                    token_types: [
+                        "class", "interface", "enum", "struct", "typeParameter", "type",
+                        "namespace", "parameter", "variable", "property", "enumMember",
+                        "event", "function", "method", "macro", "keyword", "comment",
+                        "string", "number", "operator", "decorator",
+                    ]
+                    .into_iter()
+                    .map(lsp_types::SemanticTokenType::new)
+                    .collect(),
+                    token_modifiers: [
+                        "declaration", "static", "readonly", "deprecated", "abstract",
+                        "async", "modification", "defaultLibrary",
+                    ]
+                    .into_iter()
+                    .map(lsp_types::SemanticTokenModifier::new)
+                    .collect(),
+                    formats: vec![lsp_types::TokenFormat::RELATIVE],
+                    overlapping_token_support: Some(false),
+                    multiline_token_support: Some(false),
+                    server_cancel_support: Some(false),
+                    augments_syntax_tokens: Some(true),
+                }),
+                folding_range: Some(lsp_types::FoldingRangeClientCapabilities {
+                    line_folding_only: Some(true),
+                    ..Default::default()
+                }),
+                document_symbol: Some(lsp_types::DocumentSymbolClientCapabilities {
+                    hierarchical_document_symbol_support: Some(true),
+                    ..Default::default()
+                }),
                 ..Default::default()
             }),
             ..Default::default()
@@ -300,6 +351,7 @@ fn shared_lsp_server(
         inner: Mutex::new(SharedLspInner {
             ready: false,
             incremental_sync: false,
+            capabilities: serde_json::Value::Null,
             ready_at: None,
             analyzing: None,
             exited: false,
@@ -324,6 +376,8 @@ fn shared_lsp_server(
                                 .unwrap_or_else(|e| e.into_inner());
                             guard.ready = true;
                             guard.incremental_sync = incremental;
+                            guard.capabilities =
+                                init_val.get("capabilities").cloned().unwrap_or_default();
                             guard.ready_at = Some(std::time::Instant::now());
                             std::mem::take(&mut guard.pending_opens)
                         };
@@ -700,6 +754,11 @@ pub(crate) struct LspState {
     pending_highlight: Option<(i64, u64, usize)>,
     /// In-flight `documentColor`: id and buffer revision.
     pending_color: Option<(i64, u64)>,
+    /// In-flight `semanticTokens/full`, `documentSymbol` and `foldingRange`:
+    /// request id and the buffer revision each was asked for.
+    pending_semantic: Option<(i64, u64)>,
+    pending_symbols: Option<(i64, u64)>,
+    pending_folding: Option<(i64, u64)>,
     /// The next definition reply should open a peek, not jump.
     peek_definition: bool,
     pending_format_id: Option<i64>,
@@ -826,6 +885,9 @@ impl EditorView {
             goto_title: None,
             pending_highlight: None,
             pending_color: None,
+            pending_semantic: None,
+            pending_symbols: None,
+            pending_folding: None,
             peek_definition: false,
             pending_format_id: None,
             pending_rename_id: None,
@@ -1118,6 +1180,54 @@ impl EditorView {
                 let params = serde_json::json!({ "textDocument": { "uri": lsp.uri.as_str() } });
                 if let Ok(id) = lsp.client.request("textDocument/documentColor", params) {
                     lsp.pending_color = Some((id, revision));
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// Ask the server for semantic tokens, the outline and folding ranges
+    /// ~450 ms after the text stops changing. Each is only requested when the
+    /// server advertised it.
+    pub(crate) fn maybe_request_intel(&mut self, cx: &mut Context<Self>) {
+        let revision = self.buffer.revision();
+        if self.intel_key == Some(revision) {
+            return;
+        }
+        if !self.lsp.as_ref().is_some_and(|lsp| lsp.ready) {
+            return;
+        }
+        self.intel_key = Some(revision);
+        self.intel_seq += 1;
+        let sequence = self.intel_seq;
+        cx.spawn(async move |weak, cx| {
+            Timer::after(Duration::from_millis(450)).await;
+            let _ = weak.update(cx, |this, _cx| {
+                if this.intel_seq != sequence {
+                    return;
+                }
+                let revision = this.buffer.revision();
+                let Some(lsp) = &mut this.lsp else { return };
+                let caps = lsp.client.capabilities();
+                let provided = |key: &str| {
+                    caps.get(key)
+                        .is_some_and(|v| !v.is_null() && *v != serde_json::Value::Bool(false))
+                };
+                let params = serde_json::json!({ "textDocument": { "uri": lsp.uri.as_str() } });
+                if intel::Legend::from_capabilities(&caps).is_some() {
+                    if let Ok(id) = lsp.client.request("textDocument/semanticTokens/full", params.clone()) {
+                        lsp.pending_semantic = Some((id, revision));
+                    }
+                }
+                if provided("documentSymbolProvider") {
+                    if let Ok(id) = lsp.client.request("textDocument/documentSymbol", params.clone()) {
+                        lsp.pending_symbols = Some((id, revision));
+                    }
+                }
+                if provided("foldingRangeProvider") {
+                    if let Ok(id) = lsp.client.request("textDocument/foldingRange", params) {
+                        lsp.pending_folding = Some((id, revision));
+                    }
                 }
             });
         })
@@ -1777,6 +1887,9 @@ impl EditorView {
                         // Diagnostics mean the server finished analysing:
                         // hints asked for earlier may have come back empty.
                         self.inlay_scheduled_revision = None;
+                        // Same for semantic tokens, the outline and folds: a
+                        // server still loading the package answers empty.
+                        self.intel_key = None;
                         cx.notify();
                     }
                 }
@@ -1832,6 +1945,55 @@ impl EditorView {
                 }
                 self.doc_colors = colors;
                 cx.notify();
+            }
+            ServerMessage::Response { id, result } if lsp.pending_semantic.is_some_and(|p| p.0 == id) => {
+                let Some((_, revision)) = lsp.pending_semantic.take() else { return };
+                // A reply for older text would colour the wrong words; the
+                // request for the newer revision is already on its way.
+                if revision != self.buffer.revision() {
+                    return;
+                }
+                let Some(legend) = intel::Legend::from_capabilities(&lsp.client.capabilities()) else {
+                    return;
+                };
+                let data: Vec<u32> = result
+                    .ok()
+                    .and_then(|v| v.get("data").cloned())
+                    .and_then(|d| serde_json::from_value(d).ok())
+                    .unwrap_or_default();
+                let buffer = &self.buffer;
+                self.semantic_highlights =
+                    intel::decode_tokens(&data, &legend, |line, col| buffer.offset_from_lsp(line, col));
+                cx.notify();
+            }
+            ServerMessage::Response { id, result } if lsp.pending_symbols.is_some_and(|p| p.0 == id) => {
+                let Some((_, revision)) = lsp.pending_symbols.take() else { return };
+                if revision != self.buffer.revision() {
+                    return;
+                }
+                if let Some(symbols) = result.ok().and_then(intel::symbols_from_response) {
+                    self.lsp_symbols = Some((revision, symbols));
+                }
+            }
+            ServerMessage::Response { id, result } if lsp.pending_folding.is_some_and(|p| p.0 == id) => {
+                let Some((_, revision)) = lsp.pending_folding.take() else { return };
+                if revision != self.buffer.revision() || self.syntax_tree.is_some() {
+                    // With a grammar, tree-sitter's folds are already exact
+                    // and update incrementally; the server's only fill gaps
+                    // for languages without one.
+                    return;
+                }
+                let buffer = &self.buffer;
+                let folds = result.ok().and_then(|v| {
+                    intel::folds_from_response(v, buffer.line_count(), |l| buffer.line_to_byte(l), buffer.len_bytes())
+                });
+                if let Some(folds) = folds.filter(|f| !f.is_empty()) {
+                    self.fold_ranges = folds;
+                    if !self.folded_starts.is_empty() {
+                        self.rebuild_visible_lines();
+                    }
+                    cx.notify();
+                }
             }
             ServerMessage::Response { id, result } if lsp.pending_definition_id == Some(id) => {
                 lsp.pending_definition_id = None;
@@ -2427,6 +2589,98 @@ mod tests {
         let (_, main_edits) = main.expect("an edit to main.dart's import");
         let text: String = main_edits.iter().map(|e| e.new_text.as_str()).collect();
         assert!(text.contains("ui/primary_button.dart"), "got {main_edits:?}");
+    }
+
+    /// End to end against a real `gopls`: the handshake advertises what the
+    /// editor can decode, and the three replies decode into highlights, an
+    /// outline and folds. Needs `go` and `gopls`; run with
+    /// `cargo test -p editor-view -- --ignored gopls_intel`.
+    #[test]
+    #[ignore]
+    fn gopls_intel_decodes_tokens_symbols_and_folds() {
+        let dir = std::env::temp_dir().join(format!("shame-gopls-intel-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let source = "package main\n\ntype Server struct{ port int }\n\nfunc (s *Server) Run() {\n\tif s.port > 0 {\n\t\tprintln(\"up\")\n\t}\n}\n\nfunc main() {\n\t(&Server{port: 1}).Run()\n}\n";
+        std::fs::write(dir.join("go.mod"), "module demo\n\ngo 1.21\n").unwrap();
+        std::fs::write(dir.join("main.go"), source).unwrap();
+        let dir = std::fs::canonicalize(&dir).unwrap();
+        let uri = Uri::from_str(&format!("file://{}", dir.join("main.go").display())).unwrap();
+
+        let server = shared_lsp_server("go", Some(dir.clone()), "gopls", &[]).expect("gopls starts");
+        let (events, ready, _) = server.register_document(DidOpenTextDocumentParams {
+            text_document: TextDocumentItem {
+                uri: uri.clone(),
+                language_id: "go".into(),
+                version: 1,
+                text: source.into(),
+            },
+        });
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
+        let mut is_ready = ready;
+        while !is_ready && std::time::Instant::now() < deadline {
+            while let Ok(message) = events.try_recv() {
+                if matches!(&message, ServerMessage::Notification { method, .. } if method == "$ide/lspReady") {
+                    is_ready = true;
+                }
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(is_ready, "gopls initialized");
+
+        let caps = server.capabilities();
+        let legend = intel::Legend::from_capabilities(&caps).expect("gopls offers semantic tokens");
+        let params = serde_json::json!({ "textDocument": { "uri": uri.as_str() } });
+        let ask = |method: &str| -> serde_json::Value {
+            let id = server.request(method, params.clone()).unwrap();
+            let deadline = std::time::Instant::now() + Duration::from_secs(60);
+            while std::time::Instant::now() < deadline {
+                while let Ok(message) = events.try_recv() {
+                    if let ServerMessage::Response { id: got, result } = message {
+                        if got == id {
+                            return result.unwrap_or_default();
+                        }
+                    }
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            panic!("no reply to {method}");
+        };
+
+        let line_starts: Vec<usize> = std::iter::once(0)
+            .chain(source.match_indices('\n').map(|(i, _)| i + 1))
+            .collect();
+        // A server still loading the package answers with no tokens: ask
+        // until it has them, as the editor does after each diagnostics push.
+        let mut data: Vec<u32> = Vec::new();
+        let warm = std::time::Instant::now() + Duration::from_secs(60);
+        while data.is_empty() && std::time::Instant::now() < warm {
+            let tokens = ask("textDocument/semanticTokens/full");
+            data = serde_json::from_value(tokens["data"].clone()).unwrap_or_default();
+            if data.is_empty() {
+                std::thread::sleep(Duration::from_millis(500));
+            }
+        }
+        let highlights = intel::decode_tokens(&data, &legend, |l, c| line_starts[l as usize] + c as usize);
+        let word_kind = |word: &str| {
+            let at = source.find(word).unwrap();
+            highlights.iter().find(|h| h.range.start == at).map(|h| h.kind)
+        };
+        assert_eq!(word_kind("Server struct"), Some(core_syntax::HighlightKind::Type), "{highlights:?}");
+
+        let symbols = intel::symbols_from_response(ask("textDocument/documentSymbol")).expect("symbols");
+        let names: Vec<&str> = symbols.entries.iter().map(|(n, _, _)| n.as_str()).collect();
+        assert!(names.iter().any(|n| n.ends_with("Run")) && names.contains(&"main"), "{names:?}");
+
+        let folds = intel::folds_from_response(
+            ask("textDocument/foldingRange"),
+            line_starts.len(),
+            |l| line_starts[l],
+            source.len(),
+        )
+        .expect("folds");
+        assert!(folds.iter().any(|f| f.start_line == 4), "func Run folds: {folds:?}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

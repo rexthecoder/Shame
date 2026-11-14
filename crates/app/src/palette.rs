@@ -595,6 +595,9 @@ impl DartIde {
             }
             "toggle-terminal" => self.terminal_open = !self.terminal_open,
             "toggle-sidebar" => self.sidebar_open = !self.sidebar_open,
+            "toggle-word-wrap" => {
+                self.update_editor_options(|o| o.soft_wrap = !o.soft_wrap, cx);
+            }
             "toggle-web-preview" => self.toggle_web_preview(window, cx),
             "toggle-agent" => self.set_agent_open(!self.agent_open),
             "format-doc" => {

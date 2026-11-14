@@ -135,10 +135,14 @@ impl DartIde {
     pub(crate) fn render_status_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let active_editor = self.active_editor().map(|ed| ed.read(cx));
         let active_path = active_editor.and_then(|ed| ed.buffer().path().map(Path::to_path_buf));
-        let segments: Vec<String> = active_path
+        let mut segments: Vec<String> = active_path
             .as_deref()
             .map(|path| breadcrumb_segments(&self.root, path))
             .unwrap_or_default();
+        // The path continues into the file: the class and method the caret is in.
+        if let Some(ed) = active_editor {
+            segments.extend(ed.symbol_path());
+        }
         let language = active_path.as_deref().and_then(language_label);
         let is_dirty = active_editor.is_some_and(|ed| ed.buffer().is_dirty());
         let cursor_pos = active_editor.map(|ed| ed.cursor_position());

@@ -66,7 +66,7 @@ impl HighlightKind {
 }
 
 /// One highlighted span, as byte offsets into the source that was parsed.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Highlight {
     pub range: Range<usize>,
     pub kind: HighlightKind,

@@ -30,7 +30,9 @@ mod lsp_integration;
 mod margin_notes;
 mod multicursor;
 pub mod python;
+mod intel;
 mod snippet;
+mod wrap;
 
 use std::io;
 use std::ops::Range;
@@ -200,6 +202,8 @@ pub struct EditorOptions {
     pub indent_guides: bool,
     /// Colour `()`, `[]` and `{}` by nesting depth.
     pub bracket_colors: bool,
+    /// Break long lines at the editor's width instead of scrolling sideways.
+    pub soft_wrap: bool,
 }
 
 impl Default for EditorOptions {
@@ -210,6 +214,7 @@ impl Default for EditorOptions {
             inlay_hints: false,
             indent_guides: true,
             bracket_colors: true,
+            soft_wrap: false,
         }
     }
 }
@@ -310,6 +315,17 @@ pub struct EditorView {
     /// Logical line -> its row in the list (folds hide lines), rebuilt on
     /// every render so scrolling lands on the right row.
     display_line_index: Vec<usize>,
+    /// Row width in cells while soft wrap is on and the text area has been
+    /// measured; `None` otherwise.
+    wrap_cols: Option<usize>,
+    /// The display rows (line, start column, end column) the last render
+    /// built with soft wrap on, reused while nothing that shapes them changed.
+    wrap_rows: Option<std::rc::Rc<DisplayRows>>,
+    /// Bumped whenever the fold set changes, so cached wrap rows are rebuilt.
+    fold_gen: u64,
+    /// Text-area width the wrap rows were laid out for; the canvas asks for
+    /// another frame when the painted width differs.
+    wrap_layout_width: Pixels,
     /// Last test run's result per 0-indexed line, with the failure message.
     test_marks: std::collections::HashMap<usize, (TestMark, Option<String>)>,
     /// Bracket depth at the start of each line, rebuilt per edit.
@@ -399,6 +415,15 @@ pub struct EditorView {
     doc_colors: Vec<(usize, Hsla)>,
     color_key: Option<u64>,
     color_seq: u64,
+    /// Semantic-token highlights from the server, sorted by offset and
+    /// shifted on every edit until a fresh reply arrives.
+    semantic_highlights: Vec<Highlight>,
+    /// The server's outline and the buffer revision it describes.
+    lsp_symbols: Option<(u64, intel::Outline)>,
+    /// Buffer revision the last semantic/outline/folding request was
+    /// scheduled for, and the debounce token for those requests.
+    intel_key: Option<u64>,
+    intel_seq: u64,
 }
 
 impl EditorView {
@@ -454,6 +479,10 @@ impl EditorView {
             h_drag: None,
             h_span: px(1.),
             display_line_index: Vec::new(),
+            wrap_cols: None,
+            wrap_rows: None,
+            fold_gen: 0,
+            wrap_layout_width: px(0.),
             test_marks: std::collections::HashMap::new(),
             bracket_depths: Vec::new(),
             guide_counts: Vec::new(),
@@ -502,6 +531,10 @@ impl EditorView {
             doc_colors: Vec::new(),
             color_key: None,
             color_seq: 0,
+            semantic_highlights: Vec::new(),
+            lsp_symbols: None,
+            intel_key: None,
+            intel_seq: 0,
         };
         this.refresh_text_measures(&this.synced_text.clone());
         if parse_syntax && !sync_parse {
@@ -609,6 +642,12 @@ impl EditorView {
                     edit.old_end_byte,
                     edit.new_end_byte,
                 );
+                intel::shift_highlights(
+                    &mut self.semantic_highlights,
+                    edit.start_byte,
+                    edit.old_end_byte,
+                    edit.new_end_byte,
+                );
             }
             let grammar = syntax_language(self.language.language_id(), self.buffer.path());
             if let Some(grammar) = grammar {
@@ -639,6 +678,7 @@ impl EditorView {
             self.fold_ranges.clear();
             self.synced_text.clear();
             self.inlay_hints.clear();
+            self.semantic_highlights.clear();
         }
         if !self.folded_starts.is_empty() {
             self.rebuild_visible_lines();
@@ -698,6 +738,7 @@ impl EditorView {
     }
 
     fn rebuild_visible_lines(&mut self) {
+        self.fold_gen = self.fold_gen.wrapping_add(1);
         self.visible_lines.clear();
         if self.folded_starts.is_empty() {
             return;
@@ -838,6 +879,8 @@ impl EditorView {
         }
         self.folded_starts.clear();
         self.visible_lines.clear();
+        self.fold_gen = self.fold_gen.wrapping_add(1);
+        self.wrap_rows = None;
         self.synced_revision = self.buffer.revision();
         self.bracket_pair_cache = None;
         self.indent_width = self.buffer.detect_indent_width();
@@ -1025,7 +1068,71 @@ impl EditorView {
     fn ensure_cursor_visible(&mut self) {
         let head = self.buffer.selections().primary().head;
         let line = self.buffer.byte_to_line(head);
+        if let Some((row, _)) = self.wrapped_row_of(head) {
+            self.scroll_handle.scroll_to_item(row, ScrollStrategy::Nearest);
+            return;
+        }
         self.scroll_to_line(line, ScrollStrategy::Nearest);
+    }
+
+    /// With soft wrap on: the list row holding byte offset `offset` and the
+    /// offset's display column within its line. `None` when wrap is off or the
+    /// rows are not built yet.
+    fn wrapped_row_of(&self, offset: usize) -> Option<(usize, usize)> {
+        self.wrap_cols?;
+        let rows = self.wrap_rows.as_ref()?;
+        let line = self.buffer.byte_to_line(offset);
+        if line >= rows.line_row.len() {
+            return None;
+        }
+        let line_start = self.buffer.line_to_byte(line);
+        let text = self.buffer.line(line);
+        let display = text.trim_end_matches(['\n', '\r']);
+        let col = display_column_at_byte(display, (offset - line_start).min(display.len()));
+        let first = rows.line_row[line];
+        let mut row = first;
+        while row + 1 < rows.items.len()
+            && rows.items[row + 1] == line
+            && rows.segs[row + 1].0 <= col
+        {
+            row += 1;
+        }
+        Some((row, col))
+    }
+
+    /// Up/Down/Page with soft wrap: step by display row, keeping the offset
+    /// within the row as the goal. Returns whether it handled the move.
+    fn move_vertical_wrapped(&mut self, delta: isize, extend: bool, cx: &mut Context<Self>) -> bool {
+        let head = self.buffer.selections().primary().head;
+        let Some((row, col)) = self.wrapped_row_of(head) else {
+            return false;
+        };
+        let Some(rows) = self.wrap_rows.clone() else {
+            return false;
+        };
+        let goal = self.preferred_column.unwrap_or(col - rows.segs[row].0);
+        self.preferred_column = Some(goal);
+        let target = row as isize + delta;
+        if target < 0 || target as usize >= rows.items.len() {
+            return true;
+        }
+        let target = target as usize;
+        let line = rows.items[target];
+        if line >= self.buffer.line_count() {
+            return true;
+        }
+        let (start, end) = rows.segs[target];
+        let mut want = start + goal;
+        if end != usize::MAX {
+            // The last cell of a wrapped row is where the next row begins.
+            want = want.min(end.saturating_sub(1)).max(start);
+        }
+        let text = self.buffer.line(line);
+        let display = text.trim_end_matches(['\n', '\r']);
+        let offset = self.buffer.line_to_byte(line) + byte_at_display_column(display, want);
+        self.move_head_or_cursor(offset, extend, cx);
+        self.preferred_column = Some(goal);
+        true
     }
 
     /// Pan the text column by `delta` points; negative moves the code left
@@ -1216,12 +1323,31 @@ impl EditorView {
     /// Extract document symbols `(symbol_name, kind_badge, 0_indexed_line)` from the buffer
     /// for the Go to Symbol in File (`⌘⇧O` / `@`) overlay.
     pub fn document_symbols(&self) -> Vec<(String, &'static str, u32)> {
+        // The server's outline, when it describes this exact text; otherwise
+        // the line-prefix scan, which is instant and works without a server.
+        if let Some((revision, outline)) = &self.lsp_symbols {
+            if *revision == self.buffer.revision() && !outline.entries.is_empty() {
+                return outline.entries.clone();
+            }
+        }
         let text = if !self.synced_text.is_empty() {
             std::borrow::Cow::Borrowed(self.synced_text.as_str())
         } else {
             std::borrow::Cow::Owned(self.buffer.text())
         };
         extract_document_symbols(&text)
+    }
+
+    /// Names of the symbols the caret is inside (`Widget`, `build`), outermost
+    /// first, for the breadcrumb. Empty without a server outline. The last
+    /// outline is used while a newer one is on its way, so the path does not
+    /// vanish on every keystroke.
+    pub fn symbol_path(&self) -> Vec<String> {
+        let Some((_, outline)) = &self.lsp_symbols else {
+            return Vec::new();
+        };
+        let line = self.buffer.byte_to_line(self.buffer.selections().primary().head);
+        outline.path_at(line as u32)
     }
 
     fn recompute_search_matches(&mut self) {
@@ -2011,6 +2137,9 @@ impl EditorView {
     }
 
     fn move_vertical(&mut self, delta: isize, extend: bool, cx: &mut Context<Self>) {
+        if self.move_vertical_wrapped(delta, extend, cx) {
+            return;
+        }
         let head = self.buffer.selections().primary().head;
         let line = self.buffer.byte_to_line(head);
         let line_start = self.buffer.line_to_byte(line);
@@ -2518,11 +2647,13 @@ impl EditorView {
         current_word: Option<&str>,
         bracket_pair: Option<(usize, usize)>,
         scroll_x: Pixels,
+        seg: RowSeg,
         char_width: f64,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let is_active_line = cursor_line == Some(index);
+        let continuation = !seg.first;
         let display_text_check = line_text.trim_end_matches(['\n', '\r']);
         let is_comment_or_blank = display_text_check.trim().is_empty()
             || display_text_check.trim_start().starts_with("//");
@@ -2973,6 +3104,12 @@ impl EditorView {
             x.min(max).max(px(0.))
         };
         let width_cell = self.text_area_width.clone();
+        // Zero when soft wrap is off, so the relayout check stays idle.
+        let wrap_layout_width = if self.wrap_cols.is_some() {
+            self.wrap_layout_width
+        } else {
+            px(0.)
+        };
         let view = cx.entity();
         let line_canvas = canvas(
             move |bounds, window, _cx| {
@@ -3028,6 +3165,15 @@ impl EditorView {
                 (hitbox, shaped, shaped_closing, inlays, shaped_inlays)
             },
             move |bounds, (hitbox, shaped, shaped_closing, inlays, shaped_inlays), window, cx| {
+                // Soft wrap lays rows out for the width measured last frame;
+                // when the painted width differs (a resize, a panel opening)
+                // ask for one more frame so the rows catch up.
+                if wrap_layout_width > px(0.)
+                    && (bounds.size.width - wrap_layout_width).abs() > px(1.)
+                {
+                    let relayout = view.clone();
+                    cx.defer(move |cx| relayout.update(cx, |_, cx| cx.notify()));
+                }
                 width_cell.set(bounds.size.width);
                 // The row itself stays where it is (clicks and the hitbox use
                 // `frame_bounds`); the text is painted and hit-tested shifted
@@ -3043,6 +3189,15 @@ impl EditorView {
                 let xs = |col: usize| shaped.x_for_index(col.min(line_len)) + inlays.shift(col, true);
                 let xe = |col: usize| shaped.x_for_index(col.min(line_len)) + inlays.shift(col, false);
                 let text_w = shaped.width + inlays.total();
+                // A wrapped row shows one slice of the line: anything painted
+                // past the slice's width belongs to the next row.
+                let slice_mask = seg.clip.map(|w| ContentMask {
+                    bounds: Bounds::new(
+                        frame_bounds.origin,
+                        size(w.min(frame_bounds.size.width), frame_bounds.size.height),
+                    ),
+                });
+                window.with_content_mask(slice_mask, |window| {
                 // 1. Indent guides, at the shaped x of their column inside the
                 //    leading whitespace (and at whole cells past a short or
                 //    blank line), full height so they join up between lines.
@@ -3249,6 +3404,12 @@ impl EditorView {
                     window.paint_quad(fill(caret_rect, caret_color).corner_radii(px(0.75)));
                 }
 
+                });
+                // Clicks right of a wrapped row's slice land at its end, not
+                // in the next slice's text.
+                let rel_x_max = seg
+                    .clip
+                    .map(|w| scroll_x + w - px((char_width * 0.51) as f32));
                 // 6. Mouse interactions using the exact same `shaped` line, gated by `hitbox.is_hovered(window)`
                 // so any `.occlude()` modal, popover, or menu above the editor blocks background clicks/hovers.
                 let down_shaped = shaped.clone();
@@ -3265,6 +3426,7 @@ impl EditorView {
                     }
                     let is_right_click = event.button == MouseButton::Right;
                     let rel_x = (event.position.x - bounds.origin.x).max(px(0.));
+                    let rel_x = rel_x_max.map_or(rel_x, |m| rel_x.min(m));
                     let column = down_inlays.column_for_x(
                         rel_x,
                         |i| down_shaped.x_for_index(i),
@@ -3317,6 +3479,7 @@ impl EditorView {
                         return;
                     }
                     let rel_x = (event.position.x - bounds.origin.x).max(px(0.));
+                    let rel_x = rel_x_max.map_or(rel_x, |m| rel_x.min(m));
                     let column = move_inlays.column_for_x(
                         rel_x,
                         |i| move_shaped.x_for_index(i),
@@ -3380,6 +3543,7 @@ impl EditorView {
                         return;
                     }
                     let rel_x = (event.position.x - bounds.origin.x).max(px(0.));
+                    let rel_x = rel_x_max.map_or(rel_x, |m| rel_x.min(m));
                     let column = hover_inlays.column_for_x(
                         rel_x,
                         |i| hover_shaped.x_for_index(i),
@@ -3394,7 +3558,7 @@ impl EditorView {
         .size_full();
 
         div()
-            .id(("editor-line", index))
+            .id(("editor-line", index * 256 + seg.ordinal.min(255)))
             .group(row_group.clone())
             // Lets UI tests find a row; compiled out of normal builds.
             .debug_selector(|| format!("editor-line-{index}"))
@@ -3412,9 +3576,14 @@ impl EditorView {
             // competing for the same job.
             .when(is_active_line && !is_debug_line, |el| el.bg(rgb(ACTIVE_LINE_BG)))
             .when(is_debug_line, |el| el.bg(cx.theme().warning.opacity(0.16)))
-            .when_some(change_marker, |el, marker| el.child(marker))
-            .when_some(active_right_marker, |el, marker| el.child(marker))
-            .child(gutter)
+            .when_some(change_marker.filter(|_| !continuation), |el, marker| el.child(marker))
+            .when_some(active_right_marker.filter(|_| !continuation), |el, marker| el.child(marker))
+            .child(if continuation {
+                // Later slices of a wrapped line leave the gutter blank.
+                div().w(px(GUTTER_WIDTH)).h_full().flex_shrink_0().into_any_element()
+            } else {
+                gutter.into_any_element()
+            })
             .child(
                 div()
                     .relative()
@@ -3423,7 +3592,7 @@ impl EditorView {
                     .overflow_hidden()
                     .child(div().relative().h_full().w_full().child(line_canvas))
                     .when_some(
-                        test_target.clone().and_then(|(is_whole_file, test_name)| {
+                        test_target.clone().filter(|_| !continuation).and_then(|(is_whole_file, test_name)| {
                             self.buffer
                                 .path()
                                 .map(|p| (p.to_path_buf(), is_whole_file, test_name))
@@ -4377,6 +4546,34 @@ fn reveal_offset(current: f64, caret_x: f64, viewport: f64, margin: f64, max: f6
     x.clamp(0.0, max)
 }
 
+/// The list's rows with their wrap slices. `items[row]` is the logical line a
+/// row shows, `segs[row]` the display columns it covers (`usize::MAX` for the
+/// last slice), and `line_row[line]` the first row of a line. Cached while
+/// the text, the row width and the fold set stay the same.
+struct DisplayRows {
+    revision: u64,
+    len_bytes: usize,
+    cols: usize,
+    fold_gen: u64,
+    items: Vec<usize>,
+    segs: Vec<(usize, usize)>,
+    line_row: Vec<usize>,
+}
+
+/// Which slice of a line a row paints. `first` rows carry the gutter; `clip`
+/// is the slice's width, so the next slice's text never shows past it.
+#[derive(Clone, Copy)]
+struct RowSeg {
+    first: bool,
+    clip: Option<Pixels>,
+    ordinal: usize,
+}
+
+impl RowSeg {
+    /// A whole line, as drawn without soft wrap.
+    const WHOLE: RowSeg = RowSeg { first: true, clip: None, ordinal: 0 };
+}
+
 /// The editor's list rows: the visible (unfolded) lines in order, plus
 /// logical line -> row for scrolling.
 fn display_rows(visible: &[usize], line_count: usize) -> (Vec<usize>, Vec<usize>) {
@@ -4958,6 +5155,7 @@ impl Render for EditorView {
         self.maybe_prefetch_code_actions(cx);
         self.maybe_request_highlights(cx);
         self.maybe_request_colors(cx);
+        self.maybe_request_intel(cx);
 
         let primary = self.buffer.selections().primary();
         let head = primary.head;
@@ -5039,8 +5237,22 @@ impl Render for EditorView {
             }
         }
         let viewport = self.text_area_width.get().to_f64();
+        // Soft wrap: rows are as wide as the text area (less one cell for the
+        // caret at a line's end), so there is nothing to pan sideways. Until
+        // the first paint has measured the area, ask for another frame.
+        let wrap_cols: Option<usize> = (options.soft_wrap && viewport > 1.0)
+            .then(|| ((viewport / char_width).floor() as usize).saturating_sub(1).max(2));
+        if options.soft_wrap && wrap_cols.is_none() {
+            cx.notify();
+        }
+        self.wrap_cols = wrap_cols;
+        self.wrap_layout_width = self.text_area_width.get();
         let content_width = self.content_cols as f64 * char_width + 24.0;
-        let max_scroll = (content_width - viewport).max(0.0);
+        let max_scroll = if wrap_cols.is_some() {
+            0.0
+        } else {
+            (content_width - viewport).max(0.0)
+        };
         self.max_scroll_x = px(max_scroll as f32);
 
         // Follow the cursor only when it moves, so panning by hand sticks
@@ -5076,9 +5288,66 @@ impl Render for EditorView {
         } else {
             self.visible_lines.clone()
         };
-        let (display_items, display_line_index) =
-            display_rows(&visible_lines, self.buffer.line_count());
-        self.display_line_index = display_line_index;
+        let line_count = self.buffer.line_count();
+        let rows: std::rc::Rc<DisplayRows> = match wrap_cols {
+            Some(cols) => {
+                let revision = self.buffer.revision();
+                let len_bytes = self.buffer.len_bytes();
+                let fresh = self.wrap_rows.as_ref().is_some_and(|r| {
+                    r.revision == revision
+                        && r.len_bytes == len_bytes
+                        && r.cols == cols
+                        && r.fold_gen == self.fold_gen
+                });
+                if !fresh {
+                    let mut items = Vec::new();
+                    let mut segs = Vec::new();
+                    let mut line_row = vec![0usize; line_count];
+                    for &line in &visible_lines {
+                        if let Some(slot) = line_row.get_mut(line) {
+                            *slot = items.len();
+                        }
+                        let text = self.buffer.line(line);
+                        let starts =
+                            wrap::row_starts(text.trim_end_matches(['\n', '\r']), cols);
+                        for (k, &start) in starts.iter().enumerate() {
+                            items.push(line);
+                            segs.push((start, starts.get(k + 1).copied().unwrap_or(usize::MAX)));
+                        }
+                    }
+                    if items.is_empty() {
+                        items.push(0);
+                        segs.push((0, usize::MAX));
+                    }
+                    self.wrap_rows = Some(std::rc::Rc::new(DisplayRows {
+                        revision,
+                        len_bytes,
+                        cols,
+                        fold_gen: self.fold_gen,
+                        items,
+                        segs,
+                        line_row,
+                    }));
+                }
+                self.wrap_rows.clone().expect("built above")
+            }
+            None => {
+                self.wrap_rows = None;
+                let (items, line_row) = display_rows(&visible_lines, line_count);
+                let segs = vec![(0, usize::MAX); items.len()];
+                std::rc::Rc::new(DisplayRows {
+                    revision: 0,
+                    len_bytes: 0,
+                    cols: 0,
+                    fold_gen: 0,
+                    items,
+                    segs,
+                    line_row,
+                })
+            }
+        };
+        self.display_line_index = rows.line_row.clone();
+        let display_items = &rows.items;
         // The note column takes its width out of the text area, so long
         // lines scroll under the code's own edge, never under a note.
         let line_notes = self.line_notes();
@@ -5123,6 +5392,7 @@ impl Render for EditorView {
                     None,
                     None,
                     scroll_x,
+                    RowSeg::WHOLE,
                     char_width,
                     window,
                     cx,
@@ -5159,14 +5429,16 @@ impl Render for EditorView {
                 .children(sticky_rows)
         });
 
+        let list_rows = rows.clone();
         let list = uniform_list(
             "editor-lines",
-            display_items.len(),
+            list_rows.items.len(),
             cx.processor(move |this, visible_range: Range<usize>, window, cx| {
                 if visible_range.is_empty() {
                     return Vec::new();
                 }
                 this.viewport_lines = visible_range.len();
+                let display_items = &list_rows.items;
                 let mut first_line = None;
                 let mut end_line = 0usize;
                 for &line in &display_items[visible_range.clone()] {
@@ -5195,7 +5467,7 @@ impl Render for EditorView {
                 } else {
                     std::collections::HashMap::new()
                 };
-                let highlights = if let Some(tree) = &this.syntax_tree {
+                let mut highlights = if let Some(tree) = &this.syntax_tree {
                     tree.highlights_in_range(&this.synced_text, clamped_start..clamped_end)
                 } else if !this.synced_text.is_empty() {
                     lexical_highlights_in_range(
@@ -5206,6 +5478,12 @@ impl Render for EditorView {
                 } else {
                     Vec::new()
                 };
+                // The server knows a class from a variable; its tokens paint
+                // over the syntax colours (later highlights win).
+                highlights.extend_from_slice(intel::highlights_in_range(
+                    &this.semantic_highlights,
+                    clamped_start..clamped_end,
+                ));
 
                 visible_range
                     .map(|row| {
@@ -5216,6 +5494,35 @@ impl Render for EditorView {
                             this.buffer.line(ix)
                         } else {
                             String::new()
+                        };
+                        // With soft wrap, a row is one slice of a line: the
+                        // line painted shifted left by the slice's start and
+                        // clipped to its width. Only the first slice carries
+                        // the gutter.
+                        let (seg_start, seg_end) = list_rows.segs[row];
+                        let (row_scroll, seg) = match this.wrap_cols {
+                            Some(cols) => {
+                                let cells = if seg_end == usize::MAX {
+                                    cols + 1
+                                } else {
+                                    seg_end - seg_start
+                                };
+                                (
+                                    px((seg_start as f64 * char_width) as f32),
+                                    RowSeg {
+                                        first: seg_start == 0,
+                                        clip: Some(px((cells as f64 * char_width) as f32)),
+                                        ordinal: row
+                                            - this
+                                                .display_line_index
+                                                .get(ix)
+                                                .copied()
+                                                .unwrap_or(0)
+                                                .min(row),
+                                    },
+                                )
+                            }
+                            None => (scroll_x, RowSeg::WHOLE),
                         };
                         this.render_line(
                             ix,
@@ -5228,7 +5535,8 @@ impl Render for EditorView {
                             &this.line_changes,
                             current_word.as_deref(),
                             bracket_pair,
-                            scroll_x,
+                            row_scroll,
+                            seg,
                             char_width,
                             window,
                             cx,

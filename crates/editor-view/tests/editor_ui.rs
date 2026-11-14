@@ -356,3 +356,61 @@ fn cmd_shift_k_deletes_the_line(cx: &mut TestAppContext) {
     cx.simulate_keystrokes("cmd-z");
     assert_eq!(text(&editor, cx), "b\nc");
 }
+
+/// Turn soft wrap on for `editor` and let the two frames it needs (one to
+/// measure the text area, one to lay the rows out) run.
+fn enable_soft_wrap(editor: &Entity<EditorView>, cx: &mut VisualTestContext) {
+    cx.update(|_, cx| {
+        cx.set_global(editor_view::EditorOptions { soft_wrap: true, ..Default::default() });
+        editor.update(cx, |_, cx| cx.notify());
+    });
+    for _ in 0..3 {
+        cx.run_until_parked();
+    }
+}
+
+#[gpui::test]
+fn soft_wrap_replaces_the_horizontal_bar(cx: &mut TestAppContext) {
+    let long = "word ".repeat(80);
+    let (editor, cx) = open_editor(cx, &format!("{long}\nshort\n"));
+    assert!(cx.debug_bounds("editor-h-scrollbar").is_some(), "unwrapped, the bar shows");
+    enable_soft_wrap(&editor, cx);
+    assert!(cx.debug_bounds("editor-h-scrollbar").is_none(), "wrapped, nothing scrolls sideways");
+}
+
+#[gpui::test]
+fn soft_wrap_moves_up_and_down_by_display_row(cx: &mut TestAppContext) {
+    let long = "word ".repeat(80);
+    let (editor, cx) = open_editor(cx, &format!("{long}\nshort\n"));
+    enable_soft_wrap(&editor, cx);
+
+    cx.simulate_keystrokes("down");
+    let (line, col) = cx.update(|_, cx| editor.read(cx).cursor_position());
+    assert_eq!(line, 1, "Down inside a wrapped line stays on the line");
+    assert!(col > 20, "and lands on its next display row, got column {col}");
+
+    cx.simulate_keystrokes("up");
+    assert_eq!(cx.update(|_, cx| editor.read(cx).cursor_position()), (1, 1));
+
+    // Walk past the last display row of the long line onto the next line.
+    for _ in 0..8 {
+        cx.simulate_keystrokes("down");
+    }
+    let (line, _) = cx.update(|_, cx| editor.read(cx).cursor_position());
+    assert!(line >= 2, "eventually Down leaves the wrapped line, got line {line}");
+}
+
+#[gpui::test]
+fn soft_wrap_clicks_land_on_the_row_that_was_hit(cx: &mut TestAppContext) {
+    let long = "abcdefghij".repeat(40);
+    let (editor, cx) = open_editor(cx, &format!("{long}\n"));
+    enable_soft_wrap(&editor, cx);
+    // Every slice of line 0 shares one debug selector, so anchor on line 1
+    // (the empty line after it): the row just above it is line 0's last slice.
+    let next = cx.debug_bounds("editor-line-1").expect("line 1 is rendered");
+    let last_slice = point(px(300.), next.center().y - px(22.));
+    cx.simulate_click(last_slice, Modifiers::none());
+    let (line, col) = cx.update(|_, cx| editor.read(cx).cursor_position());
+    assert_eq!(line, 1, "the click stays on the wrapped line");
+    assert!(col > 100, "a click on a later row maps past the earlier rows' text: {col}");
+}
