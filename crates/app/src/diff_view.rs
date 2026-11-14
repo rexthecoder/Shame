@@ -117,6 +117,8 @@ pub(crate) struct DiffState {
     new_spans: Vec<Spans>,
     /// Gaps (by their first row) the developer has unfolded.
     expanded: HashSet<usize>,
+    /// Whether all unchanged context lines are unfolded across the whole file.
+    pub(crate) expand_all: bool,
     display: Vec<DisplayItem>,
     scroll: UniformListScrollHandle,
     /// Runs of changed rows; the unit for hunk staging, navigation and the change map.
@@ -180,7 +182,7 @@ impl DiffState {
             while i < n && !near_change[i] {
                 i += 1;
             }
-            if self.expanded.contains(&start) {
+            if self.expand_all || self.expanded.contains(&start) {
                 for r in start..i {
                     push_row(&mut display, r, &self.diff.rows);
                 }
@@ -207,14 +209,32 @@ impl DiffState {
     }
 }
 
+/// Resolves a file path extension to a tree-sitter `SyntaxLanguage`.
+pub(crate) fn syntax_language_for_path(path: &str) -> Option<core_syntax::SyntaxLanguage> {
+    let ext = std::path::Path::new(path)
+        .extension()
+        .and_then(|e| e.to_str())?
+        .to_ascii_lowercase();
+    match ext.as_str() {
+        "py" | "pyi" => Some(core_syntax::SyntaxLanguage::Python),
+        other => core_syntax::SyntaxLanguage::from_language_id(other),
+    }
+}
+
 /// Syntax spans for each line of `text`, from a Dart parse. Overlaps are dropped so the spans can
 /// be handed straight to `StyledText`.
+#[cfg(test)]
 pub(crate) fn line_spans(text: &str) -> Vec<Spans> {
+    line_spans_for(text, core_syntax::SyntaxLanguage::Dart)
+}
+
+/// Multi-language syntax spans per line using tree-sitter (`core_syntax::SyntaxLanguage`).
+pub(crate) fn line_spans_for(text: &str, lang: core_syntax::SyntaxLanguage) -> Vec<Spans> {
     let line_starts: Vec<usize> = std::iter::once(0)
         .chain(text.match_indices('\n').map(|(i, _)| i + 1))
         .collect();
     let mut out: Vec<Spans> = vec![Vec::new(); line_starts.len()];
-    let mut highlights = SyntaxTree::parse(text).highlights(text);
+    let mut highlights = SyntaxTree::parse_as(lang, text).highlights(text);
     highlights.sort_by_key(|h| (h.range.start, h.range.end));
     let mut cursor = 0;
     for h in highlights {
@@ -278,6 +298,11 @@ impl DartIde {
             .filter(|d| d.file.path == file.path && d.commit == commit)
             .map(|d| d.expanded.clone())
             .unwrap_or_default();
+        let expand_all = self
+            .diff
+            .as_ref()
+            .filter(|d| d.file.path == file.path && d.commit == commit)
+            .is_some_and(|d| d.expand_all);
         let (tx, rx) = async_channel::bounded(1);
         let job_file = file.clone();
         let job_root = root.clone();
@@ -288,11 +313,13 @@ impl DartIde {
                 None => core_workspace::file_diff(&job_root, &job_file, staged),
             };
             let result = raw.map(|diff| {
-                let is_dart = job_file.path.ends_with(".dart");
-                let (old_spans, new_spans) = if is_dart && !diff.binary {
-                    (line_spans(&diff.old_text()), line_spans(&diff.new_text()))
-                } else {
-                    (Vec::new(), Vec::new())
+                let syntax_lang = syntax_language_for_path(&job_file.path);
+                let (old_spans, new_spans) = match syntax_lang.filter(|_| !diff.binary) {
+                    Some(lang) => (
+                        line_spans_for(&diff.old_text(), lang),
+                        line_spans_for(&diff.new_text(), lang),
+                    ),
+                    None => (Vec::new(), Vec::new()),
                 };
                 let intra: HashMap<usize, _> = diff
                     .rows
@@ -352,6 +379,7 @@ impl DartIde {
                             old_spans,
                             new_spans,
                             expanded,
+                            expand_all,
                             display: Vec::new(),
                             // Keep the scroll position across refreshes of the same file only.
                             scroll: this
@@ -389,6 +417,31 @@ impl DartIde {
             diff.rebuild_display();
         }
         cx.notify();
+    }
+
+    pub(crate) fn toggle_diff_expand_all(&mut self, cx: &mut Context<Self>) {
+        if let Some(diff) = self.diff.as_mut() {
+            diff.expand_all = !diff.expand_all;
+            if !diff.expand_all {
+                diff.expanded.clear();
+            }
+            diff.rebuild_display();
+            cx.notify();
+        }
+    }
+
+    /// Open the diff's file in the editor and place the cursor at `line_1` (1-based).
+    pub(crate) fn diff_open_at_line(&mut self, line_1: u32, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(state) = &self.diff else { return };
+        if state.file.kind == ChangeKind::Deleted || !state.full_path.exists() {
+            return;
+        }
+        let path = state.full_path.clone();
+        self.open_path(path, window, cx);
+        if let Some(editor) = self.active_editor().cloned() {
+            let line_0 = line_1.saturating_sub(1);
+            editor.update(cx, |ed, cx| ed.set_cursor_to_position(line_0, 0, cx));
+        }
     }
 
     pub(crate) fn close_diff(&mut self, cx: &mut Context<Self>) {
@@ -885,6 +938,29 @@ impl DartIde {
                                 cx,
                             )),
                     )
+                    .child(
+                        Button::new("diff-expand-all")
+                            .ghost()
+                            .xsmall()
+                            .selected(state.expand_all)
+                            .icon(
+                                Icon::new(IconName::ChevronsUpDown)
+                                    .with_size(px(12.))
+                                    .text_color(if state.expand_all {
+                                        cx.theme().primary
+                                    } else {
+                                        muted
+                                    }),
+                            )
+                            .tooltip(if state.expand_all {
+                                "Fold unchanged context lines"
+                            } else {
+                                "Expand all unchanged context lines"
+                            })
+                            .on_click(cx.listener(|this, _e, _w, cx| {
+                                this.toggle_diff_expand_all(cx);
+                            })),
+                    )
                     .when(!is_commit_diff, |el| el.child(reviewed_button))
                     .child(
                         Button::new("diff-close")
@@ -1041,179 +1117,300 @@ impl DartIde {
         let split_ratio = state.split_ratio;
         let dragging = self.git.diff_dragging_split;
         let drag_view = cx.entity();
+        let muted = cx.theme().muted_foreground;
+        let (left_label, right_label) = if state.commit.as_deref().is_some_and(|c| c.contains("..")) {
+            ("Before turn".to_string(), "After turn".to_string())
+        } else if let Some(hash) = &state.commit {
+            ("Parent".to_string(), format!("Commit {hash}"))
+        } else {
+            match (state.file.kind, state.staged) {
+                (ChangeKind::Untracked, _) => {
+                    ("Empty".to_string(), "Working tree (untracked)".to_string())
+                }
+                (_, true) => ("HEAD".to_string(), "Staged (Index)".to_string()),
+                (_, false) => ("HEAD / Index".to_string(), "Working tree".to_string()),
+            }
+        };
 
-        div()
-            .relative()
+        v_flex()
             .flex_1()
             .w_full()
             .min_h(px(0.))
-            .child(
-                uniform_list(
-                    "diff-rows",
-                    state.display.len(),
-                    cx.processor(|this, range: Range<usize>, window, cx| {
-                        let Some(state) = &this.diff else {
-                            return Vec::new();
-                        };
-                        let armed = this.git.confirm_discard.clone();
-                        range
-                            .map(|ix| {
-                                let accept = this
-                                    .agent
-                                    .ai_touched_paths
-                                    .iter()
-                                    .any(|p| *p == state.file.path);
-                                render_diff_item(state, ix, armed.as_deref(), accept, window, cx)
-                            })
-                            .collect()
-                    }),
-                )
-                .track_scroll(&scroll)
-                .size_full(),
-            )
-            // Draggable vertical split divider between Old (left) and New (right) diff columns
             .when(!unified, |el| {
                 el.child(
-                    div()
-                        .id("diff-split-resizer")
-                        .absolute()
-                        .top_0()
-                        .bottom_0()
-                        .left(relative(split_ratio))
-                        .ml(px(-3.))
-                        .w(px(7.))
-                        .cursor_col_resize()
-                        .flex()
-                        .justify_center()
-                        .group("diff-resizer-grp")
+                    h_flex()
+                        .w_full()
+                        .h(px(22.))
+                        .flex_shrink_0()
+                        .items_center()
+                        .bg(cx.theme().title_bar.opacity(0.45))
+                        .border_b_1()
+                        .border_color(cx.theme().border.opacity(0.65))
                         .child(
-                            div()
-                                .w(px(if dragging { 2. } else { 1. }))
+                            h_flex()
+                                .w(relative(split_ratio))
+                                .min_w(px(0.))
                                 .h_full()
-                                .bg(if dragging {
-                                    cx.theme().primary
-                                } else {
-                                    cx.theme().border
-                                })
-                                .group_hover("diff-resizer-grp", |s| {
-                                    s.w(px(2.)).bg(cx.theme().primary)
+                                .items_center()
+                                .justify_between()
+                                .px(px(tokens::SPACE_4))
+                                .border_r_1()
+                                .border_color(cx.theme().border.opacity(0.65))
+                                .child(
+                                    h_flex()
+                                        .items_center()
+                                        .gap(px(tokens::SPACE_2))
+                                        .min_w(px(0.))
+                                        .child(
+                                            div()
+                                                .w(px(6.))
+                                                .h(px(6.))
+                                                .rounded(px(3.))
+                                                .bg(cx.theme().red.opacity(0.75)),
+                                        )
+                                        .child(
+                                            div()
+                                                .truncate()
+                                                .text_size(px(10.))
+                                                .font_medium()
+                                                .text_color(muted)
+                                                .child(left_label),
+                                        ),
+                                )
+                                .when(state.diff.removed > 0, |s| {
+                                    s.child(
+                                        div()
+                                            .font_family(cx.theme().mono_font_family.clone())
+                                            .text_size(px(10.))
+                                            .text_color(cx.theme().red.opacity(0.85))
+                                            .child(format!("\u{2212}{}", state.diff.removed)),
+                                    )
+                                }),
+                        )
+                        .child(
+                            h_flex()
+                                .w(relative(1.0 - split_ratio))
+                                .min_w(px(0.))
+                                .h_full()
+                                .items_center()
+                                .justify_between()
+                                .pl(px(tokens::SPACE_4))
+                                .pr(px(tokens::SPACE_6))
+                                .child(
+                                    h_flex()
+                                        .items_center()
+                                        .gap(px(tokens::SPACE_2))
+                                        .min_w(px(0.))
+                                        .child(
+                                            div()
+                                                .w(px(6.))
+                                                .h(px(6.))
+                                                .rounded(px(3.))
+                                                .bg(cx.theme().green.opacity(0.75)),
+                                        )
+                                        .child(
+                                            div()
+                                                .truncate()
+                                                .text_size(px(10.))
+                                                .font_medium()
+                                                .text_color(muted)
+                                                .child(right_label),
+                                        ),
+                                )
+                                .when(state.diff.added > 0, |s| {
+                                    s.child(
+                                        div()
+                                            .font_family(cx.theme().mono_font_family.clone())
+                                            .text_size(px(10.))
+                                            .text_color(cx.theme().green.opacity(0.85))
+                                            .child(format!("+{}", state.diff.added)),
+                                    )
                                 }),
                         ),
                 )
-                .child(
-                    canvas(
-                        move |bounds, _window, _cx| bounds,
-                        move |bounds, _, window, _cx| {
-                            let view = drag_view.clone();
-                            window.on_mouse_event(
-                                move |event: &MouseDownEvent, phase, _window, cx| {
-                                    if phase != DispatchPhase::Bubble
-                                        || event.button != MouseButton::Left
-                                        || !bounds.contains(&event.position)
-                                    {
-                                        return;
-                                    }
-                                    let w: f32 = bounds.size.width.into();
-                                    if w <= 10.0 {
-                                        return;
-                                    }
-                                    let rx: f32 = (event.position.x - bounds.origin.x).into();
-                                    let handle_x = w * split_ratio;
-                                    if (rx - handle_x).abs() <= 8.0 {
-                                        view.update(cx, |this, cx| {
-                                            if event.click_count >= 2 {
-                                                this.git.diff_split_ratio = 0.5;
-                                                if let Some(d) = this.diff.as_mut() {
-                                                    d.split_ratio = 0.5;
-                                                }
-                                                this.git.diff_dragging_split = false;
-                                            } else {
-                                                this.git.diff_dragging_split = true;
-                                            }
-                                            cx.notify();
-                                        });
-                                    }
-                                },
-                            );
-                            let view = drag_view.clone();
-                            window.on_mouse_event(
-                                move |event: &MouseMoveEvent, phase, _window, cx| {
-                                    if phase != DispatchPhase::Bubble
-                                        || !dragging
-                                        || event.pressed_button != Some(MouseButton::Left)
-                                    {
-                                        return;
-                                    }
-                                    let w: f32 = bounds.size.width.into();
-                                    if w <= 10.0 {
-                                        return;
-                                    }
-                                    let rx: f32 = (event.position.x - bounds.origin.x).into();
-                                    let ratio = (rx / w).clamp(0.18, 0.82);
-                                    view.update(cx, |this, cx| {
-                                        this.git.diff_split_ratio = ratio;
-                                        if let Some(d) = this.diff.as_mut() {
-                                            d.split_ratio = ratio;
-                                        }
-                                        cx.notify();
-                                    });
-                                },
-                            );
-                            let view = drag_view.clone();
-                            window.on_mouse_event(
-                                move |event: &MouseUpEvent, phase, _window, cx| {
-                                    if phase != DispatchPhase::Bubble
-                                        || !dragging
-                                        || event.button != MouseButton::Left
-                                    {
-                                        return;
-                                    }
-                                    view.update(cx, |this, cx| {
-                                        this.git.diff_dragging_split = false;
-                                        cx.notify();
-                                    });
-                                },
-                            );
-                        },
-                    )
-                    .absolute()
-                    .inset_0(),
-                )
             })
-            // The change map: one mark per change block, positioned along the whole file.
             .child(
                 div()
-                    .absolute()
-                    .top_0()
-                    .bottom_0()
-                    .right_0()
-                    .w(px(10.))
-                    .bg(cx.theme().background.opacity(0.6))
-                    .border_l_1()
-                    .border_color(cx.theme().border)
-                    .children(state.blocks.iter().enumerate().map(|(i, block)| {
-                        let row = &state.diff.rows[block.start];
-                        let color = match row.kind {
-                            RowKind::Added => cx.theme().green,
-                            RowKind::Removed => cx.theme().red,
-                            _ => cx.theme().warning,
-                        };
-                        let current = i == state.current_change;
-                        let at = state.block_display.get(i).copied().unwrap_or(0) as f32 / total;
-                        div()
-                            .id(("diff-map-mark", i))
-                            .absolute()
-                            .left(px(1.))
-                            .right(px(1.))
-                            .top(relative(at))
-                            .h(px(if current { 7. } else { 5. }))
-                            .rounded(px(1.))
-                            .bg(color.opacity(if current { 1.0 } else { 0.75 }))
-                            .cursor_pointer()
-                            .on_click(
-                                cx.listener(move |this, _e, _w, cx| this.diff_goto_block(i, cx)),
+                    .relative()
+                    .flex_1()
+                    .w_full()
+                    .min_h(px(0.))
+                    .child(
+                        uniform_list(
+                            "diff-rows",
+                            state.display.len(),
+                            cx.processor(|this, range: Range<usize>, window, cx| {
+                                let Some(state) = &this.diff else {
+                                    return Vec::new();
+                                };
+                                let armed = this.git.confirm_discard.clone();
+                                range
+                                    .map(|ix| {
+                                        let accept = this
+                                            .agent
+                                            .ai_touched_paths
+                                            .iter()
+                                            .any(|p| *p == state.file.path);
+                                        render_diff_item(
+                                            state,
+                                            ix,
+                                            armed.as_deref(),
+                                            accept,
+                                            window,
+                                            cx,
+                                        )
+                                    })
+                                    .collect()
+                            }),
+                        )
+                        .track_scroll(&scroll)
+                        .size_full(),
+                    )
+                    // Draggable vertical split divider between Old (left) and New (right) diff columns
+                    .when(!unified, |el| {
+                        el.child(
+                            div()
+                                .id("diff-split-resizer")
+                                .absolute()
+                                .top_0()
+                                .bottom_0()
+                                .left(relative(split_ratio))
+                                .ml(px(-3.))
+                                .w(px(7.))
+                                .cursor_col_resize()
+                                .flex()
+                                .justify_center()
+                                .group("diff-resizer-grp")
+                                .child(
+                                    div()
+                                        .w(px(if dragging { 2. } else { 1. }))
+                                        .h_full()
+                                        .bg(if dragging {
+                                            cx.theme().primary
+                                        } else {
+                                            cx.theme().border
+                                        })
+                                        .group_hover("diff-resizer-grp", |s| {
+                                            s.w(px(2.)).bg(cx.theme().primary)
+                                        }),
+                                ),
+                        )
+                        .child(
+                            canvas(
+                                move |bounds, _window, _cx| bounds,
+                                move |bounds, _, window, _cx| {
+                                    let view = drag_view.clone();
+                                    window.on_mouse_event(
+                                        move |event: &MouseDownEvent, phase, _window, cx| {
+                                            if phase != DispatchPhase::Bubble
+                                                || event.button != MouseButton::Left
+                                                || !bounds.contains(&event.position)
+                                            {
+                                                return;
+                                            }
+                                            let w: f32 = bounds.size.width.into();
+                                            if w <= 10.0 {
+                                                return;
+                                            }
+                                            let rx: f32 = (event.position.x - bounds.origin.x).into();
+                                            let handle_x = w * split_ratio;
+                                            if (rx - handle_x).abs() <= 8.0 {
+                                                view.update(cx, |this, cx| {
+                                                    if event.click_count >= 2 {
+                                                        this.git.diff_split_ratio = 0.5;
+                                                        if let Some(d) = this.diff.as_mut() {
+                                                            d.split_ratio = 0.5;
+                                                        }
+                                                        this.git.diff_dragging_split = false;
+                                                    } else {
+                                                        this.git.diff_dragging_split = true;
+                                                    }
+                                                    cx.notify();
+                                                });
+                                            }
+                                        },
+                                    );
+                                    let view = drag_view.clone();
+                                    window.on_mouse_event(
+                                        move |event: &MouseMoveEvent, phase, _window, cx| {
+                                            if phase != DispatchPhase::Bubble
+                                                || !dragging
+                                                || event.pressed_button != Some(MouseButton::Left)
+                                            {
+                                                return;
+                                            }
+                                            let w: f32 = bounds.size.width.into();
+                                            if w <= 10.0 {
+                                                return;
+                                            }
+                                            let rx: f32 = (event.position.x - bounds.origin.x).into();
+                                            let ratio = (rx / w).clamp(0.18, 0.82);
+                                            view.update(cx, |this, cx| {
+                                                this.git.diff_split_ratio = ratio;
+                                                if let Some(d) = this.diff.as_mut() {
+                                                    d.split_ratio = ratio;
+                                                }
+                                                cx.notify();
+                                            });
+                                        },
+                                    );
+                                    let view = drag_view.clone();
+                                    window.on_mouse_event(
+                                        move |event: &MouseUpEvent, phase, _window, cx| {
+                                            if phase != DispatchPhase::Bubble
+                                                || !dragging
+                                                || event.button != MouseButton::Left
+                                            {
+                                                return;
+                                            }
+                                            view.update(cx, |this, cx| {
+                                                this.git.diff_dragging_split = false;
+                                                cx.notify();
+                                            });
+                                        },
+                                    );
+                                },
                             )
-                    })),
+                            .absolute()
+                            .inset_0(),
+                        )
+                    })
+                    // The change map: one mark per change block, positioned along the whole file.
+                    .child(
+                        div()
+                            .absolute()
+                            .top_0()
+                            .bottom_0()
+                            .right_0()
+                            .w(px(10.))
+                            .bg(cx.theme().background.opacity(0.6))
+                            .border_l_1()
+                            .border_color(cx.theme().border)
+                            .children(state.blocks.iter().enumerate().map(|(i, block)| {
+                                let row = &state.diff.rows[block.start];
+                                let color = match row.kind {
+                                    RowKind::Added => cx.theme().green,
+                                    RowKind::Removed => cx.theme().red,
+                                    _ => cx.theme().warning,
+                                };
+                                let current = i == state.current_change;
+                                let at = state.block_display.get(i).copied().unwrap_or(0) as f32
+                                    / total;
+                                div()
+                                    .id(("diff-map-mark", i))
+                                    .absolute()
+                                    .left(px(1.))
+                                    .right(px(1.))
+                                    .top(relative(at))
+                                    .h(px(if current { 7. } else { 5. }))
+                                    .rounded(px(1.))
+                                    .bg(color.opacity(if current { 1.0 } else { 0.75 }))
+                                    .cursor_pointer()
+                                    .on_click(cx.listener(move |this, _e, _w, cx| {
+                                        this.diff_goto_block(i, cx)
+                                    }))
+                            })),
+                    ),
             )
     }
 }
@@ -1296,13 +1493,21 @@ fn render_diff_item(
         DisplayItem::Gap { start, end } => {
             let muted = cx.theme().muted_foreground;
             let hidden = end - start;
+            let line_at = |r_ix: usize| -> Option<u32> {
+                let r = state.diff.rows.get(r_ix)?;
+                r.right.as_ref().or(r.left.as_ref()).map(|c| c.line)
+            };
+            let range_prefix = match (line_at(start), line_at(end.saturating_sub(1))) {
+                (Some(a), Some(b)) if a <= b => format!("Lines {a}\u{2013}{b} \u{00b7} "),
+                _ => String::new(),
+            };
             h_flex()
                 .id(("diff-gap", ix))
                 .w_full()
                 .h(px(ROW_H))
                 .items_center()
                 .justify_center()
-                .gap(px(tokens::SPACE_3))
+                .gap(px(tokens::SPACE_2))
                 .bg(cx.theme().list_hover.opacity(0.5))
                 .border_y_1()
                 .border_color(cx.theme().border)
@@ -1312,7 +1517,7 @@ fn render_diff_item(
                 .text_color(muted)
                 .child(Icon::new(IconName::ChevronsUpDown).xsmall())
                 .child(format!(
-                    "{hidden} unchanged line{}",
+                    "{range_prefix}{hidden} unchanged line{}",
                     if hidden == 1 { "" } else { "s" }
                 ))
                 .on_click(cx.listener(move |this, _event, _window, cx| {
@@ -1579,6 +1784,44 @@ fn merge_styles(
         .collect()
 }
 
+/// Expands `\t` into 4 spaces and remaps byte offsets in `spans` and `marks` so
+/// syntax highlights and intraline word-diff marks remain aligned on tabbed lines.
+pub(crate) fn expand_tabs_and_remap(
+    raw: &str,
+    spans: Spans,
+    marks: Vec<Range<usize>>,
+) -> (String, Spans, Vec<Range<usize>>) {
+    if !raw.contains('\t') {
+        return (raw.to_string(), spans, marks);
+    }
+    let mut expanded = String::with_capacity(raw.len() + 16);
+    let mut byte_map = vec![0usize; raw.len() + 1];
+    let mut shift = 0usize;
+    for (idx, ch) in raw.char_indices() {
+        let len = ch.len_utf8();
+        for offset in 0..len {
+            byte_map[idx + offset] = idx + offset + shift;
+        }
+        if ch == '\t' {
+            expanded.push_str("    ");
+            shift += 3;
+        } else {
+            expanded.push(ch);
+        }
+    }
+    byte_map[raw.len()] = raw.len() + shift;
+    let map_pos = |pos: usize| byte_map[pos.min(raw.len())];
+    let remapped_spans = spans
+        .into_iter()
+        .map(|(r, k)| (map_pos(r.start)..map_pos(r.end), k))
+        .collect();
+    let remapped_marks = marks
+        .into_iter()
+        .map(|r| map_pos(r.start)..map_pos(r.end))
+        .collect();
+    (expanded, remapped_spans, remapped_marks)
+}
+
 /// One half of a row: line-number gutter plus the (syntax-colored) text.
 fn diff_half(
     cell: &Option<DiffCell>,
@@ -1622,19 +1865,16 @@ fn diff_half(
     } else {
         theme.muted_foreground.opacity(0.7)
     };
-    let plain = spans.is_empty() && marks.is_empty();
-    let text: SharedString = if plain {
-        cell.text.replace('\t', "    ")
-    } else {
-        cell.text.clone()
-    }
-    .into();
+    let (expanded_text, spans, marks) = expand_tabs_and_remap(&cell.text, spans, marks);
+    let text: SharedString = expanded_text.into();
     let mark_bg = match tint {
         Some(Side::Removed) => theme.red.opacity(0.35),
         _ => theme.green.opacity(0.35),
     };
     let styles = merge_styles(text.len(), &spans, &marks, mark_bg);
     let default = theme.foreground;
+    let line_no = cell.line;
+    let primary = theme.primary;
     half.font_family(theme.mono_font_family.clone())
         .text_size(px(tokens::MONO))
         .child(
@@ -1644,7 +1884,15 @@ fn diff_half(
                 .pr(px(tokens::SPACE_5))
                 .text_right()
                 .text_color(gutter_color)
-                .child(cell.line.to_string()),
+                .cursor_pointer()
+                .hover(move |s| s.text_color(primary).underline())
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, _e, window, cx| {
+                        this.diff_open_at_line(line_no, window, cx);
+                    }),
+                )
+                .child(line_no.to_string()),
         )
         .child(
             div()
@@ -1689,18 +1937,15 @@ fn diff_unified_row(
     } else {
         theme.muted_foreground.opacity(0.7)
     };
-    let plain = spans.is_empty() && marks.is_empty();
-    let text: SharedString = if plain {
-        raw_text.replace('\t', "    ")
-    } else {
-        raw_text.to_string()
-    }
-    .into();
+    let (expanded_text, spans, marks) = expand_tabs_and_remap(raw_text, spans, marks);
+    let text: SharedString = expanded_text.into();
     let mark_bg = match tint {
         Some(Side::Removed) => theme.red.opacity(0.35),
         _ => theme.green.opacity(0.35),
     };
     let styles = merge_styles(text.len(), &spans, &marks, mark_bg);
+    let jump_line = new_line.or(old_line);
+    let primary = theme.primary;
     h_flex()
         .group("diff-row")
         .relative()
@@ -1729,6 +1974,16 @@ fn diff_unified_row(
                 .pr(px(tokens::SPACE_2))
                 .text_right()
                 .text_color(gutter_color)
+                .when_some(old_line, |el, line_no| {
+                    el.cursor_pointer()
+                        .hover(move |s| s.text_color(primary).underline())
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |this, _e, window, cx| {
+                                this.diff_open_at_line(line_no, window, cx);
+                            }),
+                        )
+                })
                 .child(old_line.map_or(String::new(), |n| n.to_string())),
         )
         .child(
@@ -1738,6 +1993,16 @@ fn diff_unified_row(
                 .pr(px(tokens::SPACE_3))
                 .text_right()
                 .text_color(gutter_color)
+                .when_some(jump_line, |el, line_no| {
+                    el.cursor_pointer()
+                        .hover(move |s| s.text_color(primary).underline())
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |this, _e, window, cx| {
+                                this.diff_open_at_line(line_no, window, cx);
+                            }),
+                        )
+                })
                 .child(new_line.map_or(String::new(), |n| n.to_string())),
         )
         .child(
@@ -1800,6 +2065,7 @@ mod tests {
             staged: false,
             commit: None,
             unified: false,
+            expand_all: false,
             split_ratio: 0.5,
             full_path: PathBuf::from("/a.dart"),
             images: DiffImages::default(),
@@ -1987,6 +2253,66 @@ mod tests {
             assert_eq!((preview.width, preview.height), (8, 4));
             assert_eq!(preview.format_label, label);
         }
+    }
+
+    #[core::prelude::v1::test]
+    fn expand_tabs_remaps_syntax_spans_and_intraline_marks() {
+        let raw = "\tlet x = 42;";
+        let spans = vec![
+            (1..4, HighlightKind::Keyword),
+            (9..11, HighlightKind::Number),
+        ];
+        let marks = vec![5..6];
+        let (expanded, remapped_spans, remapped_marks) =
+            expand_tabs_and_remap(raw, spans, marks);
+        assert_eq!(expanded, "    let x = 42;");
+        assert_eq!(&expanded[remapped_spans[0].0.clone()], "let");
+        assert_eq!(&expanded[remapped_spans[1].0.clone()], "42");
+        assert_eq!(&expanded[remapped_marks[0].clone()], "x");
+    }
+
+    #[core::prelude::v1::test]
+    fn multi_language_line_spans_highlight_rust_and_typescript() {
+        assert_eq!(
+            syntax_language_for_path("src/main.rs"),
+            Some(core_syntax::SyntaxLanguage::Rust)
+        );
+        assert_eq!(
+            syntax_language_for_path("scripts/run.py"),
+            Some(core_syntax::SyntaxLanguage::Python)
+        );
+        let rs_spans = line_spans_for("pub fn greet() {}\n", core_syntax::SyntaxLanguage::Rust);
+        assert!(
+            rs_spans[0]
+                .iter()
+                .any(|(_, k)| *k == HighlightKind::Keyword),
+            "Rust diff should highlight keywords"
+        );
+        let ts_spans = line_spans_for(
+            "const count = 42;\n",
+            core_syntax::SyntaxLanguage::TypeScript,
+        );
+        assert!(
+            ts_spans[0]
+                .iter()
+                .any(|(_, k)| *k == HighlightKind::Keyword || *k == HighlightKind::Number),
+            "TypeScript diff should highlight keywords/numbers"
+        );
+    }
+
+    #[core::prelude::v1::test]
+    fn expand_all_unfolds_all_context_gaps() {
+        let mut rows: Vec<DiffRow> = (1..=20).map(|n| row(RowKind::Context, n)).collect();
+        rows.push(row(RowKind::Added, 21));
+        rows.extend((22..=41).map(|n| row(RowKind::Context, n)));
+        let mut s = state(rows);
+        s.expand_all = true;
+        s.rebuild_display();
+        assert!(
+            !shape(&s).iter().any(|x| x.starts_with("gap")),
+            "expand_all should unfold all gaps"
+        );
+        assert_eq!(s.display.len(), 41);
     }
 }
 

@@ -1261,6 +1261,7 @@ impl DartIde {
     }
 
     fn render_git_body(&self, status: &RepoStatus, cx: &mut Context<Self>) -> Div {
+        let show_filter = !status.is_clean() || !status.recent_commits.is_empty();
         // The composer is docked under the scrolling lists, not above them: it
         // stays reachable while the developer reads a long diff list, and the
         // panel opens on the changes rather than on an empty text box.
@@ -1269,11 +1270,98 @@ impl DartIde {
             .w_full()
             .min_h(px(0.))
             .child(self.render_git_branch_bar(status, cx))
+            .when(show_filter, |el| {
+                el.child(self.render_git_filter_bar(status, cx))
+            })
             .child(self.render_git_publish_banner(status, cx))
             .child(self.render_git_changes(status, cx))
             .child(self.render_git_notice(cx))
             .when(!status.is_clean() || self.git.amend, |el| {
                 el.child(self.render_git_commit_box(status, cx))
+            })
+    }
+
+    fn render_git_filter_bar(&self, status: &RepoStatus, cx: &mut Context<Self>) -> Div {
+        let muted = cx.theme().muted_foreground;
+        let border = cx.theme().border;
+        let primary = cx.theme().primary;
+        let query = self
+            .git
+            .filter_input
+            .read(cx)
+            .value()
+            .trim()
+            .to_lowercase();
+        let has_query = !query.is_empty();
+        let match_count = if has_query {
+            let file_hits = status
+                .conflicts
+                .iter()
+                .chain(&status.staged)
+                .chain(&status.unstaged)
+                .filter(|f| f.path.to_lowercase().contains(&query))
+                .count();
+            let commit_hits = status
+                .recent_commits
+                .iter()
+                .filter(|c| {
+                    c.subject.to_lowercase().contains(&query)
+                        || c.author.to_lowercase().contains(&query)
+                        || c.hash.to_lowercase().contains(&query)
+                })
+                .count();
+            file_hits + commit_hits
+        } else {
+            0
+        };
+
+        h_flex()
+            .w_full()
+            .h(px(28.))
+            .flex_shrink_0()
+            .px(px(tokens::PANEL_INSET))
+            .gap(px(tokens::SPACE_2))
+            .items_center()
+            .border_b_1()
+            .border_color(border.opacity(0.45))
+            .child(
+                Icon::new(IconName::Search)
+                    .with_size(px(12.))
+                    .text_color(if has_query { primary } else { muted.opacity(0.8) }),
+            )
+            .child(
+                div().flex_1().min_w(px(0.)).child(
+                    Input::new(&self.git.filter_input)
+                        .appearance(false)
+                        .xsmall(),
+                ),
+            )
+            .when(has_query, |el| {
+                el.child(
+                    div()
+                        .flex_shrink_0()
+                        .px(px(5.))
+                        .py(px(1.))
+                        .rounded(px(tokens::RADIUS_BADGE))
+                        .bg(primary.opacity(0.14))
+                        .font_family(cx.theme().mono_font_family.clone())
+                        .text_size(px(9.5))
+                        .text_color(primary)
+                        .child(match_count.to_string()),
+                )
+                .child(
+                    Button::new("git-filter-clear")
+                        .ghost()
+                        .xsmall()
+                        .icon(Icon::new(IconName::X).with_size(px(11.)).text_color(muted))
+                        .tooltip("Clear filter")
+                        .on_click(cx.listener(|this, _e, window, cx| {
+                            this.git
+                                .filter_input
+                                .update(cx, |s, cx| s.set_value("", window, cx));
+                            cx.notify();
+                        })),
+                )
             })
     }
 
@@ -2161,7 +2249,13 @@ impl DartIde {
                     cx.stop_propagation();
                 }
             }))
-            .child(
+            .child({
+                let active_kind = crate::git_panel::parse_commit_subject(
+                    message.lines().next().unwrap_or(""),
+                )
+                .kind
+                .map(str::to_string);
+                const PREFIXES: [&str; 6] = ["feat", "fix", "refactor", "docs", "test", "chore"];
                 v_flex()
                     .w_full()
                     .rounded(px(tokens::RADIUS_PANEL))
@@ -2169,11 +2263,56 @@ impl DartIde {
                     .border_color(if live { primary.opacity(0.5) } else { border })
                     .bg(cx.theme().background)
                     .overflow_hidden()
+                    // Conventional-commit quick prefix chips
+                    .child(
+                        h_flex()
+                            .w_full()
+                            .px(px(tokens::SPACE_3))
+                            .pt(px(tokens::SPACE_2))
+                            .gap(px(4.))
+                            .items_center()
+                            .flex_wrap()
+                            .children(PREFIXES.into_iter().enumerate().map(|(chip_ix, prefix)| {
+                                let is_active = active_kind.as_deref() == Some(prefix);
+                                let tone = match prefix {
+                                    "feat" => cx.theme().green,
+                                    "fix" => cx.theme().warning,
+                                    _ => primary,
+                                };
+                                div()
+                                    .id(("git-prefix-chip", chip_ix))
+                                    .px(px(6.))
+                                    .py(px(1.))
+                                    .rounded(px(tokens::RADIUS_BADGE))
+                                    .border_1()
+                                    .border_color(if is_active {
+                                        tone.opacity(0.55)
+                                    } else {
+                                        border.opacity(0.6)
+                                    })
+                                    .bg(if is_active {
+                                        tone.opacity(0.16)
+                                    } else {
+                                        gpui_kit::transparent_black()
+                                    })
+                                    .font_family(cx.theme().mono_font_family.clone())
+                                    .text_size(px(9.5))
+                                    .text_color(if is_active { tone } else { muted })
+                                    .cursor_pointer()
+                                    .hover(move |s| {
+                                        s.bg(tone.opacity(0.12)).text_color(tone)
+                                    })
+                                    .child(prefix)
+                                    .on_click(cx.listener(move |this, _e, window, cx| {
+                                        this.git_apply_commit_prefix(prefix, window, cx);
+                                    }))
+                            })),
+                    )
                     .child(
                         div()
                             .w_full()
                             .px(px(CARD_INSET))
-                            .pt(px(tokens::SPACE_3))
+                            .pt(px(tokens::SPACE_2))
                             .pb(px(tokens::SPACE_2))
                             .child(
                                 div().mx(px(-8.)).child(
@@ -2280,8 +2419,8 @@ impl DartIde {
                                     }),
                             )
                             .child(split),
-                    ),
-            )
+                    )
+            })
     }
 
     /// Working changes on top, history (stashes and recent commits) below.
@@ -2331,6 +2470,28 @@ impl DartIde {
                 });
         }
 
+        let filter_query = self
+            .git
+            .filter_input
+            .read(cx)
+            .value()
+            .trim()
+            .to_lowercase();
+        let filter_files = |items: &[ChangedFile]| -> Vec<ChangedFile> {
+            if filter_query.is_empty() {
+                items.to_vec()
+            } else {
+                items
+                    .iter()
+                    .filter(|f| f.path.to_lowercase().contains(&filter_query))
+                    .cloned()
+                    .collect()
+            }
+        };
+        let conflicts = filter_files(&status.conflicts);
+        let staged_files = filter_files(&status.staged);
+        let unstaged_files = filter_files(&status.unstaged);
+
         let list = v_flex()
             .id("git-changes")
             .w_full()
@@ -2338,29 +2499,29 @@ impl DartIde {
             .min_h(px(0.))
             .overflow_y_scroll()
             .pb(px(tokens::SPACE_2))
-            .when(!status.conflicts.is_empty(), |el| {
+            .when(!conflicts.is_empty(), |el| {
                 el.child(self.render_git_section(
                     "Merge conflicts",
                     Section::Conflicts,
-                    &status.conflicts,
+                    &conflicts,
                     false,
                     cx,
                 ))
             })
-            .when(!status.staged.is_empty(), |el| {
+            .when(!staged_files.is_empty(), |el| {
                 el.child(self.render_git_section(
                     "Staged changes",
                     Section::Staged,
-                    &status.staged,
+                    &staged_files,
                     self.git.staged_collapsed,
                     cx,
                 ))
             })
-            .when(!status.unstaged.is_empty(), |el| {
+            .when(!unstaged_files.is_empty(), |el| {
                 el.child(self.render_git_section(
                     "Changes",
                     Section::Changes,
-                    &status.unstaged,
+                    &unstaged_files,
                     self.git.changes_collapsed,
                     cx,
                 ))
@@ -2940,10 +3101,16 @@ impl DartIde {
                                     })
                                     .child(
                                         div()
-                                            .w(px(8.))
+                                            .min_w(px(15.))
+                                            .h(px(15.))
+                                            .px(px(3.5))
+                                            .rounded(px(3.))
+                                            .bg(color.opacity(0.14))
                                             .flex()
+                                            .items_center()
                                             .justify_center()
-                                            .text_size(px(10.))
+                                            .font_family(cx.theme().mono_font_family.clone())
+                                            .text_size(px(9.5))
                                             .font_medium()
                                             .text_color(color)
                                             .child(file.kind.letter().to_string()),
@@ -3216,6 +3383,23 @@ impl DartIde {
     fn render_git_commits(&self, status: &RepoStatus, cx: &mut Context<Self>) -> Div {
         let collapsed = self.git.commits_collapsed;
         let has_upstream = status.upstream.is_some();
+        let filter_query = self
+            .git
+            .filter_input
+            .read(cx)
+            .value()
+            .trim()
+            .to_lowercase();
+        let filtered_commits: Vec<&CommitInfo> = status
+            .recent_commits
+            .iter()
+            .filter(|c| {
+                filter_query.is_empty()
+                    || c.subject.to_lowercase().contains(&filter_query)
+                    || c.author.to_lowercase().contains(&filter_query)
+                    || c.hash.to_lowercase().contains(&filter_query)
+            })
+            .collect();
 
         v_flex()
             .w_full()
@@ -3226,7 +3410,7 @@ impl DartIde {
                     crate::rails::section_label(
                         "git-section-commits",
                         "Recent commits",
-                        Some(status.recent_commits.len()),
+                        Some(filtered_commits.len()),
                         collapsed,
                         cx,
                     )
@@ -3237,10 +3421,9 @@ impl DartIde {
                 ),
             )
             .when(!collapsed, |el| {
-                let commits = &status.recent_commits;
-                el.children(commits.iter().enumerate().flat_map(|(ix, commit)| {
-                    let last = ix + 1 == commits.len();
-                    let prev = ix.checked_sub(1).map(|p| &commits[p]);
+                el.children(filtered_commits.iter().enumerate().flat_map(|(ix, commit)| {
+                    let last = ix + 1 == filtered_commits.len();
+                    let prev = ix.checked_sub(1).map(|p| filtered_commits[p]);
                     // A quiet heading where the day bucket changes ("Today",
                     // "This week", ...) replaces the time on every row.
                     let bucket = time_bucket(&commit.relative_time);
@@ -3251,12 +3434,15 @@ impl DartIde {
                     let show_author = prev.is_none_or(|p| p.author != commit.author);
                     // Where the remote branch sits: between the last unpushed
                     // commit and the first pushed one.
-                    let divider =
-                        (has_upstream && ix > 0 && commits[ix - 1].unpushed && !commit.unpushed)
-                            .then(|| {
-                                self.render_git_upstream_divider(status, cx)
-                                    .into_any_element()
-                            });
+                    let divider = (has_upstream
+                        && filter_query.is_empty()
+                        && ix > 0
+                        && filtered_commits[ix - 1].unpushed
+                        && !commit.unpushed)
+                        .then(|| {
+                            self.render_git_upstream_divider(status, cx)
+                                .into_any_element()
+                        });
                     heading.into_iter().chain(divider).chain(std::iter::once(
                         self.render_git_commit_row(ix, last, commit, has_upstream, show_author, cx)
                             .into_any_element(),
@@ -3600,17 +3786,32 @@ impl DartIde {
                                 ChangeKind::Deleted | ChangeKind::Conflicted => cx.theme().red,
                                 ChangeKind::Renamed | ChangeKind::Copied => cx.theme().info,
                             };
-                            let name = Path::new(&file.path)
+                            let path_obj = Path::new(&file.path);
+                            let name = path_obj
                                 .file_name()
                                 .and_then(|n| n.to_str())
                                 .unwrap_or(&file.path)
                                 .to_string();
+                            let dir = path_obj
+                                .parent()
+                                .and_then(|p| p.to_str())
+                                .filter(|p| !p.is_empty())
+                                .map(str::to_string);
                             let is_active = self.diff.as_ref().is_some_and(|d| {
                                 d.commit.as_deref() == Some(commit_hash.as_str())
                                     && d.file.path == file.path
                             });
                             let click_hash = commit_hash.clone();
                             let click_file = file.clone();
+                            let root = self
+                                .git
+                                .status
+                                .as_ref()
+                                .map(|s| s.root.clone())
+                                .unwrap_or_else(|| self.root.clone());
+                            let open_file_path = root.join(&file.path);
+                            let can_open = file.kind != ChangeKind::Deleted && open_file_path.exists();
+                            let row_group = format!("git-commit-file-grp-{file_ix}");
 
                             div()
                                 .w_full()
@@ -3621,6 +3822,7 @@ impl DartIde {
                                 .child(
                                     h_flex()
                                         .id(("git-commit-file", file_ix))
+                                        .group(row_group.clone())
                                         .relative()
                                         .w_full()
                                         .h(px(22.))
@@ -3648,14 +3850,78 @@ impl DartIde {
                                                         .text_size(px(tokens::UI_XS))
                                                         .text_color(fg)
                                                         .child(name),
-                                                ),
+                                                )
+                                                .when_some(dir, |el, dir| {
+                                                    el.child(
+                                                        div()
+                                                            .flex_1()
+                                                            .min_w(px(0.))
+                                                            .truncate()
+                                                            .text_size(px(tokens::UI_XS - 0.5))
+                                                            .text_color(muted.opacity(0.68))
+                                                            .child(dir),
+                                                    )
+                                                }),
                                         )
                                         .child(
-                                            div()
-                                                .text_size(px(10.))
-                                                .font_medium()
-                                                .text_color(color)
-                                                .child(file.kind.letter().to_string()),
+                                            h_flex()
+                                                .flex_shrink_0()
+                                                .items_center()
+                                                .gap(px(tokens::SPACE_1))
+                                                .when(can_open, |el| {
+                                                    let p = open_file_path.clone();
+                                                    el.child(
+                                                        div()
+                                                            .invisible()
+                                                            .group_hover(row_group, |s| s.visible())
+                                                            .on_mouse_down(
+                                                                MouseButton::Left,
+                                                                |_, _, cx| cx.stop_propagation(),
+                                                            )
+                                                            .child(
+                                                                Button::new((
+                                                                    "git-commit-open-file",
+                                                                    file_ix,
+                                                                ))
+                                                                .ghost()
+                                                                .xsmall()
+                                                                .icon(
+                                                                    Icon::new(IconName::FileCode)
+                                                                        .with_size(px(11.))
+                                                                        .text_color(muted),
+                                                                )
+                                                                .tooltip("Open file in editor")
+                                                                .on_click(cx.listener(
+                                                                    move |this, _e, window, cx| {
+                                                                        cx.stop_propagation();
+                                                                        this.open_path(
+                                                                            p.clone(),
+                                                                            window,
+                                                                            cx,
+                                                                        );
+                                                                    },
+                                                                )),
+                                                            ),
+                                                    )
+                                                })
+                                                .child(
+                                                    div()
+                                                        .min_w(px(15.))
+                                                        .h(px(15.))
+                                                        .px(px(3.5))
+                                                        .rounded(px(3.))
+                                                        .bg(color.opacity(0.14))
+                                                        .flex()
+                                                        .items_center()
+                                                        .justify_center()
+                                                        .font_family(
+                                                            cx.theme().mono_font_family.clone(),
+                                                        )
+                                                        .text_size(px(9.5))
+                                                        .font_medium()
+                                                        .text_color(color)
+                                                        .child(file.kind.letter().to_string()),
+                                                ),
                                         )
                                         .on_click(cx.listener(move |this, _e, _w, cx| {
                                             this.open_git_commit_diff(

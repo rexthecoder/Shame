@@ -74,6 +74,7 @@ pub(crate) struct GitState {
     pub(crate) notice: Option<GitNotice>,
     pub(crate) message: Entity<TextareaState>,
     pub(crate) branch_input: Entity<InputState>,
+    pub(crate) filter_input: Entity<InputState>,
     pub(crate) branches: Vec<BranchInfo>,
     pub(crate) branches_open: bool,
     pub(crate) branch_selected: usize,
@@ -123,6 +124,8 @@ impl GitState {
             }),
             branch_input: cx
                 .new(|cx| InputState::new(window, cx).placeholder("Filter or create branch…")),
+            filter_input: cx
+                .new(|cx| InputState::new(window, cx).placeholder("Filter files or commits\u{2026}")),
             branches: Vec::new(),
             branches_open: false,
             branch_selected: 0,
@@ -944,6 +947,59 @@ impl DartIde {
             },
         );
     }
+
+    pub(crate) fn git_apply_commit_prefix(
+        &mut self,
+        prefix: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let current = self.git.message.read(cx).value().to_string();
+        let next = apply_conventional_prefix(&current, prefix);
+        self.git.message.update(cx, |s, cx| {
+            s.set_value(next, window, cx);
+            s.focus(window, cx);
+        });
+        cx.notify();
+    }
+}
+
+/// Prepends, swaps, or toggles off a conventional-commit prefix (`feat`, `fix`, etc.)
+/// on the first line of `message` while preserving any scope or multi-line body.
+pub(crate) fn apply_conventional_prefix(message: &str, prefix: &str) -> String {
+    let (first_line, tail) = match message.split_once('\n') {
+        Some((head, rest)) => (head, Some(rest)),
+        None => (message, None),
+    };
+    let trimmed = first_line.trim_start();
+    let parsed = parse_commit_subject(trimmed);
+    let rebuilt_first = if parsed.kind == Some(prefix) {
+        // Clicking the active prefix chip toggles it off.
+        if let Some(colon) = trimmed.find(": ") {
+            trimmed[colon + 2..].trim_start().to_string()
+        } else {
+            trimmed.to_string()
+        }
+    } else if parsed.kind.is_some() {
+        // Replace existing prefix (`fix: ...` -> `feat: ...`), keeping any `(scope)!`.
+        if let Some(colon) = trimmed.find(": ") {
+            let head = &trimmed[..colon];
+            let old_ty = head.split(['(', '!']).next().unwrap_or(head);
+            let scope_and_bang = &head[old_ty.len()..];
+            let rest = trimmed[colon + 2..].trim_start();
+            format!("{prefix}{scope_and_bang}: {rest}")
+        } else {
+            format!("{prefix}: {trimmed}")
+        }
+    } else if trimmed.is_empty() {
+        format!("{prefix}: ")
+    } else {
+        format!("{prefix}: {trimmed}")
+    };
+    match tail {
+        Some(rest) => format!("{rebuilt_first}\n{rest}"),
+        None => rebuilt_first,
+    }
 }
 
 /// A commit subject split for display: `feat: [MOBL-4665] show the RFIs`
@@ -1030,6 +1086,25 @@ mod display_tests {
         assert_eq!(parse_stash_message("On main: tidy up"), (Some("main"), "tidy up"));
         assert_eq!(parse_stash_message("WIP on feat/x: 1a2b3c4 last"), (Some("feat/x"), "1a2b3c4 last"));
         assert_eq!(parse_stash_message("pro trade tab design"), (None, "pro trade tab design"));
+    }
+
+    #[core::prelude::v1::test]
+    fn conventional_prefix_chip_toggles_and_swaps_cleanly() {
+        assert_eq!(apply_conventional_prefix("", "feat"), "feat: ");
+        assert_eq!(
+            apply_conventional_prefix("add diff syntax highlight", "feat"),
+            "feat: add diff syntax highlight"
+        );
+        // Clicking the same prefix again toggles it off.
+        assert_eq!(
+            apply_conventional_prefix("feat: add diff syntax highlight", "feat"),
+            "add diff syntax highlight"
+        );
+        // Clicking a different prefix swaps the prefix while keeping scope and body.
+        assert_eq!(
+            apply_conventional_prefix("feat(ui): add diff syntax highlight\n\nBody text", "fix"),
+            "fix(ui): add diff syntax highlight\n\nBody text"
+        );
     }
 }
 

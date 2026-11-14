@@ -145,7 +145,11 @@ pub(crate) fn build_preview(path: &Path, target_line: u32) -> Vec<PreviewLine> {
     let window = preview_window(target_line as usize, lines.len(), CONTEXT_LINES);
     let colored = path.extension().and_then(|e| e.to_str()) == Some("dart")
         && text.len() <= MAX_HIGHLIGHT_BYTES;
-    let spans = if colored { crate::diff_view::line_spans(&text) } else { Vec::new() };
+    let spans = if colored {
+        crate::diff_view::line_spans_for(&text, core_syntax::SyntaxLanguage::Dart)
+    } else {
+        Vec::new()
+    };
     window
         .map(|ix| PreviewLine {
             number: ix + 1,
