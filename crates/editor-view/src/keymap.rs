@@ -280,7 +280,10 @@ pub const EDITOR_COMMANDS: &[&str] = &[
     "rename",
     "peek-definition",
     "find-references",
+    "incoming-calls",
+    "outgoing-calls",
     "format-doc",
+    "format-selection",
 ];
 
 /// The command bound to `stroke` in the app's keymap (or the defaults

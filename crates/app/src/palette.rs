@@ -687,6 +687,13 @@ impl DartIde {
                     ed.update(cx, |editor, _cx| editor.request_references());
                 }
             }
+            "incoming-calls" | "outgoing-calls" | "format-selection" => {
+                if let Some(ed) = self.active_editor().cloned() {
+                    ed.update(cx, |editor, cx| {
+                        editor.run_command(&id, cx);
+                    });
+                }
+            }
             "symbol-outline" | "goto-symbol" => self.open_symbol_outline(window, cx),
             "workspace-symbols" | "goto-workspace-symbol" => self.open_workspace_symbols(window, cx),
             "go-to-line" | "goto-line" => self.open_go_to_line(window, cx),

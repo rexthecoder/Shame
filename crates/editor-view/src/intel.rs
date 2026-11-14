@@ -246,6 +246,20 @@ pub(crate) fn symbols_from_response(value: serde_json::Value) -> Option<Outline>
     Some(Outline { entries: out, spans })
 }
 
+/// Where the callers (`from`) or callees (`to`) of a call hierarchy reply
+/// are: each entry's name range, in the order the server gave them.
+pub(crate) fn call_locations(value: &serde_json::Value) -> Vec<lsp_types::Location> {
+    let Some(entries) = value.as_array() else { return Vec::new() };
+    entries
+        .iter()
+        .filter_map(|entry| {
+            let item = entry.get("from").or_else(|| entry.get("to"))?;
+            let item: lsp_types::CallHierarchyItem = serde_json::from_value(item.clone()).ok()?;
+            Some(lsp_types::Location { uri: item.uri, range: item.selection_range })
+        })
+        .collect()
+}
+
 /// Fold ranges from a `textDocument/foldingRange` reply. `line_to_byte` maps
 /// a 0-indexed line to its first byte; ranges spanning a single line are
 /// dropped, and the result is sorted by start line with one range per start.
@@ -392,6 +406,20 @@ mod tests {
             symbols_from_response(reply).unwrap().entries,
             vec![("app.main".to_string(), "fn", 4)]
         );
+    }
+
+    #[test]
+    fn call_hierarchy_replies_become_locations_of_the_other_function() {
+        let item = |name: &str, line: u32| {
+            json!({ "name": name, "kind": 12, "uri": "file:///a.go",
+                "range": {"start": {"line": line, "character": 0}, "end": {"line": line + 2, "character": 1}},
+                "selectionRange": {"start": {"line": line, "character": 5}, "end": {"line": line, "character": 9}} })
+        };
+        let incoming = json!([{ "from": item("caller", 3), "fromRanges": [] }]);
+        let outgoing = json!([{ "to": item("callee", 7), "fromRanges": [] }]);
+        assert_eq!(call_locations(&incoming)[0].range.start.line, 3);
+        assert_eq!(call_locations(&outgoing)[0].range.start.line, 7);
+        assert!(call_locations(&json!(null)).is_empty());
     }
 
     #[test]

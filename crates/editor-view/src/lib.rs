@@ -550,16 +550,15 @@ impl EditorView {
     fn spawn_background_parse(&mut self, grammar: SyntaxLanguage, cx: &mut Context<Self>) {
         let revision = self.buffer.revision();
         let text = self.synced_text.clone();
-        let (tx, rx) = async_channel::bounded(1);
-        std::thread::spawn(move || {
+        // GPUI's own executor, not a bare thread: a thread waking a task
+        // from outside trips the deterministic test scheduler.
+        let parse = cx.background_executor().spawn(async move {
             let tree = SyntaxTree::parse_as(grammar, &text);
             let folds = tree.fold_ranges();
-            let _ = tx.send_blocking((revision, tree, folds));
+            (revision, tree, folds)
         });
         cx.spawn(async move |weak, cx| {
-            let Ok((rev, tree, folds)) = rx.recv().await else {
-                return;
-            };
+            let (rev, tree, folds) = parse.await;
             let _ = weak.update(cx, |this, cx| {
                 if this.buffer.revision() == rev && this.syntax_tree.is_none() {
                     this.syntax_tree = Some(tree);
@@ -580,16 +579,16 @@ impl EditorView {
             self.line_blame.clear();
             return;
         };
-        let (tx, rx) = async_channel::bounded(1);
-        std::thread::spawn(move || {
+        // Git runs on GPUI's background executor, not a bare thread: a
+        // thread waking a task from outside trips the deterministic test
+        // scheduler (and flaked CI whenever the checkout was a git repo).
+        let git = cx.background_executor().spawn(async move {
             let changes = core_workspace::line_changes(&path);
             let blame = core_workspace::line_blame(&path);
-            let _ = tx.send_blocking((changes, blame));
+            (changes, blame)
         });
         cx.spawn(async move |weak, cx| {
-            let Ok((changes, blame)) = rx.recv().await else {
-                return;
-            };
+            let (changes, blame) = git.await;
             let _ = weak.update(cx, |this, cx| {
                 if this.line_changes != changes || this.line_blame != blame {
                     this.line_changes = changes;
@@ -2501,6 +2500,11 @@ impl EditorView {
             "rename" => self.start_rename(cx),
             "peek-definition" => self.request_peek_definition(),
             "find-references" => self.request_references(),
+            "incoming-calls" => self.request_call_hierarchy(true, cx),
+            "outgoing-calls" => self.request_call_hierarchy(false, cx),
+            "format-selection" => {
+                self.request_format_selection(cx);
+            }
             "format-doc" => {
                 self.request_format();
             }
@@ -5785,11 +5789,14 @@ fn editor_context_menu(
     .item(menu_row(I::Shapes, "Go to Type Definition", None).disabled(!lsp_ready).on_click(run(view.clone(), "go-to-type-definition")))
     .item(menu_row(I::Eye, "Peek Definition", Some("\u{2318}Y")).disabled(!lsp_ready).on_click(run(view.clone(), "peek-definition")))
     .item(menu_row(I::Search, "Find All References", Some("\u{21e7}\u{2318}Y")).disabled(!lsp_ready).on_click(run(view.clone(), "find-references")))
+    .item(menu_row(I::Search, "Show Incoming Calls", None).disabled(!lsp_ready).on_click(run(view.clone(), "incoming-calls")))
+    .item(menu_row(I::Search, "Show Outgoing Calls", None).disabled(!lsp_ready).on_click(run(view.clone(), "outgoing-calls")))
     .separator()
     .item(menu_row(I::Pencil, "Rename Symbol", Some("F2")).disabled(!lsp_ready).on_click(run(view.clone(), "rename")))
     .item(menu_row(I::WandSparkles, "Refactor\u{2026}", Some("\u{21e7}\u{2318}R")).disabled(!lsp_ready).on_click(run(view.clone(), "refactor")))
     .item(menu_row(I::Lightbulb, "Quick Fix\u{2026}", Some("\u{2318}.")).disabled(!lsp_ready).on_click(run(view.clone(), "code-actions")))
     .item(menu_row(I::TextAlignStart, "Format Document", Some("\u{2325}\u{21e7}F")).disabled(!lsp_ready).on_click(run(view.clone(), "format-doc")))
+    .item(menu_row(I::TextAlignStart, "Format Selection", None).disabled(!lsp_ready).on_click(run(view.clone(), "format-selection")))
     .separator()
     .item(menu_row(I::Scissors, "Cut", Some("\u{2318}X")).disabled(!has_selection).on_click(run(view.clone(), "cut")))
     .item(menu_row(I::Copy, "Copy", Some("\u{2318}C")).disabled(!has_selection).on_click(run(view.clone(), "copy")))

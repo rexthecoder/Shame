@@ -323,6 +323,9 @@ fn shared_lsp_server(
                     server_cancel_support: Some(false),
                     augments_syntax_tokens: Some(true),
                 }),
+                call_hierarchy: Some(lsp_types::CallHierarchyClientCapabilities {
+                    dynamic_registration: Some(false),
+                }),
                 folding_range: Some(lsp_types::FoldingRangeClientCapabilities {
                     line_folding_only: Some(true),
                     ..Default::default()
@@ -771,6 +774,12 @@ pub(crate) struct LspState {
     code_action_request: Option<CodeActionRequest>,
     pending_completion_id: Option<i64>,
     pending_references_id: Option<i64>,
+    /// In-flight `prepareCallHierarchy`: request id and whether the caller
+    /// wants incoming (true) or outgoing (false) calls.
+    pending_call_prepare: Option<(i64, bool)>,
+    /// In-flight `callHierarchy/incomingCalls` or `outgoingCalls`, with the
+    /// peek's title.
+    pending_calls: Option<(i64, &'static str)>,
     pending_signature_id: Option<i64>,
     pending_organize_id: Option<i64>,
     pending_inlay_id: Option<i64>,
@@ -896,6 +905,8 @@ impl EditorView {
             code_action_request: None,
             pending_completion_id: None,
             pending_references_id: None,
+            pending_call_prepare: None,
+            pending_calls: None,
             pending_signature_id: None,
             pending_organize_id: None,
             pending_inlay_id: None,
@@ -1234,6 +1245,34 @@ impl EditorView {
         .detach();
     }
 
+    /// Show who calls the function at the cursor (`incoming`) or what it
+    /// calls, in the peek panel. Two requests: the server first resolves the
+    /// symbol (`prepareCallHierarchy`), then lists its calls.
+    pub fn request_call_hierarchy(&mut self, incoming: bool, cx: &mut Context<Self>) {
+        let head = self.buffer.selections().primary().head;
+        let (line, character) = self.buffer.lsp_position(head);
+        let Some(lsp) = &mut self.lsp else { return };
+        if !lsp.ready {
+            return;
+        }
+        let supported = lsp
+            .client
+            .capabilities()
+            .get("callHierarchyProvider")
+            .is_some_and(|v| !v.is_null() && *v != serde_json::Value::Bool(false));
+        if !supported {
+            cx.emit(EditorEvent::Notice("This language server has no call hierarchy".into()));
+            return;
+        }
+        let params = serde_json::json!({
+            "textDocument": { "uri": lsp.uri.as_str() },
+            "position": { "line": line, "character": character },
+        });
+        if let Ok(id) = lsp.client.request("textDocument/prepareCallHierarchy", params) {
+            lsp.pending_call_prepare = Some((id, incoming));
+        }
+    }
+
     /// Send `textDocument/references` for the symbol at the cursor. The
     /// reply arrives as `EditorEvent::ShowPeek`. No-op without a
     /// ready server.
@@ -1443,6 +1482,46 @@ impl EditorView {
     /// there's no ready LSP server for this buffer. Returns whether a
     /// request was actually sent, so callers (e.g. "format then save")
     /// know whether to wait for a reply or just proceed.
+    /// Format just the selection (`textDocument/rangeFormatting`); with no
+    /// selection, or a server that cannot format a range, the whole document.
+    pub fn request_format_selection(&mut self, cx: &mut Context<Self>) -> bool {
+        let primary = self.buffer.selections().primary();
+        if primary.is_empty() {
+            return self.request_format();
+        }
+        let range = primary.range();
+        let (start_line, start_character) = self.buffer.lsp_position(range.start);
+        let (end_line, end_character) = self.buffer.lsp_position(range.end);
+        let Some(lsp) = &mut self.lsp else { return false };
+        if !lsp.ready {
+            return false;
+        }
+        let supported = lsp
+            .client
+            .capabilities()
+            .get("documentRangeFormattingProvider")
+            .is_some_and(|v| !v.is_null() && *v != serde_json::Value::Bool(false));
+        if !supported {
+            cx.emit(EditorEvent::Notice("This language server cannot format a selection".into()));
+            return false;
+        }
+        let params = serde_json::json!({
+            "textDocument": { "uri": lsp.uri.as_str() },
+            "range": {
+                "start": { "line": start_line, "character": start_character },
+                "end": { "line": end_line, "character": end_character },
+            },
+            "options": { "tabSize": 2, "insertSpaces": true },
+        });
+        match lsp.client.request("textDocument/rangeFormatting", params) {
+            Ok(id) => {
+                lsp.pending_format_id = Some(id);
+                true
+            }
+            Err(_) => false,
+        }
+    }
+
     pub fn request_format(&mut self) -> bool {
         let Some(lsp) = &mut self.lsp else {
             return false;
@@ -2045,6 +2124,39 @@ impl EditorView {
                     self.apply_code_action(action, cx);
                 }
             }
+            ServerMessage::Response { id, result } if lsp.pending_call_prepare.is_some_and(|p| p.0 == id) => {
+                let Some((_, incoming)) = lsp.pending_call_prepare.take() else { return };
+                let item = result
+                    .ok()
+                    .and_then(|v| serde_json::from_value::<Option<Vec<lsp_types::CallHierarchyItem>>>(v).ok())
+                    .flatten()
+                    .and_then(|items| items.into_iter().next());
+                let Some(item) = item else {
+                    cx.emit(EditorEvent::Notice("No function at the cursor".into()));
+                    return;
+                };
+                let (method, title) = if incoming {
+                    ("callHierarchy/incomingCalls", "Incoming Calls")
+                } else {
+                    ("callHierarchy/outgoingCalls", "Outgoing Calls")
+                };
+                let params = serde_json::json!({ "item": item });
+                if let Ok(id) = lsp.client.request(method, params) {
+                    lsp.pending_calls = Some((id, title));
+                }
+            }
+            ServerMessage::Response { id, result } if lsp.pending_calls.is_some_and(|p| p.0 == id) => {
+                let Some((_, title)) = lsp.pending_calls.take() else { return };
+                let locations = result
+                    .ok()
+                    .map(|v| intel::call_locations(&v))
+                    .unwrap_or_default();
+                if locations.is_empty() {
+                    cx.emit(EditorEvent::Notice(format!("No {}", title.to_lowercase())));
+                } else {
+                    cx.emit(EditorEvent::ShowPeek { title: title.into(), locations });
+                }
+            }
             ServerMessage::Response { id, result } if lsp.pending_references_id == Some(id) => {
                 lsp.pending_references_id = None;
                 let locations = result
@@ -2631,8 +2743,8 @@ mod tests {
         let caps = server.capabilities();
         let legend = intel::Legend::from_capabilities(&caps).expect("gopls offers semantic tokens");
         let params = serde_json::json!({ "textDocument": { "uri": uri.as_str() } });
-        let ask = |method: &str| -> serde_json::Value {
-            let id = server.request(method, params.clone()).unwrap();
+        let ask_with = |method: &str, params: serde_json::Value| -> serde_json::Value {
+            let id = server.request(method, params).unwrap();
             let deadline = std::time::Instant::now() + Duration::from_secs(60);
             while std::time::Instant::now() < deadline {
                 while let Ok(message) = events.try_recv() {
@@ -2646,6 +2758,7 @@ mod tests {
             }
             panic!("no reply to {method}");
         };
+        let ask = |method: &str| ask_with(method, params.clone());
 
         let line_starts: Vec<usize> = std::iter::once(0)
             .chain(source.match_indices('\n').map(|(i, _)| i + 1))
@@ -2680,6 +2793,22 @@ mod tests {
         )
         .expect("folds");
         assert!(folds.iter().any(|f| f.start_line == 4), "func Run folds: {folds:?}");
+
+        // Call hierarchy: `Run` (line 4, on its name) is called from `main`.
+        assert!(
+            caps.get("callHierarchyProvider").is_some_and(|v| !v.is_null()),
+            "gopls offers a call hierarchy"
+        );
+        let prepared = ask_with(
+            "textDocument/prepareCallHierarchy",
+            serde_json::json!({ "textDocument": { "uri": uri.as_str() },
+                                "position": { "line": 4, "character": 18 } }),
+        );
+        let items: Vec<lsp_types::CallHierarchyItem> = serde_json::from_value(prepared).unwrap();
+        let incoming = ask_with("callHierarchy/incomingCalls", serde_json::json!({ "item": items[0] }));
+        let callers = intel::call_locations(&incoming);
+        assert_eq!(callers.len(), 1, "{incoming}");
+        assert_eq!(callers[0].range.start.line, 10, "main is declared on line 10");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
