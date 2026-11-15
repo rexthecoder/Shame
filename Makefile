@@ -7,8 +7,8 @@
 #   make icon            generate assets/icon.png + assets/icon.icns from assets/icon.svg
 #   make release-build   optimized LTO release binary (target/release/dart-ide)
 #   make bundle          package macOS app bundle (dist/Shame.app) with icon.icns
-#   make dmg             create distributable macOS disk image (dist/Shame-0.0.1+1-macos.dmg)
-#   make release         full v0.0.1+1 release pipeline (test + release-build + bundle + dmg)
+#   make dmg             create distributable macOS disk image (dist/Shame-0.0.1+2-macos.dmg)
+#   make release         full v0.0.1+2 release pipeline (test + release-build + bundle + dmg)
 #   make install         install dist/Shame.app into /Applications
 #   scripts/build-mac.sh app + dmg for arm64, x86_64 or universal, with optional
 #                        Developer ID signing and a checksum (see its header)
@@ -22,7 +22,7 @@ CRATE     := app
 BIN       := dart-ide
 APP_NAME  := Shame
 BUNDLE_ID := dev.shame.ide
-VERSION       := 0.0.1+1
+VERSION       := 0.0.1+2
 # CFBundleShortVersionString is 0.0.1; CFBundleVersion is the +N build number.
 SHORT_VERSION := $(word 1,$(subst +, ,$(VERSION)))
 BUILD_NUMBER  := $(word 2,$(subst +, ,$(VERSION)))
